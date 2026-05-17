@@ -1,0 +1,17 @@
+[package]
+name = "tikr-hyperliquid"
+description = "Hyperliquid Venue adapter for the tikr market-making engine"
+keywords = ["trading", "hyperliquid", "market-making", "crypto"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+tikr-core = "0.1"
+tikr-venue = "0.1"

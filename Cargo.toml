@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/kryptic-sh/tikr"
+authors = ["mxaddict <mxaddict@kryptic.sh>"]
+rust-version = "1.95"
+homepage = "https://tikr.kryptic.sh"
+readme = "README.md"
+
+[patch.crates-io]
+tikr-core = { path = "crates/tikr-core" }
+tikr-venue = { path = "crates/tikr-venue" }
+tikr-strategy = { path = "crates/tikr-strategy" }
+tikr-hyperliquid = { path = "crates/tikr-hyperliquid" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

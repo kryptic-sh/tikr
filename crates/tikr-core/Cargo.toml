@@ -1,0 +1,15 @@
+[package]
+name = "tikr-core"
+description = "Core types vocabulary for the tikr market-making engine"
+keywords = ["trading", "market-making", "crypto", "quant"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
