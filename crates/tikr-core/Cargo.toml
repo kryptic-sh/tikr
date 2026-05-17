@@ -13,3 +13,4 @@ homepage.workspace = true
 readme.workspace = true
 
 [dependencies]
+rust_decimal = "1"
