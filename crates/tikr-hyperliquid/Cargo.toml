@@ -15,3 +15,5 @@ readme.workspace = true
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"
+async-trait = "0.1"
+futures = "0.3"

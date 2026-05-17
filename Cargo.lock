@@ -666,6 +666,8 @@ dependencies = [
 name = "tikr-hyperliquid"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "tikr-core",
  "tikr-venue",
 ]
