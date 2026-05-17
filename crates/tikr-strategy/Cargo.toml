@@ -14,3 +14,4 @@ readme.workspace = true
 
 [dependencies]
 tikr-core = "0.1"
+tikr-venue = "0.1"
