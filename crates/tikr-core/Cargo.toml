@@ -14,3 +14,4 @@ readme.workspace = true
 
 [dependencies]
 rust_decimal = "1"
+uuid = { version = "1", features = ["v4"] }

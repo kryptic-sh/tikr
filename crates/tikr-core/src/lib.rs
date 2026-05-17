@@ -24,6 +24,8 @@ use std::{
     sync::Arc,
 };
 
+pub use uuid::Uuid;
+
 pub use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------------------
@@ -255,14 +257,28 @@ pub enum QuoteKind {
 // QuoteId
 // ---------------------------------------------------------------------------
 
-/// Opaque adapter-assigned quote identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct QuoteId(pub Arc<str>);
+/// Adapter-assigned quote identifier, backed by a UUID v4.
+///
+/// Use [`QuoteId::new`] to mint a fresh id, or [`QuoteId::from_uuid`] when
+/// converting a venue-native UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuoteId(pub Uuid);
 
 impl QuoteId {
-    /// Trim whitespace from `raw` and intern as `Arc<str>`.
-    pub fn new(raw: &str) -> Self {
-        QuoteId(raw.trim().into())
+    /// Mint a new, globally unique quote identifier.
+    pub fn new() -> Self {
+        QuoteId(Uuid::new_v4())
+    }
+
+    /// Wrap an existing [`Uuid`] as a [`QuoteId`].
+    pub fn from_uuid(u: Uuid) -> Self {
+        QuoteId(u)
+    }
+}
+
+impl Default for QuoteId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -476,7 +492,7 @@ mod tests {
             ts,
         };
         let fill = MarketEvent::Fill(Fill {
-            quote_id: QuoteId::new("q-1"),
+            quote_id: QuoteId::new(),
             price: Price(dec(3000, 0)),
             size: Size(dec(1, 0)),
             fee_asset: Asset::new("USDT"),
