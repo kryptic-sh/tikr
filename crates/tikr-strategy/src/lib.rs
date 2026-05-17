@@ -29,7 +29,10 @@
 
 #![deny(missing_docs)]
 
-use tikr_core::{Fill, MarketEvent, Position, Size, Snapshot, Symbol, Timestamp};
+use tikr_core::{
+    Decimal, Fill, MarketEvent, Position, Price, QuoteKind, Side, Size, Snapshot, Symbol,
+    TimeInForce, Timestamp,
+};
 use tikr_venue::{QuoteId, QuoteIntent};
 
 // ---------------------------------------------------------------------------
@@ -147,23 +150,89 @@ pub struct NaiveGridConfig {
     pub min_requote_interval_ms: u64,
 }
 
-/// Symmetric grid market-making strategy (Phase 1 stub).
+/// Symmetric grid market-making strategy.
 ///
-/// Places `levels_per_side` bid and ask levels around a mid-price derived
-/// from the latest book snapshot. Full logic lands in Phase 1.
+/// Places `levels_per_side` bid and ask levels symmetrically around a
+/// mid-price derived from the latest book snapshot.
 pub struct NaiveGrid {
     /// Strategy configuration.
-    #[allow(dead_code)]
     config: NaiveGridConfig,
     /// Timestamp of the most recent full requote cycle, if any.
     last_requote_ts: Option<Timestamp>,
+    /// Mid-price at the time of the most recent requote.
+    last_quoted_mid: Option<Price>,
+    /// Most recent trade price, used as a mid-price fallback when one side
+    /// of the book is empty.
+    last_trade_price: Option<Price>,
 }
 
 impl NaiveGrid {
     /// Timestamp of the most recent full requote, or `None` if no requote has
-    /// occurred yet. Used by Phase 1 logic to enforce `min_requote_interval_ms`.
+    /// occurred yet. Used to enforce `min_requote_interval_ms`.
     pub fn last_requote_ts(&self) -> Option<Timestamp> {
         self.last_requote_ts
+    }
+
+    /// Decide whether a requote should fire given a freshly observed mid and
+    /// the current time. Returns `true` on cold start (no prior requote).
+    fn should_requote(&self, new_mid: Price, now: Timestamp) -> bool {
+        let Some(last_ts) = self.last_requote_ts else {
+            return true;
+        };
+        let Some(last_mid) = self.last_quoted_mid else {
+            return true;
+        };
+
+        let elapsed_ns = now.0.saturating_sub(last_ts.0);
+        let interval_ns = self
+            .config
+            .min_requote_interval_ms
+            .saturating_mul(1_000_000);
+        if elapsed_ns >= interval_ns {
+            return true;
+        }
+
+        let drift = (new_mid.0 - last_mid.0).abs();
+        let threshold_bps = Decimal::from(self.config.level_step_bps) / Decimal::from(2);
+        let threshold = last_mid.0 * threshold_bps / Decimal::from(10_000);
+        drift > threshold
+    }
+
+    /// Build the cancel-all + 2N quote actions for the given mid.
+    fn build_quotes(&self, symbol: &Symbol, mid: Price) -> Vec<Action> {
+        let mut actions = Vec::with_capacity(1 + 2 * self.config.levels_per_side as usize);
+        actions.push(Action::CancelAll);
+        let bps_unit = Decimal::from(10_000);
+        for k in 0..self.config.levels_per_side {
+            let offset_bps = Decimal::from(self.config.base_spread_bps)
+                + Decimal::from(k as u32) * Decimal::from(self.config.level_step_bps);
+            let offset = offset_bps / bps_unit;
+            let bid_price = Price(mid.0 * (Decimal::from(1) - offset));
+            let ask_price = Price(mid.0 * (Decimal::from(1) + offset));
+            for (side, price) in [(Side::Bid, bid_price), (Side::Ask, ask_price)] {
+                actions.push(Action::Quote(QuoteIntent {
+                    symbol: symbol.clone(),
+                    side,
+                    price,
+                    size: self.config.size_per_quote,
+                    tif: TimeInForce::PostOnly,
+                    kind: QuoteKind::Point,
+                }));
+            }
+        }
+        actions
+    }
+}
+
+/// Compute the mid-price for a snapshot, falling back to `last_trade_price`
+/// when one side of the book is empty. Returns `None` if both sides are
+/// empty and no trade fallback is available.
+fn compute_mid(snapshot: &Snapshot, last_trade_price: Option<Price>) -> Option<Price> {
+    let best_bid = snapshot.bids.first().map(|l| l.price);
+    let best_ask = snapshot.asks.first().map(|l| l.price);
+    match (best_bid, best_ask) {
+        (Some(b), Some(a)) => Some(Price((b.0 + a.0) / Decimal::from(2))),
+        _ => last_trade_price,
     }
 }
 
@@ -174,6 +243,8 @@ impl Strategy for NaiveGrid {
         Self {
             config,
             last_requote_ts: None,
+            last_quoted_mid: None,
+            last_trade_price: None,
         }
     }
 
@@ -181,8 +252,38 @@ impl Strategy for NaiveGrid {
         "naive-grid"
     }
 
-    fn on_event(&mut self, _ctx: &StrategyContext<'_>, _event: &MarketEvent) -> Vec<Action> {
-        todo!("naive grid logic — Phase 1")
+    fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        match event {
+            MarketEvent::Trade { price, .. } => {
+                self.last_trade_price = Some(*price);
+                Vec::new()
+            }
+            MarketEvent::Fill(_) => Vec::new(),
+            MarketEvent::Heartbeat { ts } => {
+                let Some(mid) = compute_mid(ctx.latest_book, self.last_trade_price) else {
+                    return Vec::new();
+                };
+                if self.should_requote(mid, *ts) {
+                    self.last_requote_ts = Some(*ts);
+                    self.last_quoted_mid = Some(mid);
+                    self.build_quotes(ctx.symbol, mid)
+                } else {
+                    vec![Action::NoOp]
+                }
+            }
+            MarketEvent::BookUpdate { snapshot } => {
+                let Some(mid) = compute_mid(snapshot, self.last_trade_price) else {
+                    return Vec::new();
+                };
+                if self.should_requote(mid, snapshot.ts) {
+                    self.last_requote_ts = Some(snapshot.ts);
+                    self.last_quoted_mid = Some(mid);
+                    self.build_quotes(ctx.symbol, mid)
+                } else {
+                    vec![Action::NoOp]
+                }
+            }
+        }
     }
 }
 
@@ -193,7 +294,7 @@ impl Strategy for NaiveGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, SignedSize, VenueId};
+    use tikr_core::{Asset, Decimal, Level, SignedSize, VenueId};
     use tikr_core::{Price, QuoteKind, Side, TimeInForce};
     use tikr_venue::QuoteIntent;
 
@@ -320,6 +421,153 @@ mod tests {
         let ctx = make_ctx(&sym, &pos, &book);
         let mut grid = NaiveGrid::new(make_cfg());
         let actions = grid.on_tick(&ctx);
+        assert!(actions.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 1 grid-logic tests
+    // -------------------------------------------------------------------
+
+    fn make_pos(sym: &Symbol) -> Position {
+        Position {
+            symbol: sym.clone(),
+            size: SignedSize(Decimal::ZERO),
+            avg_entry: Price(Decimal::ZERO),
+            realized_pnl: tikr_core::Notional(Decimal::ZERO),
+        }
+    }
+
+    fn make_book(sym: &Symbol, bids: &[(i64, i64)], asks: &[(i64, i64)], ts: u64) -> Snapshot {
+        let to_levels = |xs: &[(i64, i64)]| {
+            xs.iter()
+                .map(|(p, s)| Level {
+                    price: Price(Decimal::new(*p, 0)),
+                    size: Size(Decimal::new(*s, 0)),
+                })
+                .collect()
+        };
+        Snapshot {
+            symbol: sym.clone(),
+            bids: to_levels(bids),
+            asks: to_levels(asks),
+            ts: Timestamp(ts),
+        }
+    }
+
+    fn make_phase1_cfg() -> NaiveGridConfig {
+        NaiveGridConfig {
+            levels_per_side: 2,
+            base_spread_bps: 10,
+            level_step_bps: 5,
+            size_per_quote: Size(Decimal::new(1, 0)),
+            min_requote_interval_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn first_book_update_quotes_immediately() {
+        let sym = make_symbol();
+        let pos = make_pos(&sym);
+        let book = make_book(&sym, &[(100, 1)], &[(102, 1)], 0);
+        let ctx = make_ctx(&sym, &pos, &book);
+        let mut grid = NaiveGrid::new(make_phase1_cfg());
+
+        let event = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[(100, 1)], &[(102, 1)], 0),
+        };
+        let actions = grid.on_event(&ctx, &event);
+
+        assert_eq!(actions.len(), 5);
+        assert!(matches!(actions[0], Action::CancelAll));
+        for a in &actions[1..] {
+            assert!(matches!(a, Action::Quote(_)));
+        }
+    }
+
+    #[test]
+    fn requote_fires_after_interval() {
+        let sym = make_symbol();
+        let pos = make_pos(&sym);
+        let book = make_book(&sym, &[(100, 1)], &[(102, 1)], 1000);
+        let ctx = make_ctx(&sym, &pos, &book);
+        let mut grid = NaiveGrid::new(make_phase1_cfg());
+
+        // First update consumes the cold-start requote.
+        let event1 = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[(100, 1)], &[(102, 1)], 1000),
+        };
+        let actions1 = grid.on_event(&ctx, &event1);
+        assert_eq!(actions1.len(), 5);
+
+        // Second update one full interval (1000ms = 1_000_000_000 ns) + 1ns later.
+        let event2 = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[(100, 1)], &[(102, 1)], 1000 + 1_000_000_000 + 1),
+        };
+        let actions2 = grid.on_event(&ctx, &event2);
+        assert_eq!(actions2.len(), 5);
+        assert!(matches!(actions2[0], Action::CancelAll));
+    }
+
+    #[test]
+    fn requote_fires_on_mid_drift() {
+        let sym = make_symbol();
+        let pos = make_pos(&sym);
+        let book = make_book(&sym, &[(100, 1)], &[(100, 1)], 0);
+        let ctx = make_ctx(&sym, &pos, &book);
+        let mut grid = NaiveGrid::new(make_phase1_cfg());
+
+        // First update at ts=0: mid = 100.
+        let event1 = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[(100, 1)], &[(100, 1)], 0),
+        };
+        let actions1 = grid.on_event(&ctx, &event1);
+        assert_eq!(actions1.len(), 5);
+
+        // Second update at ts=1ns (well within 1000ms interval), mid = 101 (~1%
+        // shift, far above the 2.5 bps drift threshold).
+        let event2 = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[(101, 1)], &[(101, 1)], 1),
+        };
+        let actions2 = grid.on_event(&ctx, &event2);
+        assert_eq!(actions2.len(), 5);
+        assert!(matches!(actions2[0], Action::CancelAll));
+    }
+
+    #[test]
+    fn heartbeat_emits_noop_when_no_requote() {
+        let sym = make_symbol();
+        let pos = make_pos(&sym);
+        let book = make_book(&sym, &[(100, 1)], &[(102, 1)], 1000);
+        let ctx = make_ctx(&sym, &pos, &book);
+        let mut grid = NaiveGrid::new(make_phase1_cfg());
+
+        // Prime state with a book update at ts=1000.
+        let event1 = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[(100, 1)], &[(102, 1)], 1000),
+        };
+        let _ = grid.on_event(&ctx, &event1);
+
+        // Heartbeat 1ns later (within interval, no drift since ctx.latest_book is
+        // unchanged).
+        let event2 = MarketEvent::Heartbeat {
+            ts: Timestamp(1001),
+        };
+        let actions = grid.on_event(&ctx, &event2);
+        assert!(matches!(actions[..], [Action::NoOp]));
+    }
+
+    #[test]
+    fn empty_book_no_fallback_returns_empty() {
+        let sym = make_symbol();
+        let pos = make_pos(&sym);
+        let book = make_book(&sym, &[], &[], 0);
+        let ctx = make_ctx(&sym, &pos, &book);
+        let mut grid = NaiveGrid::new(make_phase1_cfg());
+
+        let event = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, &[], &[], 0),
+        };
+        let actions = grid.on_event(&ctx, &event);
         assert!(actions.is_empty());
     }
 }
