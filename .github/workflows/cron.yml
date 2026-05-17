@@ -1,0 +1,31 @@
+name: Cron
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pre-alpha cron: only cargo-deny runs against a fresh advisory DB.
+  # Phase 1+ will re-add miri (when there's unsafe / FFI worth checking)
+  # and cargo-fuzz (when there's logic worth fuzzing). Mirrors hjkl/cron.yml
+  # minus those jobs per tikr issue #5 spec.
+
+jobs:
+  deny:
+    name: cargo-deny (fresh advisory DB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - run: cargo deny --all-features check
