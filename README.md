@@ -5,9 +5,10 @@ framework + strategy traits + Hyperliquid stub adapter only. **Not for live
 trading yet.**
 
 [![CI](https://github.com/kryptic-sh/tikr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/tikr/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/kryptic-sh/tikr)](https://github.com/kryptic-sh/tikr/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> 🚧 **Phase 0** — foundation only. No live trading logic. Watch
+> **Phase 0** — foundation only. No live trading logic. Watch
 > [Roadmap & exit criteria](https://github.com/kryptic-sh/tikr/issues/1) for
 > progress.
 
@@ -34,6 +35,15 @@ Crates land as phases ship. See
 ## Status
 
 Pre-alpha. Code is design + skeleton. **Do not run against real capital.**
+
+## Install
+
+```bash
+# build from source
+git clone https://github.com/kryptic-sh/tikr.git
+cd tikr
+cargo install --path . --bin tikr
+```
 
 ## Development
 
