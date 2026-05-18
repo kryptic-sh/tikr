@@ -29,6 +29,12 @@
 
 #![deny(missing_docs)]
 
+pub mod avellaneda_stoikov;
+pub mod volatility;
+
+pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
+pub use volatility::{EwmaConfig, EwmaVolatility};
+
 use tikr_core::{
     Decimal, Fill, MarketEvent, Position, Price, QuoteKind, Side, Size, Snapshot, Symbol,
     TimeInForce, Timestamp,
