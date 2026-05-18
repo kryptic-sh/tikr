@@ -1,0 +1,37 @@
+[package]
+name = "tikr-backtest"
+description = "Backtest engine for the tikr market-making engine: parquet replay + fill simulation + P&L accounting"
+keywords = ["trading", "backtest", "market-making", "quant"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "record"
+path = "src/bin/record.rs"
+
+[dependencies]
+tikr-core = "0.1"
+tikr-venue = "0.1"
+tikr-strategy = "0.1"
+polars = { version = "0.43", default-features = false, features = ["parquet", "lazy", "polars-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+[package.metadata.cargo-machete]
+# tikr-venue: QuoteId / QuoteIntent are used via the FillSim API in #11.
+# Currently re-exported through tikr-strategy so the direct import is
+# not yet load-bearing; keep the dep for the Phase 1 module wiring.
+ignored = ["tikr-venue"]

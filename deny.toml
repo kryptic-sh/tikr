@@ -5,7 +5,15 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "warn"
-ignore = []
+ignore = [
+  # fast-float: empty-input segfault in unsafe pointer deref. Pulled in
+  # transitively by polars-arrow -> polars (tikr-backtest replay only).
+  # No safe upgrade -- fix lives in the fast-float2 fork; polars has not
+  # migrated yet. We never feed untrusted strings to polars's float parser
+  # (recorder writes from typed WS payloads, replay reads our own files),
+  # so the empty-string path is unreachable. Revisit on polars bump.
+  { id = "RUSTSEC-2025-0003", reason = "transitive via polars; empty-input path unreachable from our usage" },
+]
 
 [licenses]
 allow = [
@@ -20,6 +28,9 @@ allow = [
   "Unicode-DFS-2016",
   "Zlib",
   "CC0-1.0",
+  # Boost Software License -- OSI-approved, FSF Free/Libre. Pulled in by
+  # xxhash-rust (transitive via polars-core).
+  "BSL-1.0",
 ]
 confidence-threshold = 0.8
 

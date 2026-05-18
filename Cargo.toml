@@ -17,6 +17,7 @@ tikr-core = { path = "crates/tikr-core" }
 tikr-venue = { path = "crates/tikr-venue" }
 tikr-strategy = { path = "crates/tikr-strategy" }
 tikr-hyperliquid = { path = "crates/tikr-hyperliquid" }
+tikr-backtest = { path = "crates/tikr-backtest" }
 
 [profile.release]
 lto = "thin"
