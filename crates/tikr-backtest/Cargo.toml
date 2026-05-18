@@ -29,9 +29,3 @@ clap = { version = "4", features = ["derive"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
-
-[package.metadata.cargo-machete]
-# tikr-venue: QuoteId / QuoteIntent are used via the FillSim API in #11.
-# Currently re-exported through tikr-strategy so the direct import is
-# not yet load-bearing; keep the dep for the Phase 1 module wiring.
-ignored = ["tikr-venue"]

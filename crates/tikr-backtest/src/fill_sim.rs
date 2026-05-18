@@ -4,8 +4,14 @@
 //!
 //! [issue #11]: https://github.com/kryptic-sh/tikr/issues/11
 
-use tikr_core::{Fill, MarketEvent, Timestamp};
+use std::collections::HashMap;
+
+use tikr_core::{
+    Decimal, Fill, MarketEvent, Notional, Price, Side, Size, Snapshot, Symbol, TimeInForce,
+    Timestamp,
+};
 use tikr_strategy::Action;
+use tikr_venue::{QuoteId, QuoteIntent};
 
 /// Per-venue fee schedule. Negative maker = rebate.
 #[derive(Debug, Clone, Copy)]
@@ -27,27 +33,437 @@ pub struct FillSimConfig {
     pub fees: VenueFees,
 }
 
-/// Trade-through fill simulator. Phase 1 stub.
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+struct PendingOp {
+    scheduled_ts_ns: u64,
+    op: Op,
+}
+
+enum Op {
+    Place(QuoteIntent),
+    Replace { id: QuoteId, intent: QuoteIntent },
+    Cancel(QuoteId),
+    CancelAll,
+}
+
+struct LiveQuote {
+    id: QuoteId,
+    symbol: Symbol,
+    side: Side,
+    price: Price,
+    size_remaining: Size,
+    #[allow(dead_code)]
+    ts_submitted: Timestamp,
+}
+
+#[derive(Default, Clone, Copy)]
+struct BookState {
+    best_bid: Option<Price>,
+    best_ask: Option<Price>,
+}
+
+// ---------------------------------------------------------------------------
+// FillSim
+// ---------------------------------------------------------------------------
+
+/// Trade-through fill simulator with configurable latency, post-only
+/// correctness, partial fills, and maker-rebate fees.
 pub struct FillSim {
-    _cfg: FillSimConfig,
+    cfg: FillSimConfig,
+    pending: Vec<PendingOp>,
+    live_quotes: Vec<LiveQuote>,
+    book_state: HashMap<Symbol, BookState>,
 }
 
 impl FillSim {
     /// Construct a new fill simulator from `cfg`.
     pub fn new(cfg: FillSimConfig) -> Self {
-        Self { _cfg: cfg }
+        Self {
+            cfg,
+            pending: Vec::new(),
+            live_quotes: Vec::new(),
+            book_state: HashMap::new(),
+        }
     }
 
-    /// Schedule a strategy action for venue submission at `now + submit_latency_ms`.
+    /// Schedule a strategy action for venue submission at `now + appropriate_latency_ms`.
     pub fn on_action(&mut self, action: Action, now: Timestamp) {
-        let _ = (action, now);
-        todo!("issue #11: queue action with latency, handle post-only reject at submit-time")
+        let submit_ns = self.cfg.submit_latency_ms.saturating_mul(1_000_000);
+        let cancel_ns = self.cfg.cancel_latency_ms.saturating_mul(1_000_000);
+        let (scheduled, op) = match action {
+            Action::Quote(intent) => (now.0.saturating_add(submit_ns), Op::Place(intent)),
+            Action::Requote { id, intent } => {
+                (now.0.saturating_add(submit_ns), Op::Replace { id, intent })
+            }
+            Action::Cancel(id) => (now.0.saturating_add(cancel_ns), Op::Cancel(id)),
+            Action::CancelAll => (now.0.saturating_add(cancel_ns), Op::CancelAll),
+            Action::NoOp => return,
+        };
+        self.pending.push(PendingOp {
+            scheduled_ts_ns: scheduled,
+            op,
+        });
+        // Stable sort preserves FIFO within identical scheduled_ts_ns.
+        self.pending.sort_by_key(|p| p.scheduled_ts_ns);
     }
 
     /// Match queued open quotes against `ev`; emit fills for any quotes
     /// taken out by the trade-through model.
     pub fn on_market_event(&mut self, ev: &MarketEvent, now: Timestamp) -> Vec<Fill> {
-        let _ = (ev, now);
-        todo!("issue #11: trade-through matching, partial fills, fee assignment")
+        self.apply_pending(now);
+        match ev {
+            MarketEvent::BookUpdate { snapshot } => {
+                self.update_book_state(snapshot);
+                Vec::new()
+            }
+            MarketEvent::Trade {
+                symbol,
+                price,
+                size,
+                side: taker_side,
+                ts,
+            } => self.match_trade(symbol, *price, *size, *taker_side, *ts),
+            MarketEvent::Heartbeat { .. } | MarketEvent::Fill(_) => Vec::new(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    fn apply_pending(&mut self, now: Timestamp) {
+        let pivot = self.pending.partition_point(|p| p.scheduled_ts_ns <= now.0);
+        let ready: Vec<_> = self.pending.drain(..pivot).collect();
+        for p in ready {
+            match p.op {
+                Op::Place(intent) => self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns)),
+                Op::Replace { id, intent } => {
+                    self.cancel_id(id);
+                    self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns));
+                }
+                Op::Cancel(id) => self.cancel_id(id),
+                Op::CancelAll => self.live_quotes.clear(),
+            }
+        }
+    }
+
+    fn place_or_reject(&mut self, intent: QuoteIntent, ts: Timestamp) {
+        if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
+            return;
+        }
+        let id = QuoteId::new();
+        self.live_quotes.push(LiveQuote {
+            id,
+            symbol: intent.symbol,
+            side: intent.side,
+            price: intent.price,
+            size_remaining: intent.size,
+            ts_submitted: ts,
+        });
+    }
+
+    fn would_cross(&self, intent: &QuoteIntent) -> bool {
+        let Some(book) = self.book_state.get(&intent.symbol) else {
+            return false;
+        };
+        match intent.side {
+            Side::Bid => book.best_ask.is_some_and(|ask| intent.price.0 >= ask.0),
+            Side::Ask => book.best_bid.is_some_and(|bid| intent.price.0 <= bid.0),
+        }
+    }
+
+    fn cancel_id(&mut self, id: QuoteId) {
+        self.live_quotes.retain(|q| q.id != id);
+    }
+
+    fn update_book_state(&mut self, snapshot: &Snapshot) {
+        let st = self.book_state.entry(snapshot.symbol.clone()).or_default();
+        st.best_bid = snapshot.bids.first().map(|l| l.price);
+        st.best_ask = snapshot.asks.first().map(|l| l.price);
+    }
+
+    fn match_trade(
+        &mut self,
+        symbol: &Symbol,
+        trade_price: Price,
+        trade_size: Size,
+        taker_side: Side,
+        trade_ts: Timestamp,
+    ) -> Vec<Fill> {
+        let mut out = Vec::new();
+        let mut trade_remaining = trade_size.0;
+
+        let mut i = 0;
+        while i < self.live_quotes.len() && trade_remaining > Decimal::ZERO {
+            let q = &mut self.live_quotes[i];
+            let eligible =
+                q.symbol == *symbol && quote_takes_trade(q.side, q.price, taker_side, trade_price);
+            if !eligible {
+                i += 1;
+                continue;
+            }
+            let fill_amount = q.size_remaining.0.min(trade_remaining);
+            let fill_price = q.price;
+            // fee_amount is signed; positive = paid, negative = rebated.
+            let fee_amount = fill_price.0 * fill_amount * Decimal::from(self.cfg.fees.maker_bps)
+                / Decimal::from(10_000);
+            out.push(Fill {
+                quote_id: q.id,
+                price: fill_price,
+                size: Size(fill_amount),
+                fee_asset: symbol.quote.clone(),
+                fee_amount,
+                fee_quote: Notional(fee_amount),
+                side: q.side,
+                ts: trade_ts,
+            });
+            q.size_remaining = Size(q.size_remaining.0 - fill_amount);
+            trade_remaining -= fill_amount;
+            if q.size_remaining.0 == Decimal::ZERO {
+                self.live_quotes.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        out
+    }
+}
+
+/// Whether a resting quote on `quote_side` at `quote_price` would be taken by
+/// a public trade printed at `trade_price` with the given aggressor side.
+fn quote_takes_trade(
+    quote_side: Side,
+    quote_price: Price,
+    taker_side: Side,
+    trade_price: Price,
+) -> bool {
+    match (quote_side, taker_side) {
+        // Our Bid (we buy) is taken when taker sold (Side::Ask) at or below our bid.
+        (Side::Bid, Side::Ask) => trade_price.0 <= quote_price.0,
+        // Our Ask (we sell) is taken when taker bought (Side::Bid) at or above our ask.
+        (Side::Ask, Side::Bid) => trade_price.0 >= quote_price.0,
+        // Same-side: taker hit the OTHER side of the book, not ours.
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tikr_core::{Asset, Decimal, Level, QuoteKind, Snapshot, TimeInForce, VenueId};
+    use tikr_venue::QuoteIntent;
+
+    fn make_symbol() -> Symbol {
+        Symbol {
+            base: Asset::new("BTC"),
+            quote: Asset::new("USDT"),
+            venue: VenueId::new("test"),
+        }
+    }
+
+    fn make_book(symbol: &Symbol, best_bid: i64, best_ask: i64) -> Snapshot {
+        Snapshot {
+            symbol: symbol.clone(),
+            bids: vec![Level {
+                price: Price(Decimal::from(best_bid)),
+                size: Size(Decimal::from(1)),
+            }],
+            asks: vec![Level {
+                price: Price(Decimal::from(best_ask)),
+                size: Size(Decimal::from(1)),
+            }],
+            ts: Timestamp(0),
+        }
+    }
+
+    fn make_intent(
+        symbol: &Symbol,
+        side: Side,
+        price: i64,
+        size: i64,
+        tif: TimeInForce,
+    ) -> QuoteIntent {
+        QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price: Price(Decimal::from(price)),
+            size: Size(Decimal::from(size)),
+            tif,
+            kind: QuoteKind::Point,
+        }
+    }
+
+    fn make_trade(
+        symbol: &Symbol,
+        price: i64,
+        size: i64,
+        taker_side: Side,
+        ts_ns: u64,
+    ) -> MarketEvent {
+        MarketEvent::Trade {
+            symbol: symbol.clone(),
+            price: Price(Decimal::from(price)),
+            size: Size(Decimal::from(size)),
+            side: taker_side,
+            ts: Timestamp(ts_ns),
+        }
+    }
+
+    fn default_cfg() -> FillSimConfig {
+        FillSimConfig {
+            submit_latency_ms: 10,
+            cancel_latency_ms: 50,
+            fees: VenueFees {
+                maker_bps: 0,
+                taker_bps: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn post_only_rejected_when_would_cross_at_submit() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        // Seed book state: bid=100, ask=101.
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, 100, 101),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        // PostOnly bid at 102 crosses the 101 ask.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 102, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+
+        // Advance past submit_latency (10ms = 10_000_000ns) to fire pending Place.
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+
+        // Trade that would have hit the rejected quote.
+        let trade = make_trade(&sym, 102, 1, Side::Ask, 30_000_000);
+        let fills = sim.on_market_event(&trade, Timestamp(30_000_000));
+
+        assert!(fills.is_empty(), "rejected post-only must not fill");
+        assert_eq!(sim.live_quotes.len(), 0, "rejected quote not in book");
+    }
+
+    #[test]
+    fn partial_fill_leaves_quote_open_with_reduced_size() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, 99, 101),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        // Place a Bid PostOnly at 100, size 5 (does not cross 99/101 book).
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 5, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+
+        // Fire pending Place at t=20ms.
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+
+        // 1-unit Ask-side taker print at 100 → partial fill on the 5-unit bid.
+        let trade = make_trade(&sym, 100, 1, Side::Ask, 30_000_000);
+        let fills = sim.on_market_event(&trade, Timestamp(30_000_000));
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].size, Size(Decimal::from(1)));
+        assert_eq!(fills[0].price, Price(Decimal::from(100)));
+        assert_eq!(sim.live_quotes.len(), 1);
+        assert_eq!(sim.live_quotes[0].size_remaining, Size(Decimal::from(4)));
+    }
+
+    #[test]
+    fn cancel_after_fill_race() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, 99, 101),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        // Place at t=0, scheduled for t=10ms.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        // Drive pending Place via heartbeat at t=15ms.
+        let hb1 = MarketEvent::Heartbeat {
+            ts: Timestamp(15_000_000),
+        };
+        let _ = sim.on_market_event(&hb1, Timestamp(15_000_000));
+
+        // Cancel-all at t=20ms; cancel_latency=50ms so it lands at t=70ms.
+        sim.on_action(Action::CancelAll, Timestamp(20_000_000));
+
+        // Trade at t=30ms races ahead of the cancel.
+        let trade = make_trade(&sym, 100, 1, Side::Ask, 30_000_000);
+        let fills = sim.on_market_event(&trade, Timestamp(30_000_000));
+        assert_eq!(fills.len(), 1, "race-lost cancel: fill still happens");
+
+        // Advance past cancel landing time (t=80ms); cancel applies to empty book.
+        let hb2 = MarketEvent::Heartbeat {
+            ts: Timestamp(80_000_000),
+        };
+        let fills2 = sim.on_market_event(&hb2, Timestamp(80_000_000));
+        assert!(fills2.is_empty(), "no fills from a stale cancel");
+    }
+
+    #[test]
+    fn maker_rebate_produces_negative_fee_quote() {
+        let sym = make_symbol();
+        let cfg = FillSimConfig {
+            submit_latency_ms: 10,
+            cancel_latency_ms: 50,
+            fees: VenueFees {
+                maker_bps: -10,
+                taker_bps: 0,
+            },
+        };
+        let mut sim = FillSim::new(cfg);
+
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, 99, 101),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+
+        let trade = make_trade(&sym, 100, 1, Side::Ask, 30_000_000);
+        let fills = sim.on_market_event(&trade, Timestamp(30_000_000));
+
+        assert_eq!(fills.len(), 1);
+        let expected =
+            Decimal::from(100) * Decimal::from(1) * Decimal::from(-10) / Decimal::from(10_000);
+        assert_eq!(fills[0].fee_quote, Notional(expected));
+        assert_eq!(fills[0].fee_amount, expected);
+        assert!(expected < Decimal::ZERO, "rebate must be negative");
     }
 }
