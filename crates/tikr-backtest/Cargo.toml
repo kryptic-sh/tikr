@@ -23,12 +23,12 @@ tikr-strategy = "0.1"
 polars = { version = "0.43", default-features = false, features = ["parquet", "lazy", "polars-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 async-trait = "0.1"
-futures = "0.3"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+tempfile = "3"
 
 [package.metadata.cargo-machete]
 # tikr-venue: QuoteId / QuoteIntent are used via the FillSim API in #11.

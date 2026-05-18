@@ -3,16 +3,14 @@
 //!
 //! [issue #10]: https://github.com/kryptic-sh/tikr/issues/10
 
-use async_trait::async_trait;
-use thiserror::Error;
-use tikr_core::MarketEvent;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
-// Re-exports to anchor crate intent for the Phase 1 scaffold; real impls
-// in the modules below will consume these directly (see #9/#10/#15).
-#[doc(hidden)]
-pub use futures as _futures;
-#[doc(hidden)]
-pub use polars as _polars;
+use async_trait::async_trait;
+use polars::prelude::*;
+use thiserror::Error;
+use tikr_core::{Decimal, Level, MarketEvent, Price, Side, Size, Snapshot, Symbol, Timestamp};
 
 /// Forward iterator over historical market events. Sim time advances per event.
 #[async_trait]
@@ -26,32 +24,448 @@ pub trait Replay: Send {
 pub struct ReplayConfig {
     /// Heartbeat synthesis cadence, in milliseconds of sim time.
     /// Injected during quiet stretches to let time-driven strategies tick.
+    /// Set to `0` to disable heartbeat synthesis entirely.
     pub heartbeat_ms: u64,
+    /// Symbols to replay. Multi-symbol streams merge by timestamp, with ties
+    /// broken by alphabetical base-asset ordering for determinism.
+    pub symbols: Vec<Symbol>,
+    /// Directory containing the parquet files (see SCHEMA.md for naming).
+    pub data_dir: PathBuf,
 }
 
 impl Default for ReplayConfig {
     fn default() -> Self {
-        Self { heartbeat_ms: 1000 }
+        Self {
+            heartbeat_ms: 1000,
+            symbols: Vec::new(),
+            data_dir: PathBuf::new(),
+        }
     }
 }
 
-/// Parquet-backed [`Replay`] implementation. Phase 1 stub.
+/// Per-symbol order-book running state, updated as book deltas are emitted.
+#[derive(Debug, Default)]
+struct BookState {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+}
+
+/// In-memory representation of one historical event.
+#[derive(Debug)]
+struct LoadedEvent {
+    ts_ns: u64,
+    symbol_idx: usize,
+    payload: EventPayload,
+}
+
+#[derive(Debug)]
+enum EventPayload {
+    BookDelta {
+        side: u8,
+        price: Decimal,
+        size: Decimal,
+        seq: u64,
+    },
+    Trade {
+        price: Decimal,
+        size: Decimal,
+        taker_side: u8,
+    },
+}
+
+/// Parquet-backed [`Replay`] implementation.
+///
+/// All events are loaded into memory and sorted once at construction time.
+/// Sort key: `(ts_ns, base-asset-alphabetical, payload-discriminator)`.
+/// This is the v0 simple path; a streaming/chunked variant can replace it
+/// when datasets outgrow RAM.
 pub struct ParquetReplay {
-    _cfg: ReplayConfig,
+    cfg: ReplayConfig,
+    /// Sort order applied to `cfg.symbols` for deterministic tiebreaks
+    /// (alphabetical by `base.0`). Indices below refer to `cfg.symbols`.
+    events: Vec<LoadedEvent>,
+    books: Vec<BookState>,
+    cursor: usize,
+    last_emitted_ts: Option<u64>,
 }
 
 impl ParquetReplay {
-    /// Construct a new parquet replay from `cfg`. Real impl in #10.
+    /// Construct a new parquet replay from `cfg`.
+    ///
+    /// Loads all parquet files matching `book_<BASE>_*.parquet` and
+    /// `trades_<BASE>_*.parquet` for each configured symbol, sorts by
+    /// `(ts_ns, base-alphabetical)`, and validates per-symbol `seq`
+    /// monotonicity on the book stream. Missing files are not an error.
     pub fn new(cfg: ReplayConfig) -> Result<Self, ReplayError> {
-        let _ = cfg;
-        todo!("issue #10: open parquet, build iterator, validate seq monotonicity")
+        let mut events: Vec<LoadedEvent> = Vec::new();
+        let mut books: Vec<BookState> = Vec::with_capacity(cfg.symbols.len());
+
+        for _ in 0..cfg.symbols.len() {
+            books.push(BookState::default());
+        }
+
+        // Build (base_str, symbol_idx) pairs for the alphabetical tiebreak.
+        let mut bases: Vec<(String, usize)> = cfg
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.base.0.to_string(), i))
+            .collect();
+        bases.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Map symbol_idx -> alphabetical rank for the secondary sort key.
+        let mut alpha_rank: Vec<usize> = vec![0; cfg.symbols.len()];
+        for (rank, (_, idx)) in bases.iter().enumerate() {
+            alpha_rank[*idx] = rank;
+        }
+
+        // Discover + load files per symbol.
+        if cfg.data_dir.as_os_str().is_empty() {
+            // Empty data_dir means "no fixtures" — valid for the
+            // empty-config heartbeat-only path. Skip discovery.
+        } else if cfg.data_dir.exists() {
+            for (symbol_idx, symbol) in cfg.symbols.iter().enumerate() {
+                let base = symbol.base.0.as_ref();
+                let book_prefix = format!("book_{}_", base);
+                let trade_prefix = format!("trades_{}_", base);
+
+                for entry in std::fs::read_dir(&cfg.data_dir)? {
+                    let entry = entry?;
+                    let fname = entry.file_name();
+                    let name = fname.to_string_lossy();
+                    if !name.ends_with(".parquet") {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if name.starts_with(&book_prefix) {
+                        load_book_parquet(&path, symbol_idx, &mut events)?;
+                    } else if name.starts_with(&trade_prefix) {
+                        load_trades_parquet(&path, symbol_idx, &mut events)?;
+                    }
+                }
+            }
+        }
+
+        // Stable sort by (ts_ns, alphabetical rank of symbol, payload discriminator).
+        // Payload discriminator: book deltas sort before trades at the same
+        // (ts, symbol) for deterministic interleaving.
+        events.sort_by(|a, b| {
+            a.ts_ns
+                .cmp(&b.ts_ns)
+                .then_with(|| alpha_rank[a.symbol_idx].cmp(&alpha_rank[b.symbol_idx]))
+                .then_with(|| payload_rank(&a.payload).cmp(&payload_rank(&b.payload)))
+        });
+
+        // Validate per-symbol seq monotonicity on book deltas.
+        for (symbol_idx, symbol) in cfg.symbols.iter().enumerate() {
+            let mut last_seq: Option<u64> = None;
+            for ev in events.iter().filter(|e| e.symbol_idx == symbol_idx) {
+                if let EventPayload::BookDelta { seq, .. } = &ev.payload {
+                    if let Some(prev) = last_seq {
+                        let expected = prev + 1;
+                        if *seq != expected {
+                            return Err(ReplayError::SeqGap {
+                                symbol: symbol.base.0.to_string(),
+                                ts_ns: ev.ts_ns,
+                                expected,
+                                got: *seq,
+                            });
+                        }
+                    }
+                    last_seq = Some(*seq);
+                }
+            }
+        }
+
+        Ok(Self {
+            cfg,
+            events,
+            books,
+            cursor: 0,
+            last_emitted_ts: None,
+        })
+    }
+}
+
+fn payload_rank(p: &EventPayload) -> u8 {
+    match p {
+        EventPayload::BookDelta { .. } => 0,
+        EventPayload::Trade { .. } => 1,
+    }
+}
+
+/// Read a book-delta parquet file and append rows as [`LoadedEvent`]s.
+///
+/// SCHEMA.md (issue #9) defines `price` / `size` as `decimal`, but for the
+/// Phase 1 fixtures we accept `Float64` columns and convert via
+/// `Decimal::try_from(f64)`. The recorder (#9 close) will revisit when it
+/// ships and produces real Decimal columns.
+fn load_book_parquet(
+    path: &Path,
+    symbol_idx: usize,
+    out: &mut Vec<LoadedEvent>,
+) -> Result<(), ReplayError> {
+    let df = read_parquet_df(path)?;
+    let ts_col = df
+        .column("ts_ns")
+        .map_err(|e| ReplayError::Schema(format!("missing ts_ns: {e}")))?
+        .u64()
+        .map_err(|e| ReplayError::Schema(format!("ts_ns not u64: {e}")))?;
+    let side_col = column_as_u8(&df, "side")?;
+    let price_col = column_as_decimal(&df, "price")?;
+    let size_col = column_as_decimal(&df, "size")?;
+    let seq_col = df
+        .column("seq")
+        .map_err(|e| ReplayError::Schema(format!("missing seq: {e}")))?
+        .u64()
+        .map_err(|e| ReplayError::Schema(format!("seq not u64: {e}")))?;
+
+    let n = df.height();
+    for i in 0..n {
+        let ts_ns = ts_col
+            .get(i)
+            .ok_or_else(|| ReplayError::Schema("null ts_ns".into()))?;
+        let side = side_col[i];
+        let price = price_col[i];
+        let size = size_col[i];
+        let seq = seq_col
+            .get(i)
+            .ok_or_else(|| ReplayError::Schema("null seq".into()))?;
+        out.push(LoadedEvent {
+            ts_ns,
+            symbol_idx,
+            payload: EventPayload::BookDelta {
+                side,
+                price,
+                size,
+                seq,
+            },
+        });
+    }
+    Ok(())
+}
+
+/// Read a trades parquet file and append rows as [`LoadedEvent`]s.
+///
+/// Same f64 fallback for `price` / `size` as [`load_book_parquet`].
+fn load_trades_parquet(
+    path: &Path,
+    symbol_idx: usize,
+    out: &mut Vec<LoadedEvent>,
+) -> Result<(), ReplayError> {
+    let df = read_parquet_df(path)?;
+    let ts_col = df
+        .column("ts_ns")
+        .map_err(|e| ReplayError::Schema(format!("missing ts_ns: {e}")))?
+        .u64()
+        .map_err(|e| ReplayError::Schema(format!("ts_ns not u64: {e}")))?;
+    let price_col = column_as_decimal(&df, "price")?;
+    let size_col = column_as_decimal(&df, "size")?;
+    let taker_col = column_as_u8(&df, "taker_side")?;
+    // trade_id is parsed-and-ignored per the spec.
+
+    let n = df.height();
+    for i in 0..n {
+        let ts_ns = ts_col
+            .get(i)
+            .ok_or_else(|| ReplayError::Schema("null ts_ns".into()))?;
+        let price = price_col[i];
+        let size = size_col[i];
+        let taker_side = taker_col[i];
+        out.push(LoadedEvent {
+            ts_ns,
+            symbol_idx,
+            payload: EventPayload::Trade {
+                price,
+                size,
+                taker_side,
+            },
+        });
+    }
+    Ok(())
+}
+
+fn read_parquet_df(path: &Path) -> Result<DataFrame, ReplayError> {
+    let file = File::open(path)?;
+    ParquetReader::new(file)
+        .finish()
+        .map_err(|e| ReplayError::Schema(format!("parquet read {}: {e}", path.display())))
+}
+
+/// Pull a column as `Vec<u8>`. Accepts native `UInt8` or widens from `UInt32`
+/// / `Int64` (Phase 1 fixtures use whatever the default polars features
+/// allow; `dtype-u8` isn't pulled in, so writers store side bytes as i64).
+fn column_as_u8(df: &DataFrame, name: &str) -> Result<Vec<u8>, ReplayError> {
+    let s = df
+        .column(name)
+        .map_err(|e| ReplayError::Schema(format!("missing {name}: {e}")))?;
+    match s.dtype() {
+        DataType::UInt8 => {
+            let ca = s.u8().map_err(|e| ReplayError::Schema(e.to_string()))?;
+            ca.into_iter()
+                .map(|opt| opt.ok_or_else(|| ReplayError::Schema(format!("null {name}"))))
+                .collect()
+        }
+        DataType::Int64 => {
+            let ca = s.i64().map_err(|e| ReplayError::Schema(e.to_string()))?;
+            ca.into_iter()
+                .map(|opt| {
+                    let v = opt.ok_or_else(|| ReplayError::Schema(format!("null {name}")))?;
+                    u8::try_from(v).map_err(|_| {
+                        ReplayError::Schema(format!("{name} value {v} out of u8 range"))
+                    })
+                })
+                .collect()
+        }
+        DataType::UInt32 => {
+            let ca = s.u32().map_err(|e| ReplayError::Schema(e.to_string()))?;
+            ca.into_iter()
+                .map(|opt| {
+                    let v = opt.ok_or_else(|| ReplayError::Schema(format!("null {name}")))?;
+                    u8::try_from(v).map_err(|_| {
+                        ReplayError::Schema(format!("{name} value {v} out of u8 range"))
+                    })
+                })
+                .collect()
+        }
+        other => Err(ReplayError::Schema(format!(
+            "{name}: unsupported dtype {other:?} (expected u8 / u32 / i64)"
+        ))),
+    }
+}
+
+/// Pull a column as `Vec<Decimal>`, accepting `Float64` (Phase 1 fixture
+/// path) or `String` (manual scientific path). See module docstring for
+/// the SCHEMA.md deviation rationale.
+fn column_as_decimal(df: &DataFrame, name: &str) -> Result<Vec<Decimal>, ReplayError> {
+    let s = df
+        .column(name)
+        .map_err(|e| ReplayError::Schema(format!("missing {name}: {e}")))?;
+    match s.dtype() {
+        DataType::Float64 => {
+            let ca = s.f64().map_err(|e| ReplayError::Schema(e.to_string()))?;
+            ca.into_iter()
+                .map(|opt| {
+                    let v = opt.ok_or_else(|| ReplayError::Schema(format!("null {name}")))?;
+                    Decimal::try_from(v).map_err(|e| {
+                        ReplayError::Schema(format!("{name}: f64 {v} -> Decimal: {e}"))
+                    })
+                })
+                .collect()
+        }
+        DataType::String => {
+            let ca = s.str().map_err(|e| ReplayError::Schema(e.to_string()))?;
+            ca.into_iter()
+                .map(|opt| {
+                    let v = opt.ok_or_else(|| ReplayError::Schema(format!("null {name}")))?;
+                    use std::str::FromStr;
+                    Decimal::from_str(v).map_err(|e| {
+                        ReplayError::Schema(format!("{name}: str {v:?} -> Decimal: {e}"))
+                    })
+                })
+                .collect()
+        }
+        other => Err(ReplayError::Schema(format!(
+            "{name}: unsupported dtype {other:?} (expected f64 or string for Phase 1 fixtures)"
+        ))),
     }
 }
 
 #[async_trait]
 impl Replay for ParquetReplay {
     async fn next(&mut self) -> Option<MarketEvent> {
-        todo!("issue #10: merge book + trades streams, inject heartbeats")
+        if self.cursor >= self.events.len() {
+            return None;
+        }
+
+        let next_event_ts = self.events[self.cursor].ts_ns;
+
+        // Heartbeat synthesis: if last_emitted_ts + heartbeat_ms strictly
+        // precedes next_event_ts, emit a heartbeat at that slot.
+        if let Some(last_ts) = self.last_emitted_ts {
+            let hb_ns = self.cfg.heartbeat_ms.saturating_mul(1_000_000);
+            if hb_ns > 0 {
+                let next_hb_ts = last_ts.saturating_add(hb_ns);
+                if next_hb_ts < next_event_ts {
+                    self.last_emitted_ts = Some(next_hb_ts);
+                    return Some(MarketEvent::Heartbeat {
+                        ts: Timestamp(next_hb_ts),
+                    });
+                }
+            }
+        }
+
+        // Emit the next real event.
+        let cursor = self.cursor;
+        self.cursor += 1;
+        self.last_emitted_ts = Some(next_event_ts);
+        let ev = &self.events[cursor];
+        let ts = Timestamp(ev.ts_ns);
+        let symbol = self.cfg.symbols[ev.symbol_idx].clone();
+
+        match &ev.payload {
+            EventPayload::BookDelta {
+                side,
+                price,
+                size,
+                seq: _,
+            } => {
+                let book = &mut self.books[ev.symbol_idx];
+                let levels = if *side == 0 {
+                    &mut book.bids
+                } else {
+                    &mut book.asks
+                };
+                if size.is_zero() {
+                    levels.remove(price);
+                } else {
+                    levels.insert(*price, *size);
+                }
+                let bids = book
+                    .bids
+                    .iter()
+                    .rev()
+                    .map(|(p, s)| Level {
+                        price: Price(*p),
+                        size: Size(*s),
+                    })
+                    .collect();
+                let asks = book
+                    .asks
+                    .iter()
+                    .map(|(p, s)| Level {
+                        price: Price(*p),
+                        size: Size(*s),
+                    })
+                    .collect();
+                Some(MarketEvent::BookUpdate {
+                    snapshot: Snapshot {
+                        symbol,
+                        bids,
+                        asks,
+                        ts,
+                    },
+                })
+            }
+            EventPayload::Trade {
+                price,
+                size,
+                taker_side,
+            } => {
+                let side_enum = if *taker_side == 0 {
+                    Side::Bid
+                } else {
+                    Side::Ask
+                };
+                Some(MarketEvent::Trade {
+                    symbol,
+                    price: Price(*price),
+                    size: Size(*size),
+                    side: side_enum,
+                    ts,
+                })
+            }
+        }
     }
 }
 
@@ -62,16 +476,273 @@ pub enum ReplayError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     /// Gap detected in the `seq` column (book stream).
-    #[error("seq gap at ts {ts_ns}: expected {expected}, got {got}")]
+    #[error("seq gap in {symbol} at ts {ts_ns}: expected {expected}, got {got}")]
     SeqGap {
-        /// Timestamp of the gap.
+        /// Base asset of the symbol where the gap was detected.
+        symbol: String,
+        /// Timestamp of the offending row.
         ts_ns: u64,
-        /// Expected next seq.
+        /// Expected next seq (`prev + 1`).
         expected: u64,
         /// Actual seq observed.
         got: u64,
     },
-    /// Schema mismatch (missing required column, wrong type).
+    /// Schema mismatch (missing required column, wrong type, null where
+    /// non-null required, decimal conversion failure).
     #[error("schema: {0}")]
     Schema(String),
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::path::Path;
+    use tempfile::TempDir;
+    use tikr_core::{Asset, VenueId};
+
+    fn btc_symbol() -> Symbol {
+        Symbol {
+            base: Asset::new("BTC"),
+            quote: Asset::new("USDT"),
+            venue: VenueId::new("hyperliquid"),
+        }
+    }
+
+    /// Write a book parquet fixture. Columns: ts_ns (u64), side (i64),
+    /// price (f64), size (f64), seq (u64). Side / price / size types
+    /// follow the Phase 1 fixture deviation documented on the loader.
+    fn write_book_parquet(
+        path: &Path,
+        rows: &[(u64, i64, f64, f64, u64)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ts: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        let side: Vec<i64> = rows.iter().map(|r| r.1).collect();
+        let price: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let size: Vec<f64> = rows.iter().map(|r| r.3).collect();
+        let seq: Vec<u64> = rows.iter().map(|r| r.4).collect();
+        let mut df = df!(
+            "ts_ns" => ts,
+            "side" => side,
+            "price" => price,
+            "size" => size,
+            "seq" => seq,
+        )?;
+        let file = File::create(path)?;
+        ParquetWriter::new(file).finish(&mut df)?;
+        Ok(())
+    }
+
+    fn write_trades_parquet(
+        path: &Path,
+        rows: &[(u64, f64, f64, i64, u64)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ts: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        let price: Vec<f64> = rows.iter().map(|r| r.1).collect();
+        let size: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let taker: Vec<i64> = rows.iter().map(|r| r.3).collect();
+        let trade_id: Vec<u64> = rows.iter().map(|r| r.4).collect();
+        let mut df = df!(
+            "ts_ns" => ts,
+            "price" => price,
+            "size" => size,
+            "taker_side" => taker,
+            "trade_id" => trade_id,
+        )?;
+        let file = File::create(path)?;
+        ParquetWriter::new(file).finish(&mut df)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_config_returns_none_immediately() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = ReplayConfig {
+            heartbeat_ms: 1000,
+            symbols: vec![],
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let mut r = ParquetReplay::new(cfg).unwrap();
+        assert!(r.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn iterates_in_timestamp_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book_BTC_2026-05-18.parquet");
+        write_book_parquet(
+            &path,
+            &[
+                (1_000, 0, 100.0, 1.0, 1), // bid level
+                (2_000, 1, 101.0, 2.0, 2), // ask level
+            ],
+        )
+        .unwrap();
+
+        let cfg = ReplayConfig {
+            heartbeat_ms: 0, // disable heartbeats for this test
+            symbols: vec![btc_symbol()],
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let mut r = ParquetReplay::new(cfg).unwrap();
+
+        let e1 = r.next().await.expect("first event");
+        match e1 {
+            MarketEvent::BookUpdate { snapshot } => {
+                assert_eq!(snapshot.ts, Timestamp(1_000));
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.asks.len(), 0);
+                assert_eq!(snapshot.bids[0].price.0, Decimal::try_from(100.0).unwrap());
+            }
+            other => panic!("expected BookUpdate, got {other:?}"),
+        }
+
+        let e2 = r.next().await.expect("second event");
+        match e2 {
+            MarketEvent::BookUpdate { snapshot } => {
+                assert_eq!(snapshot.ts, Timestamp(2_000));
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.asks.len(), 1);
+                assert_eq!(snapshot.asks[0].price.0, Decimal::try_from(101.0).unwrap());
+            }
+            other => panic!("expected BookUpdate, got {other:?}"),
+        }
+
+        assert!(r.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn gap_detection_fails_on_seq_jump() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book_BTC_2026-05-18.parquet");
+        write_book_parquet(
+            &path,
+            &[
+                (1_000, 0, 100.0, 1.0, 1),
+                (2_000, 0, 100.0, 2.0, 2),
+                (3_000, 0, 100.0, 3.0, 4), // gap: expected 3, got 4
+            ],
+        )
+        .unwrap();
+
+        let cfg = ReplayConfig {
+            heartbeat_ms: 0,
+            symbols: vec![btc_symbol()],
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let err = ParquetReplay::new(cfg)
+            .err()
+            .expect("expected seq-gap error");
+        match err {
+            ReplayError::SeqGap {
+                symbol,
+                ts_ns,
+                expected,
+                got,
+            } => {
+                assert_eq!(symbol, "BTC");
+                assert_eq!(ts_ns, 3_000);
+                assert_eq!(expected, 3);
+                assert_eq!(got, 4);
+            }
+            other => panic!("expected SeqGap, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_synthesis_quiet_period() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book_BTC_2026-05-18.parquet");
+        // 3-second gap between two book deltas at 1s and 4s. With a 1s
+        // heartbeat cadence we expect heartbeats at 2s and 3s in between.
+        write_book_parquet(
+            &path,
+            &[
+                (1_000_000_000, 0, 100.0, 1.0, 1),
+                (4_000_000_000, 0, 100.0, 2.0, 2),
+            ],
+        )
+        .unwrap();
+
+        let cfg = ReplayConfig {
+            heartbeat_ms: 1000,
+            symbols: vec![btc_symbol()],
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let mut r = ParquetReplay::new(cfg).unwrap();
+
+        // 1st: real BookUpdate at 1s.
+        let e1 = r.next().await.expect("e1");
+        assert!(matches!(
+            e1,
+            MarketEvent::BookUpdate { snapshot } if snapshot.ts == Timestamp(1_000_000_000)
+        ));
+
+        // 2nd: synthesized heartbeat at 2s.
+        let e2 = r.next().await.expect("e2");
+        assert!(matches!(
+            e2,
+            MarketEvent::Heartbeat { ts } if ts == Timestamp(2_000_000_000)
+        ));
+
+        // 3rd: synthesized heartbeat at 3s.
+        let e3 = r.next().await.expect("e3");
+        assert!(matches!(
+            e3,
+            MarketEvent::Heartbeat { ts } if ts == Timestamp(3_000_000_000)
+        ));
+
+        // 4th: real BookUpdate at 4s (no heartbeat at 4s — the real event
+        // takes precedence at the equal slot).
+        let e4 = r.next().await.expect("e4");
+        assert!(matches!(
+            e4,
+            MarketEvent::BookUpdate { snapshot } if snapshot.ts == Timestamp(4_000_000_000)
+        ));
+
+        // End of data — no trailing heartbeats.
+        assert!(r.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn trade_events_pass_through() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("trades_BTC_2026-05-18.parquet");
+        write_trades_parquet(
+            &path,
+            &[(5_000, 200.0, 3.0, 0, 42)], // taker_side=0 -> Bid
+        )
+        .unwrap();
+
+        let cfg = ReplayConfig {
+            heartbeat_ms: 0,
+            symbols: vec![btc_symbol()],
+            data_dir: tmp.path().to_path_buf(),
+        };
+        let mut r = ParquetReplay::new(cfg).unwrap();
+
+        let ev = r.next().await.expect("trade event");
+        match ev {
+            MarketEvent::Trade {
+                symbol,
+                price,
+                size,
+                side,
+                ts,
+            } => {
+                assert_eq!(symbol.base, Asset::new("BTC"));
+                assert_eq!(price.0, Decimal::try_from(200.0).unwrap());
+                assert_eq!(size.0, Decimal::try_from(3.0).unwrap());
+                assert_eq!(side, Side::Bid);
+                assert_eq!(ts, Timestamp(5_000));
+            }
+            other => panic!("expected Trade, got {other:?}"),
+        }
+
+        assert!(r.next().await.is_none());
+    }
 }
