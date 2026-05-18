@@ -30,9 +30,11 @@
 #![deny(missing_docs)]
 
 pub mod avellaneda_stoikov;
+pub mod glft;
 pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
+pub use glft::{Glft, GlftConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
 
 use tikr_core::{
