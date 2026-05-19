@@ -236,8 +236,8 @@ fn action_intent(action: &Action) -> Option<&QuoteIntent> {
 mod tests {
     use super::*;
     use tikr_core::{
-        Asset, Decimal, Notional, Position, Price, QuoteKind, Side, SignedSize, Size, Symbol,
-        TimeInForce, Timestamp, VenueId,
+        Asset, Decimal, MarketKind, Notional, Position, Price, QuoteKind, Side, SignedSize, Size,
+        Symbol, TimeInForce, Timestamp, VenueId,
     };
     use tikr_strategy::Action;
     use tikr_venue::QuoteIntent;
@@ -247,6 +247,7 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDC"),
             venue: VenueId::new("test"),
+            kind: MarketKind::Spot,
         }
     }
 

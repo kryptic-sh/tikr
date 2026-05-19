@@ -14,7 +14,7 @@
 use clap::{Parser, ValueEnum};
 use std::time::Duration;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_core::{Asset, Decimal, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv};
 use tikr_paper::{RunnerConfig, run};
 use tikr_strategy::{
@@ -122,6 +122,7 @@ async fn main() {
         base: Asset::new(&args.symbol),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     };
 
     let venue = Hyperliquid::with_config(HyperliquidConfig {

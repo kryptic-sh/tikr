@@ -194,13 +194,16 @@ fn make_intent(symbol: &Symbol, side: Side, price: Price, size: Size) -> QuoteIn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, Level, Notional, Position, SignedSize, Snapshot, VenueId};
+    use tikr_core::{
+        Asset, Decimal, Level, MarketKind, Notional, Position, SignedSize, Snapshot, VenueId,
+    };
 
     fn make_symbol() -> Symbol {
         Symbol {
             base: Asset::new("BTC"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("test"),
+            kind: MarketKind::Spot,
         }
     }
 

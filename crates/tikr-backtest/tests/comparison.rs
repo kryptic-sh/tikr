@@ -22,7 +22,7 @@ use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_backtest::pnl::PnLReport;
 use tikr_backtest::replay::{ParquetReplay, ReplayConfig};
 use tikr_backtest::runner::run;
-use tikr_core::{Asset, Decimal, Notional, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Notional, Size, Symbol, VenueId};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
     NaiveGridConfig, Strategy,
@@ -37,6 +37,7 @@ fn make_symbol() -> Symbol {
         base: Asset::new("BTC"),
         quote: Asset::new("USDT"),
         venue: VenueId::new("test"),
+        kind: MarketKind::Spot,
     }
 }
 

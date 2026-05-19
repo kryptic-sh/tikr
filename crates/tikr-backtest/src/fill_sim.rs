@@ -258,7 +258,7 @@ fn quote_takes_trade(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, Level, QuoteKind, Snapshot, TimeInForce, VenueId};
+    use tikr_core::{Asset, Decimal, Level, MarketKind, QuoteKind, Snapshot, TimeInForce, VenueId};
     use tikr_venue::QuoteIntent;
 
     fn make_symbol() -> Symbol {
@@ -266,6 +266,7 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("test"),
+            kind: MarketKind::Spot,
         }
     }
 

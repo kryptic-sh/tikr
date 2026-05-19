@@ -278,13 +278,16 @@ impl AlertSink for MultiSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, Notional, Price, QuoteId, SignedSize, Size, Symbol, VenueId};
+    use tikr_core::{
+        Asset, Decimal, MarketKind, Notional, Price, QuoteId, SignedSize, Size, Symbol, VenueId,
+    };
 
     fn make_symbol() -> Symbol {
         Symbol {
             base: Asset::new("BTC"),
             quote: Asset::new("USDC"),
             venue: VenueId::new("mock"),
+            kind: MarketKind::Perp,
         }
     }
 

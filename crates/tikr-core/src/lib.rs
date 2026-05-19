@@ -20,9 +20,12 @@
 #![deny(missing_docs)]
 
 use std::{
+    fmt,
     ops::{Add, Mul, Neg, Sub},
     sync::Arc,
 };
+
+use serde::{Deserialize, Serialize};
 
 pub use uuid::Uuid;
 
@@ -206,10 +209,60 @@ impl VenueId {
 }
 
 // ---------------------------------------------------------------------------
+// MarketKind
+// ---------------------------------------------------------------------------
+
+/// The market type of a [`Symbol`].
+///
+/// Distinguishes between spot and perpetual-futures markets so that venues,
+/// strategies, and risk layers can make context-aware decisions without
+/// inspecting venue-specific naming conventions.
+///
+/// # Variants
+///
+/// - [`Spot`][MarketKind::Spot] — Direct asset exchange (e.g. BTC/USDT spot).
+/// - [`Perp`][MarketKind::Perp] — Perpetual futures contract (e.g. BTC-PERP).
+///   No expiry date; funding-rate mechanics keep the price anchored.
+///
+/// # Future extensibility
+///
+/// COIN-M dated futures and options are explicitly out of scope for v0.
+/// New variants will be added as separate issues once a venue requires them.
+///
+/// # Serialization
+///
+/// Serializes as lowercase JSON strings (`"spot"`, `"perp"`) to match
+/// Binance and other venue conventions, and to produce readable
+/// `PaperReport` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketKind {
+    /// Direct asset exchange; no expiry, no funding rate.
+    Spot,
+    /// Perpetual futures contract; no expiry, funding-rate anchored.
+    Perp,
+}
+
+impl fmt::Display for MarketKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MarketKind::Spot => f.write_str("spot"),
+            MarketKind::Perp => f.write_str("perp"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Symbol
 // ---------------------------------------------------------------------------
 
 /// A trading pair on a specific venue.
+///
+/// Every construction site must declare an explicit [`MarketKind`] — there is
+/// no `Default` impl. Each venue knows whether it is dealing with spot or
+/// perpetual markets and must annotate accordingly:
+/// `tikr-hyperliquid` → [`MarketKind::Perp`],
+/// `tikr-dodo` → [`MarketKind::Spot`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Symbol {
     /// Base asset (e.g. `BTC`).
@@ -218,6 +271,8 @@ pub struct Symbol {
     pub quote: Asset,
     /// Venue where this symbol is traded.
     pub venue: VenueId,
+    /// Market type: spot exchange or perpetual futures contract.
+    pub kind: MarketKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +511,7 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("hyperliquid"),
+            kind: MarketKind::Perp,
         };
         let pos = Position {
             symbol: sym.clone(),
@@ -473,6 +529,7 @@ mod tests {
             base: Asset::new("ETH"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("hyperliquid"),
+            kind: MarketKind::Perp,
         };
         let ts = Timestamp(0);
 
@@ -519,5 +576,25 @@ mod tests {
     #[test]
     fn side_inequality() {
         assert_ne!(Side::Bid, Side::Ask);
+    }
+
+    #[test]
+    fn market_kind_display() {
+        assert_eq!(MarketKind::Spot.to_string(), "spot");
+        assert_eq!(MarketKind::Perp.to_string(), "perp");
+    }
+
+    #[test]
+    fn market_kind_serde_roundtrip() {
+        let spot = MarketKind::Spot;
+        let perp = MarketKind::Perp;
+        let spot_json = serde_json::to_string(&spot).unwrap();
+        let perp_json = serde_json::to_string(&perp).unwrap();
+        assert_eq!(spot_json, "\"spot\"");
+        assert_eq!(perp_json, "\"perp\"");
+        let spot_back: MarketKind = serde_json::from_str(&spot_json).unwrap();
+        let perp_back: MarketKind = serde_json::from_str(&perp_json).unwrap();
+        assert_eq!(spot_back, MarketKind::Spot);
+        assert_eq!(perp_back, MarketKind::Perp);
     }
 }

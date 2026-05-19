@@ -150,7 +150,7 @@ pub trait Venue: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, VenueId};
+    use tikr_core::{Asset, Decimal, MarketKind, VenueId};
 
     // -----------------------------------------------------------------------
     // No-op test implementation
@@ -215,6 +215,7 @@ mod tests {
                 base: Asset::new("BTC"),
                 quote: Asset::new("USDT"),
                 venue: VenueId::new("test"),
+                kind: MarketKind::Spot,
             },
             side: Side::Bid,
             price: Price(Decimal::new(60_000, 0)),

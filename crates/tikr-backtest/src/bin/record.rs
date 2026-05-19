@@ -17,7 +17,9 @@ use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
 use polars::prelude::*;
-use tikr_core::{Asset, MarketEvent, Price, Side, Size, Snapshot, Symbol, Timestamp, VenueId};
+use tikr_core::{
+    Asset, MarketEvent, MarketKind, Price, Side, Size, Snapshot, Symbol, Timestamp, VenueId,
+};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv};
 use tikr_venue::Venue;
 use tokio::signal;
@@ -70,6 +72,7 @@ async fn main() {
         base: Asset::new(&args.symbol),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     };
 
     let venue = Hyperliquid::with_config(HyperliquidConfig {

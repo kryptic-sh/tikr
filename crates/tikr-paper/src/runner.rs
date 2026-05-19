@@ -526,7 +526,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-    use tikr_core::{Asset, Level, Notional, Size, VenueId};
+    use tikr_core::{Asset, Level, MarketKind, Notional, Size, VenueId};
     use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
     use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
     use tokio::sync::watch;
@@ -602,6 +602,7 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDC"),
             venue: VenueId::new("mock"),
+            kind: MarketKind::Perp,
         }
     }
 
@@ -818,11 +819,13 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDC"),
             venue: VenueId::new("mock"),
+            kind: MarketKind::Perp,
         };
         let symbol_b = Symbol {
             base: Asset::new("ETH"),
             quote: Asset::new("USDC"),
             venue: VenueId::new("mock"),
+            kind: MarketKind::Perp,
         };
 
         let (_tx, rx) = watch::channel(false);

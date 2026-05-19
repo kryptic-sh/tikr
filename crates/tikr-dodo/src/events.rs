@@ -297,13 +297,14 @@ mod tests {
     use alloy_rpc_types::Log;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use tikr_core::{Asset, VenueId};
+    use tikr_core::{Asset, MarketKind, VenueId};
 
     fn make_symbol() -> Symbol {
         Symbol {
             base: Asset::new("WBNB"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("dodo"),
+            kind: MarketKind::Spot,
         }
     }
 

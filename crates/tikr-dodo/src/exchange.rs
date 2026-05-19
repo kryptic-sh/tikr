@@ -625,12 +625,13 @@ mod tests {
     /// Fill `size` always reports the base amount regardless of side.
     #[test]
     fn fill_side_swaps_base_and_quote_correctly() {
-        use tikr_core::{Asset, Side, Symbol, VenueId};
+        use tikr_core::{Asset, MarketKind, Side, Symbol, VenueId};
 
         let sym = Symbol {
             base: Asset::new("BNB"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("dodo"),
+            kind: MarketKind::Spot,
         };
         let qid = QuoteId(uuid::Uuid::nil());
         // Ask fill: maker provided 1.0 BNB, received 600 USDT.

@@ -45,7 +45,7 @@ use alloy_signer_local::PrivateKeySigner;
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_core::{Asset, Decimal, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv, subscribe_user_events};
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
@@ -146,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base: Asset::new(&args.symbol),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     };
 
     let config = HyperliquidConfig {

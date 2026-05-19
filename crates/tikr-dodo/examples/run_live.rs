@@ -99,7 +99,9 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tikr_core::QuoteKind;
-use tikr_core::{Asset, Decimal, MarketEvent, Price, Side, Size, Symbol, TimeInForce, VenueId};
+use tikr_core::{
+    Asset, Decimal, MarketEvent, MarketKind, Price, Side, Size, Symbol, TimeInForce, VenueId,
+};
 use tikr_dodo::{DodoClient, DodoConfig};
 use tikr_venue::Venue;
 use tracing::{info, warn};
@@ -263,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base: Asset::new(&base_name),
         quote: Asset::new(&quote_name),
         venue: VenueId::new("dodo"),
+        kind: MarketKind::Spot,
     };
 
     let signer = load_key(&args)?;

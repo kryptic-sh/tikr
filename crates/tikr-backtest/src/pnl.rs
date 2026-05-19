@@ -175,7 +175,7 @@ pub struct PnLReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, Side, Symbol, Timestamp, VenueId};
+    use tikr_core::{Asset, Decimal, MarketKind, Side, Symbol, Timestamp, VenueId};
     use tikr_venue::QuoteId;
 
     fn make_symbol() -> Symbol {
@@ -183,6 +183,7 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("test"),
+            kind: MarketKind::Spot,
         }
     }
 

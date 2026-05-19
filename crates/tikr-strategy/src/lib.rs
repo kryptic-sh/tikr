@@ -324,7 +324,7 @@ impl Strategy for NaiveGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Decimal, Level, SignedSize, VenueId};
+    use tikr_core::{Asset, Decimal, Level, MarketKind, SignedSize, VenueId};
     use tikr_core::{Price, QuoteKind, Side, TimeInForce};
     use tikr_venue::QuoteIntent;
 
@@ -333,6 +333,7 @@ mod tests {
             base: Asset::new("BTC"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("test"),
+            kind: MarketKind::Spot,
         }
     }
 

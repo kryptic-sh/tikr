@@ -8,7 +8,7 @@
 
 use futures::stream::StreamExt;
 use std::time::Duration;
-use tikr_core::{Asset, MarketEvent, Symbol, VenueId};
+use tikr_core::{Asset, MarketEvent, MarketKind, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv};
 use tikr_venue::{Venue, VenueError};
 
@@ -17,6 +17,7 @@ fn testnet_symbol() -> Symbol {
         base: Asset::new("BTC"),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     }
 }
 

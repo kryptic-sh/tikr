@@ -6,7 +6,7 @@
 use std::time::Duration;
 use tempfile::TempDir;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_core::{Asset, Decimal, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv};
 use tikr_paper::{RunnerConfig, run};
 use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
@@ -20,6 +20,7 @@ async fn paper_runner_against_testnet_5min() {
         base: Asset::new("BTC"),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     };
 
     let venue = Hyperliquid::with_config(HyperliquidConfig {

@@ -30,7 +30,8 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_core::{
-    Asset, Decimal, Level, MarketEvent, Notional, Price, Size, Snapshot, Symbol, Timestamp, VenueId,
+    Asset, Decimal, Level, MarketEvent, MarketKind, Notional, Price, Size, Snapshot, Symbol,
+    Timestamp, VenueId,
 };
 use tikr_paper::alerts::{Alert, AlertError, AlertSink};
 use tikr_paper::{RunnerConfig, run_with_resume};
@@ -119,6 +120,7 @@ fn make_symbol() -> Symbol {
         base: Asset::new("BTC"),
         quote: Asset::new("USDC"),
         venue: VenueId::new("mock"),
+        kind: MarketKind::Perp,
     }
 }
 

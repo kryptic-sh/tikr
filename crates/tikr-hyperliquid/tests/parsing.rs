@@ -2,7 +2,7 @@
 //! [`tikr_hyperliquid::mapping`]. No network, no async runtime.
 
 use std::fs;
-use tikr_core::{Asset, Decimal, MarketEvent, Side, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketEvent, MarketKind, Side, Symbol, VenueId};
 use tikr_hyperliquid::mapping::*;
 use tikr_hyperliquid::messages::*;
 
@@ -11,6 +11,7 @@ fn btc_symbol() -> Symbol {
         base: Asset::new("BTC"),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     }
 }
 
@@ -136,6 +137,7 @@ fn maps_position_signed_negative_for_short() {
         base: Asset::new("ETH"),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     };
     let pos = position_from_clearinghouse(&eth, &resp);
     assert_eq!(pos.size.0, Decimal::from_str_exact("-2.0").unwrap());
@@ -149,6 +151,7 @@ fn maps_position_returns_flat_when_coin_absent() {
         base: Asset::new("SOL"),
         quote: Asset::new("USDC"),
         venue: VenueId::new("hyperliquid"),
+        kind: MarketKind::Perp,
     };
     let pos = position_from_clearinghouse(&sol, &resp);
     assert_eq!(pos.size.0, Decimal::ZERO);

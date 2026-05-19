@@ -503,13 +503,14 @@ mod tests {
     use std::fs::File;
     use std::path::Path;
     use tempfile::TempDir;
-    use tikr_core::{Asset, VenueId};
+    use tikr_core::{Asset, MarketKind, VenueId};
 
     fn btc_symbol() -> Symbol {
         Symbol {
             base: Asset::new("BTC"),
             quote: Asset::new("USDT"),
             venue: VenueId::new("hyperliquid"),
+            kind: MarketKind::Perp,
         }
     }
 

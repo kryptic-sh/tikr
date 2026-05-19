@@ -18,7 +18,7 @@ use tempfile::TempDir;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_backtest::replay::{ParquetReplay, ReplayConfig};
 use tikr_backtest::runner::run;
-use tikr_core::{Asset, Decimal, Notional, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Notional, Size, Symbol, VenueId};
 use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
 
 #[tokio::test]
@@ -52,6 +52,7 @@ async fn golden_naive_grid_btc_single_fill() {
         base: Asset::new("BTC"),
         quote: Asset::new("USDT"),
         venue: VenueId::new("test"),
+        kind: MarketKind::Spot,
     };
 
     let replay = ParquetReplay::new(ReplayConfig {
