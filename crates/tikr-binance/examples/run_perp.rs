@@ -132,22 +132,19 @@ struct Args {
     #[arg(long, default_value = "0.001")]
     size: String,
 
-    /// A-S / GLFT risk aversion γ. Strategy-specific tunable.
-    ///
-    /// A-S/GLFT half-spread = `(1/γ)·ln(1+γ/k)` in PRICE units (dollars),
-    /// not bps. The same γ/k produces different bps depending on the
-    /// asset's price level. Per-symbol tuning is required.
-    ///
-    /// Empirical defaults targeting ~5 bps half-spread:
-    /// - BTCUSDT (~$76k): γ=0.01, k=0.1
-    /// - ETHUSDT (~$2.1k): γ=10, k=6
-    /// - BNBUSDT (~$640):  γ=100, k=6
-    #[arg(long, default_value = "0.01")]
+    /// A-S / GLFT risk aversion γ. Controls inventory mean-reversion strength
+    /// via the reservation price formula `r = mid - q·γ·σ²·(T-t)` (A-S) or
+    /// `r = mid - q·γ·σ²` (GLFT). Higher γ → stronger push toward flat inventory.
+    /// Does NOT affect spread width (use `--spread-bps` for that).
+    #[arg(long, default_value = "0.1")]
     gamma: String,
 
-    /// A-S / GLFT market-impact intensity k. See `--gamma`.
-    #[arg(long, default_value = "0.1")]
-    k: String,
+    /// A-S / GLFT half-spread in basis points per side (e.g. 5 = 5 bps/side,
+    /// 10 bps round-trip). Portable across assets: 5 bps on BTC ($76k) ≈ $38,
+    /// on ETH ($2.1k) ≈ $1.05. Replaces the old price-unit `(1/γ)·ln(1+γ/k)`
+    /// formula that required per-asset γ/k retuning.
+    #[arg(long, default_value = "5")]
+    spread_bps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,12 +305,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         StrategyArg::AvellanedaStoikov => {
-            // γ/k tunable via CLI — see --gamma/--k help for per-symbol guidance.
+            // γ controls inventory-skew (reservation price); --spread-bps controls width.
             let strategy = AvellanedaStoikov::new(AvellanedaStoikovConfig {
                 gamma: Decimal::from_str(&args.gamma)
                     .map_err(|e| format!("--gamma '{}' invalid: {}", args.gamma, e))?,
-                k: Decimal::from_str(&args.k)
-                    .map_err(|e| format!("--k '{}' invalid: {}", args.k, e))?,
+                base_spread_bps: args.spread_bps,
                 horizon_sec: 3600,
                 size_per_quote,
                 min_requote_interval_ms: 5000,
@@ -338,13 +334,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         StrategyArg::Glft => {
-            // γ/k tunable via CLI — see --gamma/--k help for per-symbol guidance.
+            // γ controls inventory-skew (reservation price); --spread-bps controls width.
             let strategy = Glft::new(GlftConfig {
                 gamma: Decimal::from_str(&args.gamma)
                     .map_err(|e| format!("--gamma '{}' invalid: {}", args.gamma, e))?,
-                k: Decimal::from_str(&args.k)
-                    .map_err(|e| format!("--k '{}' invalid: {}", args.k, e))?,
-                a: Decimal::from_str("1.0").unwrap(),
+                base_spread_bps: args.spread_bps,
                 size_per_quote,
                 min_requote_interval_ms: 5000,
                 level_step_bps: 1,

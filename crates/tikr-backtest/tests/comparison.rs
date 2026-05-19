@@ -76,7 +76,8 @@ fn naive_grid_config() -> NaiveGridConfig {
 fn avellaneda_stoikov_config() -> AvellanedaStoikovConfig {
     AvellanedaStoikovConfig {
         gamma: Decimal::try_from(0.1).unwrap(),
-        k: Decimal::try_from(1.5).unwrap(),
+        // 30 bps → bid = 100.5*(1-0.003) ≈ 99.8 at mid=100.5; different from naive-grid's 99.5
+        base_spread_bps: 30,
         horizon_sec: 3600,
         size_per_quote: Size(Decimal::from(1)),
         min_requote_interval_ms: 100_000,
@@ -91,8 +92,8 @@ fn avellaneda_stoikov_config() -> AvellanedaStoikovConfig {
 fn glft_config() -> GlftConfig {
     GlftConfig {
         gamma: Decimal::try_from(0.1).unwrap(),
-        k: Decimal::try_from(1.5).unwrap(),
-        a: Decimal::try_from(1.0).unwrap(),
+        // 20 bps → bid = 100.5*(1-0.002) ≈ 99.9 at mid=100.5; different from A-S (30 bps)
+        base_spread_bps: 20,
         size_per_quote: Size(Decimal::from(1)),
         min_requote_interval_ms: 100_000,
         level_step_bps: 10,

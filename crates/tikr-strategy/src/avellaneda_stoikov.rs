@@ -2,13 +2,24 @@
 //!
 //! # Formula (finite-horizon)
 //!
-//! Reservation price: `r = s - q·γ·σ²·(T-t)`
-//! Optimal half-spread: `δ* = γ·σ²·(T-t)/2 + (1/γ)·ln(1 + γ/k)`
+//! Reservation price: `r = mid - q·γ·σ²·(T-t)`
+//! Half-spread: `δ = mid · base_spread_bps / 10_000`
 //!
-//! Bid quote = `r - δ*`, ask quote = `r + δ*`. `s` = book mid, `q` = signed
+//! Bid quote = `r - δ`, ask quote = `r + δ`. `mid` = book mid, `q` = signed
 //! inventory (long > 0), `γ` = risk aversion, `σ²` = log-return variance from
-//! [`crate::volatility::EwmaVolatility`], `T-t` = pinned horizon in seconds,
-//! `k` = market-impact intensity.
+//! [`crate::volatility::EwmaVolatility`], `T-t` = pinned horizon in seconds.
+//!
+//! # Half-spread
+//!
+//! The original academic formula `δ* = γ·σ²·(T-t)/2 + (1/γ)·ln(1 + γ/k)` is
+//! in PRICE units, not relative. At crypto price levels (BTC ~$76k, ETH ~$2.1k)
+//! the same γ/k parameters produce radically different spread widths in bps. The
+//! formula was designed for academic mid ≈ $1 settings.
+//!
+//! The `base_spread_bps` config replaces the price-unit formula with a portable
+//! `mid · bps / 10_000`, giving consistent bps width across assets. γ is RETAINED
+//! for inventory-skew (reservation price) — that is the actual inventory-aware
+//! magic of A-S vs NaiveGrid.
 //!
 //! # Sign convention
 //!
@@ -17,9 +28,8 @@
 //!
 //! # Parameter notes
 //!
-//! `γ` (gamma) and `k` have an inverse relationship: HIGHER `γ` → NARROWER
-//! `ln(1 + γ/k)` term but STRONGER reservation skew. Operators should tune
-//! `γ` mostly via inventory-mean-reversion behavior, not spread width.
+//! `γ` (gamma) controls inventory mean-reversion strength via the reservation
+//! price formula. `base_spread_bps` controls the raw spread width independently.
 //!
 //! # References
 //!
@@ -38,8 +48,9 @@ use tikr_venue::QuoteIntent;
 pub struct AvellanedaStoikovConfig {
     /// Risk aversion γ. Default 0.1. Higher → stronger inventory mean-reversion.
     pub gamma: Decimal,
-    /// Market-impact intensity k. Default 1.5. Influences the `ln(1 + γ/k)` spread term.
-    pub k: Decimal,
+    /// Half-spread in basis points (e.g. 5 = 5 bps per side, 10 bps round-trip).
+    /// Converted to price units via `mid * base_spread_bps / 10_000` at quote time.
+    pub base_spread_bps: u32,
     /// Pinned horizon T-t in seconds. Default 3600 (1 hour). NOT a wall-clock
     /// countdown — controls how aggressively the strategy pushes inventory to zero.
     pub horizon_sec: u64,
@@ -114,20 +125,11 @@ impl Strategy for AvellanedaStoikov {
         let q = ctx.position.size.0; // signed
         let var = self.estimator.current_var();
         let gamma = self.config.gamma;
-        let k = self.config.k;
         let horizon = Decimal::from(self.config.horizon_sec);
         // Reservation price: r = mid - q · γ · σ² · (T-t)
         let r = mid.0 - q * gamma * var * horizon;
-        // Half-spread: δ* = γ·σ²·(T-t)/2 + (1/γ)·ln(1 + γ/k)
-        let two = Decimal::from(2);
-        let inv_gamma = Decimal::ONE / gamma;
-        // f64 island for ln(1 + γ/k):
-        let one_plus_ratio_f64 = (Decimal::ONE + gamma / k)
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(1.0);
-        let ln_term = Decimal::try_from(one_plus_ratio_f64.ln()).unwrap_or(Decimal::ZERO);
-        let delta = gamma * var * horizon / two + inv_gamma * ln_term;
+        // Half-spread: δ = mid · base_spread_bps / 10_000
+        let delta = mid.0 * Decimal::from(self.config.base_spread_bps) / Decimal::from(10_000);
         self.last_requote_ts = Some(snapshot.ts);
         self.last_quoted_mid = Some(mid);
         vec![
@@ -249,7 +251,7 @@ mod tests {
     fn default_config() -> AvellanedaStoikovConfig {
         AvellanedaStoikovConfig {
             gamma: Decimal::try_from(0.1).unwrap(),
-            k: Decimal::try_from(1.5).unwrap(),
+            base_spread_bps: 5,
             horizon_sec: 3600,
             size_per_quote: Size(Decimal::from(1)),
             min_requote_interval_ms: 1000,
@@ -491,5 +493,49 @@ mod tests {
         };
         let actions = strat.on_event(&ctx, &trade);
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn half_spread_is_base_spread_bps_of_mid() {
+        let sym = make_symbol();
+        let pos = make_position(&sym, Decimal::ZERO);
+        let mut cfg = default_config();
+        cfg.base_spread_bps = 5;
+        let mut strat = AvellanedaStoikov::new(cfg);
+
+        // Use mid = 100.5 (bid=100, ask=101).
+        let final_bid = Decimal::from(100);
+        let final_ask = Decimal::from(101);
+        let mid = (final_bid + final_ask) / Decimal::from(2); // 100.5
+
+        let actions = warmup_and_emit(
+            &mut strat,
+            &sym,
+            &pos,
+            WARMUP_COUNT,
+            final_bid,
+            final_ask,
+            0,
+        );
+        assert_eq!(actions.len(), 3);
+        let bid_price = match &actions[1] {
+            Action::Quote(q) => q.price.0,
+            _ => panic!("expected Quote"),
+        };
+        let ask_price = match &actions[2] {
+            Action::Quote(q) => q.price.0,
+            _ => panic!("expected Quote"),
+        };
+        // With flat inventory (q=0): r = mid, so bid = mid - delta, ask = mid + delta.
+        // delta = mid * 5 / 10_000 = 100.5 * 0.0005 = 0.05025
+        let expected_delta = mid * Decimal::try_from(0.0005).unwrap();
+        let actual_delta = (ask_price - mid).abs();
+        let diff = (actual_delta - expected_delta).abs();
+        assert!(
+            diff < Decimal::try_from(0.0001).unwrap(),
+            "expected half-spread ≈ {expected_delta}, got {actual_delta} (diff={diff})"
+        );
+        // Bid and ask should be symmetric around mid (flat inventory).
+        assert_eq!((mid - bid_price).abs(), (ask_price - mid).abs());
     }
 }

@@ -2,29 +2,42 @@
 //!
 //! Companion to [`crate::avellaneda_stoikov`] — same Strategy trait, same
 //! `[CancelAll, Quote(Bid), Quote(Ask)]` output shape, same warmup gate. The
-//! load-bearing difference is the formula: GLFT removes the `(T-t)` horizon
-//! that A-S requires (and that operators have to reset). See [issue #18] for
-//! the full design rationale.
+//! structural difference from A-S is the horizon: GLFT is infinite-horizon (no
+//! `T-t` countdown that operators must manage). See [issue #18] for rationale.
 //!
-//! # Formula (simplified Guéant 2017 closed form)
+//! # Formula
 //!
-//! Reservation price: `r = mid - q·γ·σ²·η` where `η = 2 / (γ·k·A·exp(-1))`.
-//! Optimal half-spread: `δ* = (1/γ)·ln(1 + γ/k) + 0.5·γ·σ²·η`.
-//! Bid = `r - δ*`, Ask = `r + δ*`.
+//! Reservation price: `r = mid - q·γ·σ²`
+//! Half-spread: `δ = mid · base_spread_bps / 10_000`
+//! Bid = `r - δ`, Ask = `r + δ`.
 //!
-//! `η` is a bounded constant (no `T-t` dependence), so the formula stays
-//! well-behaved over arbitrary-length runs.
+//! # Academic note — simplified reservation price
+//!
+//! The original Guéant (2017) closed form for the reservation price is
+//! `r = mid - q·γ·σ²·η` where `η = 2/(γ·k·A·exp(-1))` is a bounded constant
+//! derived from order-arrival intensity parameters (`k`, `A`). Practically, `η`
+//! is a scaling constant that was only calibratable via historical fill data
+//! (Phase 3). With the removal of `k` and `a` from the config (those parameters
+//! were only used in the now-replaced price-unit spread formula), the full `η`
+//! expression has no home. The reservation price is simplified to
+//! `r = mid - q·γ·σ²` (unit-scale η = 1), making GLFT structurally identical
+//! to A-S's inventory-skew term minus the finite-horizon multiplier. This
+//! sacrifices academic purity for practical portability: the strategy still
+//! delivers the core GLFT value proposition (infinite-horizon, no expiry reset)
+//! while avoiding a calibration dependency that was dead weight pre-Phase 3.
+//!
+//! # Half-spread
+//!
+//! The original `(1/γ)·ln(1 + γ/k)` formula is in PRICE units, not relative.
+//! At crypto price levels (BTC ~$76k, ETH ~$2.1k) the same γ/k parameters
+//! produce radically different spread widths in bps. The `base_spread_bps`
+//! config replaces the price-unit formula with a portable
+//! `mid · bps / 10_000`, giving consistent bps width across assets.
 //!
 //! # Sign convention
 //!
 //! Same as A-S: long inventory (`q > 0`) pushes the reservation price DOWN
 //! to encourage selling.
-//!
-//! # Decimal ↔ f64 island
-//!
-//! `Decimal` lacks `exp`/`ln`/`pow`, so `η` and `ln(1 + γ/k)` are computed
-//! in f64 and converted back to `Decimal`. Same pattern as
-//! [`crate::volatility::EwmaVolatility`] and [`crate::avellaneda_stoikov`].
 //!
 //! # References
 //!
@@ -46,12 +59,11 @@ use tikr_venue::QuoteIntent;
 /// difference from [`crate::avellaneda_stoikov::AvellanedaStoikovConfig`]).
 #[derive(Clone, Debug)]
 pub struct GlftConfig {
-    /// Risk aversion γ. Higher → narrower spread + stronger inventory mean-reversion.
+    /// Risk aversion γ. Higher → stronger inventory mean-reversion.
     pub gamma: Decimal,
-    /// Market depth intensity k.
-    pub k: Decimal,
-    /// Intensity pre-factor A. Default 1.0. Calibration deferred to Phase 3.
-    pub a: Decimal,
+    /// Half-spread in basis points (e.g. 5 = 5 bps per side, 10 bps round-trip).
+    /// Converted to price units via `mid * base_spread_bps / 10_000` at quote time.
+    pub base_spread_bps: u32,
     /// Size placed at each quote level (both sides).
     pub size_per_quote: Size,
     /// Minimum time between full requotes, in milliseconds.
@@ -123,37 +135,13 @@ impl Strategy for Glft {
         let q = ctx.position.size.0;
         let var = self.estimator.current_var();
         let gamma = self.config.gamma;
-        let k = self.config.k;
-        let a = self.config.a;
 
-        // η = 2 / (γ·k·A·exp(-1))
-        // f64 island: compute exp(-1) and the full denominator, then back to Decimal.
-        let denom_f64 = {
-            let g = gamma.to_string().parse::<f64>().unwrap_or(0.0);
-            let k_f = k.to_string().parse::<f64>().unwrap_or(0.0);
-            let a_f = a.to_string().parse::<f64>().unwrap_or(0.0);
-            g * k_f * a_f * (-1.0_f64).exp()
-        };
-        let eta = if denom_f64.abs() > 0.0 {
-            Decimal::try_from(2.0 / denom_f64).unwrap_or(Decimal::ZERO)
-        } else {
-            // Degenerate config (gamma/k/A = 0): η undefined, fall back to zero skew.
-            // Strategy still quotes (with symmetric ln-spread only).
-            Decimal::ZERO
-        };
+        // Reservation price: r = mid - q·γ·σ²
+        // Infinite-horizon: no (T-t) multiplier; η simplified to 1 (see module doc).
+        let r = mid.0 - q * gamma * var;
 
-        // Reservation price: r = mid - q·γ·σ²·η
-        let r = mid.0 - q * gamma * var * eta;
-
-        // Half-spread: δ* = (1/γ)·ln(1 + γ/k) + 0.5·γ·σ²·η
-        let inv_gamma = Decimal::ONE / gamma;
-        let one_plus_ratio_f64 = (Decimal::ONE + gamma / k)
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(1.0);
-        let ln_term = Decimal::try_from(one_plus_ratio_f64.ln()).unwrap_or(Decimal::ZERO);
-        let half = Decimal::ONE / Decimal::from(2);
-        let delta = inv_gamma * ln_term + half * gamma * var * eta;
+        // Half-spread: δ = mid · base_spread_bps / 10_000
+        let delta = mid.0 * Decimal::from(self.config.base_spread_bps) / Decimal::from(10_000);
 
         self.last_requote_ts = Some(snapshot.ts);
         self.last_quoted_mid = Some(mid);
@@ -279,8 +267,7 @@ mod tests {
     fn default_config() -> GlftConfig {
         GlftConfig {
             gamma: Decimal::try_from(0.1).unwrap(),
-            k: Decimal::try_from(1.5).unwrap(),
-            a: Decimal::try_from(1.0).unwrap(),
+            base_spread_bps: 5,
             size_per_quote: Size(Decimal::from(1)),
             min_requote_interval_ms: 1000,
             level_step_bps: 10,
@@ -492,14 +479,16 @@ mod tests {
         let pos = make_position(&sym, Decimal::from(5));
 
         let gamma = Decimal::try_from(0.1).unwrap();
-        let k = Decimal::try_from(1.5).unwrap();
         let vol_cfg = EwmaConfig {
             half_life_sec: 60.0,
             initial_var: Decimal::try_from(0.0001).unwrap(),
         };
+        // A-S uses horizon_sec = 3600 (finite-horizon); GLFT is infinite-horizon.
+        // With the same base_spread_bps and gamma, the spread widths are identical
+        // but reservation prices differ because A-S multiplies by horizon_sec.
         let as_cfg = AvellanedaStoikovConfig {
             gamma,
-            k,
+            base_spread_bps: 5,
             horizon_sec: 3600,
             size_per_quote: Size(Decimal::from(1)),
             min_requote_interval_ms: 1000,
@@ -508,8 +497,7 @@ mod tests {
         };
         let glft_cfg = GlftConfig {
             gamma,
-            k,
-            a: Decimal::try_from(1.0).unwrap(),
+            base_spread_bps: 5,
             size_per_quote: Size(Decimal::from(1)),
             min_requote_interval_ms: 1000,
             level_step_bps: 10,
@@ -549,11 +537,55 @@ mod tests {
 
         assert_ne!(
             as_bid, glft_bid,
-            "A-S and GLFT should produce different bid prices on identical inputs"
+            "A-S and GLFT should produce different bid prices on identical inputs (A-S has horizon_sec=3600, GLFT is infinite-horizon)"
         );
         assert_ne!(
             as_ask, glft_ask,
-            "A-S and GLFT should produce different ask prices on identical inputs"
+            "A-S and GLFT should produce different ask prices on identical inputs (A-S has horizon_sec=3600, GLFT is infinite-horizon)"
         );
+    }
+
+    #[test]
+    fn half_spread_is_base_spread_bps_of_mid() {
+        let sym = make_symbol();
+        let pos = make_position(&sym, Decimal::ZERO);
+        let mut cfg = default_config();
+        cfg.base_spread_bps = 5;
+        let mut strat = Glft::new(cfg);
+
+        // Use mid = 100.5 (bid=100, ask=101).
+        let final_bid = Decimal::from(100);
+        let final_ask = Decimal::from(101);
+        let mid = (final_bid + final_ask) / Decimal::from(2); // 100.5
+
+        let actions = warmup_and_emit(
+            &mut strat,
+            &sym,
+            &pos,
+            WARMUP_COUNT,
+            final_bid,
+            final_ask,
+            0,
+        );
+        assert_eq!(actions.len(), 3);
+        let bid_price = match &actions[1] {
+            Action::Quote(q) => q.price.0,
+            _ => panic!("expected Quote"),
+        };
+        let ask_price = match &actions[2] {
+            Action::Quote(q) => q.price.0,
+            _ => panic!("expected Quote"),
+        };
+        // With flat inventory (q=0): r = mid, so bid = mid - delta, ask = mid + delta.
+        // delta = mid * 5 / 10_000 = 100.5 * 0.0005 = 0.05025
+        let expected_delta = mid * Decimal::try_from(0.0005).unwrap();
+        let actual_delta = (ask_price - mid).abs();
+        let diff = (actual_delta - expected_delta).abs();
+        assert!(
+            diff < Decimal::try_from(0.0001).unwrap(),
+            "expected half-spread ≈ {expected_delta}, got {actual_delta} (diff={diff})"
+        );
+        // Bid and ask should be symmetric around mid (flat inventory).
+        assert_eq!((mid - bid_price).abs(), (ask_price - mid).abs());
     }
 }
