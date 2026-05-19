@@ -2822,6 +2822,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikr-risk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tikr-backtest",
+ "tikr-core",
+ "tikr-strategy",
+ "tikr-venue",
+]
+
+[[package]]
 name = "tikr-strategy"
 version = "0.1.0"
 dependencies = [

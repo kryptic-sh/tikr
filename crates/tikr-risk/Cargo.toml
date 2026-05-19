@@ -1,0 +1,20 @@
+[package]
+name = "tikr-risk"
+description = "Hard-limit risk gate + kill switches for the tikr market-making engine"
+keywords = ["trading", "risk", "market-making", "kill-switch", "quant"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+tikr-core = "0.1"
+tikr-venue = "0.1"
+tikr-strategy = "0.1"
+tikr-backtest = "0.1"
+serde = { version = "1", features = ["derive"] }
