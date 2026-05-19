@@ -5161,6 +5161,7 @@ dependencies = [
  "polars",
  "tempfile",
  "thiserror 2.0.18",
+ "tikr-binance",
  "tikr-core",
  "tikr-hyperliquid",
  "tikr-strategy",
