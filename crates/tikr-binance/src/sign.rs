@@ -197,7 +197,28 @@ pub fn append_auth_with_ts_dispatch(params: &str, key: &BinanceKeyMaterial, ts: 
         format!("{params}&recvWindow=5000&timestamp={ts}")
     };
     let sig = sign_query_dispatch(key, &base);
-    format!("{base}&signature={sig}")
+    // Ed25519 base64 signatures contain `+`, `/`, `=` — these MUST be
+    // percent-encoded in the URL or Binance interprets them wrong and rejects
+    // with -1022 "Signature for this request is not valid". HMAC hex is
+    // unaffected (no special chars) but we encode uniformly anyway.
+    format!("{base}&signature={}", percent_encode_sig(&sig))
+}
+
+/// Percent-encode the chars in a Binance signature that aren't URL-query-safe.
+///
+/// Only encodes `+`, `/`, `=` — the three base64 special chars. Hex strings
+/// (HMAC output) pass through unchanged because they contain only `[0-9a-f]`.
+fn percent_encode_sig(sig: &str) -> String {
+    let mut out = String::with_capacity(sig.len() + 8);
+    for c in sig.chars() {
+        match c {
+            '+' => out.push_str("%2B"),
+            '/' => out.push_str("%2F"),
+            '=' => out.push_str("%3D"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +246,72 @@ mod tests {
             sig, "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71",
             "HMAC must match the official Binance docs example exactly"
         );
+    }
+
+    /// Ed25519 base64 sigs contain `+`, `/`, `=` — those MUST be percent-encoded
+    /// when appended to the URL query string, or Binance receives a corrupted
+    /// signature and rejects with -1022.
+    ///
+    /// Regression: live testnet smoke for issue #45 hit this — server received
+    /// `+` as space, signature verify failed.
+    #[test]
+    fn ed25519_signature_url_encoded_in_query() {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use ed25519_dalek::SigningKey;
+
+        // Use a fixed seed that produces a signature containing `+` or `/`
+        // for our canonical payload. Seed [42u8;32] for payload below yields
+        // `DIQW7SP...` which contains `/`.
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        let key = BinanceKeyMaterial::Ed25519 { signing_key };
+        let signed = append_auth_with_ts_dispatch(
+            "symbol=BTCUSDT&side=BUY&type=LIMIT&timeInForce=GTX&quantity=0.001&price=30000",
+            &key,
+            1_699_999_999_000,
+        );
+
+        // The signed query must NOT contain raw `+`, `/`, or `=` in the
+        // signature segment (other than the leading `&signature=` separator).
+        let sig_marker = "&signature=";
+        let sig_start = signed.find(sig_marker).expect("signature must exist");
+        let sig_value = &signed[sig_start + sig_marker.len()..];
+
+        assert!(
+            !sig_value.contains('+'),
+            "signature must percent-encode `+` to `%2B`; raw value: {sig_value}"
+        );
+        assert!(
+            !sig_value.contains('/'),
+            "signature must percent-encode `/` to `%2F`; raw value: {sig_value}"
+        );
+        // base64 padding `=` characters are percent-encoded too.
+        // (Raw `=` in URL queries are typically tolerated, but Binance is
+        // strict; encode for safety.)
+        let assignment_count = signed.matches('=').count();
+        let expected_eq_signs = signed.matches("recvWindow=").count()
+            + signed.matches("timestamp=").count()
+            + signed.matches("symbol=").count()
+            + signed.matches("side=").count()
+            + signed.matches("type=").count()
+            + signed.matches("timeInForce=").count()
+            + signed.matches("quantity=").count()
+            + signed.matches("price=").count()
+            + signed.matches("signature=").count();
+        assert_eq!(
+            assignment_count, expected_eq_signs,
+            "no raw `=` should appear in the base64 signature (use %3D)"
+        );
+
+        // Decoding the percent-encoded signature back must reproduce the
+        // original base64 string.
+        let decoded = sig_value
+            .replace("%2B", "+")
+            .replace("%2F", "/")
+            .replace("%3D", "=");
+        BASE64_STANDARD
+            .decode(&decoded)
+            .expect("percent-decoded signature must be valid base64");
     }
 
     /// signature= is always the last parameter in the signed query string.
@@ -401,11 +488,16 @@ mod tests {
         assert!(signed.contains("timestamp=1000000000"));
         assert!(signed.contains("&signature="));
 
-        // Extract signature value.
+        // Extract signature value. Now percent-encoded — decode `%2B`/`%2F`/`%3D`
+        // back to `+`/`/`/`=` before base64-decoding.
         let sig_idx = signed.find("&signature=").unwrap() + "&signature=".len();
-        let sig_b64 = &signed[sig_idx..];
+        let sig_encoded = &signed[sig_idx..];
+        let sig_b64 = sig_encoded
+            .replace("%2B", "+")
+            .replace("%2F", "/")
+            .replace("%3D", "=");
         let sig_bytes = BASE64_STANDARD
-            .decode(sig_b64)
+            .decode(&sig_b64)
             .expect("base64 decode signature");
         let sig_arr: [u8; 64] = sig_bytes.try_into().expect("64 bytes");
         let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
