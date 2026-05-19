@@ -3,6 +3,13 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::str::FromStr;
 use tikr_core::{Decimal, Notional};
+use tikr_risk::RiskState;
+
+/// Current schema version of [`PaperReport`]'s serialized form.
+///
+/// Bumped any time the wire layout grows or changes semantics. The
+/// [`crate::runner::run_with_resume`] entry point hard-fails on a mismatch.
+pub const SCHEMA_VERSION: u32 = 1;
 
 /// Aggregate P&L + runtime stats for a paper trading session.
 ///
@@ -10,8 +17,10 @@ use tikr_core::{Decimal, Notional};
 /// `Notional` fields are emitted as decimal strings (via [`rust_decimal`]'s
 /// `Display`/`FromStr`) since `tikr-core` does not opt into `rust_decimal`'s
 /// `serde` feature.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PaperReport {
+    /// Wire-format schema version. Always [`SCHEMA_VERSION`] for fresh reports.
+    pub schema_version: u32,
     /// Realized P&L (gross of fees).
     pub realized: Notional,
     /// Unrealized P&L marked at last observed mid.
@@ -22,18 +31,22 @@ pub struct PaperReport {
     pub funding: Notional,
     /// Net P&L: `realized + unrealized - fees + funding`.
     pub net: Notional,
-    /// Total runtime in seconds.
+    /// Total runtime in seconds. On resume, accumulates across incarnations.
     pub runtime_secs: u64,
     /// Total `MarketEvent` count processed by the runner.
     pub events_processed: u64,
     /// Total `Fill` count emitted by [`FillSim`][tikr_backtest::fill_sim::FillSim].
     pub fills_emitted: u64,
+    /// Persisted risk-gate state, present when a [`tikr_risk::RiskGate`] was
+    /// supplied to [`crate::runner::run_with_resume`]; `None` otherwise.
+    pub risk_state: Option<RiskState>,
 }
 
 // --- serde wire format ---------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
 struct PaperReportWire {
+    schema_version: u32,
     realized: String,
     unrealized: String,
     fees: String,
@@ -42,11 +55,14 @@ struct PaperReportWire {
     runtime_secs: u64,
     events_processed: u64,
     fills_emitted: u64,
+    #[serde(default)]
+    risk_state: Option<RiskState>,
 }
 
 impl Serialize for PaperReport {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         PaperReportWire {
+            schema_version: self.schema_version,
             realized: self.realized.0.to_string(),
             unrealized: self.unrealized.0.to_string(),
             fees: self.fees.0.to_string(),
@@ -55,6 +71,7 @@ impl Serialize for PaperReport {
             runtime_secs: self.runtime_secs,
             events_processed: self.events_processed,
             fills_emitted: self.fills_emitted,
+            risk_state: self.risk_state.clone(),
         }
         .serialize(serializer)
     }
@@ -63,12 +80,19 @@ impl Serialize for PaperReport {
 impl<'de> Deserialize<'de> for PaperReport {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = PaperReportWire::deserialize(deserializer)?;
+        if wire.schema_version != SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported PaperReport schema_version {}; tikr-paper supports {}",
+                wire.schema_version, SCHEMA_VERSION
+            )));
+        }
         let parse = |s: &str| -> Result<Notional, D::Error> {
             Decimal::from_str(s)
                 .map(Notional)
                 .map_err(serde::de::Error::custom)
         };
         Ok(PaperReport {
+            schema_version: wire.schema_version,
             realized: parse(&wire.realized)?,
             unrealized: parse(&wire.unrealized)?,
             fees: parse(&wire.fees)?,
@@ -77,6 +101,7 @@ impl<'de> Deserialize<'de> for PaperReport {
             runtime_secs: wire.runtime_secs,
             events_processed: wire.events_processed,
             fills_emitted: wire.fills_emitted,
+            risk_state: wire.risk_state,
         })
     }
 }

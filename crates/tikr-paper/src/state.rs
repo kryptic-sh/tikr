@@ -21,6 +21,7 @@ mod tests {
 
     fn fixture_report() -> PaperReport {
         PaperReport {
+            schema_version: crate::report::SCHEMA_VERSION,
             realized: Notional(Decimal::from(10)),
             unrealized: Notional(Decimal::from(5)),
             fees: Notional(Decimal::from(1)),
@@ -29,6 +30,7 @@ mod tests {
             runtime_secs: 100,
             events_processed: 500,
             fills_emitted: 3,
+            risk_state: None,
         }
     }
 

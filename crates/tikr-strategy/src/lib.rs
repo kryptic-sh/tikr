@@ -140,6 +140,28 @@ pub trait Strategy: Send {
 }
 
 // ---------------------------------------------------------------------------
+// StrategyResume
+// ---------------------------------------------------------------------------
+
+/// Optional opt-in for strategies that want to persist internal state across
+/// restarts (resume path; #32).
+///
+/// Default impls are no-ops; strategies that don't override skip serialization
+/// (cold-start on resume — acceptable for stateless strategies like
+/// [`NaiveGrid`] or warmup-recoverable strategies like [`AvellanedaStoikov`] /
+/// [`Glft`]). No reference strategy implements this trait in v0; the
+/// declaration is wired in for future opt-in.
+pub trait StrategyResume {
+    /// Serialize the strategy's internal state to bytes. `None` (default) =
+    /// don't persist.
+    fn serialize_state(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// Restore internal state from previously-serialized bytes. Default: no-op.
+    fn restore_state(&mut self, _bytes: &[u8]) {}
+}
+
+// ---------------------------------------------------------------------------
 // NaiveGrid
 // ---------------------------------------------------------------------------
 

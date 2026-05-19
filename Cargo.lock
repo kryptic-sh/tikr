@@ -2813,6 +2813,7 @@ dependencies = [
  "tikr-backtest",
  "tikr-core",
  "tikr-hyperliquid",
+ "tikr-risk",
  "tikr-strategy",
  "tikr-venue",
  "tokio",

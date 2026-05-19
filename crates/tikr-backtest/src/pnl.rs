@@ -51,6 +51,29 @@ impl PositionTracker {
         }
     }
 
+    /// Reconstruct a tracker from persisted state. Resume path (#32).
+    ///
+    /// Used by [`tikr_paper::runner::run_with_resume`] to seed tracker state
+    /// from a prior `PaperReport`. Caller is responsible for ensuring the
+    /// snapshot fields are self-consistent (e.g. came from a previous
+    /// `tracker.snapshot()` plus the matching `report()` aggregates).
+    pub fn from_snapshot(
+        symbol: Symbol,
+        position: Position,
+        realized: Notional,
+        fees: Notional,
+        funding: Notional,
+    ) -> Self {
+        Self {
+            symbol,
+            size: position.size,
+            avg_entry: position.avg_entry,
+            realized_pnl: realized,
+            fees_paid: fees,
+            funding_accrued: funding,
+        }
+    }
+
     /// Apply `fill` to the running state. WACC math, fees accumulated separately.
     pub fn apply(&mut self, fill: &Fill) {
         let delta = side_delta(fill.side, fill.size);
@@ -261,6 +284,29 @@ mod tests {
         assert_eq!(snap.size.0, Decimal::ZERO);
         assert_eq!(snap.avg_entry.0, Decimal::ZERO);
         assert_eq!(snap.realized_pnl.0, Decimal::from(10));
+    }
+
+    #[test]
+    fn from_snapshot_round_trips() {
+        let symbol = make_symbol();
+        let pos = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::from(5)),
+            avg_entry: Price(Decimal::from(100)),
+            realized_pnl: Notional(Decimal::from(20)),
+        };
+        let tracker = PositionTracker::from_snapshot(
+            symbol.clone(),
+            pos.clone(),
+            Notional(Decimal::from(50)),
+            Notional(Decimal::from(3)),
+            Notional(Decimal::ZERO),
+        );
+        let report = tracker.report(Price(Decimal::from(110)));
+        assert_eq!(report.realized.0, Decimal::from(50));
+        // (110 - 100) * 5 = 50
+        assert_eq!(report.unrealized.0, Decimal::from(50));
+        assert_eq!(report.fees.0, Decimal::from(3));
     }
 
     #[test]

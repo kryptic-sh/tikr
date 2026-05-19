@@ -1,13 +1,14 @@
 //! Paper-trading runner — live `Venue` → `Strategy` → `FillSim` → `PaperReport`.
 
-use crate::report::PaperReport;
+use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::time::Instant;
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
-use tikr_core::{Decimal, MarketEvent, Price, Snapshot, Symbol, Timestamp};
+use tikr_core::{Decimal, MarketEvent, Position, Price, Snapshot, Symbol, Timestamp};
+use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
 use tikr_venue::Venue;
 use tokio::sync::watch;
@@ -35,6 +36,8 @@ impl Default for RunnerConfig {
 /// Drive `strategy` against `venue.subscribe(symbol)`, returning the final
 /// [`PaperReport`] when the stream ends or `shutdown` fires.
 ///
+/// Thin wrapper over [`run_with_resume`] with no prior report and no risk gate.
+///
 /// # v0 limitations
 ///
 /// - `StrategyContext.recent_fills` is always empty
@@ -43,32 +46,154 @@ impl Default for RunnerConfig {
 /// - `last_mid` is zero if no `BookUpdate` ever arrived
 pub async fn run<V, S>(
     venue: V,
-    mut strategy: S,
-    mut fill_sim: FillSim,
+    strategy: S,
+    fill_sim: FillSim,
     symbol: Symbol,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     config: RunnerConfig,
 ) -> PaperReport
 where
     V: Venue,
     S: Strategy,
 {
-    let mut tracker = PositionTracker::new(symbol.clone());
+    run_inner(
+        venue, strategy, fill_sim, symbol, shutdown, config, None, None,
+    )
+    .await
+}
+
+/// Drive `strategy` like [`run`], optionally seeding aggregate state from a
+/// prior [`PaperReport`] and/or layering a [`RiskGate`] between the strategy
+/// and the fill simulator.
+///
+/// # Resume semantics (v0 limitation)
+///
+/// When `resume` is `Some(prior)`, the new runner seeds:
+///
+/// - `realized`, `fees`, `funding` — aggregated forward from `prior`
+/// - `events_processed`, `fills_emitted` — counters carry over
+/// - `runtime_secs` — final report adds the new wall-clock to `prior.runtime_secs`
+///
+/// **Position size is reset to zero.** [`PaperReport`] only carries aggregate
+/// P&L, not the raw `Position { size, avg_entry }`, so v0 resume cannot
+/// reconstruct an open position. Operators must close all positions before
+/// restart; otherwise unrealized P&L attribution is wrong post-resume.
+/// (Position-state persistence is a future enhancement; see #32 follow-ups.)
+///
+/// # Risk gate
+///
+/// When `risk_gate` is `Some(gate)`:
+/// 1. Every strategy-emitted [`tikr_strategy::Action`] is run through
+///    [`RiskGate::check`] **before** the runner hands it to [`FillSim`].
+///    `Allow` forwards; `Reject` logs + drops; `Halt` logs + drops (the gate
+///    flips its sticky-halt state so subsequent checks return `Reject`).
+/// 2. After each fill is applied to the tracker, [`RiskGate::record_fill`] is
+///    called with the fill timestamp so the rolling fills-per-minute window
+///    stays current.
+/// 3. The final report's `risk_state` contains a clone of
+///    [`RiskGate::state`].
+///
+/// # Panics
+///
+/// Hard-fails on `prior.schema_version != SCHEMA_VERSION`. v0 snapshots that
+/// pre-date `schema_version` (i.e. from #26) are not resumable.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_resume<V, S>(
+    venue: V,
+    strategy: S,
+    fill_sim: FillSim,
+    symbol: Symbol,
+    shutdown: watch::Receiver<bool>,
+    config: RunnerConfig,
+    resume: Option<PaperReport>,
+    risk_gate: Option<Box<dyn RiskGate>>,
+) -> PaperReport
+where
+    V: Venue,
+    S: Strategy,
+{
+    if let Some(ref prior) = resume
+        && prior.schema_version != SCHEMA_VERSION
+    {
+        panic!(
+            "unsupported PaperReport schema_version {}; tikr-paper supports {}",
+            prior.schema_version, SCHEMA_VERSION
+        );
+    }
+    run_inner(
+        venue, strategy, fill_sim, symbol, shutdown, config, resume, risk_gate,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_inner<V, S>(
+    venue: V,
+    mut strategy: S,
+    mut fill_sim: FillSim,
+    symbol: Symbol,
+    mut shutdown: watch::Receiver<bool>,
+    config: RunnerConfig,
+    resume: Option<PaperReport>,
+    mut risk_gate: Option<Box<dyn RiskGate>>,
+) -> PaperReport
+where
+    V: Venue,
+    S: Strategy,
+{
+    // Reconstruct tracker from resume if provided, else fresh.
+    // v0 limitation: position size is reset to zero — see run_with_resume docs.
+    let mut tracker = if let Some(ref prior) = resume {
+        let pos = Position {
+            symbol: symbol.clone(),
+            size: tikr_core::SignedSize(Decimal::ZERO),
+            avg_entry: Price(Decimal::ZERO),
+            realized_pnl: prior.realized,
+        };
+        PositionTracker::from_snapshot(
+            symbol.clone(),
+            pos,
+            prior.realized,
+            prior.fees,
+            prior.funding,
+        )
+    } else {
+        PositionTracker::new(symbol.clone())
+    };
+
+    // Seed counters from resume.
+    let mut events_processed: u64 = resume.as_ref().map(|r| r.events_processed).unwrap_or(0);
+    let mut fills_emitted: u64 = resume.as_ref().map(|r| r.fills_emitted).unwrap_or(0);
+    let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
+
     let mut current_book = empty_snapshot(&symbol);
     let mut last_mid = Price(Decimal::ZERO);
-    let mut events_processed: u64 = 0;
-    let mut fills_emitted: u64 = 0;
     let started = Instant::now();
     let run_id = make_run_id(&symbol);
 
-    info!(symbol = %symbol.base.0, run_id = %run_id, "paper runner starting");
+    info!(
+        symbol = %symbol.base.0,
+        run_id = %run_id,
+        resumed = resume.is_some(),
+        risk_gate = risk_gate.is_some(),
+        "paper runner starting"
+    );
 
     // First-connect: if subscribe fails synchronously, return a zero report.
     let mut stream = match venue.subscribe(&symbol).await {
         Ok(s) => s,
         Err(e) => {
             warn!("subscribe failed: {}", e);
-            return finalize(&tracker, last_mid, started, 0, 0);
+            let mut report = finalize(
+                &tracker,
+                last_mid,
+                started,
+                events_processed,
+                fills_emitted,
+                &risk_gate,
+            );
+            report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
+            return report;
         }
     };
 
@@ -100,12 +225,35 @@ where
 
                 let actions = strategy.on_event(&ctx, &event);
                 for action in actions {
+                    // Risk-gate check happens BEFORE fill_sim.on_action.
+                    if let Some(gate) = risk_gate.as_mut() {
+                        let pnl_now = tracker.report(last_mid);
+                        let risk_ctx = RiskContext {
+                            position: &pos,
+                            pnl: pnl_now,
+                            now: ts,
+                        };
+                        match gate.check(&action, &risk_ctx) {
+                            RiskDecision::Allow => {}
+                            RiskDecision::Reject(reason) => {
+                                warn!(?action, reason = %reason, "risk: action rejected");
+                                continue;
+                            }
+                            RiskDecision::Halt(reason) => {
+                                warn!(?action, reason = %reason, "risk: HALT — action dropped, sticky");
+                                continue;
+                            }
+                        }
+                    }
                     fill_sim.on_action(action, ts);
                 }
                 let fills = fill_sim.on_market_event(&event, ts);
                 for fill in fills {
                     info!(price = %fill.price.0, size = %fill.size.0, side = ?fill.side, "fill");
                     tracker.apply(&fill);
+                    if let Some(gate) = risk_gate.as_mut() {
+                        gate.record_fill(fill.ts);
+                    }
                     fills_emitted += 1;
                 }
                 events_processed += 1;
@@ -114,7 +262,15 @@ where
                     && config.snapshot_every_n_events > 0
                     && events_processed.is_multiple_of(config.snapshot_every_n_events as u64)
                 {
-                    let report = finalize(&tracker, last_mid, started, events_processed, fills_emitted);
+                    let mut report = finalize(
+                        &tracker,
+                        last_mid,
+                        started,
+                        events_processed,
+                        fills_emitted,
+                        &risk_gate,
+                    );
+                    report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
                         warn!("snapshot write failed: {}", e);
                     }
@@ -130,6 +286,7 @@ where
     }
 
     // Drain pending FillSim actions and emit strategy on_shutdown actions.
+    // Shutdown actions skip the risk gate — cancel-all is always allowed.
     let pos = tracker.snapshot();
     let now_ts = current_book.ts;
     let ctx = StrategyContext {
@@ -145,7 +302,15 @@ where
         fill_sim.on_action(action, now_ts);
     }
 
-    let report = finalize(&tracker, last_mid, started, events_processed, fills_emitted);
+    let mut report = finalize(
+        &tracker,
+        last_mid,
+        started,
+        events_processed,
+        fills_emitted,
+        &risk_gate,
+    );
+    report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
     }
@@ -165,9 +330,11 @@ fn finalize(
     started: Instant,
     events_processed: u64,
     fills_emitted: u64,
+    risk_gate: &Option<Box<dyn RiskGate>>,
 ) -> PaperReport {
     let base = tracker.report(last_mid);
     PaperReport {
+        schema_version: SCHEMA_VERSION,
         realized: base.realized,
         unrealized: base.unrealized,
         fees: base.fees,
@@ -176,6 +343,7 @@ fn finalize(
         runtime_secs: started.elapsed().as_secs(),
         events_processed,
         fills_emitted,
+        risk_state: risk_gate.as_ref().map(|g| g.state().clone()),
     }
 }
 
@@ -213,12 +381,15 @@ fn make_run_id(symbol: &Symbol) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multi::{MultiSymbolRun, run_multi};
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-    use tikr_core::{Asset, Level, Size, VenueId};
+    use tikr_core::{Asset, Level, Notional, Size, VenueId};
     use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
     use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
     use tokio::sync::watch;
@@ -325,6 +496,23 @@ mod tests {
         }
     }
 
+    fn make_book_event(symbol: &Symbol, i: u64) -> MarketEvent {
+        MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: symbol.clone(),
+                bids: vec![Level {
+                    price: Price(Decimal::from(100)),
+                    size: Size(Decimal::from(1)),
+                }],
+                asks: vec![Level {
+                    price: Price(Decimal::from(101)),
+                    size: Size(Decimal::from(1)),
+                }],
+                ts: Timestamp(i * 1_000_000),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn runner_handles_empty_event_stream() {
         let temp = TempDir::new().unwrap();
@@ -396,6 +584,7 @@ mod tests {
         let report = run(venue, naive_grid(), fill_sim(), symbol, rx, cfg).await;
 
         assert_eq!(report.events_processed, 120);
+        assert_eq!(report.schema_version, SCHEMA_VERSION);
         // Check that at least one snapshot was written to disk.
         let entries: Vec<_> = std::fs::read_dir(temp.path())
             .unwrap()
@@ -407,10 +596,146 @@ mod tests {
             "expected at least one JSON snapshot file"
         );
 
-        // Verify the file parses back.
+        // Verify the file parses back, including schema_version round-trip.
         let path = entries[0].path();
         let txt = std::fs::read_to_string(&path).unwrap();
         let parsed: PaperReport = serde_json::from_str(&txt).unwrap();
         assert!(parsed.events_processed >= 100);
+        assert_eq!(parsed.schema_version, 1);
+    }
+
+    #[tokio::test]
+    async fn run_with_resume_seeds_position_tracker() {
+        let temp = TempDir::new().unwrap();
+        let prior = PaperReport {
+            schema_version: SCHEMA_VERSION,
+            realized: Notional(Decimal::from(5)),
+            unrealized: Notional(Decimal::ZERO),
+            fees: Notional(Decimal::from(1)),
+            funding: Notional(Decimal::ZERO),
+            net: Notional(Decimal::from(4)),
+            runtime_secs: 100,
+            events_processed: 50,
+            fills_emitted: 3,
+            risk_state: None,
+        };
+        let venue = MockVenue::finite(Vec::new());
+        let (_tx, rx) = watch::channel(false);
+        let report = run_with_resume(
+            venue,
+            naive_grid(),
+            fill_sim(),
+            make_symbol(),
+            rx,
+            test_config(temp.path().into()),
+            Some(prior),
+            None,
+        )
+        .await;
+        assert_eq!(report.realized.0, Decimal::from(5));
+        assert_eq!(report.events_processed, 50);
+        assert_eq!(report.fills_emitted, 3);
+        // runtime accumulates: prior 100 + (~0 for empty stream)
+        assert!(report.runtime_secs >= 100);
+        assert_eq!(report.schema_version, SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "unsupported PaperReport schema_version")]
+    async fn run_with_resume_rejects_unknown_schema_version() {
+        let temp = TempDir::new().unwrap();
+        let prior = PaperReport {
+            schema_version: 999,
+            realized: Notional(Decimal::ZERO),
+            unrealized: Notional(Decimal::ZERO),
+            fees: Notional(Decimal::ZERO),
+            funding: Notional(Decimal::ZERO),
+            net: Notional(Decimal::ZERO),
+            runtime_secs: 0,
+            events_processed: 0,
+            fills_emitted: 0,
+            risk_state: None,
+        };
+        let venue = MockVenue::finite(Vec::new());
+        let (_tx, rx) = watch::channel(false);
+        let _ = run_with_resume(
+            venue,
+            naive_grid(),
+            fill_sim(),
+            make_symbol(),
+            rx,
+            test_config(temp.path().into()),
+            Some(prior),
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_multi_aggregates_per_symbol() {
+        let symbol_a = Symbol {
+            base: Asset::new("BTC"),
+            quote: Asset::new("USDC"),
+            venue: VenueId::new("mock"),
+        };
+        let symbol_b = Symbol {
+            base: Asset::new("ETH"),
+            quote: Asset::new("USDC"),
+            venue: VenueId::new("mock"),
+        };
+
+        let (_tx, rx) = watch::channel(false);
+        let rx_a = rx.clone();
+        let rx_b = rx.clone();
+        let temp = TempDir::new().unwrap();
+        let cfg_a = test_config(temp.path().join("a"));
+        let cfg_b = test_config(temp.path().join("b"));
+
+        // 4 BookUpdate events per symbol.
+        let events_a: Vec<MarketEvent> = (0..4u64).map(|i| make_book_event(&symbol_a, i)).collect();
+        let events_b: Vec<MarketEvent> = (0..4u64).map(|i| make_book_event(&symbol_b, i)).collect();
+
+        let symbol_a_clone = symbol_a.clone();
+        let symbol_b_clone = symbol_b.clone();
+        let fut_a: Pin<Box<dyn Future<Output = PaperReport> + Send>> = Box::pin(async move {
+            run(
+                MockVenue::finite(events_a),
+                naive_grid(),
+                fill_sim(),
+                symbol_a_clone,
+                rx_a,
+                cfg_a,
+            )
+            .await
+        });
+        let fut_b: Pin<Box<dyn Future<Output = PaperReport> + Send>> = Box::pin(async move {
+            run(
+                MockVenue::finite(events_b),
+                naive_grid(),
+                fill_sim(),
+                symbol_b_clone,
+                rx_b,
+                cfg_b,
+            )
+            .await
+        });
+
+        let runs = vec![
+            MultiSymbolRun {
+                symbol: symbol_a.clone(),
+                future: fut_a,
+            },
+            MultiSymbolRun {
+                symbol: symbol_b.clone(),
+                future: fut_b,
+            },
+        ];
+
+        let report = run_multi(runs, rx).await;
+        assert_eq!(report.per_symbol.len(), 2);
+        assert_eq!(report.sum.events_processed, 8);
+        assert!(report.per_symbol.contains_key(&symbol_a));
+        assert!(report.per_symbol.contains_key(&symbol_b));
+        assert_eq!(report.sum.schema_version, SCHEMA_VERSION);
     }
 }

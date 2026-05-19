@@ -18,6 +18,7 @@ tikr-venue = "0.1"
 tikr-strategy = "0.1"
 tikr-hyperliquid = "0.1"
 tikr-backtest = "0.1"
+tikr-risk = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -26,8 +27,12 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "test-util"] }
-clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "supervisor"
+path = "src/bin/supervisor.rs"

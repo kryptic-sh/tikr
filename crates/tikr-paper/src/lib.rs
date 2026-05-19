@@ -12,23 +12,34 @@
 //! [`tokio::sync::watch`] channel. State snapshots written periodically as
 //! JSON for post-mortem analysis.
 //!
-//! # v0 limitations (Phase 4 risk engine fills these)
+//! # Resume + multi-symbol + supervisor (Phase 4)
 //!
-//! - No resume from snapshot on restart
-//! - No crash recovery / auto-restart on panic
-//! - Single-symbol per run (multi-symbol = spawn N runners)
-//! - No alerting (Slack/Discord webhooks)
-//! - No real-time TUI
+//! - [`runner::run_with_resume`] re-seeds aggregate P&L / counters from a
+//!   prior [`PaperReport`] and can layer a [`tikr_risk::RiskGate`] between
+//!   strategy and fill simulator.
+//! - [`multi::run_multi`] joins N per-symbol runner futures concurrently.
+//! - `supervisor` (binary) spawns the example runner and respawns on
+//!   non-zero exit, bounded by `--max-restarts-per-hour`.
+//!
+//! # v0 limitations
+//!
+//! - Resume: position size is reset to zero (only aggregate P&L carries over).
+//!   Operators must close all positions before restart.
+//! - Supervisor: no `--resume-from` flag on the example bin yet, so each
+//!   restart is cold; state snapshots are written but not re-read.
+//! - No real-time TUI; no alerting wiring (that's #33).
 //!
 //! [`Replay`]: tikr_backtest::replay::Replay
 //! [`Venue`]: tikr_venue::Venue
 
 #![deny(missing_docs)]
 
+pub mod multi;
 pub mod report;
 pub mod runner;
 pub mod state;
 
-pub use report::PaperReport;
-pub use runner::{RunnerConfig, run};
+pub use multi::{MultiPaperReport, MultiSymbolRun, run_multi};
+pub use report::{PaperReport, SCHEMA_VERSION};
+pub use runner::{RunnerConfig, run, run_with_resume};
 pub use state::write_snapshot;
