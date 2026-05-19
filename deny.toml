@@ -36,6 +36,10 @@ allow = [
   # Boost Software License -- OSI-approved, FSF Free/Libre. Pulled in by
   # xxhash-rust (transitive via polars-core).
   "BSL-1.0",
+  # The Unlicense -- public domain dedication. OSI-approved, FSF Free/Libre.
+  # Pulled in by async_io_stream + pharos + ws_stream_wasm (transitive via
+  # alloy-provider ws feature, new in tikr-dodo Phase 5).
+  "Unlicense",
   # Community Data License Agreement -- Permissive 2.0. SPDX-listed,
   # OSI-approved, no copyleft. Pulled in by webpki-roots (transitive via
   # reqwest + tokio-tungstenite for the rustls-tls trust store).

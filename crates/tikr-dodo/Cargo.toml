@@ -1,0 +1,49 @@
+[package]
+name = "tikr-dodo"
+description = "DODO LimitOrder Venue adapter for the tikr market-making engine (BSC mainnet)"
+keywords = ["trading", "dodo", "market-making", "crypto", "bsc"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+tikr-core = "0.1"
+tikr-venue = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+uuid = "1"
+# EIP-712 signing for DODO LimitOrder (mirrors tikr-hyperliquid Phase 5).
+# alloy-signer-local: PrivateKeySigner (secp256k1 ECDSA).
+# alloy-primitives: B256, Address, U256, keccak256.
+# alloy-provider + alloy-transport-ws: BSC RPC + WebSocket log subscription.
+# alloy-sol-types: ABI/log decoding for LimitOrderFilled events.
+# alloy-network + alloy-rpc-types: provider generics.
+alloy-signer = "2"
+alloy-signer-local = "2"
+alloy-primitives = { version = "1", features = ["serde"] }
+alloy-provider = { version = "2", features = ["ws"] }
+alloy-rpc-types = "2"
+hex = "0.4"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+anyhow = "1"
+serde_json = "1"
+dotenvy = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util", "signal"] }
+
+[[example]]
+name = "run_live"
+path = "examples/run_live.rs"
