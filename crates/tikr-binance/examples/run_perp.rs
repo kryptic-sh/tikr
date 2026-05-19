@@ -131,6 +131,23 @@ struct Args {
     /// `/fapi/v1/exchangeInfo`.
     #[arg(long, default_value = "0.001")]
     size: String,
+
+    /// A-S / GLFT risk aversion γ. Strategy-specific tunable.
+    ///
+    /// A-S/GLFT half-spread = `(1/γ)·ln(1+γ/k)` in PRICE units (dollars),
+    /// not bps. The same γ/k produces different bps depending on the
+    /// asset's price level. Per-symbol tuning is required.
+    ///
+    /// Empirical defaults targeting ~5 bps half-spread:
+    /// - BTCUSDT (~$76k): γ=0.01, k=0.1
+    /// - ETHUSDT (~$2.1k): γ=10, k=6
+    /// - BNBUSDT (~$640):  γ=100, k=6
+    #[arg(long, default_value = "0.01")]
+    gamma: String,
+
+    /// A-S / GLFT market-impact intensity k. See `--gamma`.
+    #[arg(long, default_value = "0.1")]
+    k: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -291,17 +308,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         StrategyArg::AvellanedaStoikov => {
-            // Tuning for BTC@~$76k on Binance Futures testnet 2026-05-19:
-            // A-S half-spread = γσ²(T-t)/2 + (1/γ)ln(1+γ/k)
-            // With testnet σ²≈2.5e-9, term 1 is negligible. The log term
-            // dominates in PRICE units, so to hit ~6 bps half-spread
-            // (≈$5 on BTC) we need (1/γ)ln(1+γ/k) ≈ 5.
-            // γ=0.01, k=0.1 → 100·ln(1.1) ≈ 9.5 dollars per side ≈ 12.5 bps,
-            // 25 bps round-trip. Wider than NaiveGrid 10bps but compensates
-            // for testnet adverse-selection bleed.
+            // γ/k tunable via CLI — see --gamma/--k help for per-symbol guidance.
             let strategy = AvellanedaStoikov::new(AvellanedaStoikovConfig {
-                gamma: Decimal::from_str("0.01").unwrap(),
-                k: Decimal::from_str("0.1").unwrap(),
+                gamma: Decimal::from_str(&args.gamma)
+                    .map_err(|e| format!("--gamma '{}' invalid: {}", args.gamma, e))?,
+                k: Decimal::from_str(&args.k)
+                    .map_err(|e| format!("--k '{}' invalid: {}", args.k, e))?,
                 horizon_sec: 3600,
                 size_per_quote,
                 min_requote_interval_ms: 5000,
@@ -326,10 +338,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         StrategyArg::Glft => {
-            // Same rationale as A-S: γ=0.01, k=0.1 for ~12 bps half-spread.
+            // γ/k tunable via CLI — see --gamma/--k help for per-symbol guidance.
             let strategy = Glft::new(GlftConfig {
-                gamma: Decimal::from_str("0.01").unwrap(),
-                k: Decimal::from_str("0.1").unwrap(),
+                gamma: Decimal::from_str(&args.gamma)
+                    .map_err(|e| format!("--gamma '{}' invalid: {}", args.gamma, e))?,
+                k: Decimal::from_str(&args.k)
+                    .map_err(|e| format!("--k '{}' invalid: {}", args.k, e))?,
                 a: Decimal::from_str("1.0").unwrap(),
                 size_per_quote,
                 min_requote_interval_ms: 5000,
