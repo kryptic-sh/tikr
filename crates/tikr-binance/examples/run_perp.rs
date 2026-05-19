@@ -49,6 +49,7 @@ use clap::{Parser, ValueEnum};
 use reqwest::Client as HttpClient;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::{
     BinanceClient, BinanceEnv, BinanceKeyMaterial, env_with_product_fallback,
@@ -211,10 +212,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting Perp runner"
     );
 
-    // Build the venue. with_credentials moves api_key, so clone first for the
-    // userDataStream task (it needs the same key independently).
+    // Build the venue. Wrap key_material in Arc so it can be shared with the
+    // user-stream pump (futures path doesn't use it, but the API requires it).
     let api_key_for_user_stream = api_key.clone();
-    let venue = BinanceClient::with_credentials(env, api_key, key_material, Some(&symbol)).await?;
+    let key_material = Arc::new(key_material);
+    let venue = BinanceClient::with_credentials(
+        env,
+        api_key,
+        match key_material.as_ref() {
+            BinanceKeyMaterial::Hmac { secret } => BinanceKeyMaterial::Hmac {
+                secret: secret.clone(),
+            },
+            BinanceKeyMaterial::Ed25519 { signing_key } => BinanceKeyMaterial::Ed25519 {
+                signing_key: signing_key.clone(),
+            },
+        },
+        Some(&symbol),
+    )
+    .await?;
 
     info!(venue = ?venue, "BinanceClient ready");
 
@@ -229,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_for_user_stream,
         env,
         api_key_for_user_stream,
+        key_material,
         MarketKind::Perp,
         symbol_for_filter,
     )

@@ -40,6 +40,7 @@
 use clap::{Parser, ValueEnum};
 use reqwest::Client as HttpClient;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::{
     BinanceClient, BinanceEnv, BinanceKeyMaterial, env_with_product_fallback,
@@ -162,7 +163,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let api_key_for_user_stream = api_key.clone();
-    let venue = BinanceClient::with_credentials(env, api_key, key_material, Some(&symbol)).await?;
+    // Wrap key_material in Arc so it can be shared with the user-stream pump.
+    let key_material = Arc::new(key_material);
+    let venue = BinanceClient::with_credentials(
+        env,
+        api_key,
+        // BinanceClient takes ownership; clone the inner value from Arc.
+        // Safety: Arc::try_unwrap would work here but we need a ref for subscribe too,
+        // so we clone the key material for the venue client.
+        match key_material.as_ref() {
+            BinanceKeyMaterial::Hmac { secret } => BinanceKeyMaterial::Hmac {
+                secret: secret.clone(),
+            },
+            BinanceKeyMaterial::Ed25519 { signing_key } => BinanceKeyMaterial::Ed25519 {
+                signing_key: signing_key.clone(),
+            },
+        },
+        Some(&symbol),
+    )
+    .await?;
 
     info!(venue = ?venue, "BinanceClient ready");
 
@@ -173,11 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_for_user_stream,
         env,
         api_key_for_user_stream,
+        key_material,
         MarketKind::Spot,
         symbol_for_filter,
     )
     .await?;
-    info!("userDataStream listenKey minted; subscribed to fills");
+    info!("spot userDataStream subscribed (WS-API session.logon path)");
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tx_ctrlc = shutdown_tx.clone();

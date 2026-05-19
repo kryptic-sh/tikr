@@ -1,27 +1,41 @@
-//! Binance userDataStream: listenKey lifecycle + fill parsing.
+//! Binance userDataStream: listenKey lifecycle (futures) + spot WS-API path.
 //!
 //! ## Architecture
 //!
+//! ### Spot (WS-API, post-2026-02-20 deprecation)
+//!
+//! The REST `POST /api/v3/userDataStream` listenKey endpoint was deprecated on
+//! 2026-02-20 and returns HTTP 410 Gone. Spot now uses the Binance Spot
+//! WebSocket API (`wss://ws-api.testnet.binance.vision/ws-api/v3`):
+//!
+//! 1. Connect to the WS-API endpoint.
+//! 2. Send `session.logon` (Ed25519-signed — **only Ed25519 is supported**).
+//! 3. After logon ack, send `userDataStream.subscribe`.
+//! 4. Events flow on the same connection, wrapped:
+//!    `{"subscriptionId": N, "event": {"e": "executionReport", ...}}`.
+//!
+//! On WS disconnect: full reconnect (new `session.logon` + `subscribe`).
+//! No keepalive needed (no listenKey to extend).
+//!
+//! ### Futures (unchanged)
+//!
 //! 1. [`mint_listen_key`] — POST to mint a new listenKey. 60-min server expiry.
 //! 2. [`keepalive_listen_key`] — PUT to extend the key. Called every 20 min.
-//! 3. [`subscribe_user_data_stream`] — spawns:
-//!    - A **WS task** that connects `wss://<host>/ws/<listenKey>`, reads
-//!      execution reports, and sends [`Fill`]s to a channel.
-//!    - A **keepalive task** that fires a PUT every 20 min.
+//! 3. [`subscribe_user_data_stream`] — for futures: spawns a WS task +
+//!    keepalive task using the listenKey path.
 //!
 //! On WS disconnect the WS task mints a **fresh** listenKey (never reuses a
 //! stale key) and reconnects.
 //!
-//! ## listenKey endpoints
+//! ## listenKey endpoints (futures only)
 //!
 //! | Product | Mint | Keepalive |
 //! |---------|------|-----------|
-//! | Spot | `POST /api/v3/userDataStream` | `PUT /api/v3/userDataStream?listenKey=…` |
 //! | Futures | `POST /fapi/v1/listenKey` | `PUT /fapi/v1/listenKey?listenKey=…` |
 //!
 //! ## Fill parsing
 //!
-//! - Spot: `executionReport` event with `X=TRADE` and `x=FILL`.
+//! - Spot WS-API: `executionReport` inside `{"subscriptionId":N,"event":{...}}`.
 //! - Futures: `ORDER_TRADE_UPDATE` event with `.o.X=FILLED`.
 
 use futures::SinkExt;
@@ -42,6 +56,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::BinanceEnv;
+use crate::sign::{BinanceKeyMaterial, sign_query_ed25519, timestamp_ms};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -135,24 +150,353 @@ fn ws_base_url(env: BinanceEnv) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Spot WS-API (session.logon + userDataStream.subscribe)
+// ---------------------------------------------------------------------------
+
+/// Spot WS-API base URL for `session.logon` + `userDataStream.subscribe`.
+///
+/// Different from the public stream WS (`testnet.binance.vision/ws/...`).
+/// Only supports Ed25519 keys — HMAC is not accepted for this endpoint.
+pub fn spot_ws_api_url(env: BinanceEnv) -> &'static str {
+    match env {
+        BinanceEnv::SpotTestnet => "wss://ws-api.testnet.binance.vision/ws-api/v3",
+        BinanceEnv::SpotMainnet => "wss://ws-api.binance.com:443/ws-api/v3",
+        // Futures envs do not use the WS-API path; included for completeness.
+        BinanceEnv::FuturesTestnet => "wss://ws-api.testnet.binancefuture.com/ws-api/v3",
+        BinanceEnv::FuturesMainnet => "wss://ws-api.binance.com:443/ws-api/v3",
+    }
+}
+
+/// Build the canonical signed string for `session.logon`.
+///
+/// Binance specifies that params MUST be in **alphabetical order** for
+/// the WS-API signature (unlike REST which uses insertion order).
+///
+/// Alphabetical order: `apiKey` < `recvWindow` < `timestamp`.
+/// Result: `"apiKey=<KEY>&recvWindow=5000&timestamp=<MS>"`.
+pub fn session_logon_signed_string(api_key: &str, ts_ms: u64) -> String {
+    format!("apiKey={api_key}&recvWindow=5000&timestamp={ts_ms}")
+}
+
+/// Connect to the Spot WS-API, perform `session.logon`, then
+/// `userDataStream.subscribe`. Returns the authenticated WS stream.
+///
+/// # Errors
+///
+/// Returns `VenueError::Rejected` if `key_material` is not `Ed25519` —
+/// Binance only supports Ed25519 keys for `session.logon`.
+pub async fn open_spot_user_data_ws(
+    env: BinanceEnv,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+) -> Result<WsStream, VenueError> {
+    // Ed25519 required — HMAC not supported for session.logon.
+    let signing_key = match key_material {
+        BinanceKeyMaterial::Ed25519 { signing_key } => signing_key,
+        BinanceKeyMaterial::Hmac { .. } => {
+            return Err(VenueError::Rejected {
+                reason: "Spot userDataStream via WS-API requires Ed25519 key material; \
+                         HMAC is not supported by Binance for session.logon. \
+                         Set TIKR_BINANCE_SPOT_KEY_TYPE=ed25519 (or TIKR_BINANCE_KEY_TYPE=ed25519) \
+                         and provide an Ed25519 PEM key."
+                    .into(),
+            });
+        }
+    };
+
+    let ws_url = spot_ws_api_url(env);
+    let (mut stream, _) = connect_async(ws_url)
+        .await
+        .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
+
+    // --- session.logon ---
+    let ts = timestamp_ms();
+    let signed_str = session_logon_signed_string(api_key, ts);
+    let signature = sign_query_ed25519(signing_key, &signed_str);
+    // Note: base64 signature in JSON body — no URL percent-encoding needed.
+
+    let logon_id = "tikr-logon-1";
+    let logon_msg = serde_json::json!({
+        "id": logon_id,
+        "method": "session.logon",
+        "params": {
+            "apiKey": api_key,
+            "recvWindow": 5000,
+            "timestamp": ts,
+            "signature": signature,
+        }
+    });
+    stream
+        .send(Message::Text(logon_msg.to_string()))
+        .await
+        .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
+
+    // Wait for session.logon ack.
+    wait_for_ack(&mut stream, logon_id, "session.logon").await?;
+
+    // --- userDataStream.subscribe ---
+    let subscribe_id = "tikr-sub-1";
+    let sub_msg = serde_json::json!({
+        "id": subscribe_id,
+        "method": "userDataStream.subscribe"
+    });
+    stream
+        .send(Message::Text(sub_msg.to_string()))
+        .await
+        .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
+
+    // Wait for subscribe ack.
+    wait_for_ack(&mut stream, subscribe_id, "userDataStream.subscribe").await?;
+
+    info!(env = ?env, "spot WS-API: session.logon + userDataStream.subscribe OK");
+    Ok(stream)
+}
+
+/// Wait for a JSON response frame with `"id"` matching `expected_id` and
+/// `"status"` == 200. Ignores unrelated frames (ping, other events).
+async fn wait_for_ack(
+    stream: &mut WsStream,
+    expected_id: &str,
+    method: &str,
+) -> Result<(), VenueError> {
+    loop {
+        let frame = stream.next().await;
+        match frame {
+            None => {
+                return Err(VenueError::Network(std::io::Error::other(format!(
+                    "WS-API connection closed waiting for {method} ack"
+                ))));
+            }
+            Some(Err(e)) => {
+                return Err(VenueError::Network(std::io::Error::other(format!(
+                    "WS-API read error waiting for {method} ack: {e}"
+                ))));
+            }
+            Some(Ok(Message::Text(txt))) => {
+                let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| {
+                    VenueError::Internal(Box::new(std::io::Error::other(format!(
+                        "WS-API non-JSON frame waiting for {method}: {e}: {txt}"
+                    ))))
+                })?;
+                let id = v.get("id").and_then(serde_json::Value::as_str);
+                if id != Some(expected_id) {
+                    // Not our response — could be an early event; skip.
+                    debug!(frame = %txt, "WS-API: skipping non-matching frame while waiting for {method}");
+                    continue;
+                }
+                let status = v
+                    .get("status")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if status != 200 {
+                    let err_msg = v
+                        .get("error")
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| txt.clone());
+                    return Err(VenueError::Rejected {
+                        reason: format!("{method} failed (status {status}): {err_msg}"),
+                    });
+                }
+                return Ok(());
+            }
+            Some(Ok(Message::Ping(p))) => {
+                // Respond to server ping immediately.
+                let _ = stream.send(Message::Pong(p)).await;
+            }
+            Some(Ok(_)) => {} // Binary / Pong — ignore
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // userDataStream subscription
 // ---------------------------------------------------------------------------
 
 /// Subscribe to userDataStream fills for the given environment.
 ///
-/// Spawns a WS task and a keepalive task. Returns an
-/// `mpsc::UnboundedReceiver<Fill>` that the caller polls.
+/// **Routing**:
+///
+/// - Spot (`!env.is_futures()`): uses the Spot WS-API path (`session.logon`
+///   + `userDataStream.subscribe`). Requires `BinanceKeyMaterial::Ed25519`;
+///     returns `VenueError::Rejected` immediately if HMAC is passed.
+/// - Futures (`env.is_futures()`): uses the existing listenKey REST path.
 ///
 /// `symbol_filter` is the Binance symbol string (e.g. `"BTCUSDT"`).
-/// Only fills whose `s` (spot) or `o.s` (futures) field matches this
-/// string are forwarded — critical when multiple `tikr-binance`
-/// processes run against the same account, since Binance returns the
-/// SAME `listenKey` per account and all processes share one event
-/// stream. Without symbol filtering, fills bleed across processes.
+/// Only fills whose symbol field matches are forwarded.
 ///
-/// On WS reconnect a **fresh** listenKey is minted (not reused).
-/// The keepalive task fires a PUT every [`KEEPALIVE_INTERVAL_MS`] ms.
+/// Returns an `mpsc::UnboundedReceiver<Fill>` that the caller polls.
 pub async fn subscribe_user_data_stream(
+    http: HttpClient,
+    env: BinanceEnv,
+    api_key: String,
+    key_material: Arc<BinanceKeyMaterial>,
+    kind: MarketKind,
+    symbol_filter: String,
+) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
+    if env.is_futures() {
+        subscribe_futures_user_data_stream(http, env, api_key, kind, symbol_filter).await
+    } else {
+        subscribe_spot_user_data_stream(env, api_key, key_material, kind, symbol_filter).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spot user data subscription (WS-API)
+// ---------------------------------------------------------------------------
+
+async fn subscribe_spot_user_data_stream(
+    env: BinanceEnv,
+    api_key: String,
+    key_material: Arc<BinanceKeyMaterial>,
+    kind: MarketKind,
+    symbol_filter: String,
+) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
+    let stream = open_spot_user_data_ws(env, &api_key, &key_material).await?;
+    let (tx, rx) = mpsc::unbounded_channel::<Fill>();
+
+    tokio::spawn(spot_user_data_pump(
+        stream,
+        tx,
+        env,
+        api_key,
+        key_material,
+        kind,
+        symbol_filter,
+    ));
+
+    Ok(rx)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spot_user_data_pump(
+    mut stream: WsStream,
+    tx: mpsc::UnboundedSender<Fill>,
+    env: BinanceEnv,
+    api_key: String,
+    key_material: Arc<BinanceKeyMaterial>,
+    kind: MarketKind,
+    symbol_filter: String,
+) {
+    let reconnect_min_ms: u64 = 1_000;
+    let reconnect_max_ms: u64 = 30_000;
+    let mut backoff_ms = reconnect_min_ms;
+
+    loop {
+        let frame = stream.next().await;
+        match frame {
+            None => {
+                warn!(
+                    backoff_ms,
+                    "spot WS-API userDataStream closed (24h limit?); reconnecting"
+                );
+                if !reconnect_spot(
+                    &mut stream,
+                    env,
+                    &api_key,
+                    &key_material,
+                    &mut backoff_ms,
+                    reconnect_min_ms,
+                    reconnect_max_ms,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Some(Err(e)) => {
+                warn!(error = %e, "spot WS-API read error; reconnecting");
+                if !reconnect_spot(
+                    &mut stream,
+                    env,
+                    &api_key,
+                    &key_material,
+                    &mut backoff_ms,
+                    reconnect_min_ms,
+                    reconnect_max_ms,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Some(Ok(Message::Text(txt))) => {
+                backoff_ms = reconnect_min_ms;
+                debug!(bytes = txt.len(), "spot WS-API: frame received");
+
+                // Parse: could be a response frame (id present) or an event frame.
+                // Event frames: {"subscriptionId": N, "event": {...}}
+                // Response frames: {"id": "...", "status": 200, "result": ...}
+                if let Some(fill) = parse_spot_ws_api_message(&txt, kind, &symbol_filter) {
+                    info!(
+                        quote_id = ?fill.quote_id,
+                        price = %fill.price.0,
+                        size = %fill.size.0,
+                        "spot WS-API: fill received"
+                    );
+                    if tx.send(fill).is_err() {
+                        return; // receiver dropped
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = stream.send(Message::Pong(p)).await;
+            }
+            Some(Ok(Message::Close(_))) => {
+                debug!("spot WS-API server close; reconnecting");
+                if !reconnect_spot(
+                    &mut stream,
+                    env,
+                    &api_key,
+                    &key_material,
+                    &mut backoff_ms,
+                    reconnect_min_ms,
+                    reconnect_max_ms,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Some(Ok(_)) => {} // Binary / Pong — ignore
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_spot(
+    stream: &mut WsStream,
+    env: BinanceEnv,
+    api_key: &str,
+    key_material: &Arc<BinanceKeyMaterial>,
+    backoff_ms: &mut u64,
+    reconnect_min_ms: u64,
+    reconnect_max_ms: u64,
+) -> bool {
+    loop {
+        warn!(
+            backoff_ms = *backoff_ms,
+            "spot WS-API disconnected; reconnecting with new session.logon"
+        );
+        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+        match open_spot_user_data_ws(env, api_key, key_material).await {
+            Ok(new_stream) => {
+                *stream = new_stream;
+                *backoff_ms = reconnect_min_ms;
+                return true;
+            }
+            Err(e) => {
+                warn!(error = ?e, "spot WS-API reconnect failed");
+                *backoff_ms = (*backoff_ms).saturating_mul(2).min(reconnect_max_ms);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Futures user data subscription (listenKey path, unchanged)
+// ---------------------------------------------------------------------------
+
+async fn subscribe_futures_user_data_stream(
     http: HttpClient,
     env: BinanceEnv,
     api_key: String,
@@ -355,6 +699,20 @@ async fn reconnect_user_data(
 // Fill parsing
 // ---------------------------------------------------------------------------
 
+/// Parse a Spot WS-API event frame into a [`Fill`], if applicable.
+///
+/// Spot WS-API wraps events as `{"subscriptionId": N, "event": {...}}`.
+/// Response frames (acks) have `"id"` + `"status"` and no `"event"` — ignored.
+pub fn parse_spot_ws_api_message(txt: &str, kind: MarketKind, symbol_filter: &str) -> Option<Fill> {
+    let v: serde_json::Value = serde_json::from_str(txt).ok()?;
+    // Only process event frames — ack frames have "id" field, not "event".
+    let event = v.get("event")?;
+    match kind {
+        MarketKind::Spot => parse_execution_report(event, symbol_filter),
+        MarketKind::Perp => parse_order_trade_update(event, symbol_filter),
+    }
+}
+
 /// Parse a userDataStream text frame into a [`Fill`], if applicable.
 ///
 /// `symbol_filter` is the Binance symbol string (e.g. `"BTCUSDT"`).
@@ -362,7 +720,7 @@ async fn reconnect_user_data(
 /// because Binance returns ONE listenKey per account so multi-process
 /// runs against the same account share an event stream.
 ///
-/// Spot: `executionReport` with `x=FILL` and `s=<symbol>`.
+/// Spot (futures path): `executionReport` with `x=FILL` and `s=<symbol>`.
 /// Futures: `ORDER_TRADE_UPDATE` with `.o.X=FILLED` and `.o.s=<symbol>`.
 pub fn parse_user_data_message(txt: &str, kind: MarketKind, symbol_filter: &str) -> Option<Fill> {
     let v: serde_json::Value = serde_json::from_str(txt).ok()?;
@@ -699,6 +1057,121 @@ mod tests {
         assert!(
             result.is_none(),
             "futures fill for ETHUSDT must not pass BTCUSDT filter"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // New spot WS-API tests
+    // -----------------------------------------------------------------------
+
+    /// Locked decision: spot WS-API URLs must match the locked values.
+    #[test]
+    fn spot_ws_api_url_for_envs() {
+        assert_eq!(
+            spot_ws_api_url(BinanceEnv::SpotTestnet),
+            "wss://ws-api.testnet.binance.vision/ws-api/v3",
+            "testnet URL must match locked decision"
+        );
+        assert_eq!(
+            spot_ws_api_url(BinanceEnv::SpotMainnet),
+            "wss://ws-api.binance.com:443/ws-api/v3",
+            "mainnet URL must match locked decision"
+        );
+    }
+
+    /// session.logon signed string must be ALPHABETICAL order.
+    ///
+    /// Binance spec: apiKey < recvWindow < timestamp.
+    /// Result: "apiKey=<KEY>&recvWindow=5000&timestamp=<MS>".
+    #[test]
+    fn session_logon_signed_string_alphabetical() {
+        let api_key = "vmPUZE6mv9SD5VNHk4HlbGLMkR5tEPQFAAAA";
+        let ts = 1_699_999_999_000u64;
+        let s = session_logon_signed_string(api_key, ts);
+        let expected = format!("apiKey={api_key}&recvWindow=5000&timestamp={ts}");
+        assert_eq!(
+            s, expected,
+            "signed string must use alphabetical param order"
+        );
+
+        // Verify order explicitly: apiKey < recvWindow < timestamp
+        let pos_api = s.find("apiKey=").expect("apiKey");
+        let pos_recv = s.find("recvWindow=").expect("recvWindow");
+        let pos_ts = s.find("timestamp=").expect("timestamp");
+        assert!(pos_api < pos_recv, "apiKey must precede recvWindow");
+        assert!(pos_recv < pos_ts, "recvWindow must precede timestamp");
+    }
+
+    /// Spot + HMAC key must return VenueError::Rejected immediately.
+    ///
+    /// Binance only supports Ed25519 for session.logon; HMAC must be rejected
+    /// with a clear error before any network call is attempted.
+    #[tokio::test]
+    async fn spot_hmac_rejected() {
+        let km = Arc::new(BinanceKeyMaterial::Hmac {
+            secret: "test-secret".to_string(),
+        });
+        let result = subscribe_user_data_stream(
+            reqwest::Client::new(),
+            BinanceEnv::SpotTestnet,
+            "test-api-key".to_string(),
+            km,
+            MarketKind::Spot,
+            "BTCUSDT".to_string(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(VenueError::Rejected { .. })),
+            "spot + HMAC must return VenueError::Rejected; got: {result:?}"
+        );
+    }
+
+    /// Spot WS-API event frame (wrapped) parses correctly.
+    ///
+    /// Format: `{"subscriptionId": N, "event": {"e":"executionReport",...}}`
+    #[test]
+    fn parse_spot_ws_api_fill_event() {
+        // Wrap the existing spot fill fixture in the WS-API envelope.
+        let inner = r#"{
+            "e": "executionReport",
+            "E": 1499405658658,
+            "s": "BTCUSDT",
+            "c": "tikr_00000000000000000000000000000001",
+            "S": "BUY",
+            "x": "FILL",
+            "X": "FILLED",
+            "i": 12345678,
+            "l": "0.001",
+            "L": "30000.00",
+            "n": "0.03",
+            "N": "USDT",
+            "T": 1499405658657
+        }"#;
+        let inner_v: serde_json::Value = serde_json::from_str(inner).unwrap();
+        let wrapped = serde_json::json!({
+            "subscriptionId": 0,
+            "event": inner_v
+        });
+        let txt = wrapped.to_string();
+
+        let fill = parse_spot_ws_api_message(&txt, MarketKind::Spot, "BTCUSDT")
+            .expect("spot WS-API wrapped executionReport must parse");
+
+        assert_eq!(fill.price.0, Decimal::from_str("30000.00").unwrap());
+        assert_eq!(fill.size.0, Decimal::from_str("0.001").unwrap());
+        assert_eq!(fill.side, Side::Bid);
+        assert_eq!(fill.fee_asset, Asset::new("USDT"));
+    }
+
+    /// Spot WS-API ack frame (id + status, no "event") must produce no fill.
+    #[test]
+    fn parse_spot_ws_api_ack_not_a_fill() {
+        let ack =
+            r#"{"id":"tikr-logon-1","status":200,"result":{"apiKey":"x","authorizedSince":1}}"#;
+        let result = parse_spot_ws_api_message(ack, MarketKind::Spot, "BTCUSDT");
+        assert!(
+            result.is_none(),
+            "ack frame with no 'event' key must not produce a fill"
         );
     }
 }
