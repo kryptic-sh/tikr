@@ -161,6 +161,18 @@ struct Args {
     /// (e.g. 1000000) to always join, set 0 to always improve.
     #[arg(long, default_value_t = 1u32)]
     improve_when_spread_gt_ticks: u32,
+
+    /// TopOfBook: maximum inventory-skew shift in ticks. `0` = no skew
+    /// (symmetric). Higher values mean-revert harder toward flat. Example:
+    /// `--max-skew-ticks 20` on perp BTC ($0.10 tick) shifts up to $2 per
+    /// side when inventory hits `--skew-unit`.
+    #[arg(long, default_value_t = 0u32)]
+    max_skew_ticks: u32,
+
+    /// TopOfBook: inventory at which skew reaches `max_skew_ticks`. Default
+    /// matches `--size` for 1-unit linear scale.
+    #[arg(long, default_value = "0.01")]
+    skew_unit: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +411,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("--tick-size '{}' invalid: {}", args.tick_size, e))?,
                 improve_when_spread_gt_ticks: args.improve_when_spread_gt_ticks,
                 min_requote_interval_ms: 1000,
+                max_skew_ticks: args.max_skew_ticks,
+                skew_unit: Size(
+                    Decimal::from_str(&args.skew_unit)
+                        .map_err(|e| format!("--skew-unit '{}' invalid: {}", args.skew_unit, e))?,
+                ),
             });
             run_with_resume(
                 venue,
