@@ -34,11 +34,17 @@
 
 #![deny(missing_docs)]
 
+pub mod alerts;
+pub mod metrics;
 pub mod multi;
 pub mod report;
 pub mod runner;
 pub mod state;
 
+pub use alerts::{
+    Alert, AlertError, AlertSink, MultiSink, Severity, StdoutSink, WebhookFormat, WebhookSink,
+};
+pub use metrics::MetricRegistry;
 pub use multi::{MultiPaperReport, MultiSymbolRun, run_multi};
 pub use report::{PaperReport, SCHEMA_VERSION};
 pub use runner::{RunnerConfig, run, run_with_resume};

@@ -1,5 +1,6 @@
 //! Paper-trading runner — live `Venue` → `Strategy` → `FillSim` → `PaperReport`.
 
+use crate::alerts::{Alert, AlertSink};
 use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
-use tikr_core::{Decimal, MarketEvent, Position, Price, Snapshot, Symbol, Timestamp};
+use tikr_core::{Decimal, MarketEvent, Notional, Position, Price, Snapshot, Symbol, Timestamp};
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
 use tikr_venue::Venue;
@@ -57,7 +58,7 @@ where
     S: Strategy,
 {
     run_inner(
-        venue, strategy, fill_sim, symbol, shutdown, config, None, None,
+        venue, strategy, fill_sim, symbol, shutdown, config, None, None, None,
     )
     .await
 }
@@ -93,6 +94,25 @@ where
 /// 3. The final report's `risk_state` contains a clone of
 ///    [`RiskGate::state`].
 ///
+/// # Alerting (#33)
+///
+/// When `alert_sink` is `Some(sink)`, the runner emits:
+///
+/// - [`Alert::Fill`] after each fill is applied to the tracker
+/// - [`Alert::Halt`] when the risk gate returns `RiskDecision::Halt`
+/// - [`Alert::Drawdown`] in addition to `Halt` if the halt reason contains
+///   `"max_drawdown"`. The `threshold` field is a sentinel `Notional(ZERO)`
+///   in v0 — the runner does not have direct access to the gate's configured
+///   threshold value (a future enhancement once `RiskGate` exposes its limits
+///   on the trait surface).
+///
+/// `ReconnectStorm`, `PositionMismatch`, and `Restart` are NOT emitted by the
+/// runner in v0 — see the [`Alert`] enum rustdoc for the rationale.
+///
+/// Sink failures are intentionally swallowed (logged inside [`crate::alerts::MultiSink`]
+/// but never propagated back to the runner) — operational alerting MUST NOT
+/// crash the trading loop. See #30 for the failure-isolation decision.
+///
 /// # Panics
 ///
 /// Hard-fails on `prior.schema_version != SCHEMA_VERSION`. v0 snapshots that
@@ -107,6 +127,7 @@ pub async fn run_with_resume<V, S>(
     config: RunnerConfig,
     resume: Option<PaperReport>,
     risk_gate: Option<Box<dyn RiskGate>>,
+    alert_sink: Option<Box<dyn AlertSink>>,
 ) -> PaperReport
 where
     V: Venue,
@@ -121,7 +142,7 @@ where
         );
     }
     run_inner(
-        venue, strategy, fill_sim, symbol, shutdown, config, resume, risk_gate,
+        venue, strategy, fill_sim, symbol, shutdown, config, resume, risk_gate, alert_sink,
     )
     .await
 }
@@ -136,6 +157,7 @@ async fn run_inner<V, S>(
     config: RunnerConfig,
     resume: Option<PaperReport>,
     mut risk_gate: Option<Box<dyn RiskGate>>,
+    alert_sink: Option<Box<dyn AlertSink>>,
 ) -> PaperReport
 where
     V: Venue,
@@ -241,6 +263,23 @@ where
                             }
                             RiskDecision::Halt(reason) => {
                                 warn!(?action, reason = %reason, "risk: HALT — action dropped, sticky");
+                                if let Some(sink) = alert_sink.as_ref() {
+                                    let halt_msg = reason.clone();
+                                    let _ = sink
+                                        .send(Alert::Halt {
+                                            reason: halt_msg.clone(),
+                                        })
+                                        .await;
+                                    if reason.contains("max_drawdown") {
+                                        let report = tracker.report(last_mid);
+                                        let _ = sink
+                                            .send(Alert::Drawdown {
+                                                net: report.net,
+                                                threshold: Notional(Decimal::ZERO),
+                                            })
+                                            .await;
+                                    }
+                                }
                                 continue;
                             }
                         }
@@ -255,6 +294,17 @@ where
                         gate.record_fill(fill.ts);
                     }
                     fills_emitted += 1;
+                    if let Some(sink) = alert_sink.as_ref() {
+                        let _ = sink
+                            .send(Alert::Fill {
+                                quote_id: fill.quote_id,
+                                price: fill.price,
+                                size: fill.size,
+                                side: fill.side,
+                                symbol: symbol.clone(),
+                            })
+                            .await;
+                    }
                 }
                 events_processed += 1;
 
@@ -630,6 +680,7 @@ mod tests {
             test_config(temp.path().into()),
             Some(prior),
             None,
+            None,
         )
         .await;
         assert_eq!(report.realized.0, Decimal::from(5));
@@ -666,6 +717,7 @@ mod tests {
             rx,
             test_config(temp.path().into()),
             Some(prior),
+            None,
             None,
         )
         .await;
