@@ -33,6 +33,9 @@ pub fn parse_binance_error_code(code: i32, msg: &str) -> VenueError {
         },
 
         // Insufficient balance / margin.
+        // Binance -2010 body carries no balance detail (no need/have fields in
+        // the JSON), so we surface zeros and rely on the variant type to signal
+        // the cause. Callers must not read need/have for sizing logic.
         -2010 => VenueError::InsufficientBalance {
             need: tikr_core::Size(rust_decimal::Decimal::ZERO),
             have: tikr_core::Size(rust_decimal::Decimal::ZERO),

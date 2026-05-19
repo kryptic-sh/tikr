@@ -231,3 +231,73 @@ fn now_ns() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tikr_core::{Asset, MarketKind, VenueId};
+
+    fn test_symbol() -> Symbol {
+        Symbol {
+            base: Asset::new("BTC"),
+            quote: Asset::new("USDT"),
+            venue: VenueId::new("binance"),
+            kind: MarketKind::Spot,
+        }
+    }
+
+    #[test]
+    fn depth_ws_url_spot_testnet() {
+        assert_eq!(
+            depth_ws_url(BinanceEnv::SpotTestnet, "btcusdt"),
+            "wss://testnet.binance.vision/ws/btcusdt@depth20@100ms"
+        );
+    }
+
+    #[test]
+    fn depth_ws_url_spot_mainnet_includes_port() {
+        assert_eq!(
+            depth_ws_url(BinanceEnv::SpotMainnet, "btcusdt"),
+            "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms"
+        );
+    }
+
+    #[test]
+    fn depth_ws_url_futures_testnet() {
+        assert_eq!(
+            depth_ws_url(BinanceEnv::FuturesTestnet, "btcusdt"),
+            "wss://stream.binancefuture.com/ws/btcusdt@depth20@100ms"
+        );
+    }
+
+    #[test]
+    fn depth_ws_url_futures_mainnet() {
+        assert_eq!(
+            depth_ws_url(BinanceEnv::FuturesMainnet, "btcusdt"),
+            "wss://fstream.binance.com/ws/btcusdt@depth20@100ms"
+        );
+    }
+
+    #[test]
+    fn parse_depth_frame_extracts_bids_and_asks() {
+        let txt = r#"{
+            "lastUpdateId": 160,
+            "bids": [["0.00010000","100.00000000"], ["0.00009900","50.00000000"]],
+            "asks": [["0.00010500","75.00000000"]]
+        }"#;
+        let event = parse_depth_frame(txt, &test_symbol()).expect("frame parses");
+        let MarketEvent::BookUpdate { snapshot } = event else {
+            panic!("expected BookUpdate");
+        };
+        assert_eq!(snapshot.bids.len(), 2);
+        assert_eq!(snapshot.asks.len(), 1);
+        assert_eq!(snapshot.bids[0].price.0.to_string(), "0.00010000");
+        assert_eq!(snapshot.bids[0].size.0.to_string(), "100.00000000");
+        assert_eq!(snapshot.asks[0].price.0.to_string(), "0.00010500");
+    }
+
+    #[test]
+    fn parse_depth_frame_returns_none_on_garbage() {
+        assert!(parse_depth_frame("not json", &test_symbol()).is_none());
+    }
+}

@@ -191,9 +191,13 @@ impl BinanceClient {
             exchange_info_cache,
         };
 
-        // Futures: set 1x leverage at startup.
+        // Futures: set 1x leverage at startup. Gated by mainnet flag — this is a
+        // write action against /fapi/v1/leverage and must respect the same gate as
+        // quote/cancel. On mainnet without the flag, skip silently (the same call
+        // will be retried by the operator after enabling writes).
         if env.is_futures()
             && let Some(sym) = symbol
+            && (!env.is_mainnet() || mainnet_writes_enabled)
         {
             let sym_str = binance_symbol(sym);
             if let Err(e) = crate::futs::update_leverage(
@@ -212,6 +216,12 @@ impl BinanceClient {
                     "update_leverage(1) at startup failed; proceeding"
                 );
             }
+        } else if env.is_futures() && env.is_mainnet() && !mainnet_writes_enabled {
+            warn!(
+                "Skipping futures update_leverage(1) at startup: \
+                 TIKR_BINANCE_ENABLE_MAINNET not set. \
+                 Order placement will also be refused until the flag is enabled."
+            );
         }
 
         Ok(client)
