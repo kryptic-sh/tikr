@@ -16,11 +16,16 @@ readme.workspace = true
 name = "record"
 path = "src/bin/record.rs"
 
+[[bin]]
+name = "record_binance"
+path = "src/bin/record_binance.rs"
+
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"
 tikr-strategy = "0.1"
 tikr-hyperliquid = "0.1"
+tikr-binance = "0.1"
 polars = { version = "0.43", default-features = false, features = ["parquet", "lazy", "polars-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 async-trait = "0.1"

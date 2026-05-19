@@ -49,6 +49,7 @@ pub mod exchange_info;
 pub mod futs;
 pub mod sign;
 pub mod spot;
+pub mod trade_stream;
 pub mod user_stream;
 
 pub use sign::BinanceKeyMaterial;
