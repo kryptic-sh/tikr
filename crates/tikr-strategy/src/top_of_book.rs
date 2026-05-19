@@ -54,6 +54,12 @@ pub struct TopOfBookConfig {
     /// Skew scales linearly from 0 to `max_skew_ticks` over `[0, skew_unit]`.
     /// Must be > 0 if `max_skew_ticks > 0`.
     pub skew_unit: Size,
+    /// Maximum book-imbalance shift in ticks (each side). Top-of-book size
+    /// imbalance `(bid_size - ask_size) / (bid_size + ask_size)` in `[-1,
+    /// +1]` is scaled to `[-max, +max]` ticks and added to both quotes.
+    /// Positive imbalance (bid-heavy) shifts both UP — expects price drift
+    /// up, wants to capture the uptick on the ask. `0` disables the term.
+    pub max_imbalance_ticks: u32,
 }
 
 /// Top-of-book join/improve strategy state.
@@ -72,8 +78,10 @@ impl TopOfBook {
     /// Compute the (bid, ask) target prices given a book snapshot + current
     /// position. Returns `None` if either side is empty.
     fn compute_targets(&self, snapshot: &Snapshot, position: &Position) -> Option<(Price, Price)> {
-        let best_bid = snapshot.bids.first().map(|l| l.price)?;
-        let best_ask = snapshot.asks.first().map(|l| l.price)?;
+        let best_bid_lvl = snapshot.bids.first()?;
+        let best_ask_lvl = snapshot.asks.first()?;
+        let best_bid = best_bid_lvl.price;
+        let best_ask = best_ask_lvl.price;
 
         let tick = self.config.tick_size;
         if tick <= Decimal::ZERO {
@@ -91,8 +99,11 @@ impl TopOfBook {
             (best_bid, best_ask)
         };
 
-        // Apply inventory skew: long → shift down, short → shift up.
-        let skew = self.compute_skew(position);
+        // Combine inventory skew + imbalance skew. Both are price shifts in
+        // tick-aligned increments.
+        let inv_skew = self.compute_inventory_skew(position);
+        let imb_skew = self.compute_imbalance_skew(best_bid_lvl.size, best_ask_lvl.size);
+        let skew = inv_skew + imb_skew;
         if skew != Decimal::ZERO {
             bid = Price(bid.0 + skew);
             ask = Price(ask.0 + skew);
@@ -109,9 +120,37 @@ impl TopOfBook {
         Some((bid, ask))
     }
 
+    /// Imbalance shift in price units (signed). Positive imbalance (bid-
+    /// heavy) returns positive (shift quotes UP). Computes top-of-book
+    /// size imbalance `(B - A) / (B + A)` in `[-1, +1]`, scales by
+    /// `max_imbalance_ticks * tick_size`, then floors to integer ticks.
+    fn compute_imbalance_skew(&self, bid_size: Size, ask_size: Size) -> Decimal {
+        if self.config.max_imbalance_ticks == 0 {
+            return Decimal::ZERO;
+        }
+        let b = bid_size.0;
+        let a = ask_size.0;
+        let total = b + a;
+        if total <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        // imbalance in [-1, +1]
+        let imbalance = (b - a) / total;
+        let max_ticks = Decimal::from(self.config.max_imbalance_ticks);
+        // Sign-preserving floor toward zero so the integer-tick shift
+        // stays under the configured cap on both sides.
+        let raw_ticks = imbalance * max_ticks;
+        let ticks_shifted = if raw_ticks >= Decimal::ZERO {
+            raw_ticks.floor()
+        } else {
+            -((-raw_ticks).floor())
+        };
+        ticks_shifted * self.config.tick_size
+    }
+
     /// Inventory-skew shift in price units (signed). Long position →
     /// negative (shift down); short position → positive (shift up).
-    fn compute_skew(&self, position: &Position) -> Decimal {
+    fn compute_inventory_skew(&self, position: &Position) -> Decimal {
         if self.config.max_skew_ticks == 0 {
             return Decimal::ZERO;
         }
@@ -273,6 +312,7 @@ mod tests {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 0,
             skew_unit: Size(Decimal::new(1, 0)),
+            max_imbalance_ticks: 0,
         }
     }
 
@@ -284,6 +324,41 @@ mod tests {
             min_requote_interval_ms: 1000,
             max_skew_ticks,
             skew_unit: Size(skew_unit),
+            max_imbalance_ticks: 0,
+        }
+    }
+
+    fn cfg_imbalance(improve_gt: u32, max_imbalance_ticks: u32) -> TopOfBookConfig {
+        TopOfBookConfig {
+            size_per_quote: Size(Decimal::new(1, 3)),
+            tick_size: Decimal::from(1),
+            improve_when_spread_gt_ticks: improve_gt,
+            min_requote_interval_ms: 1000,
+            max_skew_ticks: 0,
+            skew_unit: Size(Decimal::new(1, 0)),
+            max_imbalance_ticks,
+        }
+    }
+
+    fn book_sized(
+        s: &Symbol,
+        bid: i64,
+        bid_size: i64,
+        ask: i64,
+        ask_size: i64,
+        ts: u64,
+    ) -> Snapshot {
+        Snapshot {
+            symbol: s.clone(),
+            bids: vec![Level {
+                price: Price(Decimal::new(bid, 0)),
+                size: Size(Decimal::new(bid_size, 0)),
+            }],
+            asks: vec![Level {
+                price: Price(Decimal::new(ask, 0)),
+                size: Size(Decimal::new(ask_size, 0)),
+            }],
+            ts: Timestamp(ts),
         }
     }
 
@@ -579,6 +654,108 @@ mod tests {
         };
         assert_eq!(bid.price.0, Decimal::from(88), "bid must be tick-aligned");
         assert_eq!(ask.price.0, Decimal::from(186), "ask must be tick-aligned");
+    }
+
+    /// Imbalance: bid-heavy book shifts both quotes UP by integer ticks.
+    /// imbalance = (9 - 1) / 10 = 0.8 × max_imbalance_ticks 10 = 8 ticks.
+    #[test]
+    fn bid_heavy_imbalance_shifts_both_quotes_up() {
+        let s = sym();
+        let p = pos(&s);
+        // bid_size=9, ask_size=1, spread=10 ticks (improve mode kicks in).
+        let b = book_sized(&s, 100, 9, 110, 1, 0);
+        let ctx = StrategyContext {
+            symbol: &s,
+            now: Timestamp(0),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &b,
+            open_quotes: &[],
+        };
+        let mut tob = TopOfBook::new(cfg_imbalance(1, 10));
+        let actions = tob.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+        // Base improve: bid=101, ask=109. Shift +8: bid=109, ask=117.
+        // ask=117 above best_ask 110 is fine (post-only doesn't cross).
+        // bid=109 below best_ask 110 is fine (post-only-safe).
+        let Action::Quote(bid) = &actions[1] else {
+            panic!("bid")
+        };
+        let Action::Quote(ask) = &actions[2] else {
+            panic!("ask")
+        };
+        assert_eq!(bid.price.0, Decimal::from(109));
+        assert_eq!(ask.price.0, Decimal::from(117));
+    }
+
+    /// Imbalance: ask-heavy book shifts both quotes DOWN.
+    /// imbalance = (1 - 9) / 10 = -0.8 × 10 = -8 ticks.
+    #[test]
+    fn ask_heavy_imbalance_shifts_both_quotes_down() {
+        let s = sym();
+        let p = pos(&s);
+        let b = book_sized(&s, 100, 1, 110, 9, 0);
+        let ctx = StrategyContext {
+            symbol: &s,
+            now: Timestamp(0),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &b,
+            open_quotes: &[],
+        };
+        let mut tob = TopOfBook::new(cfg_imbalance(1, 10));
+        let actions = tob.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+        // Base improve: bid=101, ask=109. Shift -8: bid=93, ask=101.
+        // bid=93 below best_bid 100 is fine. ask=101 above best_bid 100 fine.
+        let Action::Quote(bid) = &actions[1] else {
+            panic!("bid")
+        };
+        let Action::Quote(ask) = &actions[2] else {
+            panic!("ask")
+        };
+        assert_eq!(bid.price.0, Decimal::from(93));
+        assert_eq!(ask.price.0, Decimal::from(101));
+    }
+
+    /// Balanced book → zero imbalance shift.
+    #[test]
+    fn balanced_book_zero_imbalance() {
+        let s = sym();
+        let p = pos(&s);
+        let b = book_sized(&s, 100, 5, 110, 5, 0);
+        let ctx = StrategyContext {
+            symbol: &s,
+            now: Timestamp(0),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &b,
+            open_quotes: &[],
+        };
+        let mut tob = TopOfBook::new(cfg_imbalance(1, 10));
+        let actions = tob.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+        // No imbalance: pure improve. bid=101, ask=109.
+        let Action::Quote(bid) = &actions[1] else {
+            panic!("bid")
+        };
+        let Action::Quote(ask) = &actions[2] else {
+            panic!("ask")
+        };
+        assert_eq!(bid.price.0, Decimal::from(101));
+        assert_eq!(ask.price.0, Decimal::from(109));
     }
 
     #[test]

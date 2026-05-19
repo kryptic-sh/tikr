@@ -173,6 +173,11 @@ struct Args {
     /// matches `--size` for 1-unit linear scale.
     #[arg(long, default_value = "0.01")]
     skew_unit: String,
+
+    /// TopOfBook: maximum book-imbalance shift in ticks. Positive top-of-
+    /// book imbalance (bid-heavy) shifts both quotes UP. 0 disables.
+    #[arg(long, default_value_t = 0u32)]
+    max_imbalance_ticks: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Decimal::from_str(&args.skew_unit)
                         .map_err(|e| format!("--skew-unit '{}' invalid: {}", args.skew_unit, e))?,
                 ),
+                max_imbalance_ticks: args.max_imbalance_ticks,
             });
             run_with_resume(
                 venue,

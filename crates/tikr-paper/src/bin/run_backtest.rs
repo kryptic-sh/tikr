@@ -101,6 +101,10 @@ struct Args {
     #[arg(long, default_value = "0.005")]
     skew_unit: String,
 
+    /// TopOfBook: max book-imbalance shift in ticks (0 = disable).
+    #[arg(long, default_value_t = 0u32)]
+    max_imbalance_ticks: u32,
+
     /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
     #[arg(long, default_value_t = 1000u64)]
     heartbeat_ms: u64,
@@ -243,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_requote_interval_ms: 1000,
                 max_skew_ticks: args.max_skew_ticks,
                 skew_unit: Size(Decimal::from_str(&args.skew_unit)?),
+                max_imbalance_ticks: args.max_imbalance_ticks,
             });
             run_with_resume(
                 venue,

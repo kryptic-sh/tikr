@@ -171,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 0,
             skew_unit: Size(Decimal::from(1)),
+            max_imbalance_ticks: 0,
         }),
         fees,
     )
@@ -188,6 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 0,
             skew_unit: Size(Decimal::from(1)),
+            max_imbalance_ticks: 0,
         }),
         fees,
     )
@@ -205,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 10,
             skew_unit: Size(Decimal::from_str("0.005")?),
+            max_imbalance_ticks: 0,
         }),
         fees,
     )
@@ -222,11 +225,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 20,
             skew_unit: Size(Decimal::from_str("0.005")?),
+            max_imbalance_ticks: 0,
         }),
         fees,
     )
     .await?;
     results.push(("TOB improve=1 skew(20,0.005)".into(), r));
+
+    // Preset: TOB + imbalance shift (5 ticks max), no inventory skew.
+    let r = run_one(
+        &args,
+        &symbol,
+        TopOfBook::new(TopOfBookConfig {
+            size_per_quote,
+            tick_size: tick,
+            improve_when_spread_gt_ticks: 1,
+            min_requote_interval_ms: 1000,
+            max_skew_ticks: 0,
+            skew_unit: Size(Decimal::from(1)),
+            max_imbalance_ticks: 5,
+        }),
+        fees,
+    )
+    .await?;
+    results.push(("TOB improve=1 imbalance(5)".into(), r));
+
+    // Preset: TOB + imbalance + inventory skew combined.
+    let r = run_one(
+        &args,
+        &symbol,
+        TopOfBook::new(TopOfBookConfig {
+            size_per_quote,
+            tick_size: tick,
+            improve_when_spread_gt_ticks: 1,
+            min_requote_interval_ms: 1000,
+            max_skew_ticks: 10,
+            skew_unit: Size(Decimal::from_str("0.005")?),
+            max_imbalance_ticks: 5,
+        }),
+        fees,
+    )
+    .await?;
+    results.push(("TOB improve=1 skew(10) + imb(5)".into(), r));
 
     // BNB-discount duplicates of the top TOB presets.
     let r = run_one(
@@ -239,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 0,
             skew_unit: Size(Decimal::from(1)),
+            max_imbalance_ticks: 0,
         }),
         bnb_fees,
     )
@@ -255,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
             max_skew_ticks: 10,
             skew_unit: Size(Decimal::from_str("0.005")?),
+            max_imbalance_ticks: 0,
         }),
         bnb_fees,
     )
