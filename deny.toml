@@ -31,6 +31,10 @@ allow = [
   # Boost Software License -- OSI-approved, FSF Free/Libre. Pulled in by
   # xxhash-rust (transitive via polars-core).
   "BSL-1.0",
+  # Community Data License Agreement -- Permissive 2.0. SPDX-listed,
+  # OSI-approved, no copyleft. Pulled in by webpki-roots (transitive via
+  # reqwest + tokio-tungstenite for the rustls-tls trust store).
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
