@@ -20,11 +20,16 @@ path = "src/bin/record.rs"
 tikr-core = "0.1"
 tikr-venue = "0.1"
 tikr-strategy = "0.1"
+tikr-hyperliquid = "0.1"
 polars = { version = "0.43", default-features = false, features = ["parquet", "lazy", "polars-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 async-trait = "0.1"
+futures = "0.3"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

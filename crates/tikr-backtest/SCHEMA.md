@@ -40,16 +40,38 @@ golden test in #15).
 ## Recording fresh data
 
 ```bash
-cargo run -p tikr-backtest --bin record -- --symbol BTC --hours 24
+cargo run -p tikr-backtest --bin record -- --symbol BTC --hours 24 --env mainnet --out ./data
 ```
 
-Outputs the two parquet files for that day into `./data/` by default; override
-with `--out`.
-
-> **Note:** the recorder bin is currently a stub (`todo!()` body); real impl
-> ships with issue #9 close-out.
+Outputs per-flush parquet files into `--out` (default `./data`). See the
+"Recorder output (v0)" section below for the file naming convention and v0
+caveats. `--env testnet` selects the Hyperliquid testnet endpoint. `--hours 0`
+runs until SIGINT.
 
 ## Example data
 
 Example tiny parquet file checked in at `tests/data/` — will land with issue #15
 (golden regression test).
+
+## Recorder output (v0)
+
+The recorder writes per-flush files matching
+`book_<SYM>_<DATE>_<FLUSH-COUNTER>.parquet` (and `trades_*` for trades).
+`<FLUSH-COUNTER>` is a 6-digit zero-padded monotonic counter within one recorder
+process. Flushes happen every 1000 rows or every 60 seconds, whichever comes
+first; SIGINT triggers a final flush before exit.
+
+### v0 caveats
+
+- **Within a single recorder run**, all `book_<SYM>_*` files use a globally
+  monotonic `seq` column — `ParquetReplay`'s gap detection holds.
+- **Mixing files from different recorder runs** in one `ParquetReplay` directory
+  will trip the seq check (each run resets `seq` to 1). Clear the directory or
+  use distinct dirs per run.
+- **Each `BookUpdate` from Hyperliquid produces N rows** (one per bid level +
+  one per ask level — the full top-N snapshot serialized as deltas). Wasteful
+  but correct; replay reconstructs identically. Phase 4 cleanup target: emit
+  only changed levels.
+- **Prices + sizes stored as `f64`** for compatibility with the existing
+  test-fixture / replay path. Phase 2.5+ migrates to true `Decimal` columns via
+  the polars `dtype-decimal` cargo feature.

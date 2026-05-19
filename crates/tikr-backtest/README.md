@@ -17,12 +17,31 @@
 | `fill_sim::FillSim`                    | stub   | #11   |
 | `pnl::PositionTracker` + `PnLReport`   | stub   | #12   |
 | `runner::run`                          | stub   | #15   |
-| `bin/record` (Hyperliquid WS recorder) | stub   | #9    |
+| `bin/record` (Hyperliquid WS recorder) | live   | #9    |
 
 ## Data format
 
 See [`SCHEMA.md`](SCHEMA.md). Parquet, split files per event type, L2 deltas +
 trades.
+
+## Recorder
+
+```bash
+cargo run -p tikr-backtest --bin record -- --symbol BTC --hours 24 --env mainnet --out ./data
+```
+
+Connects to the Hyperliquid WebSocket, captures L2 book + trades for the given
+symbol, and writes per-flush parquet files into `--out` matching the
+`book_<SYM>_<DATE>_<FLUSH>.parquet` / `trades_<SYM>_<DATE>_<FLUSH>.parquet`
+naming convention. Flushes every 1000 rows or 60 seconds, whichever comes first.
+SIGINT triggers a clean final flush and exit.
+
+- `--hours 0` runs until SIGINT (useful for multi-day captures).
+- `--env testnet` switches to the Hyperliquid testnet endpoint.
+
+Recorded files are directly consumable by `ParquetReplay` — point your backtest
+at the same directory. See [`SCHEMA.md`](SCHEMA.md) for v0 caveats
+(full-snapshot dump, per-run `seq` reset, `f64` price/size).
 
 ## Phase 1 roadmap
 
