@@ -1,0 +1,42 @@
+[package]
+name = "tikr-paper"
+description = "Paper-trading runner for the tikr market-making engine — drives live Venue stream through Strategy + FillSim + PositionTracker"
+keywords = ["trading", "paper-trading", "market-making", "quant"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+tikr-core = "0.1"
+tikr-venue = "0.1"
+tikr-strategy = "0.1"
+tikr-hyperliquid = "0.1"
+tikr-backtest = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "test-util"] }
+
+# Deps reserved for the downstream example bin (#27): the runner is generic
+# over `V: Venue`, so the library itself never names `tikr-hyperliquid`; the
+# example binary will. `thiserror` is reserved for upcoming runner-specific
+# error variants; `tracing-subscriber` is reserved for the binary's logging
+# initializer. Keep declared so the example bin in #27 picks them up without
+# editing this manifest again.
+[package.metadata.cargo-machete]
+ignored = ["tikr-hyperliquid", "thiserror", "tracing-subscriber"]
