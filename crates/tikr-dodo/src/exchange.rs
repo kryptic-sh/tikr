@@ -29,7 +29,8 @@
 //! Order type string (from deployed contract `ORDER_TYPEHASH`):
 //! `Order(address makerToken,address takerToken,uint256 makerAmount,uint256 takerAmount,address maker,address taker,uint256 expiration,uint256 salt)`
 //!
-//! ORDER_TYPEHASH (keccak256 of above): `0x621f3db621de9f3f54820b129b0a28203499510cf968b4cd9a1155cce12e41d1`
+//! ORDER_TYPEHASH (keccak256 of above): `0x9e31ac2990003b5142f3966f6d93f8ee4befc60049bcd8504dce6d014d939c8a`
+//! (verified against deployed contract source; see ORDER_TYPEHASH const below for context.)
 //!
 //! ## Salt generation
 //!
@@ -110,6 +111,13 @@ pub struct AssetPair {
     pub taker_token: Address,
     /// Human-readable symbol.
     pub symbol: Symbol,
+    /// Side from market-maker perspective at place time.
+    ///
+    /// - `Side::Ask`: we sell base → maker_token=base, taker_token=quote.
+    /// - `Side::Bid`: we buy base → maker_token=quote, taker_token=base.
+    ///
+    /// Used by the fill event handler to populate `Fill.side` correctly.
+    pub side: tikr_core::Side,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +329,7 @@ impl DodoExchangeClient {
     /// 4. POST `{ chainId: 56, order: {...}, signature: "0x..." }` to
     ///    `https://api.dodoex.io/limit-order/create?apikey=<key>`.
     /// 5. Parse response → (QuoteId, numeric_id); store in order_map.
+    #[allow(clippy::too_many_arguments)]
     pub async fn place_order(
         &self,
         maker_token: Address,
@@ -329,6 +338,7 @@ impl DodoExchangeClient {
         taker_amount: U256,
         expiry_secs: u64,
         symbol: Symbol,
+        side: tikr_core::Side,
     ) -> Result<(QuoteId, u64), VenueError> {
         self.check_mainnet_gate()?;
 
@@ -357,9 +367,10 @@ impl DodoExchangeClient {
         );
 
         let sig_bytes = self.sign_order(digest).await?;
-        // Compute order hash for QuoteId and fill matching.
-        // DODO's orderHash is the EIP-712 struct hash (digest without "\x19\x01").
-        // We use the full digest here as the unique key (same entropy, simpler).
+        // Use the full EIP-712 digest (_hashTypedDataV4 = "\x19\x01" || domain || struct)
+        // as our QuoteId key. The deployed contract's `orderHash` is the same value
+        // (see DODOLimitOrder.sol `_hashTypedDataV4(structHash)`), so this key matches
+        // the orderHash emitted in `LimitOrderFilled` events for fill correlation.
         let order_hash_bytes: [u8; 32] = digest
             .as_slice()
             .try_into()
@@ -427,6 +438,7 @@ impl DodoExchangeClient {
             maker_token,
             taker_token,
             symbol,
+            side,
         };
 
         {
@@ -523,6 +535,7 @@ pub fn quote_id_from_hash(hash: &[u8; 32]) -> QuoteId {
 /// `taker_fill_amount` of `taker_token`. The fill price is implied by the
 /// ratio, but we model it as `taker_fill_amount / maker_fill_amount`.
 /// Fee is zero for makers (DODO charges takers).
+#[allow(clippy::too_many_arguments)]
 pub fn fill_from_limit_order_filled(
     quote_id: QuoteId,
     cur_taker_fill_amount: U256,
@@ -531,21 +544,33 @@ pub fn fill_from_limit_order_filled(
     base_decimals: u32,
     symbol: Symbol,
     ts_ns: u64,
+    side: tikr_core::Side,
 ) -> Fill {
     use std::str::FromStr;
 
     // Convert U256 amounts to Decimal with proper scale.
+    // Which side held which token depends on the MM's intent at place time:
+    //   Ask (sell base): maker_token=base, taker_token=quote.
+    //   Bid (buy base):  maker_token=quote, taker_token=base.
     let base_scale = Decimal::from(10u64.pow(base_decimals));
     let quote_scale = Decimal::from(10u64.pow(quote_decimals));
 
-    let maker_dec = parse_u256_to_decimal(cur_maker_fill_amount) / base_scale;
-    let taker_dec = parse_u256_to_decimal(cur_taker_fill_amount) / quote_scale;
+    let (base_amount, quote_amount) = match side {
+        tikr_core::Side::Ask => (
+            parse_u256_to_decimal(cur_maker_fill_amount) / base_scale,
+            parse_u256_to_decimal(cur_taker_fill_amount) / quote_scale,
+        ),
+        tikr_core::Side::Bid => (
+            parse_u256_to_decimal(cur_taker_fill_amount) / base_scale,
+            parse_u256_to_decimal(cur_maker_fill_amount) / quote_scale,
+        ),
+    };
 
-    // Implied fill price = taker (quote) / maker (base).
-    let price_dec = if maker_dec.is_zero() {
+    // Fill price is always quote-per-base.
+    let price_dec = if base_amount.is_zero() {
         Decimal::ZERO
     } else {
-        taker_dec / maker_dec
+        quote_amount / base_amount
     };
 
     let fee = Decimal::from_str("0").expect("zero is valid decimal");
@@ -553,11 +578,11 @@ pub fn fill_from_limit_order_filled(
     Fill {
         quote_id,
         price: Price(price_dec),
-        size: Size(maker_dec),
+        size: Size(base_amount),
         fee_asset: symbol.quote.clone(),
         fee_amount: fee,
         fee_quote: Notional(fee),
-        side: tikr_core::Side::Ask, // maker providing base token = sell side
+        side,
         ts: Timestamp(ts_ns),
     }
 }
@@ -595,6 +620,53 @@ pub(crate) fn internal_err(e: reqwest::Error) -> VenueError {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    /// Fill side semantics: Ask uses maker=base/taker=quote; Bid swaps them.
+    /// Fill `size` always reports the base amount regardless of side.
+    #[test]
+    fn fill_side_swaps_base_and_quote_correctly() {
+        use tikr_core::{Asset, Side, Symbol, VenueId};
+
+        let sym = Symbol {
+            base: Asset::new("BNB"),
+            quote: Asset::new("USDT"),
+            venue: VenueId::new("dodo"),
+        };
+        let qid = QuoteId(uuid::Uuid::nil());
+        // Ask fill: maker provided 1.0 BNB, received 600 USDT.
+        let ask = fill_from_limit_order_filled(
+            qid,
+            U256::from(600_000_000_000_000_000_000u128), // 600 USDT (taker)
+            U256::from(1_000_000_000_000_000_000u128),   // 1.0 BNB (maker)
+            18,
+            18,
+            sym.clone(),
+            0,
+            Side::Ask,
+        );
+        assert_eq!(ask.side, Side::Ask);
+        assert_eq!(ask.size.0, Decimal::from(1));
+        assert_eq!(ask.price.0, Decimal::from(600));
+
+        // Bid fill: maker provided 600 USDT, received 1.0 BNB.
+        let bid = fill_from_limit_order_filled(
+            qid,
+            U256::from(1_000_000_000_000_000_000u128), // 1.0 BNB (taker)
+            U256::from(600_000_000_000_000_000_000u128), // 600 USDT (maker)
+            18,
+            18,
+            sym,
+            0,
+            Side::Bid,
+        );
+        assert_eq!(bid.side, Side::Bid);
+        assert_eq!(
+            bid.size.0,
+            Decimal::from(1),
+            "Bid size must report base amount"
+        );
+        assert_eq!(bid.price.0, Decimal::from(600), "Bid price = quote/base");
+    }
 
     /// Salt counter increments strictly from the seeded value.
     #[test]

@@ -86,11 +86,15 @@ pub struct DodoConfig {
     /// Default: 60 seconds (matches typical MM requote cadence).
     pub order_expiry_secs: u64,
 
-    /// Maker token address (the token we provide — e.g. WBNB).
-    pub maker_token: Address,
+    /// Base token address (e.g. WBNB in WBNB/USDT).
+    ///
+    /// Maker/taker assignment is derived per-order from `QuoteIntent.side`:
+    /// - Ask (sell base): maker_token = base_token, taker_token = quote_token.
+    /// - Bid (buy base):  maker_token = quote_token, taker_token = base_token.
+    pub base_token: Address,
 
-    /// Taker token address (the token we receive — e.g. USDT).
-    pub taker_token: Address,
+    /// Quote token address (e.g. USDT in WBNB/USDT).
+    pub quote_token: Address,
 
     /// BSC WebSocket RPC URL for fill-event subscription.
     /// Default: `TIKR_BSC_RPC_URL` env, fallback `wss://bsc-ws-node.nariox.org`.
@@ -103,8 +107,8 @@ impl Default for DodoConfig {
             .unwrap_or_else(|_| "wss://bsc-ws-node.nariox.org".to_string());
         Self {
             order_expiry_secs: 60,
-            maker_token: Address::ZERO,
-            taker_token: Address::ZERO,
+            base_token: Address::ZERO,
+            quote_token: Address::ZERO,
             rpc_ws_url,
         }
     }
@@ -131,8 +135,8 @@ impl std::fmt::Debug for DodoClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DodoClient")
             .field("order_expiry_secs", &self.config.order_expiry_secs)
-            .field("maker_token", &self.config.maker_token)
-            .field("taker_token", &self.config.taker_token)
+            .field("base_token", &self.config.base_token)
+            .field("quote_token", &self.config.quote_token)
             // NEVER print signer or api_key in Debug output.
             .finish()
     }
@@ -201,26 +205,43 @@ impl Venue for DodoClient {
 
     /// Sign an EIP-712 typed Order, POST to DODO API, return a `QuoteId`.
     ///
-    /// The `intent.price` and `intent.size` are used to derive `makerAmount`
-    /// and `takerAmount` as integer token amounts (18 decimals assumed for both
-    /// tokens — operator should verify for non-standard tokens).
+    /// Maker/taker token assignment is derived from `intent.side`:
+    /// - Ask (sell base): maker_token = base, taker_token = quote.
+    ///                    maker_amount = size; taker_amount = size * price.
+    /// - Bid (buy base):  maker_token = quote, taker_token = base.
+    ///                    maker_amount = size * price; taker_amount = size.
     ///
-    /// Specifically:
-    /// - `makerAmount` = `intent.size.0` scaled to 18 decimals.
-    /// - `takerAmount` = `intent.size.0 * intent.price.0` scaled to 18 decimals.
+    /// 18 decimals assumed for BOTH tokens (safe for WBNB/USDT on BSC; verify
+    /// for other pairs — see crate doc).
     async fn quote(&self, intent: QuoteIntent) -> Result<QuoteId, VenueError> {
-        let maker_amount = decimal_to_u256_18dec(intent.size.0)?;
-        let taker_amount = decimal_to_u256_18dec(intent.size.0 * intent.price.0)?;
+        let base_amount = decimal_to_u256_18dec(intent.size.0)?;
+        let quote_amount = decimal_to_u256_18dec(intent.size.0 * intent.price.0)?;
+
+        let (maker_token, taker_token, maker_amount, taker_amount) = match intent.side {
+            tikr_core::Side::Ask => (
+                self.config.base_token,
+                self.config.quote_token,
+                base_amount,
+                quote_amount,
+            ),
+            tikr_core::Side::Bid => (
+                self.config.quote_token,
+                self.config.base_token,
+                quote_amount,
+                base_amount,
+            ),
+        };
 
         let (quote_id, _numeric_id) = self
             .exchange
             .place_order(
-                self.config.maker_token,
-                self.config.taker_token,
+                maker_token,
+                taker_token,
                 maker_amount,
                 taker_amount,
                 self.config.order_expiry_secs,
                 intent.symbol,
+                intent.side,
             )
             .await?;
 
@@ -238,19 +259,7 @@ impl Venue for DodoClient {
             self.config.order_expiry_secs
         );
 
-        let maker_amount = decimal_to_u256_18dec(intent.size.0)?;
-        let taker_amount = decimal_to_u256_18dec(intent.size.0 * intent.price.0)?;
-
-        self.exchange
-            .place_order(
-                self.config.maker_token,
-                self.config.taker_token,
-                maker_amount,
-                taker_amount,
-                self.config.order_expiry_secs,
-                intent.symbol,
-            )
-            .await?;
+        let _ = self.quote(intent).await?;
 
         Ok(())
     }

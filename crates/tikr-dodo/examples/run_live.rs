@@ -273,10 +273,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = signer.address().to_checksum(None);
     info!(address = %address, pair = %args.pair, "signer loaded");
 
-    let (maker_token, taker_token) = load_token_addresses()?;
+    let (base_token, quote_token) = load_token_addresses()?;
     info!(
-        maker_token = %maker_token,
-        taker_token = %taker_token,
+        base_token = %base_token,
+        quote_token = %quote_token,
         "token addresses loaded"
     );
 
@@ -285,8 +285,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = DodoConfig {
         order_expiry_secs: args.expiry_secs,
-        maker_token,
-        taker_token,
+        base_token,
+        quote_token,
         rpc_ws_url: rpc_ws_url.clone(),
     };
 
@@ -303,8 +303,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(
         pair = %args.pair,
         maker = %address,
-        maker_token = %maker_token,
-        taker_token = %taker_token,
+        base_token = %base_token,
+        quote_token = %quote_token,
         expiry_secs = args.expiry_secs,
         state_dir = %args.state_dir.display(),
         "starting DODO live runner"

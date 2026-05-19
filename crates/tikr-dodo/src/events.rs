@@ -237,7 +237,7 @@ pub fn parse_limit_order_filled_log(
     let cur_maker_fill = U256::from_be_bytes(maker_fill_bytes);
 
     // Look up QuoteId and decimals from the order_map via order_hash.
-    let (quote_id, quote_decimals, base_decimals, matched_symbol) = {
+    let (quote_id, quote_decimals, base_decimals, matched_symbol, side) = {
         let map = order_map.lock().expect("order_map lock poisoned");
         // Find by matching the stored hash.
         let found = map.iter().find(|(_, (_, stored_hash, _))| {
@@ -246,18 +246,21 @@ pub fn parse_limit_order_filled_log(
         });
         if let Some((qid, (_, _, pair))) = found {
             // Use 18 decimals as default for both tokens (WBNB + USDT on BSC).
-            (*qid, 18u32, 18u32, pair.symbol.clone())
+            (*qid, 18u32, 18u32, pair.symbol.clone(), pair.side)
         } else {
             // Unknown hash — derive QuoteId best-effort from the hash bytes.
+            // Side cannot be recovered; default to Ask (matches the v0 sell-side
+            // bias when only single-direction orders are placed).
             warn!(
                 order_hash = %hex::encode(order_hash),
-                "LimitOrderFilled: hash not in order_map; deriving QuoteId from hash bytes"
+                "LimitOrderFilled: hash not in order_map; deriving QuoteId from hash bytes, assuming Ask"
             );
             (
                 quote_id_from_hash(&order_hash),
                 18u32,
                 18u32,
                 symbol.clone(),
+                tikr_core::Side::Ask,
             )
         }
     };
@@ -272,6 +275,7 @@ pub fn parse_limit_order_filled_log(
         base_decimals,
         matched_symbol,
         ts_ns,
+        side,
     ))
 }
 
@@ -382,16 +386,14 @@ mod tests {
     }
 
     /// topic0 must match the expected keccak256 of the event signature.
+    ///
+    /// Independently verifiable: `cast keccak "LimitOrderFilled(address,address,bytes32,uint256,uint256)"`.
     #[test]
     fn limit_order_filled_topic0_matches_expected() {
+        const EXPECTED: &str = "30a60b21c24c8f631a1e032527b3ee9a12b7e1fce164b4273c40f5db96415245";
         let topic0 = limit_order_filled_topic0();
-        // keccak256("LimitOrderFilled(address,address,bytes32,uint256,uint256)")
-        // Computed offline for fixture verification.
         let hex = hex::encode(topic0.as_slice());
-        // The topic0 must be exactly 64 hex chars (32 bytes).
-        assert_eq!(hex.len(), 64, "topic0 must be 32 bytes hex");
-        // It must not be all zeros.
-        assert_ne!(hex, "0".repeat(64), "topic0 must not be zero");
+        assert_eq!(hex, EXPECTED, "topic0 must match deployed event signature");
     }
 
     use tikr_core::Decimal;
