@@ -118,6 +118,15 @@ fn ed25519_roundtrip_sign_and_verify() {
         "Ed25519 base64 signature must be 88 chars"
     );
 
+    // Pin the exact base64 against the deterministic fixture (seed = [42u8; 32]).
+    // Independently verified via python cryptography library; any drift here
+    // signals a library or seed regression we want to catch loudly.
+    assert_eq!(
+        sig_b64,
+        "DIQW7SPdWLOMBMTZki5uvkPXdjBfka7PDXRUuFUp4jEKlujDeU2/nGEFfwIPbn+WvXGq192bJDF5sOa5bUO+Bw==",
+        "Ed25519 fixture drift: signature does not match pinned value"
+    );
+
     // Decode and verify.
     let raw = BASE64_STANDARD
         .decode(&sig_b64)

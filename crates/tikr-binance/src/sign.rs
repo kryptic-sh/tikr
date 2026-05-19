@@ -102,8 +102,10 @@ pub fn sign_query(secret: &str, params: &str) -> String {
 
 /// Compute Ed25519 signature of `params`. Returns base64 standard (with `=` padding).
 ///
-/// Signs the raw message bytes (EdDSA internally does double-SHA-512
-/// prehash — do NOT pre-hash before calling this).
+/// Signs the raw UTF-8 message bytes directly. Ed25519 hashes the message with
+/// SHA-512 as part of the EdDSA protocol — do NOT pre-hash before calling this
+/// (pre-hashing produces an Ed25519ph signature, a different scheme Binance
+/// does not accept).
 ///
 /// Returns a base64-encoded 64-byte signature (~88 chars with padding).
 pub fn sign_query_ed25519(key: &SigningKey, params: &str) -> String {
