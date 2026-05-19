@@ -4,7 +4,7 @@
 //!
 //! [issue #11]: https://github.com/kryptic-sh/tikr/issues/11
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tikr_core::{
     Decimal, Fill, MarketEvent, Notional, Price, Side, Size, Snapshot, Symbol, TimeInForce,
@@ -55,14 +55,36 @@ struct LiveQuote {
     side: Side,
     price: Price,
     size_remaining: Size,
+    /// Aggregate size resting at our price level when we were placed.
+    /// Trades at our price level consume this BEFORE consuming our size
+    /// (FIFO/price-time priority approximation; cancels are not modeled).
+    queue_ahead: Decimal,
     #[allow(dead_code)]
     ts_submitted: Timestamp,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct BookState {
-    best_bid: Option<Price>,
-    best_ask: Option<Price>,
+    /// Per-level aggregate size on the bid side, keyed by price.
+    bids: BTreeMap<Decimal, Decimal>,
+    /// Per-level aggregate size on the ask side, keyed by price.
+    asks: BTreeMap<Decimal, Decimal>,
+}
+
+impl BookState {
+    fn best_bid(&self) -> Option<Price> {
+        self.bids.keys().next_back().copied().map(Price)
+    }
+    fn best_ask(&self) -> Option<Price> {
+        self.asks.keys().next().copied().map(Price)
+    }
+    fn level_size(&self, side: Side, price: Price) -> Decimal {
+        let map = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        map.get(&price.0).copied().unwrap_or(Decimal::ZERO)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +176,14 @@ impl FillSim {
         if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
             return;
         }
+        // Snapshot queue position at our price level when placed. We're
+        // appended to the back, so queue_ahead = current aggregate at that
+        // level. New price levels (improve mode) have zero ahead of us.
+        let queue_ahead = self
+            .book_state
+            .get(&intent.symbol)
+            .map(|b| b.level_size(intent.side, intent.price))
+            .unwrap_or(Decimal::ZERO);
         let id = QuoteId::new();
         self.live_quotes.push(LiveQuote {
             id,
@@ -161,6 +191,7 @@ impl FillSim {
             side: intent.side,
             price: intent.price,
             size_remaining: intent.size,
+            queue_ahead,
             ts_submitted: ts,
         });
     }
@@ -170,8 +201,8 @@ impl FillSim {
             return false;
         };
         match intent.side {
-            Side::Bid => book.best_ask.is_some_and(|ask| intent.price.0 >= ask.0),
-            Side::Ask => book.best_bid.is_some_and(|bid| intent.price.0 <= bid.0),
+            Side::Bid => book.best_ask().is_some_and(|ask| intent.price.0 >= ask.0),
+            Side::Ask => book.best_bid().is_some_and(|bid| intent.price.0 <= bid.0),
         }
     }
 
@@ -181,8 +212,14 @@ impl FillSim {
 
     fn update_book_state(&mut self, snapshot: &Snapshot) {
         let st = self.book_state.entry(snapshot.symbol.clone()).or_default();
-        st.best_bid = snapshot.bids.first().map(|l| l.price);
-        st.best_ask = snapshot.asks.first().map(|l| l.price);
+        st.bids.clear();
+        st.asks.clear();
+        for lvl in &snapshot.bids {
+            st.bids.insert(lvl.price.0, lvl.size.0);
+        }
+        for lvl in &snapshot.asks {
+            st.asks.insert(lvl.price.0, lvl.size.0);
+        }
     }
 
     fn match_trade(
@@ -205,6 +242,25 @@ impl FillSim {
                 i += 1;
                 continue;
             }
+
+            // Queue priority: trade consumes the orders RESTING AHEAD of us
+            // at our level before reaching our quote. queue_ahead drops to
+            // zero before we can fill. Trades at deeper prices (sweeps that
+            // walk through our level) implicitly cleared queue ahead by the
+            // time they reach us, but we model this conservatively: ONLY
+            // trades AT our exact price level decrement our queue_ahead.
+            // (Sweeping trades will print at multiple prices including ours
+            // if size is sufficient; the prints AT our level decrement the
+            // queue and fill us together.)
+            if q.queue_ahead > Decimal::ZERO {
+                let ate = q.queue_ahead.min(trade_remaining);
+                q.queue_ahead -= ate;
+                trade_remaining -= ate;
+                if trade_remaining == Decimal::ZERO {
+                    break;
+                }
+            }
+
             let fill_amount = q.size_remaining.0.min(trade_remaining);
             let fill_price = q.price;
             // fee_amount is signed; positive = paid, negative = rebated.
@@ -428,6 +484,129 @@ mod tests {
         };
         let fills2 = sim.on_market_event(&hb2, Timestamp(80_000_000));
         assert!(fills2.is_empty(), "no fills from a stale cancel");
+    }
+
+    fn make_book_with_size(
+        symbol: &Symbol,
+        bid_price: i64,
+        bid_size: i64,
+        ask_price: i64,
+        ask_size: i64,
+    ) -> Snapshot {
+        Snapshot {
+            symbol: symbol.clone(),
+            bids: vec![Level {
+                price: Price(Decimal::from(bid_price)),
+                size: Size(Decimal::from(bid_size)),
+            }],
+            asks: vec![Level {
+                price: Price(Decimal::from(ask_price)),
+                size: Size(Decimal::from(ask_size)),
+            }],
+            ts: Timestamp(0),
+        }
+    }
+
+    /// Queue-priority: a join order at an existing best-bid level must wait
+    /// for queue_ahead to drain before filling.
+    #[test]
+    fn queue_priority_join_waits_for_queue_to_drain() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        // Seed book: best bid at 100 with 5 units resting, ask at 101.
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 5, 101, 1),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        // Place a JOIN bid at 100 (size 1). queue_ahead = 5.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+
+        // Trade of size 3 at 100 — consumes 3 of the 5 ahead. We don't fill.
+        let t1 = make_trade(&sym, 100, 3, Side::Ask, 30_000_000);
+        let fills1 = sim.on_market_event(&t1, Timestamp(30_000_000));
+        assert!(
+            fills1.is_empty(),
+            "join order behind queue must not fill yet"
+        );
+
+        // Trade of size 3 at 100 — consumes remaining 2 of queue then fills 1 of ours.
+        let t2 = make_trade(&sym, 100, 3, Side::Ask, 40_000_000);
+        let fills2 = sim.on_market_event(&t2, Timestamp(40_000_000));
+        assert_eq!(fills2.len(), 1, "queue exhausted, our order should fill");
+        assert_eq!(fills2[0].size, Size(Decimal::from(1)));
+    }
+
+    /// Queue-priority: an IMPROVE order (new price level) has queue_ahead = 0
+    /// and fills immediately on the first adverse trade at its price.
+    #[test]
+    fn queue_priority_improve_fills_immediately() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        // Book has best bid at 99 (size 5), ask at 102. No level at 100.
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 99, 5, 102, 1),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        // Place a 1-tick IMPROVE bid at 100 (size 1). queue_ahead = 0.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+
+        // Trade of size 1 at 100 — fills our order immediately (no queue).
+        let trade = make_trade(&sym, 100, 1, Side::Ask, 30_000_000);
+        let fills = sim.on_market_event(&trade, Timestamp(30_000_000));
+        assert_eq!(
+            fills.len(),
+            1,
+            "improve order at new level should fill immediately"
+        );
+        assert_eq!(fills[0].price, Price(Decimal::from(100)));
+    }
+
+    /// Queue-priority: book updates that change aggregate at our level do
+    /// NOT shift our queue position (cancels are not modeled — optimistic).
+    #[test]
+    fn book_update_does_not_shift_queue_position() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        let book1 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 5, 101, 1),
+        };
+        let _ = sim.on_market_event(&book1, Timestamp(0));
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(5));
+
+        // Book updates — aggregate at 100 grows to 10. Our queue_ahead must
+        // still be 5 (we don't track new arrivals; we're not behind them).
+        let book2 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 10, 101, 1),
+        };
+        let _ = sim.on_market_event(&book2, Timestamp(25_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(5));
     }
 
     #[test]

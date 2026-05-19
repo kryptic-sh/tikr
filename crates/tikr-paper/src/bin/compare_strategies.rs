@@ -80,6 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         maker_bps: args.maker_bps,
         taker_bps: args.taker_bps,
     };
+    // Binance Futures USD-M with BNB-pay enabled = 10% discount on both
+    // sides → 1.8 bps maker, 4.5 bps taker (rounded). See [[binance-fees]].
+    let bnb_fees = VenueFees {
+        maker_bps: ((args.maker_bps * 9) as f64 / 10.0).round() as i32,
+        taker_bps: ((args.taker_bps as f64 * 0.9).round()) as u32,
+    };
     let ewma = EwmaConfig {
         half_life_sec: 60.0,
         initial_var: Decimal::from_str("0.000001")?,
@@ -221,6 +227,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     results.push(("TOB improve=1 skew(20,0.005)".into(), r));
+
+    // BNB-discount duplicates of the top TOB presets.
+    let r = run_one(
+        &args,
+        &symbol,
+        TopOfBook::new(TopOfBookConfig {
+            size_per_quote,
+            tick_size: tick,
+            improve_when_spread_gt_ticks: 1,
+            min_requote_interval_ms: 1000,
+            max_skew_ticks: 0,
+            skew_unit: Size(Decimal::from(1)),
+        }),
+        bnb_fees,
+    )
+    .await?;
+    results.push(("TOB improve=1 noskew (BNB)".into(), r));
+
+    let r = run_one(
+        &args,
+        &symbol,
+        TopOfBook::new(TopOfBookConfig {
+            size_per_quote,
+            tick_size: tick,
+            improve_when_spread_gt_ticks: 1,
+            min_requote_interval_ms: 1000,
+            max_skew_ticks: 10,
+            skew_unit: Size(Decimal::from_str("0.005")?),
+        }),
+        bnb_fees,
+    )
+    .await?;
+    results.push(("TOB improve=1 skew(10,0.005) (BNB)".into(), r));
 
     print_table(&results);
     Ok(())
