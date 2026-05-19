@@ -1,17 +1,17 @@
-//! Live BSC mainnet single-pair DODO LimitOrder market-maker (v0).
+//! Live BSC mainnet single-pair DODO LimitOrder market-maker (v1 — Chainlink-driven).
 //!
-//! # Architecture (v0 — write-side only)
+//! # Architecture
 //!
-//! DODO LimitOrder in v0 provides only the write side of the `Venue` trait:
+//! DODO LimitOrder provides the full `Venue` trait surface:
 //! - `quote()` → sign EIP-712 → POST to DODO API → order live on BSC
 //! - `requote()` → warn (old order self-expires) → place new order
 //! - `cancel()` / `cancel_all()` → no-op + warn (self-expiry is the mechanism)
+//! - `snapshot()` → Chainlink `latestRoundData()` → 1-level BBO around mid
+//! - `subscribe()` → poll Chainlink every `price_poll_interval_secs` seconds →
+//!   emit `MarketEvent::BookUpdate`
 //!
-//! For market data (snapshots + subscribe), v0 feeds synthetic price events from
-//! a configurable mid-price + Gaussian noise. This drives the NaiveGrid strategy
-//! for testing purposes. A production deployment should replace `synthetic_feed`
-//! with a real price oracle (e.g. Chainlink BSC feed, or DODO `/route` API for
-//! pool prices).
+//! The price feed is driven by the Chainlink BNB/USD aggregator on BSC mainnet:
+//! `0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE`. No synthetic mid-price needed.
 //!
 //! # Operator pre-flight
 //!
@@ -31,7 +31,22 @@
 //!
 //! Or pass `--key-file /path/to/keyfile` (single-line hex, 0x-prefix optional).
 //!
-//! ## 3. Wrap BNB → WBNB (one-time per wallet)
+//! ## 3. Set BSC RPC URL (WebSocket, used for fills + Chainlink reads)
+//!
+//! ```text
+//! TIKR_BSC_RPC_URL=wss://your-bsc-wss-endpoint
+//! ```
+//!
+//! ## 4. Set Chainlink feed address
+//!
+//! ```text
+//! TIKR_CHAINLINK_FEED=0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE
+//! ```
+//!
+//! Or pass `--chainlink-feed <address>` on the command line.
+//! Default (if neither set): BNB/USD on BSC mainnet.
+//!
+//! ## 5. Wrap BNB → WBNB (one-time per wallet)
 //!
 //! ```bash
 //! cast send 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c \
@@ -40,7 +55,7 @@
 //!     --private-key $TIKR_BSC_PRIVATE_KEY
 //! ```
 //!
-//! ## 4. Approve DODO to spend WBNB and USDT (one-time per token)
+//! ## 6. Approve DODO to spend WBNB and USDT (one-time per token)
 //!
 //! DODOApprove contract on BSC: `0xa128Ba44B2738A558A1fdC06d6303d52D3Cef8c1`
 //!
@@ -60,32 +75,31 @@
 //!     --rpc-url $TIKR_BSC_RPC_URL --private-key $TIKR_BSC_PRIVATE_KEY
 //! ```
 //!
-//! ## 5. Run
+//! ## 7. Run
 //!
 //! ```bash
 //! TIKR_DODO_ENABLE_MAINNET=1 cargo run -p tikr-dodo --example run_live -- \
 //!     --pair WBNB/USDT \
-//!     --mid-price 600 \
 //!     --minutes 30
 //! ```
 //!
 //! ## Notes
 //!
 //! - Orders self-cancel after `--expiry-secs` seconds (default 60). No cancel API in v0.
-//! - The read-side (snapshot/subscribe) is SYNTHETIC in v0 — feed real market data
-//!   for production (replace `synthetic_feed` with a BSC price oracle or AMM pool reader).
+//! - Market data is driven by Chainlink BNB/USD (configurable via `--chainlink-feed`).
+//! - The subscribe loop polls every `--poll-interval` seconds (default 5s).
+//! - Spread is `--spread-bps` per side (default 20 = 0.20%).
 //! - WBNB and USDT both use 18 decimals on BSC.
 //! - Maker rebates: DODO LimitOrder charges no maker fee. Spread is your profit.
-//! - See issue #41 for real cancel, #42 for approval helper, #43 for WBNB wrap helper.
+//! - See issue #42 for real cancel, #43 for approval helper, #44 for WBNB wrap helper.
 
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser;
 use std::path::PathBuf;
 use std::str::FromStr;
-use tikr_core::{
-    Asset, Decimal, Level, MarketEvent, Price, Size, Snapshot, Symbol, Timestamp, VenueId,
-};
+use tikr_core::QuoteKind;
+use tikr_core::{Asset, Decimal, MarketEvent, Price, Side, Size, Symbol, TimeInForce, VenueId};
 use tikr_dodo::{DodoClient, DodoConfig};
 use tikr_venue::Venue;
 use tracing::{info, warn};
@@ -97,7 +111,7 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(
     name = "run_live",
-    about = "Single-pair live DODO LimitOrder market-maker on BSC mainnet (v0 — write-side only)"
+    about = "Single-pair live DODO LimitOrder market-maker on BSC mainnet (Chainlink-driven)"
 )]
 struct Args {
     /// Token pair to trade in BASE/QUOTE format (e.g. `WBNB/USDT`).
@@ -123,10 +137,20 @@ struct Args {
     #[arg(long, default_value_t = 60u64)]
     expiry_secs: u64,
 
-    /// Mid-price for synthetic market data feed (e.g. 600 for WBNB/USDT ≈ $600).
-    /// Replace with a real oracle for production use.
-    #[arg(long, default_value_t = 600.0f64)]
-    mid_price: f64,
+    /// Chainlink AggregatorV3Interface feed address.
+    /// Defaults to `TIKR_CHAINLINK_FEED` env var, then BNB/USD on BSC mainnet
+    /// (`0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE`).
+    #[arg(long)]
+    chainlink_feed: Option<String>,
+
+    /// Chainlink poll interval in seconds (default 5s).
+    /// Polls faster than the 30s heartbeat so updates are caught promptly.
+    #[arg(long, default_value_t = 5u64)]
+    poll_interval: u64,
+
+    /// Spread per side in basis points (default 20 = 0.20% per side).
+    #[arg(long, default_value_t = 20u16)]
+    spread_bps: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,50 +216,22 @@ fn load_token_addresses() -> Result<(Address, Address), Box<dyn std::error::Erro
     Ok((maker, taker))
 }
 
-// ---------------------------------------------------------------------------
-// Synthetic market data feed (v0 read-side placeholder)
-// ---------------------------------------------------------------------------
-
-/// Generate a synthetic market snapshot around a mid-price.
+/// Resolve the Chainlink feed address.
 ///
-/// This is the v0 read-side placeholder. Replace with a real BSC price oracle
-/// or DODO `/route` API call for production use.
-///
-/// Structure: 5 bid levels (mid × (1 - spread)), 5 ask levels (mid × (1 + spread)).
-fn synthetic_snapshot(symbol: &Symbol, mid: Decimal, spread_bps: u32) -> Snapshot {
-    let spread = Decimal::from(spread_bps) / Decimal::from(10000u32);
-    let ts = Timestamp(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0),
-    );
+/// Priority:
+/// 1. `--chainlink-feed <addr>` CLI flag
+/// 2. `TIKR_CHAINLINK_FEED` env var
+/// 3. Default: BNB/USD on BSC mainnet (`0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE`)
+fn resolve_chainlink_feed(args: &Args) -> Result<Address, Box<dyn std::error::Error>> {
+    const BNB_USD_FEED: &str = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE";
 
-    let n_levels = 5;
-    let level_step = spread / Decimal::from(n_levels as u32);
-    let size_per_level = Decimal::from_str_exact("0.01").expect("valid");
+    let raw = args
+        .chainlink_feed
+        .clone()
+        .or_else(|| std::env::var("TIKR_CHAINLINK_FEED").ok())
+        .unwrap_or_else(|| BNB_USD_FEED.to_string());
 
-    let bids: Vec<Level> = (1..=n_levels)
-        .rev()
-        .map(|i| Level {
-            price: Price(mid * (Decimal::ONE - spread + level_step * Decimal::from(i as u32 - 1))),
-            size: Size(size_per_level),
-        })
-        .collect();
-
-    let asks: Vec<Level> = (1..=n_levels)
-        .map(|i| Level {
-            price: Price(mid * (Decimal::ONE + spread + level_step * Decimal::from(i as u32 - 1))),
-            size: Size(size_per_level),
-        })
-        .collect();
-
-    Snapshot {
-        symbol: symbol.clone(),
-        bids,
-        asks,
-        ts,
-    }
+    Address::from_str(&raw).map_err(|e| format!("Chainlink feed address '{}': {}", raw, e).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +276,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "token addresses loaded"
     );
 
+    let chainlink_feed = resolve_chainlink_feed(&args)?;
+    info!(feed = %chainlink_feed, "Chainlink feed resolved");
+
     let rpc_ws_url = std::env::var("TIKR_BSC_RPC_URL")
         .unwrap_or_else(|_| "wss://bsc-ws-node.nariox.org".to_string());
 
@@ -288,13 +287,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_token,
         quote_token,
         rpc_ws_url: rpc_ws_url.clone(),
+        chainlink_feed_addr: Some(chainlink_feed),
+        price_poll_interval_secs: args.poll_interval,
+        spread_bps: args.spread_bps,
     };
 
     warn!(
         "MAINNET mode — DODO LimitOrder on BSC mainnet. Real funds at risk.\n\
          Order expiry: {}s. cancel()/cancel_all() are no-ops in v0 (self-expiry only).\n\
-         See issue #41 for real cancel implementation.",
-        args.expiry_secs
+         Chainlink feed: {}. Poll interval: {}s. Spread: {} bps per side.",
+        args.expiry_secs, chainlink_feed, args.poll_interval, args.spread_bps
     );
 
     let venue = DodoClient::with_wallet(config, signer)?;
@@ -307,7 +309,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         quote_token = %quote_token,
         expiry_secs = args.expiry_secs,
         state_dir = %args.state_dir.display(),
-        "starting DODO live runner"
+        chainlink_feed = %chainlink_feed,
+        poll_interval_secs = args.poll_interval,
+        spread_bps = args.spread_bps,
+        "starting DODO live runner (Chainlink-driven)"
     );
 
     // Subscribe to fill events via BSC log subscription.
@@ -328,8 +333,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    // Subscribe to Chainlink-driven market data.
+    let mut market_stream = venue.subscribe(&symbol).await?;
+
     // Shutdown channel.
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Wire Ctrl-C.
     let tx_ctrlc = shutdown_tx.clone();
@@ -350,70 +358,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // v0 demo loop: generate synthetic snapshots and place a quote every expiry interval.
-    // Replace with run_with_resume + a real market data source for production.
-    let mid = Decimal::from_str_exact(&format!("{}", args.mid_price))?;
-    let spread_bps = 20u32; // 0.20% spread
-
-    info!(
-        mid_price = %mid,
-        spread_bps,
-        "v0 synthetic feed started — replace with real BSC price oracle for production"
-    );
-
     let size = Size(Decimal::from_str_exact("0.001")?); // 0.001 WBNB per quote
-    let mut interval =
-        tokio::time::interval(std::time::Duration::from_secs(args.expiry_secs.max(5)));
 
+    // Main loop: consume Chainlink BookUpdate events and place quotes on each update.
     loop {
-        interval.tick().await;
-
-        // Generate a synthetic snapshot.
-        let snapshot = synthetic_snapshot(&symbol, mid, spread_bps);
-        let best_bid = snapshot.bids.first();
-        let best_ask = snapshot.asks.first();
-
-        if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-            info!(
-                bid = %bid.price.0,
-                ask = %ask.price.0,
-                "synthetic market update"
-            );
-
-            // Place a bid quote.
-            let bid_intent = tikr_venue::QuoteIntent {
-                symbol: symbol.clone(),
-                side: tikr_core::Side::Bid,
-                price: bid.price,
-                size,
-                tif: tikr_core::TimeInForce::GTC,
-                kind: tikr_core::QuoteKind::Point,
-            };
-
-            match venue.quote(bid_intent).await {
-                Ok(quote_id) => info!(quote_id = ?quote_id, "bid quote placed"),
-                Err(e) => warn!(error = %e, "bid quote failed"),
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("shutdown signal received; exiting");
+                    break;
+                }
             }
+            event = futures::StreamExt::next(&mut market_stream) => {
+                match event {
+                    None => {
+                        info!("market stream ended; exiting");
+                        break;
+                    }
+                    Some(MarketEvent::BookUpdate { snapshot }) => {
+                        let best_bid = snapshot.bids.first();
+                        let best_ask = snapshot.asks.first();
 
-            // Place an ask quote.
-            let ask_intent = tikr_venue::QuoteIntent {
-                symbol: symbol.clone(),
-                side: tikr_core::Side::Ask,
-                price: ask.price,
-                size,
-                tif: tikr_core::TimeInForce::GTC,
-                kind: tikr_core::QuoteKind::Point,
-            };
+                        if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+                            info!(
+                                bid = %bid.price.0,
+                                ask = %ask.price.0,
+                                "Chainlink market update"
+                            );
 
-            match venue.quote(ask_intent).await {
-                Ok(quote_id) => info!(quote_id = ?quote_id, "ask quote placed"),
-                Err(e) => warn!(error = %e, "ask quote failed"),
+                            // Place a bid quote.
+                            let bid_intent = tikr_venue::QuoteIntent {
+                                symbol: symbol.clone(),
+                                side: Side::Bid,
+                                price: bid.price,
+                                size,
+                                tif: TimeInForce::GTC,
+                                kind: QuoteKind::Point,
+                            };
+
+                            match venue.quote(bid_intent).await {
+                                Ok(quote_id) => info!(quote_id = ?quote_id, "bid quote placed"),
+                                Err(e) => warn!(error = %e, "bid quote failed"),
+                            }
+
+                            // Place an ask quote.
+                            let ask_intent = tikr_venue::QuoteIntent {
+                                symbol: symbol.clone(),
+                                side: Side::Ask,
+                                price: Price(ask.price.0),
+                                size,
+                                tif: TimeInForce::GTC,
+                                kind: QuoteKind::Point,
+                            };
+
+                            match venue.quote(ask_intent).await {
+                                Ok(quote_id) => info!(quote_id = ?quote_id, "ask quote placed"),
+                                Err(e) => warn!(error = %e, "ask quote failed"),
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        // Heartbeats, fills, etc. — log and continue.
+                        info!(event = ?other, "market event (non-book)");
+                    }
+                }
             }
         }
-
-        // Emit synthetic market event to logs for observability.
-        let _event = MarketEvent::BookUpdate {
-            snapshot: snapshot.clone(),
-        };
     }
+
+    Ok(())
 }

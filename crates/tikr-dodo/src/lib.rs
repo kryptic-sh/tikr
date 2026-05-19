@@ -1,8 +1,8 @@
-//! DODO LimitOrder [`Venue`] adapter — write-side implementation (Phase 5).
+//! DODO LimitOrder [`Venue`] adapter — write + Chainlink read implementation (Phase 5).
 //!
 //! Implements the [`tikr_venue::Venue`] trait for DODO LimitOrder on BSC mainnet.
 //!
-//! # Write-side methods (v0)
+//! # Write-side methods
 //!
 //! - [`Venue::quote`] — Sign an EIP-712 typed Order struct, POST it to the DODO
 //!   API at `https://api.dodoex.io/limit-order/create?apikey=<key>`, return a
@@ -12,15 +12,18 @@
 //!   cancel needed.
 //! - [`Venue::cancel`] — **No-op + `tracing::warn!`**. DODO's cancel API
 //!   requires a `signkey` whose derivation is undocumented. v0 uses short-expiry
-//!   self-cancel instead. See issue #41 for the real cancel follow-up.
+//!   self-cancel instead. See issue #42 for the real cancel follow-up.
 //! - [`Venue::cancel_all`] — Same no-op strategy as `cancel`.
 //!
-//! # Read-side methods (v0 stubs)
+//! # Read-side methods (Chainlink-driven)
 //!
-//! - [`Venue::snapshot`] — `todo!()` — DODO LimitOrder has no on-chain orderbook
-//!   snapshot API; feed market data from another source (e.g. a price oracle or
-//!   a separate BSC AMM) and pass it to the runner externally.
-//! - [`Venue::subscribe`] — `todo!()` — same rationale as `snapshot`.
+//! - [`Venue::snapshot`] — Calls `latestRoundData()` on the configured Chainlink
+//!   feed, synthesises a 1-level bid/ask book around the returned mid-price, and
+//!   returns a [`tikr_core::Snapshot`]. Requires `DodoConfig::chainlink_feed_addr`
+//!   to be set to a valid AggregatorV3Interface contract address.
+//! - [`Venue::subscribe`] — Spawns a poll task that calls Chainlink every
+//!   `price_poll_interval_secs` seconds and emits `MarketEvent::BookUpdate` per poll.
+//!   Returns a `BoxStream<MarketEvent>`.
 //! - [`Venue::position`] — `todo!()` — position is tracked via the paper runner's
 //!   fill accumulator, not queried from DODO directly (no REST endpoint).
 //! - [`Venue::fills_since`] — `todo!()` — fills are pushed via the BSC log
@@ -35,6 +38,14 @@
 //! one expires harmlessly. `cancel()` and `cancel_all()` log a `warn!` and
 //! return `Ok(())` — callers (the runner, risk gate) must be aware of this
 //! v0 limitation.
+//!
+//! # Price feed (Chainlink)
+//!
+//! BNB/USD on BSC mainnet: `0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE`.
+//! Set `DodoConfig::chainlink_feed_addr` to this address.
+//! Staleness guard: warn at 600s, error at 3600s.
+//! Poll interval: `DodoConfig::price_poll_interval_secs` (default 5s).
+//! Spread: `DodoConfig::spread_bps` per side (default 20 = 0.20%).
 //!
 //! # API key
 //!
@@ -57,10 +68,11 @@
 //! to spend both tokens. See `examples/run_live.rs` for the `cast send` commands.
 //! The approval address on BSC is `0xa128Ba44B2738A558A1fdC06d6303d52D3Cef8c1`.
 //!
-//! See issues #38 (Hyperliquid sibling), #40 (this impl), #41-44 (follow-ups).
+//! See issues #38 (Hyperliquid sibling), #40 (write-side), #41 (Chainlink read-side).
 
 #![deny(missing_docs)]
 
+pub mod chainlink;
 pub mod events;
 pub mod exchange;
 
@@ -70,8 +82,9 @@ pub use exchange::{DodoExchangeClient, OrderMap};
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
+use chainlink::{ChainlinkPriceFeed, build_snapshot, now_timestamp};
 use futures::stream::BoxStream;
-use tikr_core::{Fill, MarketEvent, Position, Symbol};
+use tikr_core::{Decimal, Fill, MarketEvent, Position, Symbol};
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tracing::warn;
 
@@ -96,9 +109,34 @@ pub struct DodoConfig {
     /// Quote token address (e.g. USDT in WBNB/USDT).
     pub quote_token: Address,
 
-    /// BSC WebSocket RPC URL for fill-event subscription.
+    /// BSC WebSocket RPC URL for fill-event subscription and Chainlink reads.
     /// Default: `TIKR_BSC_RPC_URL` env, fallback `wss://bsc-ws-node.nariox.org`.
+    ///
+    /// alloy's WS provider supports `eth_call`, so the same WS connection is used
+    /// for both log subscriptions (fills) and read-only `eth_call`s (Chainlink).
     pub rpc_ws_url: String,
+
+    /// Chainlink AggregatorV3Interface feed address.
+    ///
+    /// BNB/USD on BSC mainnet: `0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE`.
+    /// Set to `None` to disable the Chainlink price feed (snapshot/subscribe
+    /// will return `VenueError::Rejected`).
+    pub chainlink_feed_addr: Option<Address>,
+
+    /// Chainlink poll interval in seconds.
+    ///
+    /// Default: 5 seconds. Faster than the Chainlink 30s heartbeat so the bot
+    /// picks up heartbeat updates within one poll interval.
+    pub price_poll_interval_secs: u64,
+
+    /// Spread per side in basis points (e.g. 20 = 0.20% per side).
+    ///
+    /// Book emitted as 1 level:
+    /// - bid: mid × (10000 − spread_bps) / 10000
+    /// - ask: mid × (10000 + spread_bps) / 10000
+    ///
+    /// Default: 20 (0.20% per side).
+    pub spread_bps: u16,
 }
 
 impl Default for DodoConfig {
@@ -110,6 +148,9 @@ impl Default for DodoConfig {
             base_token: Address::ZERO,
             quote_token: Address::ZERO,
             rpc_ws_url,
+            chainlink_feed_addr: None,
+            price_poll_interval_secs: 5,
+            spread_bps: 20,
         }
     }
 }
@@ -173,6 +214,22 @@ impl DodoClient {
     pub fn order_map(&self) -> OrderMap {
         self.exchange.order_map.clone()
     }
+
+    /// Build a `ChainlinkPriceFeed` from the active config.
+    ///
+    /// Returns `Err(VenueError::Rejected)` if `chainlink_feed_addr` is not configured.
+    fn chainlink_feed(&self) -> Result<ChainlinkPriceFeed, VenueError> {
+        let feed_addr = self.config.chainlink_feed_addr.ok_or_else(|| VenueError::Rejected {
+            reason: "DodoConfig::chainlink_feed_addr is None — set it to a Chainlink \
+                     AggregatorV3Interface address (e.g. 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE \
+                     for BNB/USD on BSC mainnet)"
+                .into(),
+        })?;
+        Ok(ChainlinkPriceFeed::new(
+            feed_addr,
+            self.config.rpc_ws_url.clone(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -181,26 +238,78 @@ impl Venue for DodoClient {
         "dodo"
     }
 
-    /// DODO LimitOrder has no on-chain orderbook snapshot endpoint.
+    /// Fetch a 1-level book snapshot from Chainlink.
     ///
-    /// v0 stub — `todo!()`. For the live runner, feed market data from an
-    /// external source (e.g. DODO pool price via `/route` API, or a price
-    /// oracle). See `examples/run_live.rs` for guidance.
-    async fn snapshot(&self, _symbol: &Symbol) -> Result<tikr_core::Snapshot, VenueError> {
-        todo!(
-            "Phase 5+: DODO read-side via /route API or on-chain pool price oracle. \
-             For v0 live trading, feed market data externally — see run_live.rs."
-        )
+    /// Calls `latestRoundData()` on the configured Chainlink feed, divides by 1e8
+    /// to get the USD mid-price, and synthesises a 1-level bid/ask book using
+    /// `DodoConfig::spread_bps`.
+    ///
+    /// Requires `DodoConfig::chainlink_feed_addr` to be set.
+    async fn snapshot(&self, symbol: &Symbol) -> Result<tikr_core::Snapshot, VenueError> {
+        let feed = self.chainlink_feed()?;
+        let (raw_answer, _updated_at) = feed.read_latest_price().await?;
+        let mid = raw_answer / Decimal::from(10u64.pow(8));
+        let ts = now_timestamp();
+        Ok(build_snapshot(
+            symbol,
+            mid,
+            self.config.spread_bps,
+            Decimal::from(1_000_000u64),
+            ts,
+        ))
     }
 
-    /// DODO LimitOrder has no on-chain orderbook stream.
+    /// Subscribe to a live Chainlink-polled book update stream.
     ///
-    /// v0 stub — `todo!()`. See `snapshot` for rationale and workaround.
-    async fn subscribe(&self, _symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
-        todo!(
-            "Phase 5+: DODO market data stream via /route API polling or \
-             on-chain AMM pool events. Feed externally for v0."
-        )
+    /// Spawns a task that polls Chainlink every `price_poll_interval_secs` seconds
+    /// and emits `MarketEvent::BookUpdate` per poll. The stream ends when the
+    /// receiver is dropped (task exits cleanly).
+    ///
+    /// Requires `DodoConfig::chainlink_feed_addr` to be set.
+    async fn subscribe(&self, symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
+        use futures::stream;
+        use tokio::time::interval;
+
+        let feed = self.chainlink_feed()?;
+        let symbol = symbol.clone();
+        let spread_bps = self.config.spread_bps;
+        let poll_interval = self.config.price_poll_interval_secs;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MarketEvent>();
+
+        tokio::spawn(async move {
+            let mut ticker = interval(std::time::Duration::from_secs(poll_interval.max(1)));
+            loop {
+                ticker.tick().await;
+                match feed.read_latest_price().await {
+                    Ok((raw_answer, _)) => {
+                        let mid = raw_answer / Decimal::from(10u64.pow(8));
+                        let ts = now_timestamp();
+                        let snapshot = build_snapshot(
+                            &symbol,
+                            mid,
+                            spread_bps,
+                            Decimal::from(1_000_000u64),
+                            ts,
+                        );
+                        let event = MarketEvent::BookUpdate { snapshot };
+                        if tx.send(event).is_err() {
+                            // Receiver dropped — stop polling.
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Chainlink poll error; skipping this tick");
+                    }
+                }
+            }
+        });
+
+        let recv_stream = stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        });
+
+        Ok(Box::pin(recv_stream))
     }
 
     /// Sign an EIP-712 typed Order, POST to DODO API, return a `QuoteId`.
