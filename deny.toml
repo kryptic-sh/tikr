@@ -13,6 +13,11 @@ ignore = [
   # (recorder writes from typed WS payloads, replay reads our own files),
   # so the empty-string path is unreachable. Revisit on polars bump.
   { id = "RUSTSEC-2025-0003", reason = "transitive via polars; empty-input path unreachable from our usage" },
+  # paste: crate archived by dtolnay; no functional vulnerabilities reported.
+  # Pulled transitively by alloy-primitives (via alloy-signer-local, new in
+  # Phase 5). The paste macro is a proc-macro used at compile time only; no
+  # runtime exposure. Revisit when alloy-primitives drops the dependency.
+  { id = "RUSTSEC-2024-0436", reason = "transitive via alloy-primitives; compile-time proc-macro only, no runtime exposure" },
 ]
 
 [licenses]

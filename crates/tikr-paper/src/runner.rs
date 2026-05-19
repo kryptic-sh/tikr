@@ -1,4 +1,15 @@
 //! Paper-trading runner — live `Venue` → `Strategy` → `FillSim` → `PaperReport`.
+//!
+//! # Two modes
+//!
+//! **Paper mode** (`external_fills = None`): fills are synthesized by
+//! [`FillSim`] based on the market-event stream. No real orders are placed.
+//!
+//! **Live mode** (`external_fills = Some(rx)`): fills arrive over the
+//! `external_fills` receiver (e.g. from a Hyperliquid `userEvents` WS task).
+//! The [`FillSim`] is still wired for actions (so the strategy's `on_action`
+//! results are tracked) but the fills it would synthesize are discarded — real
+//! exchange fills drive the tracker instead.
 
 use crate::alerts::{Alert, AlertSink};
 use crate::report::{PaperReport, SCHEMA_VERSION};
@@ -8,11 +19,13 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
-use tikr_core::{Decimal, MarketEvent, Notional, Position, Price, Snapshot, Symbol, Timestamp};
+use tikr_core::{
+    Decimal, Fill, MarketEvent, Notional, Position, Price, Snapshot, Symbol, Timestamp,
+};
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
 use tikr_venue::Venue;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -58,7 +71,7 @@ where
     S: Strategy,
 {
     run_inner(
-        venue, strategy, fill_sim, symbol, shutdown, config, None, None, None,
+        venue, strategy, fill_sim, symbol, shutdown, config, None, None, None, None,
     )
     .await
 }
@@ -128,6 +141,7 @@ pub async fn run_with_resume<V, S>(
     resume: Option<PaperReport>,
     risk_gate: Option<Box<dyn RiskGate>>,
     alert_sink: Option<Box<dyn AlertSink>>,
+    external_fills: Option<mpsc::UnboundedReceiver<Fill>>,
 ) -> PaperReport
 where
     V: Venue,
@@ -142,7 +156,16 @@ where
         );
     }
     run_inner(
-        venue, strategy, fill_sim, symbol, shutdown, config, resume, risk_gate, alert_sink,
+        venue,
+        strategy,
+        fill_sim,
+        symbol,
+        shutdown,
+        config,
+        resume,
+        risk_gate,
+        alert_sink,
+        external_fills,
     )
     .await
 }
@@ -158,6 +181,7 @@ async fn run_inner<V, S>(
     resume: Option<PaperReport>,
     mut risk_gate: Option<Box<dyn RiskGate>>,
     alert_sink: Option<Box<dyn AlertSink>>,
+    mut external_fills: Option<mpsc::UnboundedReceiver<Fill>>,
 ) -> PaperReport
 where
     V: Venue,
@@ -219,7 +243,14 @@ where
         }
     };
 
+    // Whether we are in live mode (external fills) or paper mode (FillSim).
+    // In live mode the FillSim is still driven by actions for state tracking
+    // but its synthesized fills are discarded; real fills come from `external_fills`.
+    let live_mode = external_fills.is_some();
+
     loop {
+        // Poll the external fill receiver when in live mode. We use an async
+        // block that resolves to `Option<Fill>` so the select! can be unified.
         tokio::select! {
             ev = stream.next() => {
                 let Some(event) = ev else {
@@ -286,25 +317,26 @@ where
                     }
                     fill_sim.on_action(action, ts);
                 }
-                let fills = fill_sim.on_market_event(&event, ts);
-                for fill in fills {
-                    info!(price = %fill.price.0, size = %fill.size.0, side = ?fill.side, "fill");
-                    tracker.apply(&fill);
-                    if let Some(gate) = risk_gate.as_mut() {
-                        gate.record_fill(fill.ts);
+
+                // In paper mode: synthesize fills from FillSim.
+                // In live mode: discard synthesized fills (real fills come from
+                //               the `external_fills` arm below).
+                if !live_mode {
+                    let fills = fill_sim.on_market_event(&event, ts);
+                    for fill in fills {
+                        apply_fill(
+                            fill,
+                            &mut tracker,
+                            &mut risk_gate,
+                            &mut fills_emitted,
+                            alert_sink.as_deref(),
+                            &symbol,
+                        )
+                        .await;
                     }
-                    fills_emitted += 1;
-                    if let Some(sink) = alert_sink.as_ref() {
-                        let _ = sink
-                            .send(Alert::Fill {
-                                quote_id: fill.quote_id,
-                                price: fill.price,
-                                size: fill.size,
-                                side: fill.side,
-                                symbol: symbol.clone(),
-                            })
-                            .await;
-                    }
+                } else {
+                    // Still call on_market_event so FillSim internal state advances.
+                    let _ = fill_sim.on_market_event(&event, ts);
                 }
                 events_processed += 1;
 
@@ -325,6 +357,29 @@ where
                         warn!("snapshot write failed: {}", e);
                     }
                 }
+            }
+            // Live mode: process real exchange fills.
+            // When external_fills is None this arm always returns Poll::Pending
+            // (the future never resolves), so it never fires in paper mode.
+            fill = async {
+                match external_fills.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(fill) = fill else {
+                    info!("external fill channel closed");
+                    break;
+                };
+                apply_fill(
+                    fill,
+                    &mut tracker,
+                    &mut risk_gate,
+                    &mut fills_emitted,
+                    alert_sink.as_deref(),
+                    &symbol,
+                )
+                .await;
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -372,6 +427,38 @@ where
         "paper runner done"
     );
     report
+}
+
+/// Apply a fill to the tracker, update the risk gate, emit alerts.
+///
+/// Shared by paper mode (FillSim-synthesized fills) and live mode (external
+/// venue fills). Keeping this as a standalone async fn avoids code duplication
+/// in the two `select!` arms.
+async fn apply_fill(
+    fill: Fill,
+    tracker: &mut PositionTracker,
+    risk_gate: &mut Option<Box<dyn RiskGate>>,
+    fills_emitted: &mut u64,
+    alert_sink: Option<&dyn AlertSink>,
+    symbol: &Symbol,
+) {
+    info!(price = %fill.price.0, size = %fill.size.0, side = ?fill.side, "fill");
+    tracker.apply(&fill);
+    if let Some(gate) = risk_gate.as_mut() {
+        gate.record_fill(fill.ts);
+    }
+    *fills_emitted += 1;
+    if let Some(sink) = alert_sink {
+        let _ = sink
+            .send(Alert::Fill {
+                quote_id: fill.quote_id,
+                price: fill.price,
+                size: fill.size,
+                side: fill.side,
+                symbol: symbol.clone(),
+            })
+            .await;
+    }
 }
 
 fn finalize(
@@ -681,6 +768,7 @@ mod tests {
             Some(prior),
             None,
             None,
+            None, // no external fills (paper mode)
         )
         .await;
         assert_eq!(report.realized.0, Decimal::from(5));
@@ -719,6 +807,7 @@ mod tests {
             Some(prior),
             None,
             None,
+            None, // no external fills (paper mode)
         )
         .await;
     }

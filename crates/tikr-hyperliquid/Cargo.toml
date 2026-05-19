@@ -25,6 +25,28 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 uuid = "1"
+# EIP-712 signing for Hyperliquid /exchange actions (Phase 5).
+# alloy-signer-local: PrivateKeySigner (secp256k1 ECDSA).
+# alloy-primitives: B256, Address, keccak256 (with serde feature for hex round-trips).
+# alloy-dyn-abi: runtime EIP-712 typed-data encoding (dynamic types for Agent struct).
+# rmp-serde: msgpack serialization required by Hyperliquid action_hash construction.
+alloy-signer = "2"
+alloy-signer-local = "2"
+alloy-primitives = { version = "1", features = ["serde"] }
+rmp-serde = "1"
+hex = "0.4"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tikr-paper = "0.1"
+tikr-strategy = "0.1"
+tikr-risk = "0.1"
+tikr-backtest = "0.1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util", "signal"] }
+
+[[example]]
+name = "run_live"
+path = "examples/run_live.rs"

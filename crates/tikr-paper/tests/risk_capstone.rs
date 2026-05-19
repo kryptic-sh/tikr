@@ -328,6 +328,7 @@ async fn risk_resume_alerting_capstone() {
         None,
         Some(risk_gate1),
         Some(alert_sink1),
+        None, // no external fills (paper mode)
     )
     .await;
 
@@ -389,6 +390,7 @@ async fn risk_resume_alerting_capstone() {
         Some(report_phase1.clone()), // RESUME from Phase 1
         Some(risk_gate2),
         Some(alert_sink2),
+        None, // no external fills (paper mode)
     )
     .await;
 
@@ -451,6 +453,7 @@ async fn risk_resume_alerting_capstone() {
         Some(report_phase3.clone()),
         Some(Box::new(risk_gate3)),
         Some(alert_sink3),
+        None, // no external fills (paper mode)
     )
     .await;
 

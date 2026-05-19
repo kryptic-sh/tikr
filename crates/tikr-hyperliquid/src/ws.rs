@@ -1,4 +1,4 @@
-//! WebSocket subscription pump for Hyperliquid market data.
+//! WebSocket subscription pump for Hyperliquid market data + user events.
 //!
 //! [`subscribe_stream`] performs a synchronous connect + subscribe + first-data
 //! handshake (so callers see errors at startup), then spawns a background task
@@ -7,22 +7,29 @@
 //! `Ping` frames, synthesizes heartbeats at a configurable cadence, and
 //! reconnects with exponential backoff on disconnect.
 //!
+//! [`subscribe_user_events`] opens a *separate* WS connection to the same
+//! endpoint and subscribes to `userEvents` for the given user address. Each
+//! fill that arrives on the socket is parsed and sent through an
+//! `mpsc::UnboundedSender<Fill>`. Reconnect logic mirrors the market-data pump.
+//!
 //! The returned `BoxStream` ends when the receiver is dropped (cooperative
 //! shutdown via `tx.send().is_err()`).
 
 use crate::HyperliquidConfig;
 use crate::HyperliquidEnv;
+use crate::exchange::{UserEventFill, fill_from_user_event};
 use crate::mapping::*;
 use crate::messages::*;
 use futures::SinkExt;
 use futures::stream::{BoxStream, StreamExt};
+use serde::Deserialize;
 use std::time::Duration;
-use tikr_core::{MarketEvent, Symbol, Timestamp};
+use tikr_core::{Fill, MarketEvent, Symbol, Timestamp};
 use tikr_venue::VenueError;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -259,4 +266,190 @@ fn now_ns() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// userEvents subscription
+// ---------------------------------------------------------------------------
+
+/// Hyperliquid `userEvents` WS push — `fills` array payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserEventsData {
+    /// Fill events in this push.
+    #[serde(default)]
+    pub fills: Vec<UserEventFill>,
+}
+
+/// `userEvents` channel envelope.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "channel", content = "data")]
+enum UserEventsMsg {
+    /// `userEvents` channel push.
+    #[serde(rename = "userEvents")]
+    UserEvents(UserEventsData),
+    /// Subscription acknowledgement or other channels — ignored.
+    #[serde(other, deserialize_with = "deserialize_ignore_user_events_any")]
+    Other,
+}
+
+fn deserialize_ignore_user_events_any<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| ())
+}
+
+/// Subscribe to the `userEvents` channel for `user_address`.
+///
+/// Spawns a background task that maintains the WS connection (reconnect +
+/// heartbeat handling mirrors the market-data pump). Each `Fill` parsed from
+/// the `fills` array is sent through the returned `UnboundedReceiver<Fill>`.
+///
+/// The task terminates cooperatively when the receiver is dropped.
+pub async fn subscribe_user_events(
+    config: HyperliquidConfig,
+    user_address: String,
+) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
+    let ws_url = ws_url_for(config.env).to_string();
+
+    let stream = open_and_subscribe_user_events(&ws_url, &user_address).await?;
+
+    let (tx, rx) = mpsc::unbounded_channel::<Fill>();
+    tokio::spawn(user_events_pump(stream, tx, ws_url, user_address, config));
+
+    Ok(rx)
+}
+
+async fn open_and_subscribe_user_events(
+    ws_url: &str,
+    user_address: &str,
+) -> Result<WsStream, VenueError> {
+    let (mut stream, _resp) = connect_async(ws_url).await.map_err(ws_to_network_err)?;
+    let msg = serde_json::json!({
+        "method": "subscribe",
+        "subscription": { "type": "userEvents", "user": user_address }
+    });
+    stream
+        .send(Message::Text(msg.to_string()))
+        .await
+        .map_err(ws_to_network_err)?;
+    Ok(stream)
+}
+
+async fn user_events_pump(
+    mut stream: WsStream,
+    tx: mpsc::UnboundedSender<Fill>,
+    ws_url: String,
+    user_address: String,
+    config: HyperliquidConfig,
+) {
+    let mut backoff_ms = config.reconnect_min_backoff_ms.max(1);
+
+    loop {
+        let frame = stream.next().await;
+        match frame {
+            None => {
+                // Stream ended; reconnect.
+                if !reconnect_user_events(
+                    &mut stream,
+                    &ws_url,
+                    &user_address,
+                    &mut backoff_ms,
+                    &config,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Some(Err(e)) => {
+                warn!(error = %e, "userEvents WS read error; reconnecting");
+                if !reconnect_user_events(
+                    &mut stream,
+                    &ws_url,
+                    &user_address,
+                    &mut backoff_ms,
+                    &config,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Some(Ok(Message::Text(txt))) => {
+                backoff_ms = config.reconnect_min_backoff_ms.max(1);
+                let msg: UserEventsMsg = match serde_json::from_str(&txt) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(error = %e, "userEvents WS: failed to parse frame");
+                        continue;
+                    }
+                };
+                if let UserEventsMsg::UserEvents(data) = msg {
+                    for raw_fill in &data.fills {
+                        let fill = fill_from_user_event("", raw_fill);
+                        info!(
+                            oid = raw_fill.oid,
+                            price = %raw_fill.px,
+                            size = %raw_fill.sz,
+                            side = %raw_fill.side,
+                            "userEvents fill"
+                        );
+                        if tx.send(fill).is_err() {
+                            // Receiver dropped; exit.
+                            return;
+                        }
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(p))) => {
+                let _ = stream.send(Message::Pong(p)).await;
+            }
+            Some(Ok(Message::Close(_))) => {
+                debug!("userEvents WS server-initiated close; reconnecting");
+                if !reconnect_user_events(
+                    &mut stream,
+                    &ws_url,
+                    &user_address,
+                    &mut backoff_ms,
+                    &config,
+                )
+                .await
+                {
+                    return;
+                }
+            }
+            Some(Ok(_)) => {
+                // Binary / Pong / Frame -- ignore.
+            }
+        }
+    }
+}
+
+async fn reconnect_user_events(
+    stream: &mut WsStream,
+    ws_url: &str,
+    user_address: &str,
+    backoff_ms: &mut u64,
+    config: &HyperliquidConfig,
+) -> bool {
+    loop {
+        warn!(
+            backoff_ms = *backoff_ms,
+            "userEvents WS disconnected; reconnecting"
+        );
+        tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
+        match open_and_subscribe_user_events(ws_url, user_address).await {
+            Ok(new_stream) => {
+                *stream = new_stream;
+                *backoff_ms = config.reconnect_min_backoff_ms.max(1);
+                return true;
+            }
+            Err(e) => {
+                warn!(error = ?e, "userEvents WS reconnect failed");
+                *backoff_ms = (*backoff_ms)
+                    .saturating_mul(2)
+                    .min(config.reconnect_max_backoff_ms.max(1));
+            }
+        }
+    }
 }
