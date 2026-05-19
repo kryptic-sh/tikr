@@ -28,8 +28,8 @@ uuid = "1"
 # EIP-712 signing for Hyperliquid /exchange actions (Phase 5).
 # alloy-signer-local: PrivateKeySigner (secp256k1 ECDSA).
 # alloy-primitives: B256, Address, keccak256 (with serde feature for hex round-trips).
-# alloy-dyn-abi: runtime EIP-712 typed-data encoding (dynamic types for Agent struct).
 # rmp-serde: msgpack serialization required by Hyperliquid action_hash construction.
+# EIP-712 struct encoding is done manually (see exchange::sign_agent_eip712).
 alloy-signer = "2"
 alloy-signer-local = "2"
 alloy-primitives = { version = "1", features = ["serde"] }

@@ -168,16 +168,24 @@ impl ExchangeClient {
 
     /// Fetch the next nonce (epoch-ms, strictly increasing).
     fn next_nonce(&self) -> u64 {
-        // Use the max of the wall clock and the last emitted value + 1 to
-        // ensure strict monotonicity even if clock resolution is coarse.
+        // CAS loop: concurrent callers must not collide on the same nonce.
+        // Wall clock seeds the floor; `prev + 1` enforces strict monotonicity
+        // even when clock resolution is coarse.
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let prev = self.nonce.load(Ordering::Relaxed);
-        let next = now_ms.max(prev + 1);
-        self.nonce.store(next, Ordering::Relaxed);
-        next
+        loop {
+            let prev = self.nonce.load(Ordering::Relaxed);
+            let next = now_ms.max(prev + 1);
+            if self
+                .nonce
+                .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return next;
+            }
+        }
     }
 
     /// Look up the `asset` integer index for a coin name.
@@ -795,7 +803,13 @@ pub fn fill_from_user_event(_coin: &str, f: &UserEventFill) -> Fill {
 
 fn parse_decimal_str(s: &str) -> Decimal {
     use std::str::FromStr;
-    Decimal::from_str(s).unwrap_or(Decimal::ZERO)
+    match Decimal::from_str(s) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(value = %s, error = %e, "userEvents: failed to parse decimal — defaulting to 0");
+            Decimal::ZERO
+        }
+    }
 }
 
 /// Fill shape from `userEvents` WS channel.
