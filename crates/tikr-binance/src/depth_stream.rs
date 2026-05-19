@@ -38,13 +38,17 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 // ---------------------------------------------------------------------------
 
 /// Binance depth update JSON shape (`@depth20@100ms`).
+///
+/// Spot uses `"bids"` / `"asks"` field names. USD-M Futures uses `"b"` / `"a"`
+/// (and adds event-type metadata like `e`, `E`, `T`, `s`, `U`, `u`, `pu`).
+/// Accept both via serde alias; ignore the futures metadata fields.
 #[derive(Debug, Deserialize)]
 pub struct DepthUpdate {
     /// Bid price levels `[price, size]`.
-    #[serde(rename = "bids")]
+    #[serde(rename = "bids", alias = "b")]
     pub bids: Vec<[String; 2]>,
     /// Ask price levels `[price, size]`.
-    #[serde(rename = "asks")]
+    #[serde(rename = "asks", alias = "a")]
     pub asks: Vec<[String; 2]>,
 }
 
@@ -299,5 +303,33 @@ mod tests {
     #[test]
     fn parse_depth_frame_returns_none_on_garbage() {
         assert!(parse_depth_frame("not json", &test_symbol()).is_none());
+    }
+
+    /// Regression: USD-M Futures depth WS emits `"b"` / `"a"` (with event-type
+    /// metadata fields like `e`, `E`, `T`, `s`, `U`, `u`, `pu`) — not
+    /// `"bids"` / `"asks"` like Spot. Verified live against testnet
+    /// `wss://stream.binancefuture.com/ws/btcusdt@depth20@100ms` 2026-05-19.
+    /// Without the alias, the strategy never sees any market data on Futures.
+    #[test]
+    fn futures_depth_frame_uses_short_bid_ask_keys() {
+        let txt = r#"{
+            "e": "depthUpdate",
+            "E": 1716130000000,
+            "T": 1716129999999,
+            "s": "BTCUSDT",
+            "U": 1,
+            "u": 5,
+            "pu": 0,
+            "b": [["66000.00","1.234"], ["65999.50","0.500"]],
+            "a": [["66001.00","2.000"]]
+        }"#;
+        let event = parse_depth_frame(txt, &test_symbol()).expect("futures frame parses");
+        let MarketEvent::BookUpdate { snapshot } = event else {
+            panic!("expected BookUpdate");
+        };
+        assert_eq!(snapshot.bids.len(), 2, "two bids from `b` field");
+        assert_eq!(snapshot.asks.len(), 1, "one ask from `a` field");
+        assert_eq!(snapshot.bids[0].price.0.to_string(), "66000.00");
+        assert_eq!(snapshot.asks[0].price.0.to_string(), "66001.00");
     }
 }
