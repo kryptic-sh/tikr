@@ -267,6 +267,7 @@ impl Venue for DodoClient {
     ///
     /// Requires `DodoConfig::chainlink_feed_addr` to be set.
     async fn subscribe(&self, symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
+        use alloy_provider::{ProviderBuilder, WsConnect};
         use futures::stream;
         use tokio::time::interval;
 
@@ -275,13 +276,22 @@ impl Venue for DodoClient {
         let spread_bps = self.config.spread_bps;
         let poll_interval = self.config.price_poll_interval_secs;
 
+        // Construct the WS provider ONCE before the poll loop. Reconnecting per
+        // tick (e.g. every 5s) burns ~720 connections/hour against public BSC
+        // nodes — they rate-limit WS handshakes hard. Re-use the connection.
+        let ws = WsConnect::new(&feed.rpc_ws_url);
+        let provider = ProviderBuilder::new()
+            .connect_ws(ws)
+            .await
+            .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MarketEvent>();
 
         tokio::spawn(async move {
             let mut ticker = interval(std::time::Duration::from_secs(poll_interval.max(1)));
             loop {
                 ticker.tick().await;
-                match feed.read_latest_price().await {
+                match feed.read_latest_price_with_provider(&provider).await {
                     Ok((raw_answer, _)) => {
                         let mid = raw_answer / Decimal::from(10u64.pow(8));
                         let ts = now_timestamp();
