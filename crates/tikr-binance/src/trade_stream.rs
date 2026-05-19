@@ -57,15 +57,21 @@ pub async fn subscribe_trades(
     Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
 }
 
-/// Build the aggTrade WS URL.
+/// Build the trade-stream WS URL.
+///
+/// Spot uses `@aggTrade` (the canonical aggregated trade stream).
+/// **Futures uses `@trade`** — verified 2026-05-19 that `@aggTrade` on
+/// `fstream.binance.com` connects but emits nothing for BTC for 13+ minutes
+/// while `@trade` fires immediately. Frame field shapes (`p`, `q`, `T`, `m`)
+/// match for both, so the same parser handles both.
 pub fn trade_ws_url(env: BinanceEnv, sym_lower: &str) -> String {
-    let base = match env {
-        BinanceEnv::SpotTestnet => "wss://stream.testnet.binance.vision:9443/ws",
-        BinanceEnv::SpotMainnet => "wss://stream.binance.com:9443/ws",
-        BinanceEnv::FuturesTestnet => "wss://stream.binancefuture.com/ws",
-        BinanceEnv::FuturesMainnet => "wss://fstream.binance.com/ws",
+    let (base, stream) = match env {
+        BinanceEnv::SpotTestnet => ("wss://stream.testnet.binance.vision:9443/ws", "aggTrade"),
+        BinanceEnv::SpotMainnet => ("wss://stream.binance.com:9443/ws", "aggTrade"),
+        BinanceEnv::FuturesTestnet => ("wss://stream.binancefuture.com/ws", "trade"),
+        BinanceEnv::FuturesMainnet => ("wss://fstream.binance.com/ws", "trade"),
     };
-    format!("{base}/{sym_lower}@aggTrade")
+    format!("{base}/{sym_lower}@{stream}")
 }
 
 async fn open_ws(ws_url: &str) -> Result<WsStream, VenueError> {
@@ -179,10 +185,18 @@ mod tests {
     }
 
     #[test]
-    fn trade_url_futures_mainnet() {
+    fn trade_url_futures_mainnet_uses_trade_not_aggtrade() {
         assert_eq!(
             trade_ws_url(BinanceEnv::FuturesMainnet, "btcusdt"),
-            "wss://fstream.binance.com/ws/btcusdt@aggTrade"
+            "wss://fstream.binance.com/ws/btcusdt@trade"
+        );
+    }
+
+    #[test]
+    fn trade_url_spot_mainnet_uses_aggtrade() {
+        assert_eq!(
+            trade_ws_url(BinanceEnv::SpotMainnet, "btcusdt"),
+            "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
         );
     }
 
