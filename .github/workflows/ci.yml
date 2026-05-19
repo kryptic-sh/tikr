@@ -21,8 +21,26 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
+  warning:
+    name: financial-risk warning present
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # Sentinels are stable phrases unique to the warning block. Any
+      # rewording must keep them. Fail-fast: all downstream jobs depend on
+      # this so a stripped warning blocks fmt/clippy/test/etc.
+      - name: README has financial-risk warning
+        run: grep -F 'READ THIS FIRST — FINANCIAL RISK WARNING' README.md
+      - name: README has user-liability clause
+        run: grep -F 'You are 100% responsible' README.md
+      - name: LICENSE has financial-risk warning
+        run: grep -F 'FINANCIAL RISK WARNING — READ FIRST' LICENSE
+      - name: LICENSE has user-liability clause
+        run: grep -F 'YOU ARE 100% RESPONSIBLE' LICENSE
+
   fmt:
     name: cargo fmt --check
+    needs: warning
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -38,6 +56,7 @@ jobs:
 
   clippy:
     name: cargo clippy (${{ matrix.os }})
+    needs: warning
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +77,7 @@ jobs:
 
   test:
     name: cargo test (${{ matrix.os }})
+    needs: warning
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +101,7 @@ jobs:
 
   deny:
     name: cargo-deny
+    needs: warning
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -90,6 +111,7 @@ jobs:
 
   machete:
     name: cargo-machete
+    needs: warning
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
