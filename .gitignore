@@ -11,3 +11,4 @@ keys/
 *.pem
 state/
 paper_state/
+logs/

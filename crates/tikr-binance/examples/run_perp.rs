@@ -60,7 +60,7 @@ use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
-    NaiveGridConfig, Strategy,
+    NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tokio::signal;
 use tokio::sync::watch;
@@ -89,6 +89,9 @@ enum StrategyArg {
     /// GLFT (Guéant-Lehalle-Fernandez-Tapia, 2013) — infinite-horizon variant.
     #[value(name = "glft")]
     Glft,
+    /// TopOfBook — join or improve at best bid/ask. Post-only safe.
+    #[value(name = "top-of-book", alias = "tob")]
+    TopOfBook,
 }
 
 #[derive(Parser, Debug)]
@@ -147,6 +150,17 @@ struct Args {
     /// formula that required per-asset γ/k retuning.
     #[arg(long, default_value = "5")]
     spread_bps: u32,
+
+    /// TopOfBook: venue tick size (price increment). 0.1 for Binance Futures
+    /// BTCUSDT/ETHUSDT, 0.01 for spot BTCUSDT.
+    #[arg(long, default_value = "0.1")]
+    tick_size: String,
+
+    /// TopOfBook: improve (post inside the book by 1 tick) when the current
+    /// book spread is strictly greater than this many ticks. Set high
+    /// (e.g. 1000000) to always join, set 0 to always improve.
+    #[arg(long, default_value_t = 1u32)]
+    improve_when_spread_gt_ticks: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -298,12 +312,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // impl and hands it to run_with_resume.
     let report = match args.strategy {
         StrategyArg::NaiveGrid => {
-            // 5bps/side = 10bps round trip; ~6bps margin over 2bps maker fee.
-            // Verified profitable on Binance Futures testnet 2026-05-19:
-            // 3-min run, 14 fills, net +$0.36.
+            // 2bps/side = 4bps round trip. Tight for testnet smoke; bump for
+            // live capital where 2bps maker fee eats the spread.
             let strategy = NaiveGrid::new(NaiveGridConfig {
                 levels_per_side: 1,
-                base_spread_bps: 5,
+                base_spread_bps: 2,
                 level_step_bps: 1,
                 size_per_quote,
                 min_requote_interval_ms: 5000,
@@ -364,6 +377,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     half_life_sec: 60.0,
                     initial_var: Decimal::from_str("0.000001").unwrap(),
                 },
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::TopOfBook => {
+            let strategy = TopOfBook::new(TopOfBookConfig {
+                size_per_quote,
+                tick_size: Decimal::from_str(&args.tick_size)
+                    .map_err(|e| format!("--tick-size '{}' invalid: {}", args.tick_size, e))?,
+                improve_when_spread_gt_ticks: args.improve_when_spread_gt_ticks,
+                min_requote_interval_ms: 1000,
             });
             run_with_resume(
                 venue,

@@ -31,10 +31,12 @@
 
 pub mod avellaneda_stoikov;
 pub mod glft;
+pub mod top_of_book;
 pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
 pub use glft::{Glft, GlftConfig};
+pub use top_of_book::{TopOfBook, TopOfBookConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
 
 use tikr_core::{
