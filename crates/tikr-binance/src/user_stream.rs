@@ -143,6 +143,13 @@ fn ws_base_url(env: BinanceEnv) -> &'static str {
 /// Spawns a WS task and a keepalive task. Returns an
 /// `mpsc::UnboundedReceiver<Fill>` that the caller polls.
 ///
+/// `symbol_filter` is the Binance symbol string (e.g. `"BTCUSDT"`).
+/// Only fills whose `s` (spot) or `o.s` (futures) field matches this
+/// string are forwarded — critical when multiple `tikr-binance`
+/// processes run against the same account, since Binance returns the
+/// SAME `listenKey` per account and all processes share one event
+/// stream. Without symbol filtering, fills bleed across processes.
+///
 /// On WS reconnect a **fresh** listenKey is minted (not reused).
 /// The keepalive task fires a PUT every [`KEEPALIVE_INTERVAL_MS`] ms.
 pub async fn subscribe_user_data_stream(
@@ -150,6 +157,7 @@ pub async fn subscribe_user_data_stream(
     env: BinanceEnv,
     api_key: String,
     kind: MarketKind,
+    symbol_filter: String,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     let listen_key = mint_listen_key(&http, env, &api_key).await?;
     let ws_url = format!("{}/{}", ws_base_url(env), listen_key);
@@ -182,7 +190,14 @@ pub async fn subscribe_user_data_stream(
 
     // WS pump task.
     tokio::spawn(user_data_pump(
-        stream, tx, http, env, api_key, kind, shared_key,
+        stream,
+        tx,
+        http,
+        env,
+        api_key,
+        kind,
+        shared_key,
+        symbol_filter,
     ));
 
     Ok(rx)
@@ -195,6 +210,7 @@ async fn open_user_data_ws(ws_url: &str) -> Result<WsStream, VenueError> {
     Ok(stream)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn user_data_pump(
     mut stream: WsStream,
     tx: mpsc::UnboundedSender<Fill>,
@@ -203,6 +219,7 @@ async fn user_data_pump(
     api_key: String,
     kind: MarketKind,
     shared_key: Arc<Mutex<String>>,
+    symbol_filter: String,
 ) {
     let reconnect_min_ms: u64 = 1_000;
     let reconnect_max_ms: u64 = 30_000;
@@ -250,7 +267,7 @@ async fn user_data_pump(
                 // operators can confirm the channel is alive even when
                 // no fills are happening (only fills surface at info level).
                 debug!(bytes = txt.len(), "userDataStream: frame received");
-                if let Some(fill) = parse_user_data_message(&txt, kind) {
+                if let Some(fill) = parse_user_data_message(&txt, kind, &symbol_filter) {
                     info!(
                         quote_id = ?fill.quote_id,
                         price = %fill.price.0,
@@ -340,13 +357,18 @@ async fn reconnect_user_data(
 
 /// Parse a userDataStream text frame into a [`Fill`], if applicable.
 ///
-/// Spot: `executionReport` with `x=FILL`.
-/// Futures: `ORDER_TRADE_UPDATE` with `.o.X=FILLED`.
-pub fn parse_user_data_message(txt: &str, kind: MarketKind) -> Option<Fill> {
+/// `symbol_filter` is the Binance symbol string (e.g. `"BTCUSDT"`).
+/// Returns `None` if the frame's symbol field doesn't match — necessary
+/// because Binance returns ONE listenKey per account so multi-process
+/// runs against the same account share an event stream.
+///
+/// Spot: `executionReport` with `x=FILL` and `s=<symbol>`.
+/// Futures: `ORDER_TRADE_UPDATE` with `.o.X=FILLED` and `.o.s=<symbol>`.
+pub fn parse_user_data_message(txt: &str, kind: MarketKind, symbol_filter: &str) -> Option<Fill> {
     let v: serde_json::Value = serde_json::from_str(txt).ok()?;
     match kind {
-        MarketKind::Spot => parse_execution_report(&v),
-        MarketKind::Perp => parse_order_trade_update(&v),
+        MarketKind::Spot => parse_execution_report(&v, symbol_filter),
+        MarketKind::Perp => parse_order_trade_update(&v, symbol_filter),
     }
 }
 
@@ -396,9 +418,14 @@ pub struct ExecutionReport {
     pub transaction_time: u64,
 }
 
-fn parse_execution_report(v: &serde_json::Value) -> Option<Fill> {
+fn parse_execution_report(v: &serde_json::Value, symbol_filter: &str) -> Option<Fill> {
     let event_type = v.get("e").and_then(serde_json::Value::as_str)?;
     if event_type != "executionReport" {
+        return None;
+    }
+    // Symbol filter: skip fills for other symbols on the same account.
+    let frame_symbol = v.get("s").and_then(serde_json::Value::as_str)?;
+    if frame_symbol != symbol_filter {
         return None;
     }
     let exec_type = v.get("x").and_then(serde_json::Value::as_str)?;
@@ -447,13 +474,19 @@ fn parse_execution_report(v: &serde_json::Value) -> Option<Fill> {
 // Futures: ORDER_TRADE_UPDATE
 // ---------------------------------------------------------------------------
 
-fn parse_order_trade_update(v: &serde_json::Value) -> Option<Fill> {
+fn parse_order_trade_update(v: &serde_json::Value, symbol_filter: &str) -> Option<Fill> {
     let event_type = v.get("e").and_then(serde_json::Value::as_str)?;
     if event_type != "ORDER_TRADE_UPDATE" {
         return None;
     }
 
     let o = v.get("o")?;
+
+    // Symbol filter: skip fills for other symbols on the same account.
+    let frame_symbol = o.get("s").and_then(serde_json::Value::as_str)?;
+    if frame_symbol != symbol_filter {
+        return None;
+    }
 
     // Only process FILLED status.
     let status = o.get("X").and_then(serde_json::Value::as_str)?;
@@ -593,7 +626,7 @@ mod tests {
 
     #[test]
     fn parse_execution_report_to_fill_spot() {
-        let fill = parse_user_data_message(spot_fill_report(), MarketKind::Spot)
+        let fill = parse_user_data_message(spot_fill_report(), MarketKind::Spot, "BTCUSDT")
             .expect("should parse spot executionReport");
 
         assert_eq!(fill.price.0, Decimal::from_str("30000.00").unwrap());
@@ -607,7 +640,7 @@ mod tests {
 
     #[test]
     fn parse_order_trade_update_to_fill_futures() {
-        let fill = parse_user_data_message(futures_fill_report(), MarketKind::Perp)
+        let fill = parse_user_data_message(futures_fill_report(), MarketKind::Perp, "BTCUSDT")
             .expect("should parse futures ORDER_TRADE_UPDATE");
 
         assert_eq!(fill.price.0, Decimal::from_str("31000.00").unwrap());
@@ -627,9 +660,8 @@ mod tests {
     #[test]
     fn non_fill_execution_report_ignored() {
         // "x": "NEW" should not produce a fill.
-        let msg =
-            r#"{"e":"executionReport","x":"NEW","i":999,"S":"BUY","L":"0","l":"0","n":"0","T":0}"#;
-        let result = parse_user_data_message(msg, MarketKind::Spot);
+        let msg = r#"{"e":"executionReport","s":"BTCUSDT","x":"NEW","i":999,"S":"BUY","L":"0","l":"0","n":"0","T":0}"#;
+        let result = parse_user_data_message(msg, MarketKind::Spot, "BTCUSDT");
         assert!(
             result.is_none(),
             "NEW execution type must not produce a fill"
@@ -640,7 +672,33 @@ mod tests {
     fn non_order_event_ignored() {
         // Spot balance update event should not produce a fill.
         let msg = r#"{"e":"outboundAccountPosition","E":1234567890}"#;
-        let result = parse_user_data_message(msg, MarketKind::Spot);
+        let result = parse_user_data_message(msg, MarketKind::Spot, "BTCUSDT");
         assert!(result.is_none());
+    }
+
+    /// Regression: spot fill for SOLUSDT must NOT produce a Fill when the
+    /// process is filtering on BTCUSDT (multi-process listenKey-sharing case).
+    #[test]
+    fn spot_fill_other_symbol_filtered_out() {
+        let mut msg = spot_fill_report().to_string();
+        // Replace the symbol in the fixture.
+        msg = msg.replace("\"s\": \"BTCUSDT\"", "\"s\": \"SOLUSDT\"");
+        let result = parse_user_data_message(&msg, MarketKind::Spot, "BTCUSDT");
+        assert!(
+            result.is_none(),
+            "spot fill for SOLUSDT must not pass BTCUSDT filter"
+        );
+    }
+
+    /// Same regression for futures.
+    #[test]
+    fn futures_fill_other_symbol_filtered_out() {
+        let mut msg = futures_fill_report().to_string();
+        msg = msg.replace("\"s\": \"BTCUSDT\"", "\"s\": \"ETHUSDT\"");
+        let result = parse_user_data_message(&msg, MarketKind::Perp, "BTCUSDT");
+        assert!(
+            result.is_none(),
+            "futures fill for ETHUSDT must not pass BTCUSDT filter"
+        );
     }
 }

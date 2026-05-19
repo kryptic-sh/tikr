@@ -203,12 +203,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(venue = ?venue, "BinanceClient ready");
 
     // Subscribe to userDataStream for fills (separate HttpClient — cheap).
+    // Pass the Binance symbol string so fills for OTHER symbols on the same
+    // account are filtered out (matters when multiple processes share one
+    // account; Binance issues ONE listenKey per account).
     let http_for_user_stream = HttpClient::new();
+    let symbol_for_filter =
+        format!("{}{}", symbol.base.0.as_ref(), symbol.quote.0.as_ref()).to_uppercase();
     let fill_rx = subscribe_user_data_stream(
         http_for_user_stream,
         env,
         api_key_for_user_stream,
         MarketKind::Perp,
+        symbol_for_filter,
     )
     .await?;
     info!("userDataStream listenKey minted; subscribed to fills");
