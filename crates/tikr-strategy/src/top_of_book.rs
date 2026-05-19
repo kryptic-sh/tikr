@@ -125,8 +125,12 @@ impl TopOfBook {
         }
         let max_ticks = Decimal::from(self.config.max_skew_ticks);
         // Linear scale: at |pos| == unit → max ticks; saturate beyond.
+        // Floor to an integer tick count so the final price stays tick-aligned
+        // (Binance silently truncates fractional prices, breaking the audit
+        // trail — best_bid/best_ask are tick-aligned, the shift must be too).
         let ratio = (pos.abs() / unit).min(Decimal::from(1));
-        let magnitude = ratio * max_ticks * self.config.tick_size;
+        let ticks_shifted = (ratio * max_ticks).floor();
+        let magnitude = ticks_shifted * self.config.tick_size;
         if pos > Decimal::ZERO {
             -magnitude
         } else {
@@ -540,6 +544,41 @@ mod tests {
         // Pure improve: bid=101, ask=109.
         assert_eq!(bid.price.0, Decimal::from(101));
         assert_eq!(ask.price.0, Decimal::from(109));
+    }
+
+    /// Regression: fractional position/unit ratios must produce tick-aligned
+    /// skewed prices, not e.g. 76789.4666... that Binance silently truncates.
+    #[test]
+    fn skew_prices_stay_tick_aligned() {
+        let s = sym();
+        // position = 2, unit = 3 → ratio = 0.666..., max_ticks = 20.
+        // ratio * max_ticks = 13.333... → floor = 13 ticks shift.
+        let p = pos_with(&s, Decimal::from(2));
+        let b = book(&s, 100, 200, 0); // spread = 100 ticks (improve mode)
+        let ctx = StrategyContext {
+            symbol: &s,
+            now: Timestamp(0),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &b,
+            open_quotes: &[],
+        };
+        // tick = 1, base improve: bid=101, ask=199. Skew = -13.
+        let mut tob = TopOfBook::new(cfg_skew(1, 20, Decimal::from(3)));
+        let actions = tob.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+        let Action::Quote(bid) = &actions[1] else {
+            panic!("expected bid")
+        };
+        let Action::Quote(ask) = &actions[2] else {
+            panic!("expected ask")
+        };
+        assert_eq!(bid.price.0, Decimal::from(88), "bid must be tick-aligned");
+        assert_eq!(ask.price.0, Decimal::from(186), "ask must be tick-aligned");
     }
 
     #[test]
