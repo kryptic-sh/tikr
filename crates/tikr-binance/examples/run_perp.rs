@@ -207,12 +207,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // NaiveGrid: 1 level per side, 2bps spread (tight for testnet smoke —
-    // typical BTCUSDT touch is ~1-2bps; this provokes fills against natural
-    // market action). Tune higher for live capital.
+    // NaiveGrid: 1 level per side, 5bps per side (10bps round-trip spread).
+    //
+    // Profitability math (verified on Binance Futures testnet 2026-05-19):
+    // - maker fee ~2bps per fill → round-trip cost 4bps
+    // - 5bps × 2 sides = 10bps captured per round trip
+    // - net margin ~6bps before slippage
+    //
+    // Trade-off: fewer fills per minute than tight (2bps) spread but each
+    // round trip nets profit instead of losing to fees.
     let strategy = NaiveGrid::new(NaiveGridConfig {
         levels_per_side: 1,
-        base_spread_bps: 2,
+        base_spread_bps: 5,
         level_step_bps: 1,
         size_per_quote: Size(Decimal::from_str_exact("0.001").unwrap()),
         min_requote_interval_ms: 5000,
