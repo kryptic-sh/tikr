@@ -124,6 +124,13 @@ struct Args {
     /// Strategy to run.
     #[arg(long, value_enum, default_value = "naive-grid")]
     strategy: StrategyArg,
+
+    /// Order size per quote. Default 0.001 (works for BTCUSDT @ $76k).
+    /// ETHUSDT needs ≥ 0.01 (minNotional $20 / ~$2100 ETH); BNBUSDT
+    /// needs ≥ 0.01 (minQty). Other symbols vary — check
+    /// `/fapi/v1/exchangeInfo`.
+    #[arg(long, default_value = "0.001")]
+    size: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +235,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let size_per_quote = Size(Decimal::from_str("0.001").unwrap());
+    let size_per_quote = Size(
+        Decimal::from_str(&args.size)
+            .map_err(|e| format!("--size '{}' is not a valid decimal: {}", args.size, e))?,
+    );
     // FillSim required by the runner but discarded in live mode (external_fills set).
     let fill_sim = FillSim::new(FillSimConfig {
         submit_latency_ms: 0,
