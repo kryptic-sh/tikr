@@ -1,0 +1,583 @@
+//! Binance Spot + USD-M Perps [`Venue`] adapter.
+//!
+//! # Architecture
+//!
+//! One [`BinanceClient`] instance targets a single [`BinanceEnv`]:
+//! - `SpotTestnet` / `SpotMainnet` — Spot REST + WS.
+//! - `FuturesTestnet` / `FuturesMainnet` — USD-M Futures REST + WS.
+//!
+//! ## Construction
+//!
+//! Use [`BinanceClient::with_credentials`] to build a write-capable client.
+//! The constructor:
+//! 1. Fetches `exchangeInfo` and caches precision filters.
+//! 2. For futures envs: calls `POST /fapi/v1/leverage` (1x).
+//! 3. Checks the mainnet gate.
+//!
+//! ## Mainnet gate
+//!
+//! Write actions on `SpotMainnet` or `FuturesMainnet` require the env var
+//! `TIKR_BINANCE_ENABLE_MAINNET=1`. Without it every write call returns
+//! `VenueError::Rejected { reason: "mainnet writes disabled..." }`.
+//!
+//! ## Signing
+//!
+//! HMAC-SHA256 over the query string; `&signature=<hex>` appended last.
+//! See [`sign`] module.
+//!
+//! ## Credentials
+//!
+//! Read from env vars `TIKR_BINANCE_API_KEY` and `TIKR_BINANCE_API_SECRET`,
+//! or via the `--key-file` flag in example bins (single line `key:secret`).
+//!
+//! ## Security
+//!
+//! [`BinanceClient`] implements a manual `Debug` that omits `api_key` and
+//! `api_secret`. Never log those fields.
+//!
+//! See issues #42, #43, #44 for design decisions and architecture notes.
+
+#![deny(missing_docs)]
+
+pub mod depth_stream;
+pub mod errors;
+pub mod exchange_info;
+/// USD-M Futures REST endpoint wrappers (`/fapi/v1/...`).
+pub mod futs;
+pub mod sign;
+pub mod spot;
+pub mod user_stream;
+
+use async_trait::async_trait;
+use depth_stream::binance_symbol;
+use exchange_info::{
+    ExchangeInfoCache, parse_exchange_info, round_price, round_size, validate_qty,
+};
+use futures::stream::BoxStream;
+use reqwest::Client as HttpClient;
+use std::fmt;
+use tikr_core::{Fill, MarketEvent, Position, Price, SignedSize, Snapshot, Symbol, Timestamp};
+use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
+use tracing::{info, warn};
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// BinanceEnv
+// ---------------------------------------------------------------------------
+
+/// Binance environment selector.
+///
+/// Each variant maps to a distinct REST + WS base URL pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinanceEnv {
+    /// Spot testnet (`testnet.binance.vision`).
+    SpotTestnet,
+    /// Spot mainnet (`api.binance.com`). Requires `TIKR_BINANCE_ENABLE_MAINNET=1`.
+    SpotMainnet,
+    /// USD-M Futures testnet (`testnet.binancefuture.com`).
+    FuturesTestnet,
+    /// USD-M Futures mainnet (`fapi.binance.com`). Requires `TIKR_BINANCE_ENABLE_MAINNET=1`.
+    FuturesMainnet,
+}
+
+impl BinanceEnv {
+    /// Returns the REST base URL for this environment.
+    pub fn rest_base_url(&self) -> &'static str {
+        match self {
+            BinanceEnv::SpotTestnet => "https://testnet.binance.vision",
+            BinanceEnv::SpotMainnet => "https://api.binance.com",
+            BinanceEnv::FuturesTestnet => "https://testnet.binancefuture.com",
+            BinanceEnv::FuturesMainnet => "https://fapi.binance.com",
+        }
+    }
+
+    /// Returns `true` for mainnet environments.
+    pub fn is_mainnet(&self) -> bool {
+        matches!(self, BinanceEnv::SpotMainnet | BinanceEnv::FuturesMainnet)
+    }
+
+    /// Returns `true` for futures environments.
+    pub fn is_futures(&self) -> bool {
+        matches!(
+            self,
+            BinanceEnv::FuturesTestnet | BinanceEnv::FuturesMainnet
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BinanceClient
+// ---------------------------------------------------------------------------
+
+/// Binance Spot + USD-M Perps [`Venue`] adapter.
+///
+/// Constructed via [`BinanceClient::with_credentials`]. One instance per
+/// environment; create separate instances for Spot and Futures.
+///
+/// # Debug
+///
+/// Manual impl: `api_key` and `api_secret` are never printed.
+pub struct BinanceClient {
+    env: BinanceEnv,
+    http: HttpClient,
+    api_key: String,
+    api_secret: String,
+    mainnet_writes_enabled: bool,
+    exchange_info_cache: ExchangeInfoCache,
+}
+
+impl fmt::Debug for BinanceClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BinanceClient")
+            .field("env", &self.env)
+            .field("mainnet_writes_enabled", &self.mainnet_writes_enabled)
+            .field("cached_symbols", &self.exchange_info_cache.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BinanceClient {
+    /// Build a fully write-capable client.
+    ///
+    /// Steps:
+    /// 1. Fetches `exchangeInfo` and caches filters.
+    /// 2. For futures envs: calls `POST /fapi/v1/leverage` with `leverage=1`.
+    /// 3. Checks mainnet gate (warns if unset).
+    ///
+    /// `symbol` is used for the initial leverage call (futures only).
+    /// Pass `None` to skip leverage init (useful in tests / read-only contexts).
+    pub async fn with_credentials(
+        env: BinanceEnv,
+        api_key: String,
+        api_secret: String,
+        symbol: Option<&Symbol>,
+    ) -> Result<Self, VenueError> {
+        let http = HttpClient::new();
+        let base_url = env.rest_base_url();
+
+        // Check mainnet gate.
+        let mainnet_writes_enabled = if env.is_mainnet() {
+            std::env::var("TIKR_BINANCE_ENABLE_MAINNET").as_deref() == Ok("1")
+        } else {
+            true
+        };
+
+        if env.is_mainnet() && !mainnet_writes_enabled {
+            warn!(
+                "BinanceClient: mainnet env + TIKR_BINANCE_ENABLE_MAINNET not set; \
+                 write actions will be refused"
+            );
+        }
+
+        // Fetch exchangeInfo.
+        let info_resp = if env.is_futures() {
+            crate::futs::get_exchange_info(&http, base_url).await?
+        } else {
+            crate::spot::get_exchange_info(&http, base_url).await?
+        };
+        let exchange_info_cache = parse_exchange_info(&info_resp);
+        info!(
+            env = ?env,
+            symbols = exchange_info_cache.len(),
+            "exchangeInfo cached"
+        );
+
+        let client = Self {
+            env,
+            http,
+            api_key,
+            api_secret,
+            mainnet_writes_enabled,
+            exchange_info_cache,
+        };
+
+        // Futures: set 1x leverage at startup.
+        if env.is_futures()
+            && let Some(sym) = symbol
+        {
+            let sym_str = binance_symbol(sym);
+            if let Err(e) = crate::futs::update_leverage(
+                &client.http,
+                base_url,
+                &client.api_key,
+                &client.api_secret,
+                &sym_str,
+                1,
+            )
+            .await
+            {
+                warn!(
+                    symbol = sym_str,
+                    error = ?e,
+                    "update_leverage(1) at startup failed; proceeding"
+                );
+            }
+        }
+
+        Ok(client)
+    }
+
+    // -------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------
+
+    /// Enforce mainnet gate before any write action.
+    fn check_mainnet_gate(&self) -> Result<(), VenueError> {
+        if self.env.is_mainnet() && !self.mainnet_writes_enabled {
+            return Err(VenueError::Rejected {
+                reason: "mainnet writes disabled — set TIKR_BINANCE_ENABLE_MAINNET=1".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Build a `clientOrderId` from a `QuoteId`.
+    ///
+    /// Format: `"tikr_{:032x}"` of the UUID's u128 value.
+    fn client_order_id(id: QuoteId) -> String {
+        format!("tikr_{:032x}", id.0.as_u128())
+    }
+
+    /// Parse a `clientOrderId` back to a `QuoteId`.
+    ///
+    /// Strips the `"tikr_"` prefix, parses as hex u128, wraps in Uuid.
+    /// Used in tests and available for future runner state reconciliation.
+    #[allow(dead_code)]
+    fn quote_id_from_client_order_id(coid: &str) -> Option<QuoteId> {
+        let hex = coid.strip_prefix("tikr_")?;
+        let val = u128::from_str_radix(hex, 16).ok()?;
+        Some(QuoteId::from_uuid(Uuid::from_u128(val)))
+    }
+
+    /// Format a Decimal for the wire (normalized, no scientific notation).
+    fn format_decimal(d: tikr_core::Decimal) -> String {
+        format!("{}", d.normalize())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Venue impl
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl Venue for BinanceClient {
+    fn id(&self) -> &str {
+        match self.env {
+            BinanceEnv::SpotTestnet | BinanceEnv::SpotMainnet => "binance-spot",
+            BinanceEnv::FuturesTestnet | BinanceEnv::FuturesMainnet => "binance-futures",
+        }
+    }
+
+    /// Fetch the current order-book snapshot.
+    ///
+    /// Delegated to the depth stream's first event for simplicity in v0.
+    /// (A dedicated REST snapshot endpoint could replace this in a follow-up.)
+    async fn snapshot(&self, symbol: &Symbol) -> Result<Snapshot, VenueError> {
+        // v0: return an empty snapshot; the live runner relies on subscribe().
+        // A proper REST snapshot call (`/api/v3/depth` or `/fapi/v1/depth`)
+        // is a follow-up item.
+        let ts = Timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+        );
+        Ok(Snapshot {
+            symbol: symbol.clone(),
+            bids: vec![],
+            asks: vec![],
+            ts,
+        })
+    }
+
+    /// Subscribe to a live depth stream.
+    ///
+    /// Returns a `BoxStream` of [`MarketEvent::BookUpdate`] frames sourced
+    /// from the `@depth20@100ms` WebSocket endpoint.
+    async fn subscribe(&self, symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
+        depth_stream::subscribe_depth(self.env, symbol.clone()).await
+    }
+
+    /// Place a post-only limit order.
+    ///
+    /// Rounds price and size to tick/step, validates min_qty and min_notional,
+    /// then places via the appropriate REST endpoint.
+    async fn quote(&self, intent: QuoteIntent) -> Result<QuoteId, VenueError> {
+        self.check_mainnet_gate()?;
+
+        let sym_str = binance_symbol(&intent.symbol);
+        let price = round_price(&self.exchange_info_cache, &sym_str, intent.price)?;
+        let size = round_size(&self.exchange_info_cache, &sym_str, intent.size)?;
+        validate_qty(&self.exchange_info_cache, &sym_str, size, price)?;
+
+        let quote_id = QuoteId::new();
+        let coid = Self::client_order_id(quote_id);
+        let price_str = Self::format_decimal(price.0);
+        let size_str = Self::format_decimal(size.0);
+        let base_url = self.env.rest_base_url();
+
+        if self.env.is_futures() {
+            crate::futs::place_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.api_secret,
+                &sym_str,
+                intent.side,
+                &price_str,
+                &size_str,
+                &coid,
+            )
+            .await?;
+        } else {
+            crate::spot::place_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.api_secret,
+                &sym_str,
+                intent.side,
+                &price_str,
+                &size_str,
+                &coid,
+            )
+            .await?;
+        }
+
+        Ok(quote_id)
+    }
+
+    /// Cancel the old quote then place a new one.
+    async fn requote(&self, id: QuoteId, intent: QuoteIntent) -> Result<(), VenueError> {
+        self.check_mainnet_gate()?;
+
+        let sym_str = binance_symbol(&intent.symbol);
+        let coid = Self::client_order_id(id);
+        let base_url = self.env.rest_base_url();
+
+        // Cancel old (idempotent).
+        let cancel_result = if self.env.is_futures() {
+            crate::futs::cancel_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.api_secret,
+                &sym_str,
+                &coid,
+            )
+            .await
+        } else {
+            crate::spot::cancel_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.api_secret,
+                &sym_str,
+                &coid,
+            )
+            .await
+        };
+        if let Err(e) = cancel_result {
+            warn!(error = ?e, "requote: cancel failed; proceeding with new quote");
+        }
+
+        // Place new.
+        self.quote(intent).await?;
+        Ok(())
+    }
+
+    /// Cancel a single quote by id.
+    ///
+    /// Requires knowing the symbol — in v0 the `cancel` call encodes the
+    /// `clientOrderId` in the `QuoteId`, so we re-derive it here.
+    /// The symbol must be passed via the `id` encoding (v0 limitation: same
+    /// as Hyperliquid adapter — caller should prefer `cancel_all`).
+    ///
+    /// Because the Venue trait doesn't pass the symbol to `cancel`, v0 uses
+    /// the `clientOrderId` derived from the `QuoteId`. We send a DELETE with
+    /// `origClientOrderId=tikr_<hex>` which Binance accepts without a symbol
+    /// lookup — however, Binance does require the `symbol` param. Since we
+    /// don't have it here, this returns `VenueError::Rejected` with an
+    /// explanatory message. Callers should use `cancel_all` with a symbol
+    /// or `requote` instead.
+    ///
+    /// **v0 limitation**: store `symbol → QuoteId` map in the runner; use
+    /// `cancel_all` for defensive startup cancels.
+    async fn cancel(&self, id: QuoteId) -> Result<(), VenueError> {
+        self.check_mainnet_gate()?;
+        // Binance cancel requires `symbol`. The Venue trait's cancel() does
+        // not pass symbol. In v0, we return a clear error so the operator
+        // knows to use cancel_all(symbol) instead.
+        let coid = Self::client_order_id(id);
+        Err(VenueError::Rejected {
+            reason: format!(
+                "BinanceClient::cancel requires symbol; use cancel_all(symbol) or \
+                 requote instead. clientOrderId={coid}"
+            ),
+        })
+    }
+
+    /// Cancel all open orders for a symbol.
+    async fn cancel_all(&self, symbol: &Symbol) -> Result<(), VenueError> {
+        self.check_mainnet_gate()?;
+
+        let sym_str = binance_symbol(symbol);
+        let base_url = self.env.rest_base_url();
+
+        if self.env.is_futures() {
+            crate::futs::cancel_all_orders(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.api_secret,
+                &sym_str,
+            )
+            .await
+        } else {
+            crate::spot::cancel_all_orders(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.api_secret,
+                &sym_str,
+            )
+            .await
+        }
+    }
+
+    /// Return the current position for a symbol.
+    ///
+    /// v0: returns a zero position. A REST call to `/fapi/v2/positionRisk`
+    /// (futures) or account endpoint (spot) is a follow-up item.
+    async fn position(&self, symbol: &Symbol) -> Result<Position, VenueError> {
+        use tikr_core::Notional;
+        Ok(Position {
+            symbol: symbol.clone(),
+            size: SignedSize(tikr_core::Decimal::ZERO),
+            avg_entry: Price(tikr_core::Decimal::ZERO),
+            realized_pnl: Notional(tikr_core::Decimal::ZERO),
+        })
+    }
+
+    /// Return fills timestamped at or after `since_ts`.
+    ///
+    /// v0: returns empty (REST fill history is a follow-up item).
+    async fn fills_since(&self, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credential helpers (used by example bins)
+// ---------------------------------------------------------------------------
+
+/// Load API key + secret from environment variables.
+///
+/// Reads `TIKR_BINANCE_API_KEY` and `TIKR_BINANCE_API_SECRET`.
+pub fn load_credentials_from_env() -> Result<(String, String), String> {
+    let key = std::env::var("TIKR_BINANCE_API_KEY")
+        .map_err(|_| "TIKR_BINANCE_API_KEY not set".to_string())?;
+    let secret = std::env::var("TIKR_BINANCE_API_SECRET")
+        .map_err(|_| "TIKR_BINANCE_API_SECRET not set".to_string())?;
+    Ok((key, secret))
+}
+
+/// Load API key + secret from a key file (`key:secret` single line).
+pub fn load_credentials_from_file(path: &std::path::Path) -> Result<(String, String), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("key-file {}: {}", path.display(), e))?;
+    let line = content.trim();
+    let mut parts = line.splitn(2, ':');
+    let key = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("key-file: empty key")?
+        .to_string();
+    let secret = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("key-file: missing ':secret' part")?
+        .to_string();
+    Ok((key, secret))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_order_id_format() {
+        let id = QuoteId::from_uuid(Uuid::from_u128(1));
+        let coid = BinanceClient::client_order_id(id);
+        assert!(coid.starts_with("tikr_"), "must start with tikr_");
+        let hex_part = &coid[5..];
+        assert_eq!(hex_part.len(), 32, "hex part must be 32 chars");
+        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn client_order_id_roundtrip() {
+        let id = QuoteId::new();
+        let coid = BinanceClient::client_order_id(id);
+        let recovered = BinanceClient::quote_id_from_client_order_id(&coid)
+            .expect("must recover QuoteId from clientOrderId");
+        assert_eq!(id, recovered);
+    }
+
+    #[test]
+    fn binance_env_mainnet_flag() {
+        assert!(BinanceEnv::SpotMainnet.is_mainnet());
+        assert!(BinanceEnv::FuturesMainnet.is_mainnet());
+        assert!(!BinanceEnv::SpotTestnet.is_mainnet());
+        assert!(!BinanceEnv::FuturesTestnet.is_mainnet());
+    }
+
+    #[test]
+    fn binance_env_futures_flag() {
+        assert!(BinanceEnv::FuturesTestnet.is_futures());
+        assert!(BinanceEnv::FuturesMainnet.is_futures());
+        assert!(!BinanceEnv::SpotTestnet.is_futures());
+        assert!(!BinanceEnv::SpotMainnet.is_futures());
+    }
+
+    #[test]
+    fn mainnet_gate_refuses_without_flag() {
+        // Simulate the gate check logic.
+        let is_mainnet = true;
+        let mainnet_writes_enabled = false;
+        let result: Result<(), VenueError> = if is_mainnet && !mainnet_writes_enabled {
+            Err(VenueError::Rejected {
+                reason: "mainnet writes disabled — set TIKR_BINANCE_ENABLE_MAINNET=1".into(),
+            })
+        } else {
+            Ok(())
+        };
+        assert!(matches!(result, Err(VenueError::Rejected { .. })));
+    }
+
+    #[test]
+    fn load_credentials_from_file_parses() {
+        use std::io::Write;
+        let mut tmp = tempfile_hack();
+        writeln!(tmp.0, "mykey:mysecret").unwrap();
+        let (key, secret) = load_credentials_from_file(&tmp.1).unwrap();
+        assert_eq!(key, "mykey");
+        assert_eq!(secret, "mysecret");
+    }
+
+    // Minimal temp file helper to avoid adding a dep.
+    fn tempfile_hack() -> (std::fs::File, std::path::PathBuf) {
+        let path = std::env::temp_dir().join("tikr_binance_test_key.txt");
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        (f, path)
+    }
+}

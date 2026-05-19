@@ -5104,6 +5104,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikr-binance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "dotenvy",
+ "futures",
+ "hex",
+ "hmac",
+ "reqwest 0.12.28",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tikr-backtest",
+ "tikr-core",
+ "tikr-paper",
+ "tikr-risk",
+ "tikr-strategy",
+ "tikr-venue",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "tikr-core"
 version = "0.1.0"
 dependencies = [
