@@ -246,6 +246,10 @@ async fn user_data_pump(
             }
             Some(Ok(Message::Text(txt))) => {
                 backoff_ms = reconnect_min_ms;
+                // Visibility into the WS stream: log every frame at debug so
+                // operators can confirm the channel is alive even when
+                // no fills are happening (only fills surface at info level).
+                debug!(bytes = txt.len(), "userDataStream: frame received");
                 if let Some(fill) = parse_user_data_message(&txt, kind) {
                     info!(
                         quote_id = ?fill.quote_id,

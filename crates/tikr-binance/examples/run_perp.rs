@@ -207,11 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // NaiveGrid: 1 level per side, 20bps spread, 0.001 BTC per quote.
+    // NaiveGrid: 1 level per side, 2bps spread (tight for testnet smoke —
+    // typical BTCUSDT touch is ~1-2bps; this provokes fills against natural
+    // market action). Tune higher for live capital.
     let strategy = NaiveGrid::new(NaiveGridConfig {
         levels_per_side: 1,
-        base_spread_bps: 20,
-        level_step_bps: 5,
+        base_spread_bps: 2,
+        level_step_bps: 1,
         size_per_quote: Size(Decimal::from_str_exact("0.001").unwrap()),
         min_requote_interval_ms: 5000,
     });
