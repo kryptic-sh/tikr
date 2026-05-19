@@ -100,7 +100,9 @@ async fn main() {
         }
     };
 
-    let mut recorder = Recorder::new(args.symbol.clone(), args.out.clone());
+    // Use just the base asset in filenames so ParquetReplay (which discovers
+    // by `book_<BASE>_*.parquet`) finds them. Mirrors the HL recorder.
+    let mut recorder = Recorder::new(base_str.to_string(), args.out.clone());
 
     let started = Instant::now();
     let duration_cap = if args.hours == 0 {

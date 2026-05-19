@@ -1,0 +1,361 @@
+//! Run a tikr strategy against recorded parquet market data.
+//!
+//! Loads `book_<SYM>_*.parquet` + `trades_<SYM>_*.parquet` from the data
+//! directory via [`tikr_backtest::replay::ParquetReplay`], wraps the stream
+//! in a no-op [`BacktestVenue`], and drives it through `tikr_paper::run_with_resume`
+//! against the chosen strategy. Emits a `PaperReport` JSON on completion.
+//!
+//! Backtest is paper-mode only: write-side venue calls are recorded but not
+//! dispatched, and fills come from `FillSim` (not external_fills).
+
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use clap::{Parser, ValueEnum};
+use futures::stream::{self, BoxStream};
+use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
+use tikr_backtest::replay::{ParquetReplay, Replay, ReplayConfig};
+use tikr_core::{
+    Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
+    VenueId,
+};
+use tikr_paper::{RunnerConfig, run_with_resume};
+use tikr_strategy::{
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
+    NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+};
+use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
+use tokio::sync::watch;
+use tracing::info;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StrategyArg {
+    #[value(name = "naive-grid")]
+    NaiveGrid,
+    #[value(name = "avellaneda-stoikov", alias = "as")]
+    AvellanedaStoikov,
+    #[value(name = "glft")]
+    Glft,
+    #[value(name = "top-of-book", alias = "tob")]
+    TopOfBook,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "run_backtest",
+    about = "Replay recorded parquet data through a strategy and emit a P&L report"
+)]
+struct Args {
+    /// Directory containing `book_<SYM>_*.parquet` + `trades_<SYM>_*.parquet`.
+    #[arg(long, default_value = "./data")]
+    data_dir: PathBuf,
+
+    /// Binance-style symbol (e.g. `BTCUSDT`). Base+quote split via 4-char
+    /// suffix heuristic (USDT/USDC/BUSD/TUSD).
+    #[arg(long, default_value = "BTCUSDT")]
+    symbol: String,
+
+    /// Strategy to run.
+    #[arg(long, value_enum, default_value = "naive-grid")]
+    strategy: StrategyArg,
+
+    /// Order size per quote.
+    #[arg(long, default_value = "0.001")]
+    size: String,
+
+    /// Maker fee in basis points (default = Binance Futures USD-M tier 0).
+    /// Negative values mean rebate.
+    #[arg(long, default_value_t = 2i32)]
+    maker_bps: i32,
+
+    /// Taker fee in basis points.
+    #[arg(long, default_value_t = 5u32)]
+    taker_bps: u32,
+
+    // --- NaiveGrid / A-S / GLFT spread ---
+    /// Half-spread in bps (used by naive-grid + A-S + GLFT).
+    #[arg(long, default_value_t = 5u32)]
+    spread_bps: u32,
+
+    // --- A-S / GLFT inventory aversion ---
+    /// γ risk aversion for A-S / GLFT.
+    #[arg(long, default_value = "0.1")]
+    gamma: String,
+
+    // --- TopOfBook ---
+    /// TopOfBook: venue tick size.
+    #[arg(long, default_value = "0.1")]
+    tick_size: String,
+
+    /// TopOfBook: improve when spread > N ticks.
+    #[arg(long, default_value_t = 1u32)]
+    improve_when_spread_gt_ticks: u32,
+
+    /// TopOfBook: max inventory-skew shift in ticks (0 = no skew).
+    #[arg(long, default_value_t = 0u32)]
+    max_skew_ticks: u32,
+
+    /// TopOfBook: position at which skew is fully applied.
+    #[arg(long, default_value = "0.005")]
+    skew_unit: String,
+
+    /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
+    #[arg(long, default_value_t = 1000u64)]
+    heartbeat_ms: u64,
+
+    /// State directory for snapshots (unused for one-shot backtest but
+    /// required by RunnerConfig).
+    #[arg(long, default_value = "./state/backtest")]
+    state_dir: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    let (base_str, quote_str) = split_symbol(&args.symbol);
+    let symbol = Symbol {
+        base: Asset::new(base_str),
+        quote: Asset::new(quote_str),
+        venue: VenueId::new("binance"),
+        kind: MarketKind::Perp,
+    };
+
+    let replay = ParquetReplay::new(ReplayConfig {
+        heartbeat_ms: args.heartbeat_ms,
+        symbols: vec![symbol.clone()],
+        data_dir: args.data_dir.clone(),
+    })?;
+
+    let venue = BacktestVenue::new(replay);
+    let size_per_quote = Size(Decimal::from_str(&args.size)?);
+
+    let fill_sim = FillSim::new(FillSimConfig {
+        submit_latency_ms: 0,
+        cancel_latency_ms: 0,
+        fees: VenueFees {
+            maker_bps: args.maker_bps,
+            taker_bps: args.taker_bps,
+        },
+    });
+
+    let runner_config = RunnerConfig {
+        state_dir: args.state_dir.clone(),
+        snapshot_every_n_events: 0, // backtest = no snapshots
+    };
+
+    // No shutdown trigger — replay ends naturally when events exhaust.
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    // No external fills — paper mode uses FillSim.
+    let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
+
+    info!(
+        symbol = %args.symbol,
+        strategy = ?args.strategy,
+        data_dir = %args.data_dir.display(),
+        "starting backtest"
+    );
+
+    let report = match args.strategy {
+        StrategyArg::NaiveGrid => {
+            let strategy = NaiveGrid::new(NaiveGridConfig {
+                levels_per_side: 1,
+                base_spread_bps: args.spread_bps,
+                level_step_bps: 1,
+                size_per_quote,
+                min_requote_interval_ms: 1000,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+            )
+            .await
+        }
+        StrategyArg::AvellanedaStoikov => {
+            let strategy = AvellanedaStoikov::new(AvellanedaStoikovConfig {
+                gamma: Decimal::from_str(&args.gamma)?,
+                base_spread_bps: args.spread_bps,
+                horizon_sec: 3600,
+                size_per_quote,
+                min_requote_interval_ms: 1000,
+                level_step_bps: 1,
+                volatility: EwmaConfig {
+                    half_life_sec: 60.0,
+                    initial_var: Decimal::from_str("0.000001")?,
+                },
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+            )
+            .await
+        }
+        StrategyArg::Glft => {
+            let strategy = Glft::new(GlftConfig {
+                gamma: Decimal::from_str(&args.gamma)?,
+                base_spread_bps: args.spread_bps,
+                size_per_quote,
+                min_requote_interval_ms: 1000,
+                level_step_bps: 1,
+                volatility: EwmaConfig {
+                    half_life_sec: 60.0,
+                    initial_var: Decimal::from_str("0.000001")?,
+                },
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+            )
+            .await
+        }
+        StrategyArg::TopOfBook => {
+            let strategy = TopOfBook::new(TopOfBookConfig {
+                size_per_quote,
+                tick_size: Decimal::from_str(&args.tick_size)?,
+                improve_when_spread_gt_ticks: args.improve_when_spread_gt_ticks,
+                min_requote_interval_ms: 1000,
+                max_skew_ticks: args.max_skew_ticks,
+                skew_unit: Size(Decimal::from_str(&args.skew_unit)?),
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+            )
+            .await
+        }
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+    println!("{json}");
+    info!(
+        events = report.events_processed,
+        fills = report.fills_emitted,
+        "backtest done"
+    );
+    Ok(())
+}
+
+fn split_symbol(sym: &str) -> (&str, &str) {
+    for suffix in &["USDT", "BUSD", "USDC", "TUSD"] {
+        if let Some(base) = sym.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return (base, suffix);
+        }
+    }
+    let n = sym.len();
+    if n > 4 {
+        (&sym[..n - 4], &sym[n - 4..])
+    } else {
+        (sym, "USDT")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BacktestVenue — wraps a Replay as a Venue. Write methods are no-ops; the
+// runner is in paper mode, so FillSim handles fill simulation.
+// ---------------------------------------------------------------------------
+
+struct BacktestVenue {
+    replay: Mutex<Option<ParquetReplay>>,
+}
+
+impl BacktestVenue {
+    fn new(replay: ParquetReplay) -> Self {
+        Self {
+            replay: Mutex::new(Some(replay)),
+        }
+    }
+}
+
+#[async_trait]
+impl Venue for BacktestVenue {
+    fn id(&self) -> &str {
+        "backtest"
+    }
+
+    async fn snapshot(&self, _symbol: &Symbol) -> Result<Snapshot, VenueError> {
+        Err(VenueError::Internal(Box::new(std::io::Error::other(
+            "BacktestVenue::snapshot not supported — strategies read book via MarketEvent",
+        ))))
+    }
+
+    async fn subscribe(&self, _symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
+        let replay = self.replay.lock().unwrap().take().ok_or_else(|| {
+            VenueError::Internal(Box::new(std::io::Error::other(
+                "BacktestVenue::subscribe called twice — Replay can only be consumed once",
+            )))
+        })?;
+
+        // Bridge Replay::next() (async) into a Stream.
+        let s = stream::unfold(
+            replay,
+            |mut r| async move { r.next().await.map(|ev| (ev, r)) },
+        );
+        Ok(Box::pin(s))
+    }
+
+    async fn quote(&self, _intent: QuoteIntent) -> Result<QuoteId, VenueError> {
+        Ok(QuoteId::new())
+    }
+
+    async fn requote(&self, _id: QuoteId, _intent: QuoteIntent) -> Result<(), VenueError> {
+        Ok(())
+    }
+
+    async fn cancel(&self, _id: QuoteId) -> Result<(), VenueError> {
+        Ok(())
+    }
+
+    async fn cancel_all(&self, _symbol: &Symbol) -> Result<(), VenueError> {
+        Ok(())
+    }
+
+    async fn position(&self, symbol: &Symbol) -> Result<Position, VenueError> {
+        Ok(Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::ZERO),
+            avg_entry: tikr_core::Price(Decimal::ZERO),
+            realized_pnl: tikr_core::Notional(Decimal::ZERO),
+        })
+    }
+
+    async fn fills_since(&self, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
+        Ok(Vec::new())
+    }
+}
