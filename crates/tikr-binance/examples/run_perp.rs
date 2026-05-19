@@ -48,6 +48,7 @@
 use clap::{Parser, ValueEnum};
 use reqwest::Client as HttpClient;
 use std::path::PathBuf;
+use std::str::FromStr;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::{
     BinanceClient, BinanceEnv, BinanceKeyMaterial, load_credentials_from_file,
@@ -55,7 +56,10 @@ use tikr_binance::{
 };
 use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
-use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
+use tikr_strategy::{
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
+    NaiveGridConfig, Strategy,
+};
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -70,6 +74,19 @@ enum EnvArg {
     FuturesTestnet,
     #[value(name = "futures-mainnet")]
     FuturesMainnet,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum StrategyArg {
+    /// NaiveGrid — symmetric grid around mid, no inventory awareness.
+    #[value(name = "naive-grid")]
+    NaiveGrid,
+    /// Avellaneda-Stoikov — inventory-aware finite-horizon optimal MM.
+    #[value(name = "avellaneda-stoikov", alias = "as")]
+    AvellanedaStoikov,
+    /// GLFT (Guéant-Lehalle-Fernandez-Tapia, 2013) — infinite-horizon variant.
+    #[value(name = "glft")]
+    Glft,
 }
 
 #[derive(Parser, Debug)]
@@ -103,6 +120,10 @@ struct Args {
     /// Run duration in minutes. 0 = run until Ctrl-C.
     #[arg(long, default_value_t = 0u32)]
     minutes: u32,
+
+    /// Strategy to run.
+    #[arg(long, value_enum, default_value = "naive-grid")]
+    strategy: StrategyArg,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,23 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // NaiveGrid: 1 level per side, 5bps per side (10bps round-trip spread).
-    //
-    // Profitability math (verified on Binance Futures testnet 2026-05-19):
-    // - maker fee ~2bps per fill → round-trip cost 4bps
-    // - 5bps × 2 sides = 10bps captured per round trip
-    // - net margin ~6bps before slippage
-    //
-    // Trade-off: fewer fills per minute than tight (2bps) spread but each
-    // round trip nets profit instead of losing to fees.
-    let strategy = NaiveGrid::new(NaiveGridConfig {
-        levels_per_side: 1,
-        base_spread_bps: 5,
-        level_step_bps: 1,
-        size_per_quote: Size(Decimal::from_str_exact("0.001").unwrap()),
-        min_requote_interval_ms: 5000,
-    });
-
+    let size_per_quote = Size(Decimal::from_str("0.001").unwrap());
     // FillSim required by the runner but discarded in live mode (external_fills set).
     let fill_sim = FillSim::new(FillSimConfig {
         submit_latency_ms: 0,
@@ -239,19 +244,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_every_n_events: 100,
     };
 
-    let report = run_with_resume(
-        venue,
-        strategy,
-        fill_sim,
-        symbol,
-        shutdown_rx,
-        runner_config,
-        None,          // no resume
-        None,          // no risk gate (add tikr-risk for production)
-        None,          // no alert sink (add tikr-paper::alerts for production)
-        Some(fill_rx), // live mode: fills via userDataStream
-    )
-    .await;
+    info!(strategy = ?args.strategy, "strategy selected");
+
+    // Dispatch on strategy enum. Each branch builds its concrete Strategy
+    // impl and hands it to run_with_resume.
+    let report = match args.strategy {
+        StrategyArg::NaiveGrid => {
+            // 5bps/side = 10bps round trip; ~6bps margin over 2bps maker fee.
+            // Verified profitable on Binance Futures testnet 2026-05-19:
+            // 3-min run, 14 fills, net +$0.36.
+            let strategy = NaiveGrid::new(NaiveGridConfig {
+                levels_per_side: 1,
+                base_spread_bps: 5,
+                level_step_bps: 1,
+                size_per_quote,
+                min_requote_interval_ms: 5000,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::AvellanedaStoikov => {
+            // Tuning for BTC@~$76k on Binance Futures testnet 2026-05-19:
+            // A-S half-spread = γσ²(T-t)/2 + (1/γ)ln(1+γ/k)
+            // With testnet σ²≈2.5e-9, term 1 is negligible. The log term
+            // dominates in PRICE units, so to hit ~6 bps half-spread
+            // (≈$5 on BTC) we need (1/γ)ln(1+γ/k) ≈ 5.
+            // γ=0.01, k=0.1 → 100·ln(1.1) ≈ 9.5 dollars per side ≈ 12.5 bps,
+            // 25 bps round-trip. Wider than NaiveGrid 10bps but compensates
+            // for testnet adverse-selection bleed.
+            let strategy = AvellanedaStoikov::new(AvellanedaStoikovConfig {
+                gamma: Decimal::from_str("0.01").unwrap(),
+                k: Decimal::from_str("0.1").unwrap(),
+                horizon_sec: 3600,
+                size_per_quote,
+                min_requote_interval_ms: 5000,
+                level_step_bps: 1,
+                volatility: EwmaConfig {
+                    half_life_sec: 60.0,
+                    initial_var: Decimal::from_str("0.000001").unwrap(),
+                },
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::Glft => {
+            // Same rationale as A-S: γ=0.01, k=0.1 for ~12 bps half-spread.
+            let strategy = Glft::new(GlftConfig {
+                gamma: Decimal::from_str("0.01").unwrap(),
+                k: Decimal::from_str("0.1").unwrap(),
+                a: Decimal::from_str("1.0").unwrap(),
+                size_per_quote,
+                min_requote_interval_ms: 5000,
+                level_step_bps: 1,
+                volatility: EwmaConfig {
+                    half_life_sec: 60.0,
+                    initial_var: Decimal::from_str("0.000001").unwrap(),
+                },
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+    };
 
     let report_json = serde_json::to_string_pretty(&report)
         .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
