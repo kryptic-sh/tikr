@@ -4,3 +4,6 @@
 .DS_Store
 /target
 /temp.*
+.env
+.env.*
+!.env.example

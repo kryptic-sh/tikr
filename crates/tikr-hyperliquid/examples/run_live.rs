@@ -122,6 +122,9 @@ fn parse_key(raw: &str) -> Result<PrivateKeySigner, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load .env from cwd if present (ignore missing — env-only setups still work).
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
