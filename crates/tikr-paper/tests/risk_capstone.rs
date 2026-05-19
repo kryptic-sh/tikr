@@ -415,13 +415,15 @@ async fn risk_resume_alerting_capstone() {
     // =========================================================================
 
     // Construct gate from phase-3 state, then clear the halt externally.
-    // Use permissive limits (None drawdown) so the low-inventory phase-4
-    // event stream doesn't immediately re-trip the gate.
+    // Use a permissive-but-armed drawdown threshold (-10_000) — phase-4's
+    // event stream can't trip it, but the limit being Some makes the
+    // "no new Halt alerts" assertion below non-vacuous (verifies clear_halt
+    // actually unstuck the gate, not just that no limit was checked).
     let mut risk_gate3 = BasicRiskGate::from_state(
         RiskLimits {
             max_position_size: None,
             max_open_notional: None,
-            max_drawdown: None, // permissive: no drawdown limit in phase 4
+            max_drawdown: Some(Notional(Decimal::from(-10_000))),
             max_fills_per_minute: None,
         },
         risk_state_phase3.clone(),
