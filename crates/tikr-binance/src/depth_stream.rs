@@ -78,9 +78,14 @@ pub async fn subscribe_depth(
 }
 
 /// Build the depth WS URL for the given env and lowercase symbol.
+///
+/// Spot testnet uses the `stream.testnet.binance.vision:9443` host for
+/// market-data WS (NOT `testnet.binance.vision` which is REST + WS-API).
+/// Verified live 2026-05-19: `wss://testnet.binance.vision/ws/...` returns
+/// HTTP 404, the stream subdomain works.
 pub fn depth_ws_url(env: BinanceEnv, sym_lower: &str) -> String {
     let base = match env {
-        BinanceEnv::SpotTestnet => "wss://testnet.binance.vision/ws",
+        BinanceEnv::SpotTestnet => "wss://stream.testnet.binance.vision:9443/ws",
         BinanceEnv::SpotMainnet => "wss://stream.binance.com:9443/ws",
         BinanceEnv::FuturesTestnet => "wss://stream.binancefuture.com/ws",
         BinanceEnv::FuturesMainnet => "wss://fstream.binance.com/ws",
@@ -250,11 +255,14 @@ mod tests {
         }
     }
 
+    /// Regression: spot testnet depth WS lives on the `stream.testnet.binance.vision`
+    /// host with port 9443, NOT `testnet.binance.vision` (which serves REST + WS-API).
+    /// Live 2026-05-19: the latter returns HTTP 404 on WS upgrade.
     #[test]
     fn depth_ws_url_spot_testnet() {
         assert_eq!(
             depth_ws_url(BinanceEnv::SpotTestnet, "btcusdt"),
-            "wss://testnet.binance.vision/ws/btcusdt@depth20@100ms"
+            "wss://stream.testnet.binance.vision:9443/ws/btcusdt@depth20@100ms"
         );
     }
 

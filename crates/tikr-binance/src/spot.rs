@@ -75,8 +75,11 @@ pub async fn place_order(
         Side::Ask => "SELL",
     };
 
+    // Post-only on Spot = `type=LIMIT_MAKER` (NO timeInForce param).
+    // Futures uses `type=LIMIT&timeInForce=GTX` instead. Verified live
+    // 2026-05-19: Spot rejects `timeInForce=GTX` with -1115.
     let params = format!(
-        "symbol={symbol}&side={side_str}&type=LIMIT&timeInForce=GTX\
+        "symbol={symbol}&side={side_str}&type=LIMIT_MAKER\
          &quantity={quantity}&price={price}\
          &newClientOrderId={client_order_id}"
     );
