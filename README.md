@@ -28,6 +28,8 @@ venue-agnostic, with risk limits before live capital.
 | `tikr-venue`       | `Venue` trait — abstracts over CEX orderbooks, DEX orderbooks, AMMs via quote-intent model |
 | `tikr-strategy`    | `Strategy` trait + reference impls                                                         |
 | `tikr-hyperliquid` | First adapter — on-chain orderbook                                                         |
+| `tikr-backtest`    | Phase 1 backtest engine + recorder bin                                                     |
+| `tikr-paper`       | Phase 3 paper-trading runner (live feed + simulated fills)                                 |
 
 Crates land as phases ship. See
 [roadmap](https://github.com/kryptic-sh/tikr/issues/1).

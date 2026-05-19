@@ -2805,11 +2805,11 @@ name = "tikr-paper"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "clap",
  "futures",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tikr-backtest",
  "tikr-core",
  "tikr-hyperliquid",

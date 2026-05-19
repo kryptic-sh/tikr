@@ -21,7 +21,6 @@ tikr-backtest = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 async-trait = "0.1"
 futures = "0.3"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,12 +30,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "test-util"] }
-
-# Deps reserved for the downstream example bin (#27): the runner is generic
-# over `V: Venue`, so the library itself never names `tikr-hyperliquid`; the
-# example binary will. `thiserror` is reserved for upcoming runner-specific
-# error variants; `tracing-subscriber` is reserved for the binary's logging
-# initializer. Keep declared so the example bin in #27 picks them up without
-# editing this manifest again.
-[package.metadata.cargo-machete]
-ignored = ["tikr-hyperliquid", "thiserror", "tracing-subscriber"]
+clap = { version = "4", features = ["derive"] }
