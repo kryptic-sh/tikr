@@ -85,6 +85,18 @@ impl BookState {
         };
         map.get(&price.0).copied().unwrap_or(Decimal::ZERO)
     }
+    fn decrement_level(&mut self, side: Side, price: Price, amount: Decimal) {
+        let map = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        if let Some(v) = map.get_mut(&price.0) {
+            *v -= amount;
+            if *v <= Decimal::ZERO {
+                map.remove(&price.0);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +223,14 @@ impl FillSim {
     }
 
     fn update_book_state(&mut self, snapshot: &Snapshot) {
+        // Cancel attribution: any LiveQuote at a level whose aggregate
+        // SHRANK between the previous BookState snapshot and this one had
+        // orders cancelled ahead of it (proportionally — assume cancels are
+        // uniformly distributed across the queue). queue_ahead scales by
+        // (new_agg / prev_agg). Trade-attributed shrinkage is excluded
+        // because match_trade decrements book_state aggregates inline before
+        // the next BookUpdate arrives.
+        let prev = self.book_state.get(&snapshot.symbol).cloned();
         let st = self.book_state.entry(snapshot.symbol.clone()).or_default();
         st.bids.clear();
         st.asks.clear();
@@ -219,6 +239,30 @@ impl FillSim {
         }
         for lvl in &snapshot.asks {
             st.asks.insert(lvl.price.0, lvl.size.0);
+        }
+        let Some(prev) = prev else {
+            return;
+        };
+        for q in &mut self.live_quotes {
+            if q.symbol != snapshot.symbol {
+                continue;
+            }
+            let prev_agg = prev.level_size(q.side, q.price);
+            let new_agg = st.level_size(q.side, q.price);
+            if prev_agg <= Decimal::ZERO {
+                continue;
+            }
+            if new_agg >= prev_agg {
+                // Aggregate grew (or held) — only new arrivals behind us,
+                // no impact on queue_ahead.
+                continue;
+            }
+            // Aggregate dropped without explanation — assume cancels
+            // uniformly distributed. Scale queue_ahead proportionally.
+            // Note: if the level vanished (new_agg == 0), queue_ahead → 0
+            // (everyone ahead of us cancelled; we're sole resting quote).
+            let new_queue = q.queue_ahead * new_agg / prev_agg;
+            q.queue_ahead = new_queue;
         }
     }
 
@@ -252,14 +296,23 @@ impl FillSim {
             // (Sweeping trades will print at multiple prices including ours
             // if size is sufficient; the prints AT our level decrement the
             // queue and fill us together.)
-            if q.queue_ahead > Decimal::ZERO {
-                let ate = q.queue_ahead.min(trade_remaining);
+            let q_side = q.side;
+            let q_price = q.price;
+            let ate = q.queue_ahead.min(trade_remaining);
+            if ate > Decimal::ZERO {
                 q.queue_ahead -= ate;
                 trade_remaining -= ate;
+                // Decrement book aggregate at our level so the next
+                // BookUpdate doesn't mis-attribute this trade-shrinkage as
+                // cancels.
+                if let Some(b) = self.book_state.get_mut(symbol) {
+                    b.decrement_level(q_side, q_price, ate);
+                }
                 if trade_remaining == Decimal::ZERO {
                     break;
                 }
             }
+            let q = &mut self.live_quotes[i];
 
             let fill_amount = q.size_remaining.0.min(trade_remaining);
             let fill_price = q.price;
@@ -579,10 +632,10 @@ mod tests {
         assert_eq!(fills[0].price, Price(Decimal::from(100)));
     }
 
-    /// Queue-priority: book updates that change aggregate at our level do
-    /// NOT shift our queue position (cancels are not modeled — optimistic).
+    /// Book updates that GROW aggregate at our level do NOT shift queue
+    /// position (new arrivals are behind us).
     #[test]
-    fn book_update_does_not_shift_queue_position() {
+    fn book_update_grow_does_not_shift_queue_position() {
         let sym = make_symbol();
         let mut sim = FillSim::new(default_cfg());
 
@@ -600,13 +653,83 @@ mod tests {
         let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
         assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(5));
 
-        // Book updates — aggregate at 100 grows to 10. Our queue_ahead must
-        // still be 5 (we don't track new arrivals; we're not behind them).
+        // Aggregate at 100 grows to 10. Our queue_ahead must stay 5 (new
+        // arrivals are behind us).
         let book2 = MarketEvent::BookUpdate {
             snapshot: make_book_with_size(&sym, 100, 10, 101, 1),
         };
         let _ = sim.on_market_event(&book2, Timestamp(25_000_000));
         assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(5));
+    }
+
+    /// Cancels: aggregate SHRINKS without an explaining trade → queue_ahead
+    /// scales proportionally (uniform-cancel assumption).
+    #[test]
+    fn cancels_shrink_queue_proportionally() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        // Best bid 100 with 10 resting.
+        let book1 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 10, 101, 1),
+        };
+        let _ = sim.on_market_event(&book1, Timestamp(0));
+
+        // Place JOIN bid; queue_ahead = 10.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(10));
+
+        // Aggregate drops 10 → 4 without trades (cancels). queue_ahead
+        // should scale to 10 * 4/10 = 4.
+        let book2 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 4, 101, 1),
+        };
+        let _ = sim.on_market_event(&book2, Timestamp(25_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(4));
+    }
+
+    /// Trade-shrinkage at our level must NOT be double-counted as cancels:
+    /// match_trade decrements book aggregate inline so the next book update
+    /// compares against the trade-adjusted value.
+    #[test]
+    fn trade_shrinkage_not_double_counted_as_cancels() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        let book1 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 10, 101, 1),
+        };
+        let _ = sim.on_market_event(&book1, Timestamp(0));
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(10));
+
+        // Trade of 3 at 100 consumes 3 from our queue. queue_ahead → 7.
+        let trade = make_trade(&sym, 100, 3, Side::Ask, 25_000_000);
+        let _ = sim.on_market_event(&trade, Timestamp(25_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(7));
+
+        // Next book update reflects the trade: aggregate now 7.
+        let book2 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 7, 101, 1),
+        };
+        let _ = sim.on_market_event(&book2, Timestamp(30_000_000));
+        // queue_ahead must stay 7 — the drop 10→7 is fully explained by
+        // the trade, NOT cancels. Without inline decrement we'd over-shrink.
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(7));
     }
 
     #[test]
