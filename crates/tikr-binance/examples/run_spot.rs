@@ -42,8 +42,9 @@ use reqwest::Client as HttpClient;
 use std::path::PathBuf;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::{
-    BinanceClient, BinanceEnv, BinanceKeyMaterial, load_credentials_from_file,
-    load_key_material_from_env, user_stream::subscribe_user_data_stream,
+    BinanceClient, BinanceEnv, BinanceKeyMaterial, env_with_product_fallback,
+    load_credentials_from_file, load_key_material_from_env, product_var,
+    user_stream::subscribe_user_data_stream,
 };
 use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
@@ -122,13 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Load API key.
-    let api_key =
-        std::env::var("TIKR_BINANCE_API_KEY").map_err(|_| "TIKR_BINANCE_API_KEY not set")?;
+    // Load API key (product-aware: tries TIKR_BINANCE_SPOT_API_KEY then
+    // falls back to TIKR_BINANCE_API_KEY).
+    let api_key = env_with_product_fallback(env, "API_KEY")
+        .ok_or_else(|| format!("{} (or fallback) not set", product_var(env, "API_KEY")))?;
 
-    // Load key material based on TIKR_BINANCE_KEY_TYPE.
+    // Load key material (product-aware key type + secret/PEM lookup).
     let key_material: BinanceKeyMaterial = if let Some(ref kf) = args.key_file
-        && std::env::var("TIKR_BINANCE_KEY_TYPE")
+        && env_with_product_fallback(env, "KEY_TYPE")
             .unwrap_or_default()
             .to_lowercase()
             != "ed25519"
@@ -138,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             load_credentials_from_file(kf).map_err(|e| format!("key-file error: {e}"))?;
         BinanceKeyMaterial::Hmac { secret }
     } else {
-        load_key_material_from_env(args.ed25519_key_file.as_deref())
+        load_key_material_from_env(env, args.ed25519_key_file.as_deref())
             .map_err(|e| format!("credential error: {e}"))?
     };
 

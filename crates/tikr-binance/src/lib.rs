@@ -497,12 +497,32 @@ impl Venue for BinanceClient {
 /// Reads `TIKR_BINANCE_API_KEY` and `TIKR_BINANCE_API_SECRET`.
 ///
 /// For Ed25519, use [`load_key_material_from_env`] instead.
-pub fn load_credentials_from_env() -> Result<(String, String), String> {
-    let key = std::env::var("TIKR_BINANCE_API_KEY")
-        .map_err(|_| "TIKR_BINANCE_API_KEY not set".to_string())?;
-    let secret = std::env::var("TIKR_BINANCE_API_SECRET")
-        .map_err(|_| "TIKR_BINANCE_API_SECRET not set".to_string())?;
+///
+/// Env var resolution is **product-aware**: when `env` is a spot variant we
+/// look for `TIKR_BINANCE_SPOT_*` first; for futures we look for
+/// `TIKR_BINANCE_FUTURES_*` first. Either falls back to plain `TIKR_BINANCE_*`
+/// so a single-product .env still works without changes.
+pub fn load_credentials_from_env(env: BinanceEnv) -> Result<(String, String), String> {
+    let key = env_with_product_fallback(env, "API_KEY")
+        .ok_or_else(|| format!("{} (or fallback) not set", product_var(env, "API_KEY")))?;
+    let secret = env_with_product_fallback(env, "API_SECRET")
+        .ok_or_else(|| format!("{} (or fallback) not set", product_var(env, "API_SECRET")))?;
     Ok((key, secret))
+}
+
+/// Look up an env var, trying the product-specific name first
+/// (`TIKR_BINANCE_SPOT_<SUFFIX>` or `TIKR_BINANCE_FUTURES_<SUFFIX>`)
+/// then falling back to the plain name (`TIKR_BINANCE_<SUFFIX>`).
+pub fn env_with_product_fallback(env: BinanceEnv, suffix: &str) -> Option<String> {
+    std::env::var(product_var(env, suffix))
+        .ok()
+        .or_else(|| std::env::var(format!("TIKR_BINANCE_{suffix}")).ok())
+}
+
+/// Build the product-specific env var name (e.g. `TIKR_BINANCE_SPOT_API_KEY`).
+pub fn product_var(env: BinanceEnv, suffix: &str) -> String {
+    let product = if env.is_futures() { "FUTURES" } else { "SPOT" };
+    format!("TIKR_BINANCE_{product}_{suffix}")
 }
 
 /// Load API key + HMAC secret from a key file (`key:secret` single line).
@@ -526,34 +546,46 @@ pub fn load_credentials_from_file(path: &std::path::Path) -> Result<(String, Str
 
 /// Load [`BinanceKeyMaterial`] from environment variables.
 ///
-/// Reads `TIKR_BINANCE_KEY_TYPE` (default: `hmac`) and then either:
-/// - HMAC: `TIKR_BINANCE_API_SECRET`
-/// - Ed25519: `TIKR_BINANCE_PRIVATE_KEY_PATH` (path to PEM file)
+/// Env var resolution is **product-aware**: for spot envs we look at
+/// `TIKR_BINANCE_SPOT_*` first, for futures at `TIKR_BINANCE_FUTURES_*`;
+/// either falls back to plain `TIKR_BINANCE_*`. This lets one `.env` carry
+/// distinct keys for both products simultaneously.
 ///
-/// `ed25519_key_file` overrides `TIKR_BINANCE_PRIVATE_KEY_PATH` for Ed25519.
+/// Reads `<KEY_TYPE>` (default: `hmac`) and then either:
+/// - HMAC: `<API_SECRET>`
+/// - Ed25519: `<PRIVATE_KEY_PATH>` (path to PEM file)
+///
+/// `ed25519_key_file` overrides `<PRIVATE_KEY_PATH>` for Ed25519.
 pub fn load_key_material_from_env(
+    env: BinanceEnv,
     ed25519_key_file: Option<&std::path::Path>,
 ) -> Result<BinanceKeyMaterial, String> {
-    let key_type = std::env::var("TIKR_BINANCE_KEY_TYPE")
-        .unwrap_or_else(|_| "hmac".to_string())
+    let key_type = env_with_product_fallback(env, "KEY_TYPE")
+        .unwrap_or_else(|| "hmac".to_string())
         .to_lowercase();
 
     match key_type.as_str() {
         "hmac" => {
-            let secret = std::env::var("TIKR_BINANCE_API_SECRET")
-                .map_err(|_| "TIKR_BINANCE_API_SECRET not set (required for HMAC)".to_string())?;
+            let secret = env_with_product_fallback(env, "API_SECRET").ok_or_else(|| {
+                format!(
+                    "{} (or fallback) not set (required for HMAC)",
+                    product_var(env, "API_SECRET")
+                )
+            })?;
             Ok(BinanceKeyMaterial::Hmac { secret })
         }
         "ed25519" => {
             let path = if let Some(p) = ed25519_key_file {
                 p.to_path_buf()
             } else {
-                std::env::var("TIKR_BINANCE_PRIVATE_KEY_PATH")
+                env_with_product_fallback(env, "PRIVATE_KEY_PATH")
                     .map(std::path::PathBuf::from)
-                    .map_err(|_| {
-                        "Ed25519 key path required: \
-                         --ed25519-key-file or TIKR_BINANCE_PRIVATE_KEY_PATH"
-                            .to_string()
+                    .ok_or_else(|| {
+                        format!(
+                            "Ed25519 key path required: \
+                             --ed25519-key-file or {} (or fallback)",
+                            product_var(env, "PRIVATE_KEY_PATH")
+                        )
                     })?
             };
             let pem = std::fs::read_to_string(&path)
@@ -563,7 +595,8 @@ pub fn load_key_material_from_env(
             Ok(BinanceKeyMaterial::Ed25519 { signing_key })
         }
         other => Err(format!(
-            "Unknown TIKR_BINANCE_KEY_TYPE: {other} (expected hmac|ed25519)"
+            "Unknown {}: {other} (expected hmac|ed25519)",
+            product_var(env, "KEY_TYPE")
         )),
     }
 }
@@ -613,6 +646,66 @@ mod tests {
         assert!(BinanceEnv::FuturesMainnet.is_futures());
         assert!(!BinanceEnv::SpotTestnet.is_futures());
         assert!(!BinanceEnv::SpotMainnet.is_futures());
+    }
+
+    #[test]
+    fn product_var_names_built_correctly() {
+        assert_eq!(
+            product_var(BinanceEnv::SpotTestnet, "API_KEY"),
+            "TIKR_BINANCE_SPOT_API_KEY"
+        );
+        assert_eq!(
+            product_var(BinanceEnv::SpotMainnet, "PRIVATE_KEY_PATH"),
+            "TIKR_BINANCE_SPOT_PRIVATE_KEY_PATH"
+        );
+        assert_eq!(
+            product_var(BinanceEnv::FuturesTestnet, "API_KEY"),
+            "TIKR_BINANCE_FUTURES_API_KEY"
+        );
+        assert_eq!(
+            product_var(BinanceEnv::FuturesMainnet, "KEY_TYPE"),
+            "TIKR_BINANCE_FUTURES_KEY_TYPE"
+        );
+    }
+
+    /// Product-specific env wins over plain fallback when both are set.
+    /// Plain fallback used when product-specific is absent.
+    ///
+    /// SAFETY: writing/reading env in tests is racy with other tests.
+    /// Use a unique key to avoid clashes.
+    #[test]
+    fn env_with_product_fallback_prefers_product_specific() {
+        // Use a unique-ish key to avoid clashing with other tests.
+        let suffix = "TEST_PROD_FALLBACK_FOO";
+        let plain = format!("TIKR_BINANCE_{suffix}");
+        let product = format!("TIKR_BINANCE_FUTURES_{suffix}");
+
+        // SAFETY: env mutation is racy with other tests in the same process.
+        // No other test touches these specific keys.
+        unsafe {
+            std::env::set_var(&plain, "plain-value");
+            std::env::set_var(&product, "product-value");
+        }
+        assert_eq!(
+            env_with_product_fallback(BinanceEnv::FuturesTestnet, suffix).as_deref(),
+            Some("product-value"),
+            "product-specific must win when both set"
+        );
+        unsafe {
+            std::env::remove_var(&product);
+        }
+        assert_eq!(
+            env_with_product_fallback(BinanceEnv::FuturesTestnet, suffix).as_deref(),
+            Some("plain-value"),
+            "plain fallback used when product-specific absent"
+        );
+        unsafe {
+            std::env::remove_var(&plain);
+        }
+        assert!(
+            env_with_product_fallback(BinanceEnv::FuturesTestnet, suffix).is_none(),
+            "None when neither set"
+        );
     }
 
     #[test]
