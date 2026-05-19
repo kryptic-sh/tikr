@@ -313,19 +313,57 @@ async fn run_one<S: Strategy>(
 fn print_table(results: &[(String, PaperReport)]) {
     println!();
     println!(
-        "{:<32} {:>8} {:>14} {:>14} {:>10} {:>14}",
-        "preset", "fills", "realized", "unrealized", "fees", "NET"
+        "{:<36} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11}",
+        "preset", "fills", "fills/min", "realized", "fees", "NET", "$/fill"
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(100));
     for (name, r) in results {
+        let runtime_min = (r.runtime_secs as f64) / 60.0;
+        let fills_per_min = if runtime_min > 0.0 {
+            r.fills_emitted as f64 / runtime_min
+        } else {
+            0.0
+        };
+        let net = decimal_to_f64(&r.net.0);
+        let dollars_per_fill = if r.fills_emitted > 0 {
+            net / r.fills_emitted as f64
+        } else {
+            0.0
+        };
         println!(
-            "{:<32} {:>8} {:>14.4} {:>14.4} {:>10.4} {:>14.4}",
+            "{:<36} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.5}",
             name,
             r.fills_emitted,
+            fills_per_min,
             decimal_to_f64(&r.realized.0),
-            decimal_to_f64(&r.unrealized.0),
             decimal_to_f64(&r.fees.0),
-            decimal_to_f64(&r.net.0),
+            net,
+            dollars_per_fill,
+        );
+    }
+    println!();
+    // Footer: best/worst NET.
+    if let (Some(best), Some(worst)) = (
+        results.iter().max_by(|a, b| {
+            decimal_to_f64(&a.1.net.0)
+                .partial_cmp(&decimal_to_f64(&b.1.net.0))
+                .unwrap()
+        }),
+        results.iter().min_by(|a, b| {
+            decimal_to_f64(&a.1.net.0)
+                .partial_cmp(&decimal_to_f64(&b.1.net.0))
+                .unwrap()
+        }),
+    ) {
+        println!(
+            "best:  {:<36} NET = {:>11.4}",
+            best.0,
+            decimal_to_f64(&best.1.net.0)
+        );
+        println!(
+            "worst: {:<36} NET = {:>11.4}",
+            worst.0,
+            decimal_to_f64(&worst.1.net.0)
         );
     }
     println!();
