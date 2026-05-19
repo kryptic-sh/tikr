@@ -68,18 +68,24 @@ pub enum FilterEntry {
         #[serde(rename = "minQty")]
         min_qty: String,
     },
-    /// Minimum notional (spot).
+    /// Minimum notional. Field name differs by product:
+    /// - Spot: `minNotional`
+    /// - USD-M Futures: `notional` (verified against testnet
+    ///   `/fapi/v1/exchangeInfo` 2026-05-19)
+    ///
+    /// Accept both via serde alias.
     #[serde(rename = "MIN_NOTIONAL")]
     MinNotional {
         /// Minimum notional value (price × size).
-        #[serde(rename = "minNotional")]
+        #[serde(rename = "minNotional", alias = "notional")]
         min_notional: String,
     },
-    /// Minimum notional (futures uses `"NOTIONAL"` instead of `"MIN_NOTIONAL"`).
+    /// Some Futures endpoints emit `NOTIONAL` filter type instead of
+    /// `MIN_NOTIONAL`. Field name varies; accept both.
     #[serde(rename = "NOTIONAL")]
     Notional {
         /// Minimum notional value (price × size).
-        #[serde(rename = "minNotional")]
+        #[serde(rename = "minNotional", alias = "notional")]
         min_notional: String,
     },
     /// Any other filter type we don't care about.
@@ -316,6 +322,33 @@ mod tests {
         let s = Size(Decimal::from_str("0.001").unwrap());
         let p = Price(Decimal::from_str("30000.0").unwrap());
         assert!(validate_qty(&cache, "BTCUSDT", s, p).is_ok());
+    }
+
+    /// Regression: USD-M Futures testnet emits `MIN_NOTIONAL` with field
+    /// `notional` (not `minNotional`). First-run smoke for issue #45 surfaced
+    /// this as a decode failure at column 2031. The MinNotional variant must
+    /// accept both field names via serde alias.
+    #[test]
+    fn futures_min_notional_uses_notional_field() {
+        let json = r#"{
+            "symbols": [{
+                "symbol": "BTCUSDT",
+                "filters": [
+                    { "filterType": "PRICE_FILTER", "tickSize": "0.10" },
+                    { "filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001" },
+                    { "filterType": "MIN_NOTIONAL", "notional": "50" }
+                ]
+            }]
+        }"#;
+        let resp: ExchangeInfoResponse =
+            serde_json::from_str(json).expect("futures-shaped JSON must decode");
+        let cache = parse_exchange_info(&resp);
+        let filters = cache.get("BTCUSDT").expect("symbol must parse");
+        assert_eq!(
+            filters.min_notional,
+            Decimal::from_str("50").unwrap(),
+            "futures `notional` field must populate min_notional"
+        );
     }
 
     #[test]
