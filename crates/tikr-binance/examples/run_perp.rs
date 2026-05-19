@@ -46,13 +46,16 @@
 //! disable the IP whitelist OR add your runner's public IP.
 
 use clap::{Parser, ValueEnum};
+use reqwest::Client as HttpClient;
 use std::path::PathBuf;
+use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::{
     BinanceClient, BinanceEnv, BinanceKeyMaterial, load_credentials_from_file,
-    load_key_material_from_env,
+    load_key_material_from_env, user_stream::subscribe_user_data_stream,
 };
-use tikr_core::{Asset, MarketKind, Symbol, VenueId};
-use tikr_venue::Venue;
+use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
+use tikr_paper::{RunnerConfig, run_with_resume};
+use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -164,15 +167,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting Perp runner"
     );
 
-    let client = BinanceClient::with_credentials(env, api_key, key_material, Some(&symbol)).await?;
+    // Build the venue. with_credentials moves api_key, so clone first for the
+    // userDataStream task (it needs the same key independently).
+    let api_key_for_user_stream = api_key.clone();
+    let venue = BinanceClient::with_credentials(env, api_key, key_material, Some(&symbol)).await?;
 
-    info!(client = ?client, "BinanceClient ready");
+    info!(venue = ?venue, "BinanceClient ready");
 
-    // Subscribe to depth stream.
-    let mut stream = client.subscribe(&symbol).await?;
+    // Subscribe to userDataStream for fills (separate HttpClient — cheap).
+    let http_for_user_stream = HttpClient::new();
+    let fill_rx = subscribe_user_data_stream(
+        http_for_user_stream,
+        env,
+        api_key_for_user_stream,
+        MarketKind::Perp,
+    )
+    .await?;
+    info!("userDataStream listenKey minted; subscribed to fills");
 
     // Shutdown channel.
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Ctrl-C handler.
     let tx_ctrlc = shutdown_tx.clone();
@@ -193,31 +207,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Event loop: print depth updates until shutdown.
-    use futures::StreamExt;
-    loop {
-        tokio::select! {
-            event = stream.next() => {
-                match event {
-                    Some(e) => {
-                        info!(event = ?e, "market event");
-                    }
-                    None => {
-                        warn!("depth stream ended");
-                        break;
-                    }
-                }
-            }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("shutdown received");
-                    break;
-                }
-            }
-        }
-    }
+    // NaiveGrid: 1 level per side, 20bps spread, 0.001 BTC per quote.
+    let strategy = NaiveGrid::new(NaiveGridConfig {
+        levels_per_side: 1,
+        base_spread_bps: 20,
+        level_step_bps: 5,
+        size_per_quote: Size(Decimal::from_str_exact("0.001").unwrap()),
+        min_requote_interval_ms: 5000,
+    });
 
-    info!("Perp runner stopped");
+    // FillSim required by the runner but discarded in live mode (external_fills set).
+    let fill_sim = FillSim::new(FillSimConfig {
+        submit_latency_ms: 0,
+        cancel_latency_ms: 0,
+        fees: VenueFees {
+            maker_bps: 0,
+            taker_bps: 0,
+        },
+    });
+
+    let runner_config = RunnerConfig {
+        state_dir: args.state_dir,
+        snapshot_every_n_events: 100,
+    };
+
+    let report = run_with_resume(
+        venue,
+        strategy,
+        fill_sim,
+        symbol,
+        shutdown_rx,
+        runner_config,
+        None,          // no resume
+        None,          // no risk gate (add tikr-risk for production)
+        None,          // no alert sink (add tikr-paper::alerts for production)
+        Some(fill_rx), // live mode: fills via userDataStream
+    )
+    .await;
+
+    let report_json = serde_json::to_string_pretty(&report)
+        .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+    println!("{}", report_json);
+    info!(
+        events = report.events_processed,
+        fills = report.fills_emitted,
+        "Perp runner stopped"
+    );
     Ok(())
 }
 

@@ -248,19 +248,25 @@ impl BinanceClient {
 
     /// Build a `clientOrderId` from a `QuoteId`.
     ///
-    /// Format: `"tikr_{:032x}"` of the UUID's u128 value.
+    /// Format: 32 hex chars of the UUID's u128 value (no prefix).
+    ///
+    /// Binance enforces clientOrderId length < 36 chars (verified via -4015
+    /// error on live testnet 2026-05-19). Earlier `"tikr_"` prefix produced
+    /// 37 chars and was rejected. Bare 32-hex fits with comfortable margin.
     fn client_order_id(id: QuoteId) -> String {
-        format!("tikr_{:032x}", id.0.as_u128())
+        format!("{:032x}", id.0.as_u128())
     }
 
     /// Parse a `clientOrderId` back to a `QuoteId`.
     ///
-    /// Strips the `"tikr_"` prefix, parses as hex u128, wraps in Uuid.
+    /// Parses 32-hex string as u128, wraps in Uuid.
     /// Used in tests and available for future runner state reconciliation.
     #[allow(dead_code)]
     fn quote_id_from_client_order_id(coid: &str) -> Option<QuoteId> {
-        let hex = coid.strip_prefix("tikr_")?;
-        let val = u128::from_str_radix(hex, 16).ok()?;
+        if coid.len() != 32 {
+            return None;
+        }
+        let val = u128::from_str_radix(coid, 16).ok()?;
         Some(QuoteId::from_uuid(Uuid::from_u128(val)))
     }
 
@@ -574,10 +580,14 @@ mod tests {
     fn client_order_id_format() {
         let id = QuoteId::from_uuid(Uuid::from_u128(1));
         let coid = BinanceClient::client_order_id(id);
-        assert!(coid.starts_with("tikr_"), "must start with tikr_");
-        let hex_part = &coid[5..];
-        assert_eq!(hex_part.len(), 32, "hex part must be 32 chars");
-        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()));
+        // Binance limit: clientOrderId length < 36 chars (verified via -4015
+        // on live testnet). Bare 32-hex fits with margin.
+        assert_eq!(
+            coid.len(),
+            32,
+            "clientOrderId must be exactly 32 chars (< 36 Binance limit)"
+        );
+        assert!(coid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

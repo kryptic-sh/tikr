@@ -278,7 +278,7 @@ where
 
                 let actions = strategy.on_event(&ctx, &event);
                 for action in actions {
-                    // Risk-gate check happens BEFORE fill_sim.on_action.
+                    // Risk-gate check happens BEFORE the action is dispatched.
                     if let Some(gate) = risk_gate.as_mut() {
                         let pnl_now = tracker.report(last_mid);
                         let risk_ctx = RiskContext {
@@ -313,6 +313,43 @@ where
                                 }
                                 continue;
                             }
+                        }
+                    }
+
+                    // Live mode: dispatch the action to the real venue.
+                    // Fills come back via the external_fills channel.
+                    // Paper mode: skip the venue call (fill_sim simulates).
+                    if live_mode {
+                        match &action {
+                            tikr_strategy::Action::Quote(intent) => {
+                                match venue.quote(intent.clone()).await {
+                                    Ok(qid) => info!(
+                                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                                        quote_id = ?qid, "live: order placed"
+                                    ),
+                                    Err(e) => warn!(error = ?e, "live: venue.quote failed"),
+                                }
+                            }
+                            tikr_strategy::Action::Requote { id, intent } => {
+                                match venue.requote(*id, intent.clone()).await {
+                                    Ok(()) => info!(
+                                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                                        old_id = ?id, "live: order requoted"
+                                    ),
+                                    Err(e) => warn!(error = ?e, "live: venue.requote failed"),
+                                }
+                            }
+                            tikr_strategy::Action::Cancel(id) => {
+                                if let Err(e) = venue.cancel(*id).await {
+                                    warn!(error = ?e, "live: venue.cancel failed");
+                                }
+                            }
+                            tikr_strategy::Action::CancelAll => {
+                                if let Err(e) = venue.cancel_all(&symbol).await {
+                                    warn!(error = ?e, "live: venue.cancel_all failed");
+                                }
+                            }
+                            tikr_strategy::Action::NoOp => {}
                         }
                     }
                     fill_sim.on_action(action, ts);
@@ -523,7 +560,7 @@ mod tests {
     use futures::stream::{self, BoxStream};
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
     use tikr_core::{Asset, Level, MarketKind, Notional, Size, VenueId};
@@ -534,6 +571,14 @@ mod tests {
     struct MockVenue {
         events: Mutex<Option<Vec<MarketEvent>>>,
         infinite: bool,
+        // Recording of write-side venue calls (for live-mode tests).
+        // Arc<Mutex<_>> so tests can keep a clone after the runner moves
+        // the venue. When `live_mode` is off, these stay empty because
+        // the runner never invokes the write methods.
+        quote_calls: Arc<Mutex<Vec<QuoteIntent>>>,
+        cancel_calls: Arc<Mutex<Vec<QuoteId>>>,
+        cancel_all_calls: Arc<Mutex<u32>>,
+        requote_calls: Arc<Mutex<Vec<(QuoteId, QuoteIntent)>>>,
     }
 
     impl MockVenue {
@@ -541,12 +586,20 @@ mod tests {
             Self {
                 events: Mutex::new(Some(events)),
                 infinite: false,
+                quote_calls: Arc::new(Mutex::new(Vec::new())),
+                cancel_calls: Arc::new(Mutex::new(Vec::new())),
+                cancel_all_calls: Arc::new(Mutex::new(0)),
+                requote_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
         fn infinite_heartbeats() -> Self {
             Self {
                 events: Mutex::new(Some(Vec::new())),
                 infinite: true,
+                quote_calls: Arc::new(Mutex::new(Vec::new())),
+                cancel_calls: Arc::new(Mutex::new(Vec::new())),
+                cancel_all_calls: Arc::new(Mutex::new(0)),
+                requote_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -577,17 +630,21 @@ mod tests {
                 Ok(Box::pin(stream::iter(events)))
             }
         }
-        async fn quote(&self, _intent: QuoteIntent) -> Result<QuoteId, VenueError> {
-            unimplemented!()
+        async fn quote(&self, intent: QuoteIntent) -> Result<QuoteId, VenueError> {
+            self.quote_calls.lock().unwrap().push(intent);
+            Ok(QuoteId::new())
         }
-        async fn requote(&self, _id: QuoteId, _intent: QuoteIntent) -> Result<(), VenueError> {
-            unimplemented!()
+        async fn requote(&self, id: QuoteId, intent: QuoteIntent) -> Result<(), VenueError> {
+            self.requote_calls.lock().unwrap().push((id, intent));
+            Ok(())
         }
-        async fn cancel(&self, _id: QuoteId) -> Result<(), VenueError> {
-            unimplemented!()
+        async fn cancel(&self, id: QuoteId) -> Result<(), VenueError> {
+            self.cancel_calls.lock().unwrap().push(id);
+            Ok(())
         }
         async fn cancel_all(&self, _symbol: &Symbol) -> Result<(), VenueError> {
-            unimplemented!()
+            *self.cancel_all_calls.lock().unwrap() += 1;
+            Ok(())
         }
         async fn position(&self, _symbol: &Symbol) -> Result<tikr_core::Position, VenueError> {
             unimplemented!()
@@ -881,5 +938,170 @@ mod tests {
         assert!(report.per_symbol.contains_key(&symbol_a));
         assert!(report.per_symbol.contains_key(&symbol_b));
         assert_eq!(report.sum.schema_version, SCHEMA_VERSION);
+    }
+
+    /// Live mode (external_fills = Some) dispatches strategy actions to the
+    /// venue's quote / cancel_all methods. Paper mode skips them.
+    ///
+    /// Regression: pre-fix, the runner only called fill_sim.on_action and
+    /// never invoked venue.quote() — Hyperliquid + DODO + Binance "live"
+    /// runs all processed market events but placed zero real orders.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_mode_dispatches_actions_to_venue() {
+        let symbol = make_symbol();
+        // Two BookUpdates so NaiveGrid emits CancelAll + Quote on the second.
+        let events = vec![
+            MarketEvent::BookUpdate {
+                snapshot: Snapshot {
+                    symbol: symbol.clone(),
+                    bids: vec![Level {
+                        price: Price(Decimal::from(100)),
+                        size: Size(Decimal::from(1)),
+                    }],
+                    asks: vec![Level {
+                        price: Price(Decimal::from(101)),
+                        size: Size(Decimal::from(1)),
+                    }],
+                    ts: Timestamp(1_000),
+                },
+            },
+            MarketEvent::BookUpdate {
+                snapshot: Snapshot {
+                    symbol: symbol.clone(),
+                    bids: vec![Level {
+                        price: Price(Decimal::from(102)),
+                        size: Size(Decimal::from(1)),
+                    }],
+                    asks: vec![Level {
+                        price: Price(Decimal::from(103)),
+                        size: Size(Decimal::from(1)),
+                    }],
+                    ts: Timestamp(2_000),
+                },
+            },
+        ];
+        let venue = MockVenue::finite(events);
+        // Clone the recording handles before moving the venue.
+        let quote_log = venue.quote_calls.clone();
+        let cancel_all_log = venue.cancel_all_calls.clone();
+
+        let strategy = NaiveGrid::new(NaiveGridConfig {
+            levels_per_side: 1,
+            base_spread_bps: 50,
+            level_step_bps: 10,
+            size_per_quote: Size(Decimal::from(1)),
+            min_requote_interval_ms: 0,
+        });
+        let fill_sim = FillSim::new(FillSimConfig {
+            submit_latency_ms: 0,
+            cancel_latency_ms: 0,
+            fees: VenueFees {
+                maker_bps: 0,
+                taker_bps: 0,
+            },
+        });
+
+        let temp = TempDir::new().unwrap();
+        let config = RunnerConfig {
+            state_dir: temp.path().to_path_buf(),
+            snapshot_every_n_events: 100,
+        };
+        // External fills channel: empty, never sends — but `Some` activates
+        // live_mode.
+        let (_fill_tx, fill_rx) = mpsc::unbounded_channel::<Fill>();
+        let (_tx, rx) = watch::channel(false);
+
+        let report = run_with_resume(
+            venue,
+            strategy,
+            fill_sim,
+            symbol,
+            rx,
+            config,
+            None,
+            None,
+            None,
+            Some(fill_rx),
+        )
+        .await;
+
+        assert_eq!(report.events_processed, 2);
+
+        // NaiveGrid emits CancelAll + Quotes on each book update. Live mode
+        // must have dispatched both to the venue.
+        let cancel_all_count = *cancel_all_log.lock().unwrap();
+        let quote_count = quote_log.lock().unwrap().len();
+        assert!(
+            cancel_all_count > 0,
+            "live mode must dispatch CancelAll to venue (got {cancel_all_count})"
+        );
+        assert!(
+            quote_count > 0,
+            "live mode must dispatch Quote to venue (got {quote_count})"
+        );
+    }
+
+    /// Paper mode (external_fills = None) does NOT call venue write methods.
+    /// Strategy actions go to fill_sim only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paper_mode_does_not_dispatch_to_venue() {
+        let symbol = make_symbol();
+        let events = vec![MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: symbol.clone(),
+                bids: vec![Level {
+                    price: Price(Decimal::from(100)),
+                    size: Size(Decimal::from(1)),
+                }],
+                asks: vec![Level {
+                    price: Price(Decimal::from(101)),
+                    size: Size(Decimal::from(1)),
+                }],
+                ts: Timestamp(1_000),
+            },
+        }];
+        let venue = MockVenue::finite(events);
+        let quote_log = venue.quote_calls.clone();
+        let cancel_all_log = venue.cancel_all_calls.clone();
+
+        let strategy = NaiveGrid::new(NaiveGridConfig {
+            levels_per_side: 1,
+            base_spread_bps: 50,
+            level_step_bps: 10,
+            size_per_quote: Size(Decimal::from(1)),
+            min_requote_interval_ms: 0,
+        });
+        let fill_sim = FillSim::new(FillSimConfig {
+            submit_latency_ms: 0,
+            cancel_latency_ms: 0,
+            fees: VenueFees {
+                maker_bps: 0,
+                taker_bps: 0,
+            },
+        });
+
+        let temp = TempDir::new().unwrap();
+        let config = RunnerConfig {
+            state_dir: temp.path().to_path_buf(),
+            snapshot_every_n_events: 100,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let _report = run_with_resume(
+            venue, strategy, fill_sim, symbol, rx, config, None, None, None,
+            None, // paper mode
+        )
+        .await;
+
+        assert_eq!(
+            *cancel_all_log.lock().unwrap(),
+            0,
+            "paper mode must not dispatch CancelAll to venue"
+        );
+        assert_eq!(
+            quote_log.lock().unwrap().len(),
+            0,
+            "paper mode must not dispatch Quote to venue"
+        );
     }
 }
