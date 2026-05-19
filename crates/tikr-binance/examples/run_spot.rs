@@ -3,28 +3,32 @@
 //! # Operator pre-flight
 //!
 //! ```bash
-//! # 1. Get a testnet API key + secret:
-//! #    https://testnet.binance.vision (log in, create API key)
-//! #
-//! # 2. Fund with test assets via the testnet faucet (free, no KYC).
-//! #
-//! # 3. Put credentials in .env (or export to shell):
-//! echo 'TIKR_BINANCE_API_KEY=your-testnet-key' >> .env
-//! echo 'TIKR_BINANCE_API_SECRET=your-testnet-secret' >> .env
+//! # Option A: HMAC (existing, unchanged)
+//! export TIKR_BINANCE_KEY_TYPE=hmac    # or omit; default
+//! export TIKR_BINANCE_API_KEY=your-testnet-key
+//! export TIKR_BINANCE_API_SECRET=your-testnet-secret
 //!
-//! # 4. Run (testnet, safe default):
-//! cargo run -p tikr-binance --example run_spot -- \
-//!   --env spot-testnet --symbol BTCUSDT --minutes 30
-//!
-//! # 5. Mainnet (requires real Binance account + trading permissions):
-//! TIKR_BINANCE_ENABLE_MAINNET=1 cargo run -p tikr-binance --example run_spot -- \
-//!   --env spot-mainnet --symbol BTCUSDT --minutes 30
+//! # Option B: Ed25519 (recommended for mainnet — private key never leaves machine)
+//! # 1. Generate locally:
+//! #    openssl genpkey -algorithm ed25519 -out keys/binance-ed25519.pem
+//! #    openssl pkey -pubout -in keys/binance-ed25519.pem
+//! # 2. Paste the printed public key into Binance API Management UI
+//! # 3. Copy the API key string Binance shows back to you
+//! # 4. Env:
+//! export TIKR_BINANCE_KEY_TYPE=ed25519
+//! export TIKR_BINANCE_API_KEY=your-api-key-from-binance-ui
+//! export TIKR_BINANCE_PRIVATE_KEY_PATH=./keys/binance-ed25519.pem
 //! ```
 //!
 //! # Key loading (priority order)
 //!
-//! 1. `TIKR_BINANCE_API_KEY` + `TIKR_BINANCE_API_SECRET` env vars.
-//! 2. `--key-file <path>` flag (single line: `key:secret`).
+//! HMAC:
+//!   1. `TIKR_BINANCE_API_KEY` + `TIKR_BINANCE_API_SECRET` env vars.
+//!   2. `--key-file <path>` flag (single line: `key:secret`).
+//!
+//! Ed25519:
+//!   1. `TIKR_BINANCE_KEY_TYPE=ed25519` + `TIKR_BINANCE_PRIVATE_KEY_PATH`.
+//!   2. `--ed25519-key-file <path>` flag overrides `TIKR_BINANCE_PRIVATE_KEY_PATH`.
 //!
 //! **NEVER log the raw credentials.** The client hides them internally.
 //!
@@ -36,7 +40,8 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use tikr_binance::{
-    BinanceClient, BinanceEnv, load_credentials_from_env, load_credentials_from_file,
+    BinanceClient, BinanceEnv, BinanceKeyMaterial, load_credentials_from_file,
+    load_key_material_from_env,
 };
 use tikr_core::{Asset, MarketKind, Symbol, VenueId};
 use tikr_venue::Venue;
@@ -70,10 +75,15 @@ struct Args {
     #[arg(long, default_value = "BTCUSDT")]
     symbol: String,
 
-    /// Path to a key file (`key:secret` single line).
+    /// Path to a key file (`key:secret` single line) for HMAC auth.
     /// `TIKR_BINANCE_API_KEY` / `TIKR_BINANCE_API_SECRET` take precedence.
     #[arg(long)]
     key_file: Option<PathBuf>,
+
+    /// Path to an Ed25519 private key PEM file.
+    /// Overrides `TIKR_BINANCE_PRIVATE_KEY_PATH`. Requires `TIKR_BINANCE_KEY_TYPE=ed25519`.
+    #[arg(long)]
+    ed25519_key_file: Option<PathBuf>,
 
     /// State directory for snapshots.
     #[arg(long, default_value = "./state")]
@@ -109,13 +119,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Load credentials.
-    let (api_key, api_secret) = if let Ok(creds) = load_credentials_from_env() {
-        creds
-    } else if let Some(ref path) = args.key_file {
-        load_credentials_from_file(path).map_err(|e| format!("key-file error: {e}"))?
+    // Load API key.
+    let api_key =
+        std::env::var("TIKR_BINANCE_API_KEY").map_err(|_| "TIKR_BINANCE_API_KEY not set")?;
+
+    // Load key material based on TIKR_BINANCE_KEY_TYPE.
+    let key_material: BinanceKeyMaterial = if let Some(ref kf) = args.key_file
+        && std::env::var("TIKR_BINANCE_KEY_TYPE")
+            .unwrap_or_default()
+            .to_lowercase()
+            != "ed25519"
+    {
+        // HMAC via --key-file: parse key:secret, use only the secret part.
+        let (_k, secret) =
+            load_credentials_from_file(kf).map_err(|e| format!("key-file error: {e}"))?;
+        BinanceKeyMaterial::Hmac { secret }
     } else {
-        return Err("No credentials: set TIKR_BINANCE_API_KEY/SECRET or pass --key-file".into());
+        load_key_material_from_env(args.ed25519_key_file.as_deref())
+            .map_err(|e| format!("credential error: {e}"))?
     };
 
     // Derive quote asset from symbol (last 4 chars heuristic, e.g. USDT/BUSD).
@@ -131,10 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env = ?env,
         symbol = %args.symbol,
         state_dir = %args.state_dir.display(),
+        key_type = ?key_material,
         "starting Spot runner"
     );
 
-    let client = BinanceClient::with_credentials(env, api_key, api_secret, Some(&symbol)).await?;
+    let client = BinanceClient::with_credentials(env, api_key, key_material, Some(&symbol)).await?;
 
     info!(client = ?client, "BinanceClient ready");
 

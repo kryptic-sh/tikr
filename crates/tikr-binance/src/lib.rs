@@ -22,20 +22,23 @@
 //!
 //! ## Signing
 //!
-//! HMAC-SHA256 over the query string; `&signature=<hex>` appended last.
-//! See [`sign`] module.
+//! HMAC-SHA256 (hex) or Ed25519 (base64) over the query string;
+//! `&signature=<value>` appended last. See [`sign`] module.
 //!
 //! ## Credentials
 //!
-//! Read from env vars `TIKR_BINANCE_API_KEY` and `TIKR_BINANCE_API_SECRET`,
-//! or via the `--key-file` flag in example bins (single line `key:secret`).
+//! HMAC (default): `TIKR_BINANCE_API_KEY` + `TIKR_BINANCE_API_SECRET`, or
+//! `--key-file <path>` flag (single line `key:secret`).
+//!
+//! Ed25519: `TIKR_BINANCE_API_KEY` + `TIKR_BINANCE_PRIVATE_KEY_PATH` (PEM
+//! file), or `--ed25519-key-file <path>` flag. Set `TIKR_BINANCE_KEY_TYPE=ed25519`.
 //!
 //! ## Security
 //!
 //! [`BinanceClient`] implements a manual `Debug` that omits `api_key` and
-//! `api_secret`. Never log those fields.
+//! `key_material` entirely. Never log those fields.
 //!
-//! See issues #42, #43, #44 for design decisions and architecture notes.
+//! See issues #42, #43, #44, #45 for design decisions and architecture notes.
 
 #![deny(missing_docs)]
 
@@ -47,6 +50,8 @@ pub mod futs;
 pub mod sign;
 pub mod spot;
 pub mod user_stream;
+
+pub use sign::BinanceKeyMaterial;
 
 use async_trait::async_trait;
 use depth_stream::binance_symbol;
@@ -116,12 +121,12 @@ impl BinanceEnv {
 ///
 /// # Debug
 ///
-/// Manual impl: `api_key` and `api_secret` are never printed.
+/// Manual impl: `api_key` and `key_material` are never printed.
 pub struct BinanceClient {
     env: BinanceEnv,
     http: HttpClient,
     api_key: String,
-    api_secret: String,
+    key_material: BinanceKeyMaterial,
     mainnet_writes_enabled: bool,
     exchange_info_cache: ExchangeInfoCache,
 }
@@ -149,7 +154,7 @@ impl BinanceClient {
     pub async fn with_credentials(
         env: BinanceEnv,
         api_key: String,
-        api_secret: String,
+        key_material: BinanceKeyMaterial,
         symbol: Option<&Symbol>,
     ) -> Result<Self, VenueError> {
         let http = HttpClient::new();
@@ -186,7 +191,7 @@ impl BinanceClient {
             env,
             http,
             api_key,
-            api_secret,
+            key_material,
             mainnet_writes_enabled,
             exchange_info_cache,
         };
@@ -204,7 +209,7 @@ impl BinanceClient {
                 &client.http,
                 base_url,
                 &client.api_key,
-                &client.api_secret,
+                &client.key_material,
                 &sym_str,
                 1,
             )
@@ -331,7 +336,7 @@ impl Venue for BinanceClient {
                 &self.http,
                 base_url,
                 &self.api_key,
-                &self.api_secret,
+                &self.key_material,
                 &sym_str,
                 intent.side,
                 &price_str,
@@ -344,7 +349,7 @@ impl Venue for BinanceClient {
                 &self.http,
                 base_url,
                 &self.api_key,
-                &self.api_secret,
+                &self.key_material,
                 &sym_str,
                 intent.side,
                 &price_str,
@@ -371,7 +376,7 @@ impl Venue for BinanceClient {
                 &self.http,
                 base_url,
                 &self.api_key,
-                &self.api_secret,
+                &self.key_material,
                 &sym_str,
                 &coid,
             )
@@ -381,7 +386,7 @@ impl Venue for BinanceClient {
                 &self.http,
                 base_url,
                 &self.api_key,
-                &self.api_secret,
+                &self.key_material,
                 &sym_str,
                 &coid,
             )
@@ -439,7 +444,7 @@ impl Venue for BinanceClient {
                 &self.http,
                 base_url,
                 &self.api_key,
-                &self.api_secret,
+                &self.key_material,
                 &sym_str,
             )
             .await
@@ -448,7 +453,7 @@ impl Venue for BinanceClient {
                 &self.http,
                 base_url,
                 &self.api_key,
-                &self.api_secret,
+                &self.key_material,
                 &sym_str,
             )
             .await
@@ -481,9 +486,11 @@ impl Venue for BinanceClient {
 // Credential helpers (used by example bins)
 // ---------------------------------------------------------------------------
 
-/// Load API key + secret from environment variables.
+/// Load API key + HMAC secret from environment variables.
 ///
 /// Reads `TIKR_BINANCE_API_KEY` and `TIKR_BINANCE_API_SECRET`.
+///
+/// For Ed25519, use [`load_key_material_from_env`] instead.
 pub fn load_credentials_from_env() -> Result<(String, String), String> {
     let key = std::env::var("TIKR_BINANCE_API_KEY")
         .map_err(|_| "TIKR_BINANCE_API_KEY not set".to_string())?;
@@ -492,7 +499,7 @@ pub fn load_credentials_from_env() -> Result<(String, String), String> {
     Ok((key, secret))
 }
 
-/// Load API key + secret from a key file (`key:secret` single line).
+/// Load API key + HMAC secret from a key file (`key:secret` single line).
 pub fn load_credentials_from_file(path: &std::path::Path) -> Result<(String, String), String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("key-file {}: {}", path.display(), e))?;
@@ -509,6 +516,50 @@ pub fn load_credentials_from_file(path: &std::path::Path) -> Result<(String, Str
         .ok_or("key-file: missing ':secret' part")?
         .to_string();
     Ok((key, secret))
+}
+
+/// Load [`BinanceKeyMaterial`] from environment variables.
+///
+/// Reads `TIKR_BINANCE_KEY_TYPE` (default: `hmac`) and then either:
+/// - HMAC: `TIKR_BINANCE_API_SECRET`
+/// - Ed25519: `TIKR_BINANCE_PRIVATE_KEY_PATH` (path to PEM file)
+///
+/// `ed25519_key_file` overrides `TIKR_BINANCE_PRIVATE_KEY_PATH` for Ed25519.
+pub fn load_key_material_from_env(
+    ed25519_key_file: Option<&std::path::Path>,
+) -> Result<BinanceKeyMaterial, String> {
+    let key_type = std::env::var("TIKR_BINANCE_KEY_TYPE")
+        .unwrap_or_else(|_| "hmac".to_string())
+        .to_lowercase();
+
+    match key_type.as_str() {
+        "hmac" => {
+            let secret = std::env::var("TIKR_BINANCE_API_SECRET")
+                .map_err(|_| "TIKR_BINANCE_API_SECRET not set (required for HMAC)".to_string())?;
+            Ok(BinanceKeyMaterial::Hmac { secret })
+        }
+        "ed25519" => {
+            let path = if let Some(p) = ed25519_key_file {
+                p.to_path_buf()
+            } else {
+                std::env::var("TIKR_BINANCE_PRIVATE_KEY_PATH")
+                    .map(std::path::PathBuf::from)
+                    .map_err(|_| {
+                        "Ed25519 key path required: \
+                         --ed25519-key-file or TIKR_BINANCE_PRIVATE_KEY_PATH"
+                            .to_string()
+                    })?
+            };
+            let pem = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Ed25519 PEM file {}: {e}", path.display()))?;
+            let signing_key = sign::load_ed25519_from_pem(&pem)
+                .map_err(|e| format!("Ed25519 PEM parse: {e:?}"))?;
+            Ok(BinanceKeyMaterial::Ed25519 { signing_key })
+        }
+        other => Err(format!(
+            "Unknown TIKR_BINANCE_KEY_TYPE: {other} (expected hmac|ed25519)"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

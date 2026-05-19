@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::errors::{is_cancel_idempotent, parse_binance_error_code};
 use crate::exchange_info::ExchangeInfoResponse;
-use crate::sign::append_auth;
+use crate::sign::{BinanceKeyMaterial, append_auth_dispatch};
 
 // ---------------------------------------------------------------------------
 // Order response
@@ -63,7 +63,7 @@ pub async fn place_order(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
     side: Side,
     price: &str,
@@ -80,7 +80,7 @@ pub async fn place_order(
          &quantity={quantity}&price={price}\
          &newClientOrderId={client_order_id}"
     );
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(
         symbol,
@@ -128,12 +128,12 @@ pub async fn cancel_order(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
     client_order_id: &str,
 ) -> Result<(), VenueError> {
     let params = format!("symbol={symbol}&origClientOrderId={client_order_id}");
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(symbol, client_order_id, "spot: canceling order");
 
@@ -170,11 +170,11 @@ pub async fn cancel_all_orders(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
 ) -> Result<(), VenueError> {
     let params = format!("symbol={symbol}");
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(symbol, "spot: canceling all open orders");
 

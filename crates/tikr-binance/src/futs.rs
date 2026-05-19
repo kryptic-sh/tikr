@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::errors::{is_cancel_idempotent, parse_binance_error_code};
 use crate::exchange_info::ExchangeInfoResponse;
-use crate::sign::append_auth;
+use crate::sign::{BinanceKeyMaterial, append_auth_dispatch};
 
 // ---------------------------------------------------------------------------
 // Futures endpoints
@@ -39,7 +39,7 @@ pub async fn place_order(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
     side: Side,
     price: &str,
@@ -56,7 +56,7 @@ pub async fn place_order(
          &quantity={quantity}&price={price}\
          &newClientOrderId={client_order_id}"
     );
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(
         symbol,
@@ -104,12 +104,12 @@ pub async fn cancel_order(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
     client_order_id: &str,
 ) -> Result<(), VenueError> {
     let params = format!("symbol={symbol}&origClientOrderId={client_order_id}");
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(symbol, client_order_id, "futures: canceling order");
 
@@ -146,11 +146,11 @@ pub async fn cancel_all_orders(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
 ) -> Result<(), VenueError> {
     let params = format!("symbol={symbol}");
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(symbol, "futures: canceling all open orders");
 
@@ -188,12 +188,12 @@ pub async fn update_leverage(
     http: &HttpClient,
     base_url: &str,
     api_key: &str,
-    api_secret: &str,
+    key_material: &BinanceKeyMaterial,
     symbol: &str,
     leverage: u32,
 ) -> Result<(), VenueError> {
     let params = format!("symbol={symbol}&leverage={leverage}");
-    let signed = append_auth(&params, api_secret);
+    let signed = append_auth_dispatch(&params, key_material);
 
     info!(symbol, leverage, "futures: updating leverage");
 
