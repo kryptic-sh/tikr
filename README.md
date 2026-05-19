@@ -1,5 +1,33 @@
 # tikr
 
+> ## ⚠️ READ THIS FIRST — FINANCIAL RISK WARNING ⚠️
+>
+> **This is experimental software for educational and personal research use
+> only. It is NOT financial advice and NOT a production trading system.**
+>
+> - **You can lose ALL of your money.** Market making, perpetual futures, and
+>   any leveraged trading carries unlimited downside risk including
+>   liquidation and negative balance.
+> - **Bugs in this code WILL lose you money** if you run it with real funds.
+>   This is pre-alpha, unaudited, written by hobbyists with no fiduciary
+>   relationship to you.
+> - **You are 100% responsible** for any losses, regulatory consequences, tax
+>   obligations, exchange TOS violations, and account actions resulting from
+>   running this bot. The authors accept ZERO liability.
+> - **Test on testnet only** until you fully understand the code. Even then,
+>   start with the smallest possible position sizes if you ever go live.
+> - **Manipulation, wash trading, and other prohibited strategies are NOT
+>   legal on DEXs either** — see the Mango Markets case. Don't use this for
+>   anything that would violate your jurisdiction's market-abuse laws or your
+>   exchange's terms of service.
+> - **Run only on accounts you can afford to zero out.** Never trade with
+>   money you need for rent, debt, dependents, or anything else.
+>
+> By cloning, building, or running this software you acknowledge that you
+> have read this warning and that any financial loss is entirely your own
+> responsibility. See [LICENSE](LICENSE) (MIT — "AS IS, WITHOUT WARRANTY OF
+> ANY KIND").
+
 Modular, venue-agnostic market-making engine in Rust. Pre-alpha — backtest
 framework + strategy traits + Hyperliquid stub adapter only. **Not for live
 trading yet.**

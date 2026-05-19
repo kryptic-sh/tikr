@@ -1,3 +1,33 @@
+================================================================================
+                       FINANCIAL RISK WARNING — READ FIRST
+================================================================================
+
+This software is experimental, pre-alpha, unaudited code for EDUCATIONAL and
+PERSONAL RESEARCH use only. It is NOT financial advice and NOT a production
+trading system.
+
+  * YOU CAN LOSE ALL OF YOUR MONEY. Market making, perpetual futures, and any
+    leveraged trading carries unlimited downside risk including liquidation
+    and negative balance.
+  * Bugs in this code WILL lose you money if you run it with real funds.
+  * YOU ARE 100% RESPONSIBLE for any losses, regulatory consequences, tax
+    obligations, exchange Terms-of-Service violations, and account actions
+    resulting from running this software.
+  * Manipulation, wash trading, and other prohibited strategies are illegal
+    even on DEXs in most jurisdictions. Do not use this software for anything
+    that violates your jurisdiction's market-abuse laws or your exchange's
+    Terms of Service.
+  * Test on testnet only until you fully understand the code.
+  * Run only on accounts you can afford to zero out. Never trade with money
+    you need for rent, debt, dependents, or anything else.
+
+By cloning, building, or running this software you acknowledge that you have
+read this warning and that any financial loss is entirely your own
+responsibility. The authors and copyright holders accept ZERO liability —
+see the disclaimer of warranty below.
+
+================================================================================
+
 MIT License
 
 Copyright (c) 2026 mxaddict
