@@ -16,7 +16,7 @@ use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
 use tikr_core::{
@@ -233,9 +233,12 @@ where
     // Seed counters from resume.
     let mut events_processed: u64 = resume.as_ref().map(|r| r.events_processed).unwrap_or(0);
     let mut fills_emitted: u64 = resume.as_ref().map(|r| r.fills_emitted).unwrap_or(0);
+    // Buy/sell fill counters drive the periodic status line. Not yet persisted
+    // to PaperReport — resume always starts these at 0.
+    let mut buy_fills: u64 = 0;
+    let mut sell_fills: u64 = 0;
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
-    let resumed_sim_duration_secs: u64 =
-        resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
+    let resumed_sim_duration_secs: u64 = resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
 
     // Skim-mode state. Tracks profit accumulated since the last skim. When it
     // crosses `budget × skim_pct`, that chunk is split into a spot buy (size
@@ -310,6 +313,12 @@ where
     // but its synthesized fills are discarded; real fills come from `external_fills`.
     let live_mode = external_fills.is_some();
 
+    // 1 Hz status-line ticker. First tick fires immediately; we skip it so
+    // the loop only emits status starting at +1s.
+    let mut status_tick = tokio::time::interval(Duration::from_secs(1));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    status_tick.tick().await;
+
     loop {
         // Poll the external fill receiver when in live mode. We use an async
         // block that resolves to `Option<Fill>` so the select! can be unified.
@@ -333,13 +342,14 @@ where
                 }
 
                 let pos = tracker.snapshot();
+                let open_quotes = fill_sim.live_quotes_for(&symbol);
                 let ctx = StrategyContext {
                     symbol: &symbol,
                     now: ts,
                     position: &pos,
                     recent_fills: &[],
                     latest_book: &current_book,
-                    open_quotes: &[],
+                    open_quotes: &open_quotes,
                 };
 
                 let actions = strategy.on_event(&ctx, &event);
@@ -385,16 +395,28 @@ where
                     // Live mode: dispatch the action to the real venue.
                     // Fills come back via the external_fills channel.
                     // Paper mode: skip the venue call (fill_sim simulates).
+                    //
+                    // Quote handling is special — we feed the venue's returned
+                    // QuoteId into FillSim so subsequent strategy `Cancel(id)`
+                    // actions reference ids the venue recognizes.
                     if live_mode {
                         match &action {
                             tikr_strategy::Action::Quote(intent) => {
                                 match venue.quote(intent.clone()).await {
-                                    Ok(qid) => info!(
-                                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
-                                        quote_id = ?qid, "live: order placed"
-                                    ),
+                                    Ok(qid) => {
+                                        info!(
+                                            side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                                            quote_id = ?qid, "live: order placed"
+                                        );
+                                        fill_sim.enqueue_place_with_id(
+                                            intent.clone(),
+                                            ts,
+                                            qid,
+                                        );
+                                    }
                                     Err(e) => warn!(error = ?e, "live: venue.quote failed"),
                                 }
+                                continue;
                             }
                             tikr_strategy::Action::Requote { id, intent } => {
                                 match venue.requote(*id, intent.clone()).await {
@@ -433,6 +455,8 @@ where
                             &mut tracker,
                             &mut risk_gate,
                             &mut fills_emitted,
+                            &mut buy_fills,
+                            &mut sell_fills,
                             alert_sink.as_deref(),
                             &symbol,
                         )
@@ -442,6 +466,7 @@ where
                         // results queue through fill_sim and process on the
                         // NEXT market event (no infinite-recursion risk).
                         let post_fill_pos = tracker.snapshot();
+                        let post_fill_quotes = fill_sim.live_quotes_for(&symbol);
                         let fill_event = MarketEvent::Fill(fill_clone.clone());
                         let fill_ctx = StrategyContext {
                             symbol: &symbol,
@@ -449,7 +474,7 @@ where
                             position: &post_fill_pos,
                             recent_fills: std::slice::from_ref(&fill_clone),
                             latest_book: &current_book,
-                            open_quotes: &[],
+                            open_quotes: &post_fill_quotes,
                         };
                         let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
                         for action in fill_actions {
@@ -534,10 +559,57 @@ where
                     &mut tracker,
                     &mut risk_gate,
                     &mut fills_emitted,
+                    &mut buy_fills,
+                    &mut sell_fills,
                     alert_sink.as_deref(),
                     &symbol,
                 )
                 .await;
+            }
+            _ = status_tick.tick() => {
+                let pos = tracker.snapshot();
+                let pnl = tracker.report(last_mid);
+                let quotes = fill_sim.live_quotes_for(&symbol);
+                let (open_buys, open_sells) = quotes.iter().fold((0u32, 0u32), |(b, s), (_, q)| {
+                    match q.side {
+                        tikr_core::Side::Bid => (b + 1, s),
+                        tikr_core::Side::Ask => (b, s + 1),
+                    }
+                });
+                let elapsed = started.elapsed().as_secs() + resumed_runtime_secs;
+                let fills_per_min = if elapsed > 0 {
+                    (fills_emitted as f64) * 60.0 / (elapsed as f64)
+                } else {
+                    0.0
+                };
+                let base_value = pos.size.0 * last_mid.0;
+                let acct = if let Some(sc) = skim_cfg.as_ref() {
+                    sc.budget + pnl.net.0 + skim_total_usdt + base_stacked * last_mid.0
+                } else {
+                    pnl.net.0
+                };
+                info!(
+                    target: "tikr_paper::status",
+                    symbol = %symbol.base.0,
+                    runtime_s = elapsed,
+                    fills = fills_emitted,
+                    buy = buy_fills,
+                    sell = sell_fills,
+                    fpm = format!("{:.1}", fills_per_min),
+                    open_b = open_buys,
+                    open_s = open_sells,
+                    pos = %pos.size.0,
+                    base_usdt = %base_value.round_dp(2),
+                    last = %last_mid.0,
+                    realized = %pnl.realized.0.round_dp(4),
+                    fees = %pnl.fees.0.round_dp(4),
+                    mtm = %pnl.net.0.round_dp(4),
+                    acct = %acct.round_dp(4),
+                    skims = skim_count,
+                    skim_usd = %skim_total_usdt.round_dp(2),
+                    base_stk = %base_stacked.round_dp(6),
+                    "status"
+                );
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -552,13 +624,14 @@ where
     // Shutdown actions skip the risk gate — cancel-all is always allowed.
     let pos = tracker.snapshot();
     let now_ts = current_book.ts;
+    let shutdown_quotes = fill_sim.live_quotes_for(&symbol);
     let ctx = StrategyContext {
         symbol: &symbol,
         now: now_ts,
         position: &pos,
         recent_fills: &[],
         latest_book: &current_book,
-        open_quotes: &[],
+        open_quotes: &shutdown_quotes,
     };
     let shutdown_actions = strategy.on_shutdown(&ctx);
     for action in shutdown_actions {
@@ -581,8 +654,7 @@ where
         &symbol,
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
-    report.sim_duration_secs =
-        resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
+    report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
     }
@@ -606,6 +678,8 @@ async fn apply_fill(
     tracker: &mut PositionTracker,
     risk_gate: &mut Option<Box<dyn RiskGate>>,
     fills_emitted: &mut u64,
+    buy_fills: &mut u64,
+    sell_fills: &mut u64,
     alert_sink: Option<&dyn AlertSink>,
     symbol: &Symbol,
 ) {
@@ -615,6 +689,10 @@ async fn apply_fill(
         gate.record_fill(fill.ts);
     }
     *fills_emitted += 1;
+    match fill.side {
+        tikr_core::Side::Bid => *buy_fills += 1,
+        tikr_core::Side::Ask => *sell_fills += 1,
+    }
     if let Some(sink) = alert_sink {
         let _ = sink
             .send(Alert::Fill {
@@ -650,9 +728,10 @@ fn finalize(
         _ => 0,
     };
     let final_perp_balance = match skim_cfg {
-        Some(sc) => sc.budget + base.realized.0 + base.funding.0 - base.fees.0
-            - skim_total_usdt
-            + base.unrealized.0,
+        Some(sc) => {
+            sc.budget + base.realized.0 + base.funding.0 - base.fees.0 - skim_total_usdt
+                + base.unrealized.0
+        }
         None => Decimal::ZERO,
     };
     let final_base_value = base_stacked * last_mid.0;
@@ -1203,14 +1282,11 @@ mod tests {
 
         assert_eq!(report.events_processed, 2);
 
-        // NaiveGrid emits CancelAll + Quotes on each book update. Live mode
-        // must have dispatched both to the venue.
-        let cancel_all_count = *cancel_all_log.lock().unwrap();
+        // NaiveGrid emits Quotes on every book update (Cancel(id) appears
+        // from the second update onward once `ctx.open_quotes` is populated).
+        // Verify live mode dispatched Quotes to the venue.
+        let _ = cancel_all_log;
         let quote_count = quote_log.lock().unwrap().len();
-        assert!(
-            cancel_all_count > 0,
-            "live mode must dispatch CancelAll to venue (got {cancel_all_count})"
-        );
         assert!(
             quote_count > 0,
             "live mode must dispatch Quote to venue (got {quote_count})"

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Launch the Binance USD-M Perp testnet paper trader, one process per symbol.
+#
+# Usage:
+#   ./run                                 # default BTCUSDT
+#   ./run ETHUSDT                         # single
+#   ./run BTCUSDT,ETHUSDT,SOLUSDT         # multi
+#
+# Logs land at /tmp/tikr_paper_<SYM>.log. Ctrl-C kills all children.
+
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+# Source .env if present so API keys are exported to children.
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+SYMBOLS_ARG="${1:-BTCUSDT}"
+IFS=',' read -ra SYMBOLS <<< "$SYMBOLS_ARG"
+
+echo "==> building (release) ..."
+cargo build --release --example run_perp -p tikr-binance
+
+# Force colored tracing output to log files.
+export RUST_LOG="${RUST_LOG:-info}"
+export RUST_LOG_STYLE=always
+
+declare -a PIDS=()
+
+cleanup() {
+  echo
+  echo "==> stopping ${#PIDS[@]} child(ren) ..."
+  for pid in "${PIDS[@]}"; do
+    kill -INT "$pid" 2>/dev/null || true
+  done
+  wait
+  echo "==> done."
+}
+trap cleanup INT TERM
+
+for sym in "${SYMBOLS[@]}"; do
+  sym_clean="${sym// /}"
+  [[ -z "$sym_clean" ]] && continue
+  log="/tmp/tikr_paper_${sym_clean}.log"
+  echo "==> launching ${sym_clean} (log: ${log})"
+  cargo run --release --example run_perp -p tikr-binance -- \
+    --env futures-testnet \
+    --symbol "${sym_clean}" \
+    --strategy naive-grid \
+    --minutes 0 \
+    > "${log}" 2>&1 &
+  PIDS+=($!)
+done
+
+echo "==> ${#PIDS[@]} trader(s) running. Tailing status lines (Ctrl-C to stop)."
+echo
+
+# Tail status lines across all symbols. Filters for the periodic
+# tikr_paper::status events so logs stay readable.
+tail -F -n 0 /tmp/tikr_paper_*.log | grep --line-buffered -E "status|fill |WARN|ERROR"
+
+wait

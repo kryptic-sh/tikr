@@ -140,7 +140,10 @@ impl MicroPrice {
         // Time-forced requote.
         if let Some(last_ts) = self.last_requote_ts {
             let elapsed_ns = ts.0.saturating_sub(last_ts.0);
-            let min_ns = self.config.min_requote_interval_ms.saturating_mul(1_000_000);
+            let min_ns = self
+                .config
+                .min_requote_interval_ms
+                .saturating_mul(1_000_000);
             if elapsed_ns >= min_ns {
                 return true;
             }

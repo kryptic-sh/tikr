@@ -128,8 +128,16 @@ fn compute_band(window: &[Candle], compress: f64) -> Band {
 #[derive(Debug, Clone, Copy)]
 enum Position {
     Flat,
-    Long { qty: f64, avg_entry: f64, dca_count: u32 },
-    Short { qty: f64, avg_entry: f64, dca_count: u32 },
+    Long {
+        qty: f64,
+        avg_entry: f64,
+        dca_count: u32,
+    },
+    Short {
+        qty: f64,
+        avg_entry: f64,
+        dca_count: u32,
+    },
 }
 
 #[derive(Default, Debug, Clone)]
@@ -199,15 +207,13 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                 match (hit_buy, hit_sell) {
                     (true, true) => {
                         let pnl = (band.upper - band.lower) * base_size;
-                        let fees =
-                            (band.upper + band.lower) * base_size * maker_rate;
+                        let fees = (band.upper + band.lower) * base_size * maker_rate;
                         res.realized += pnl;
                         res.fees += fees;
                         res.cycles += 1;
                         res.round_trips += 1;
                         res.wins += 1;
-                        res.total_notional_traded +=
-                            (band.upper + band.lower) * base_size;
+                        res.total_notional_traded += (band.upper + band.lower) * base_size;
                     }
                     (true, false) => {
                         pos = Position::Long {
@@ -290,14 +296,17 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                     res.realized += pnl;
                     res.fees += tp_price * qty * maker_rate;
                     res.cycles += 1;
-                    if pnl > 0.0 { res.wins += 1 } else { res.losses += 1 };
+                    if pnl > 0.0 {
+                        res.wins += 1
+                    } else {
+                        res.losses += 1
+                    };
                     res.total_notional_traded += tp_price * qty;
                     pos = Position::Flat;
                 } else if hit_dca {
                     let add_size = base_size * dca_factor.powi(dca_count as i32);
                     let new_qty = qty + add_size;
-                    let new_avg =
-                        (avg_entry * qty + band.lower * add_size) / new_qty;
+                    let new_avg = (avg_entry * qty + band.lower * add_size) / new_qty;
                     let new_dca = dca_count + 1;
                     pos = Position::Long {
                         qty: new_qty,
@@ -369,14 +378,17 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                     res.realized += pnl;
                     res.fees += tp_price * qty * maker_rate;
                     res.cycles += 1;
-                    if pnl > 0.0 { res.wins += 1 } else { res.losses += 1 };
+                    if pnl > 0.0 {
+                        res.wins += 1
+                    } else {
+                        res.losses += 1
+                    };
                     res.total_notional_traded += tp_price * qty;
                     pos = Position::Flat;
                 } else if hit_dca {
                     let add_size = base_size * dca_factor.powi(dca_count as i32);
                     let new_qty = qty + add_size;
-                    let new_avg =
-                        (avg_entry * qty + band.upper * add_size) / new_qty;
+                    let new_avg = (avg_entry * qty + band.upper * add_size) / new_qty;
                     let new_dca = dca_count + 1;
                     pos = Position::Short {
                         qty: new_qty,
@@ -438,10 +450,18 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
 
     match pos {
         Position::Flat => {}
-        Position::Long { qty, avg_entry, dca_count } => {
+        Position::Long {
+            qty,
+            avg_entry,
+            dca_count,
+        } => {
             res.open_at_end = Some(("long", qty, avg_entry, dca_count));
         }
-        Position::Short { qty, avg_entry, dca_count } => {
+        Position::Short {
+            qty,
+            avg_entry,
+            dca_count,
+        } => {
             res.open_at_end = Some(("short", qty, avg_entry, dca_count));
         }
     }
@@ -526,7 +546,11 @@ fn print_summary(args: &Args, res: &Result_) {
         println!("BTC value end     : {:>14.4}", res.final_btc_value);
         let total = res.final_perp_balance + res.final_btc_value;
         let pnl = total - args.budget;
-        let pnl_pct = if args.budget > 0.0 { pnl / args.budget * 100.0 } else { 0.0 };
+        let pnl_pct = if args.budget > 0.0 {
+            pnl / args.budget * 100.0
+        } else {
+            0.0
+        };
         println!(
             "TOTAL ACCT VALUE  : {:>14.4}  (start ${:.2} → end ${:.2}, {:+.2}% [{:+.4}])",
             total, args.budget, total, pnl_pct, pnl
@@ -543,7 +567,11 @@ fn print_summary(args: &Args, res: &Result_) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let candles = load_candles(&args.data)?;
-    eprintln!("loaded {} candles from {}", candles.len(), args.data.display());
+    eprintln!(
+        "loaded {} candles from {}",
+        candles.len(),
+        args.data.display()
+    );
     if !candles.is_empty() {
         let span_ms = candles.last().unwrap().open_ts_ms - candles[0].open_ts_ms;
         let span_d = span_ms as f64 / (24.0 * 60.0 * 60_000.0);

@@ -137,8 +137,16 @@ fn simulate(candles: &[Candle], args: &Args, seed: u64) -> SimResult {
         // Did either bracket fall inside this candle's range?
         let high = c.high;
         let low = c.low;
-        let hit_tp = if side > 0 { high >= tp_price } else { low <= tp_price };
-        let hit_sl = if side > 0 { low <= sl_price } else { high >= sl_price };
+        let hit_tp = if side > 0 {
+            high >= tp_price
+        } else {
+            low <= tp_price
+        };
+        let hit_sl = if side > 0 {
+            low <= sl_price
+        } else {
+            high >= sl_price
+        };
 
         if hit_tp || hit_sl {
             // Conservative tie-break: SL first.
@@ -149,7 +157,11 @@ fn simulate(candles: &[Candle], args: &Args, seed: u64) -> SimResult {
             } else {
                 (tp_price, true)
             };
-            let pnl_per_unit = if side > 0 { exit_price - entry } else { entry - exit_price };
+            let pnl_per_unit = if side > 0 {
+                exit_price - entry
+            } else {
+                entry - exit_price
+            };
             let realized = pnl_per_unit * size;
             res.realized += realized;
             res.fees += exit_price * size * fee_rate; // exit taker fee
@@ -164,7 +176,11 @@ fn simulate(candles: &[Candle], args: &Args, seed: u64) -> SimResult {
             }
 
             res.cycles += 1;
-            if is_win { res.wins += 1 } else { res.losses += 1 };
+            if is_win {
+                res.wins += 1
+            } else {
+                res.losses += 1
+            };
             side = 0;
             entry = 0.0;
         }
@@ -182,16 +198,7 @@ fn print_summary(args: &Args, results: &[SimResult]) {
     println!("{}", "-".repeat(96));
     println!(
         "{:>6} {:>8} {:>6} {:>6} {:>7} {:>12} {:>12} {:>12} {:>10} {:>7}",
-        "seed",
-        "cycles",
-        "wins",
-        "loss",
-        "win%",
-        "realized",
-        "fees",
-        "NET",
-        "max_DD",
-        "open"
+        "seed", "cycles", "wins", "loss", "win%", "realized", "fees", "NET", "max_DD", "open"
     );
     for r in results {
         println!(
@@ -216,7 +223,16 @@ fn print_summary(args: &Args, results: &[SimResult]) {
     println!("{}", "-".repeat(96));
     println!(
         "{:>6} {:>8.1} {:>6} {:>6} {:>6.1}% {:>12} {:>12} {:>12.4} {:>10} {:>7}",
-        "AVG", avg_cycles, "-", "-", avg_win * 100.0, "-", "-", avg_net, "-", "-"
+        "AVG",
+        avg_cycles,
+        "-",
+        "-",
+        avg_win * 100.0,
+        "-",
+        "-",
+        avg_net,
+        "-",
+        "-"
     );
     println!(
         "Per-cycle avg NET (across seeds): {:.6} ({:.2} bps on size {})",
@@ -229,7 +245,11 @@ fn print_summary(args: &Args, results: &[SimResult]) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let candles = load_candles(&args.data)?;
-    eprintln!("loaded {} candles from {}", candles.len(), args.data.display());
+    eprintln!(
+        "loaded {} candles from {}",
+        candles.len(),
+        args.data.display()
+    );
     if !candles.is_empty() {
         let span_ms = candles.last().unwrap().open_ts_ms - candles[0].open_ts_ms;
         let span_d = span_ms as f64 / (24.0 * 60.0 * 60_000.0);

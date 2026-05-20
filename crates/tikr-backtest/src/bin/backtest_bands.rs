@@ -194,8 +194,7 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                         // Round trip in one bar — both edges hit. Realized =
                         // upper − lower per unit (always positive here).
                         let pnl = (band.upper - band.lower) * size;
-                        let fees =
-                            (band.upper + band.lower) * size * maker_rate;
+                        let fees = (band.upper + band.lower) * size * maker_rate;
                         res.realized += pnl;
                         res.fees += fees;
                         res.cycles += 1;
@@ -230,7 +229,11 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                     res.realized += pnl;
                     res.fees += c.open * size * taker_rate;
                     res.cycles += 1;
-                    if pnl > 0.0 { res.wins += 1 } else { res.losses += 1 };
+                    if pnl > 0.0 {
+                        res.wins += 1
+                    } else {
+                        res.losses += 1
+                    };
                     update_dd(res.realized, res.fees, &mut peak, &mut res.max_drawdown);
                     pos = Position::Flat;
                 } else if c.high >= band.upper {
@@ -239,7 +242,11 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                     res.realized += pnl;
                     res.fees += band.upper * size * maker_rate;
                     res.cycles += 1;
-                    if pnl > 0.0 { res.wins += 1 } else { res.losses += 1 };
+                    if pnl > 0.0 {
+                        res.wins += 1
+                    } else {
+                        res.losses += 1
+                    };
                     update_dd(res.realized, res.fees, &mut peak, &mut res.max_drawdown);
                     pos = Position::Flat;
                 }
@@ -251,7 +258,11 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                     res.realized += pnl;
                     res.fees += c.open * size * taker_rate;
                     res.cycles += 1;
-                    if pnl > 0.0 { res.wins += 1 } else { res.losses += 1 };
+                    if pnl > 0.0 {
+                        res.wins += 1
+                    } else {
+                        res.losses += 1
+                    };
                     update_dd(res.realized, res.fees, &mut peak, &mut res.max_drawdown);
                     pos = Position::Flat;
                 } else if c.low <= band.lower {
@@ -259,7 +270,11 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                     res.realized += pnl;
                     res.fees += band.lower * size * maker_rate;
                     res.cycles += 1;
-                    if pnl > 0.0 { res.wins += 1 } else { res.losses += 1 };
+                    if pnl > 0.0 {
+                        res.wins += 1
+                    } else {
+                        res.losses += 1
+                    };
                     update_dd(res.realized, res.fees, &mut peak, &mut res.max_drawdown);
                     pos = Position::Flat;
                 }
@@ -285,7 +300,10 @@ fn print_summary(args: &Args, res: &Result_) {
     let mode = if args.spread_bps > 0 {
         format!("fixed-spread (naive-grid) {}bps", args.spread_bps)
     } else {
-        format!("avg-HL band lookback={} compress={:.2}", args.lookback, args.compress)
+        format!(
+            "avg-HL band lookback={} compress={:.2}",
+            args.lookback, args.compress
+        )
     };
     println!(
         "\n{} on klines  |  maker={}bps  taker={}bps  size={}",
@@ -316,7 +334,11 @@ fn print_summary(args: &Args, res: &Result_) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let candles = load_candles(&args.data)?;
-    eprintln!("loaded {} candles from {}", candles.len(), args.data.display());
+    eprintln!(
+        "loaded {} candles from {}",
+        candles.len(),
+        args.data.display()
+    );
     if !candles.is_empty() {
         let span_ms = candles.last().unwrap().open_ts_ms - candles[0].open_ts_ms;
         let span_d = span_ms as f64 / (24.0 * 60.0 * 60_000.0);

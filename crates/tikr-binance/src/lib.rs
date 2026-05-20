@@ -61,7 +61,9 @@ use exchange_info::{
 };
 use futures::stream::BoxStream;
 use reqwest::Client as HttpClient;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use tikr_core::{Fill, MarketEvent, Position, Price, SignedSize, Snapshot, Symbol, Timestamp};
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tracing::{info, warn};
@@ -130,6 +132,11 @@ pub struct BinanceClient {
     key_material: BinanceKeyMaterial,
     mainnet_writes_enabled: bool,
     exchange_info_cache: ExchangeInfoCache,
+    /// Tracks `QuoteId → binance symbol string` for every open order placed
+    /// via `quote()`. Required because the `Venue::cancel(id)` trait method
+    /// doesn't pass the symbol but Binance's DELETE endpoint requires it.
+    /// Entries are removed on successful cancel.
+    quote_symbols: Arc<Mutex<HashMap<QuoteId, String>>>,
 }
 
 impl fmt::Debug for BinanceClient {
@@ -195,6 +202,7 @@ impl BinanceClient {
             key_material,
             mainnet_writes_enabled,
             exchange_info_cache,
+            quote_symbols: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Futures: set 1x leverage at startup. Gated by mainnet flag — this is a
@@ -366,6 +374,12 @@ impl Venue for BinanceClient {
             .await?;
         }
 
+        // Record symbol for this quote so `cancel(id)` can look it up later
+        // — the Venue trait doesn't pass symbol to `cancel`.
+        if let Ok(mut map) = self.quote_symbols.lock() {
+            map.insert(quote_id, sym_str.clone());
+        }
+
         Ok(quote_id)
     }
 
@@ -410,33 +424,53 @@ impl Venue for BinanceClient {
 
     /// Cancel a single quote by id.
     ///
-    /// Requires knowing the symbol — in v0 the `cancel` call encodes the
-    /// `clientOrderId` in the `QuoteId`, so we re-derive it here.
-    /// The symbol must be passed via the `id` encoding (v0 limitation: same
-    /// as Hyperliquid adapter — caller should prefer `cancel_all`).
-    ///
-    /// Because the Venue trait doesn't pass the symbol to `cancel`, v0 uses
-    /// the `clientOrderId` derived from the `QuoteId`. We send a DELETE with
-    /// `origClientOrderId=tikr_<hex>` which Binance accepts without a symbol
-    /// lookup — however, Binance does require the `symbol` param. Since we
-    /// don't have it here, this returns `VenueError::Rejected` with an
-    /// explanatory message. Callers should use `cancel_all` with a symbol
-    /// or `requote` instead.
-    ///
-    /// **v0 limitation**: store `symbol → QuoteId` map in the runner; use
-    /// `cancel_all` for defensive startup cancels.
+    /// Looks up the symbol from the internal `quote_symbols` map populated
+    /// by `quote()`. Returns `VenueError::Rejected` if the id is unknown —
+    /// that means the order was either never placed via this client or was
+    /// already cancelled. On success removes the entry from the map.
     async fn cancel(&self, id: QuoteId) -> Result<(), VenueError> {
         self.check_mainnet_gate()?;
-        // Binance cancel requires `symbol`. The Venue trait's cancel() does
-        // not pass symbol. In v0, we return a clear error so the operator
-        // knows to use cancel_all(symbol) instead.
         let coid = Self::client_order_id(id);
-        Err(VenueError::Rejected {
-            reason: format!(
-                "BinanceClient::cancel requires symbol; use cancel_all(symbol) or \
-                 requote instead. clientOrderId={coid}"
-            ),
-        })
+        let sym_str = match self.quote_symbols.lock() {
+            Ok(map) => map.get(&id).cloned(),
+            Err(_) => None,
+        };
+        let Some(sym_str) = sym_str else {
+            return Err(VenueError::Rejected {
+                reason: format!(
+                    "BinanceClient::cancel: unknown QuoteId (no symbol recorded). \
+                     clientOrderId={coid}"
+                ),
+            });
+        };
+        let base_url = self.env.rest_base_url();
+        let result = if self.env.is_futures() {
+            crate::futs::cancel_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.key_material,
+                &sym_str,
+                &coid,
+            )
+            .await
+        } else {
+            crate::spot::cancel_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.key_material,
+                &sym_str,
+                &coid,
+            )
+            .await
+        };
+        if result.is_ok()
+            && let Ok(mut map) = self.quote_symbols.lock()
+        {
+            map.remove(&id);
+        }
+        result
     }
 
     /// Cancel all open orders for a symbol.

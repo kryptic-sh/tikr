@@ -68,15 +68,15 @@ struct Kline {
 /// permissive types because numeric fields are wire-serialized as strings.
 #[derive(Debug, Deserialize)]
 struct RawKline(
-    u64,    // open time (ms)
-    String, // open
-    String, // high
-    String, // low
-    String, // close
-    String, // volume (base asset)
-    u64,    // close time (ms)
-    String, // quote volume
-    u64,    // number of trades
+    u64,                        // open time (ms)
+    String,                     // open
+    String,                     // high
+    String,                     // low
+    String,                     // close
+    String,                     // volume (base asset)
+    u64,                        // close time (ms)
+    String,                     // quote volume
+    u64,                        // number of trades
     #[allow(dead_code)] String, // taker buy base
     #[allow(dead_code)] String, // taker buy quote
     #[allow(dead_code)] String, // ignore
@@ -117,24 +117,43 @@ async fn fetch_page(
     end_ms: u64,
 ) -> Result<Vec<Kline>, Box<dyn std::error::Error>> {
     // limit=1500 is the max for klines on both spot and futures endpoints.
-    let resp = client
-        .get(url)
-        .query(&[
-            ("symbol", symbol.to_string()),
-            ("interval", interval.to_string()),
-            ("startTime", start_ms.to_string()),
-            ("endTime", end_ms.to_string()),
-            ("limit", "1500".to_string()),
-        ])
-        .send()
-        .await?
-        .error_for_status()?;
-    let raws: Vec<RawKline> = resp.json().await?;
-    let mut out = Vec::with_capacity(raws.len());
-    for r in raws {
-        out.push(Kline::try_from(r)?);
+    // Retry on 429 (rate limit) and 418 (IP ban warn-up) with exponential
+    // backoff. Respect `Retry-After` header when present.
+    let mut delay = Duration::from_secs(2);
+    loop {
+        let resp = client
+            .get(url)
+            .query(&[
+                ("symbol", symbol.to_string()),
+                ("interval", interval.to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime", end_ms.to_string()),
+                ("limit", "1500".to_string()),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == 429 || status == 418 {
+            let wait = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(delay);
+            eprintln!("rate-limited ({status}); backing off {}s", wait.as_secs());
+            tokio::time::sleep(wait).await;
+            delay = (delay * 2).min(Duration::from_secs(60));
+            continue;
+        }
+        let resp = resp.error_for_status()?;
+        let raws: Vec<RawKline> = resp.json().await?;
+        let mut out = Vec::with_capacity(raws.len());
+        for r in raws {
+            out.push(Kline::try_from(r)?);
+        }
+        return Ok(out);
     }
-    Ok(out)
 }
 
 fn interval_ms(interval: &str) -> Result<u64, String> {
@@ -197,6 +216,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "fetched {page_len} candles, total {} so far, cursor={cursor}",
             all.len()
         );
+        // 250ms inter-request pacing keeps us well under the 2400 weight/min
+        // budget for klines (cost=10 at limit=1500 → 240 req/min ceiling).
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     eprintln!("total candles: {}", all.len());

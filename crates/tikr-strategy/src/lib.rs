@@ -209,35 +209,21 @@ impl NaiveGrid {
         self.last_requote_ts
     }
 
-    /// Decide whether a requote should fire given a freshly observed mid and
-    /// the current time. Returns `true` on cold start (no prior requote).
-    fn should_requote(&self, new_mid: Price, now: Timestamp) -> bool {
-        let Some(last_ts) = self.last_requote_ts else {
-            return true;
-        };
-        let Some(last_mid) = self.last_quoted_mid else {
-            return true;
-        };
-
-        let elapsed_ns = now.0.saturating_sub(last_ts.0);
-        let interval_ns = self
-            .config
-            .min_requote_interval_ms
-            .saturating_mul(1_000_000);
-        if elapsed_ns >= interval_ns {
-            return true;
-        }
-
-        let drift = (new_mid.0 - last_mid.0).abs();
-        let threshold_bps = Decimal::from(self.config.level_step_bps) / Decimal::from(2);
-        let threshold = last_mid.0 * threshold_bps / Decimal::from(10_000);
-        drift > threshold
-    }
-
-    /// Build the cancel-all + 2N quote actions for the given mid.
-    fn build_quotes(&self, symbol: &Symbol, mid: Price) -> Vec<Action> {
-        let mut actions = Vec::with_capacity(1 + 2 * self.config.levels_per_side as usize);
-        actions.push(Action::CancelAll);
+    /// Build the 2N quote actions for the given mid, then cancel any
+    /// previously-known open quotes.
+    ///
+    /// Order matters: place NEW orders first so we're never naked on the
+    /// book between cancel and re-place. Use specific `Cancel(id)` for each
+    /// known prior quote — `CancelAll` would also kill the just-placed new
+    /// ones since the venue sees them all under the same symbol.
+    fn build_quotes(
+        &self,
+        symbol: &Symbol,
+        mid: Price,
+        open_quotes: &[(QuoteId, QuoteIntent)],
+    ) -> Vec<Action> {
+        let n_quotes = 2 * self.config.levels_per_side as usize;
+        let mut actions = Vec::with_capacity(n_quotes + open_quotes.len());
         let bps_unit = Decimal::from(10_000);
         for k in 0..self.config.levels_per_side {
             let offset_bps = Decimal::from(self.config.base_spread_bps)
@@ -255,6 +241,9 @@ impl NaiveGrid {
                     kind: QuoteKind::Point,
                 }));
             }
+        }
+        for (id, _) in open_quotes {
+            actions.push(Action::Cancel(*id));
         }
         actions
     }
@@ -289,35 +278,46 @@ impl Strategy for NaiveGrid {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        // Static-grid semantics: place a pair on cold start anchored at the
+        // first observed mid, then sit. Only re-quote when a Fill occurs —
+        // book drift and heartbeats no longer recenter.
         match event {
             MarketEvent::Trade { price, .. } => {
                 self.last_trade_price = Some(*price);
                 Vec::new()
             }
-            MarketEvent::Fill(_) => Vec::new(),
+            MarketEvent::Fill(_) => {
+                // A fill consumed one of our resting orders. Re-quote at the
+                // ORIGINAL anchor mid so refills land at the same prices.
+                // `build_quotes` cancels any remaining open quotes from the
+                // prior cycle (only the un-filled side) and places a fresh
+                // pair at the anchor levels.
+                let Some(mid) = self.last_quoted_mid else {
+                    return Vec::new();
+                };
+                self.build_quotes(ctx.symbol, mid, ctx.open_quotes)
+            }
             MarketEvent::Heartbeat { ts } => {
+                if self.last_quoted_mid.is_some() {
+                    return vec![Action::NoOp];
+                }
                 let Some(mid) = compute_mid(ctx.latest_book, self.last_trade_price) else {
                     return Vec::new();
                 };
-                if self.should_requote(mid, *ts) {
-                    self.last_requote_ts = Some(*ts);
-                    self.last_quoted_mid = Some(mid);
-                    self.build_quotes(ctx.symbol, mid)
-                } else {
-                    vec![Action::NoOp]
-                }
+                self.last_requote_ts = Some(*ts);
+                self.last_quoted_mid = Some(mid);
+                self.build_quotes(ctx.symbol, mid, ctx.open_quotes)
             }
             MarketEvent::BookUpdate { snapshot } => {
+                if self.last_quoted_mid.is_some() {
+                    return vec![Action::NoOp];
+                }
                 let Some(mid) = compute_mid(snapshot, self.last_trade_price) else {
                     return Vec::new();
                 };
-                if self.should_requote(mid, snapshot.ts) {
-                    self.last_requote_ts = Some(snapshot.ts);
-                    self.last_quoted_mid = Some(mid);
-                    self.build_quotes(ctx.symbol, mid)
-                } else {
-                    vec![Action::NoOp]
-                }
+                self.last_requote_ts = Some(snapshot.ts);
+                self.last_quoted_mid = Some(mid);
+                self.build_quotes(ctx.symbol, mid, ctx.open_quotes)
             }
         }
     }
@@ -514,15 +514,16 @@ mod tests {
         };
         let actions = grid.on_event(&ctx, &event);
 
-        assert_eq!(actions.len(), 5);
-        assert!(matches!(actions[0], Action::CancelAll));
-        for a in &actions[1..] {
+        // Cold start: no prior open quotes → 4 Quote actions (2 levels × 2 sides),
+        // no Cancels.
+        assert_eq!(actions.len(), 4);
+        for a in &actions {
             assert!(matches!(a, Action::Quote(_)));
         }
     }
 
     #[test]
-    fn requote_fires_after_interval() {
+    fn no_requote_after_interval_when_static() {
         let sym = make_symbol();
         let pos = make_pos(&sym);
         let book = make_book(&sym, &[(100, 1)], &[(102, 1)], 1000);
@@ -534,19 +535,19 @@ mod tests {
             snapshot: make_book(&sym, &[(100, 1)], &[(102, 1)], 1000),
         };
         let actions1 = grid.on_event(&ctx, &event1);
-        assert_eq!(actions1.len(), 5);
+        assert_eq!(actions1.len(), 4);
 
-        // Second update one full interval (1000ms = 1_000_000_000 ns) + 1ns later.
+        // Static-grid: second update one full interval later does NOT requote.
         let event2 = MarketEvent::BookUpdate {
             snapshot: make_book(&sym, &[(100, 1)], &[(102, 1)], 1000 + 1_000_000_000 + 1),
         };
         let actions2 = grid.on_event(&ctx, &event2);
-        assert_eq!(actions2.len(), 5);
-        assert!(matches!(actions2[0], Action::CancelAll));
+        assert_eq!(actions2.len(), 1);
+        assert!(matches!(actions2[0], Action::NoOp));
     }
 
     #[test]
-    fn requote_fires_on_mid_drift() {
+    fn no_requote_on_mid_drift_when_static() {
         let sym = make_symbol();
         let pos = make_pos(&sym);
         let book = make_book(&sym, &[(100, 1)], &[(100, 1)], 0);
@@ -558,16 +559,15 @@ mod tests {
             snapshot: make_book(&sym, &[(100, 1)], &[(100, 1)], 0),
         };
         let actions1 = grid.on_event(&ctx, &event1);
-        assert_eq!(actions1.len(), 5);
+        assert_eq!(actions1.len(), 4);
 
-        // Second update at ts=1ns (well within 1000ms interval), mid = 101 (~1%
-        // shift, far above the 2.5 bps drift threshold).
+        // Static-grid: 1% mid jump does NOT trigger requote — orders stay put.
         let event2 = MarketEvent::BookUpdate {
             snapshot: make_book(&sym, &[(101, 1)], &[(101, 1)], 1),
         };
         let actions2 = grid.on_event(&ctx, &event2);
-        assert_eq!(actions2.len(), 5);
-        assert!(matches!(actions2[0], Action::CancelAll));
+        assert_eq!(actions2.len(), 1);
+        assert!(matches!(actions2[0], Action::NoOp));
     }
 
     #[test]

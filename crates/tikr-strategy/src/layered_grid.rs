@@ -18,9 +18,26 @@
 //! dollar, higher sells release less coin per dollar — a built-in long
 //! bias before any price movement.
 //!
-//! **Re-entry**: when a fill lands the strategy emits a fresh order on
-//! the OPPOSITE side at the filled price ± `reentry_bps`. The 6-order
-//! count stays constant.
+//! **Re-entry on fill** (rolling ladder, keeps symmetric counts):
+//!
+//! 1. Drop the filled order from the local mirror.
+//! 2. Place a TP order on the OPPOSITE side at `fill_price ± reentry_bps`.
+//! 3. Extend the FILLED side outward — buys add a new entry at
+//!    `lowest_existing_buy × (1 − step_bps/10000)`; sells at
+//!    `highest_existing_sell × (1 + step_bps/10000)`.
+//! 4. Drop the outermost opposite-side order (highest ask on buy fill,
+//!    lowest bid on sell fill) so both sides stay at `levels_per_side`.
+//!
+//! Net effect: the whole ladder shifts ONE step in the direction the
+//! market just moved (price came down → ladder shifts down; price went
+//! up → ladder shifts up). Order count is invariant: always
+//! `2 × levels_per_side`.
+//!
+//! Per-fill action set is the diff — `Cancel(outermost_opposite_id)` +
+//! `Quote(tp)` + `Quote(extension)`. Surviving orders keep their venue-
+//! assigned `QuoteId`s and queue priority. The strategy looks up the
+//! outermost order's id via `ctx.open_quotes` (populated by the runner
+//! from `FillSim::live_quotes_for`).
 //!
 //! The strategy is fill-driven: after the cold-start placement on the
 //! first BookUpdate, it only emits new orders in response to its own
@@ -30,10 +47,8 @@
 //! See `crates/tikr-backtest/src/bin/backtest_layered_grid.rs` for the
 //! standalone candle-based version of the same logic.
 
-use tikr_core::{
-    Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce,
-};
-use tikr_venue::QuoteIntent;
+use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
+use tikr_venue::{QuoteId, QuoteIntent};
 
 use crate::{Action, Strategy, StrategyContext};
 
@@ -58,9 +73,9 @@ pub struct LayeredGridConfig {
 /// Layered-grid strategy state.
 ///
 /// `placed` flips to true on the first BookUpdate (cold-start placement).
-/// `orders` mirrors the prices+sides we believe are resting; we identify
-/// fills by matching `(side, price)` since [`Strategy`] doesn't observe
-/// the `QuoteId` assigned by the venue / FillSim.
+/// `orders` mirrors the prices+sides we believe are resting for fill
+/// matching. `QuoteId`s are looked up at use-time from
+/// [`StrategyContext::open_quotes`].
 pub struct LayeredGrid {
     config: LayeredGridConfig,
     placed: bool,
@@ -69,7 +84,8 @@ pub struct LayeredGrid {
 
 impl LayeredGrid {
     fn place_initial(&mut self, symbol: &Symbol, mid: Price) -> Vec<Action> {
-        let mut actions: Vec<Action> = Vec::with_capacity(self.config.levels_per_side as usize * 2 + 1);
+        let mut actions: Vec<Action> =
+            Vec::with_capacity(self.config.levels_per_side as usize * 2 + 1);
         // Cancel any stray quotes first (defensive — usually a no-op on cold start).
         actions.push(Action::CancelAll);
         self.orders.clear();
@@ -103,12 +119,21 @@ impl LayeredGrid {
         })
     }
 
-    fn on_fill(&mut self, symbol: &Symbol, fill_side: Side, fill_price: Price) -> Vec<Action> {
-        // Drop the matching order from our local mirror (closest matching price
-        // on the filled side). Use closest match since fill_price may equal the
-        // resting limit price exactly OR be the touch where a marketable order
-        // crossed — both should resolve to the inner-most matching order.
-        if let Some(pos) = self.orders.iter().position(|(s, p)| *s == fill_side && *p == fill_price) {
+    fn on_fill(
+        &mut self,
+        symbol: &Symbol,
+        fill_side: Side,
+        fill_price: Price,
+        open_quotes: &[(QuoteId, QuoteIntent)],
+    ) -> Vec<Action> {
+        // 1. Drop the filled order from the mirror (exact match preferred,
+        //    closest same-side match as fallback when fill_price is a touch
+        //    price rather than the exact limit).
+        if let Some(pos) = self
+            .orders
+            .iter()
+            .position(|(s, p)| *s == fill_side && *p == fill_price)
+        {
             self.orders.remove(pos);
         } else if let Some(pos) = self
             .orders
@@ -125,14 +150,91 @@ impl LayeredGrid {
             self.orders.remove(pos);
         }
 
-        // Re-enter on the opposite side at fill_price ± reentry_bps.
         let reentry_dec = Decimal::from(self.config.reentry_bps) / Decimal::from(10_000);
-        let (new_side, new_price) = match fill_side {
-            Side::Bid => (Side::Ask, Price(fill_price.0 * (Decimal::ONE + reentry_dec))),
-            Side::Ask => (Side::Bid, Price(fill_price.0 * (Decimal::ONE - reentry_dec))),
+        let step_dec = Decimal::from(self.config.step_bps) / Decimal::from(10_000);
+        let opp_side = match fill_side {
+            Side::Bid => Side::Ask,
+            Side::Ask => Side::Bid,
         };
-        self.orders.push((new_side, new_price));
-        vec![self.make_quote(symbol, new_side, new_price)]
+
+        // 2. Place TP on opposite side at fill_price ± reentry_bps.
+        let tp_price = match fill_side {
+            Side::Bid => Price(fill_price.0 * (Decimal::ONE + reentry_dec)),
+            Side::Ask => Price(fill_price.0 * (Decimal::ONE - reentry_dec)),
+        };
+        self.orders.push((opp_side, tp_price));
+
+        // 3. Extend the FILLED side outward at the same step gap. Anchor
+        //    on the outermost existing order on that side. Falls back to
+        //    fill_price if no same-side orders remain (degenerate case).
+        let same_side_extreme = match fill_side {
+            Side::Bid => self
+                .orders
+                .iter()
+                .filter(|(s, _)| *s == Side::Bid)
+                .map(|(_, p)| p.0)
+                .min(),
+            Side::Ask => self
+                .orders
+                .iter()
+                .filter(|(s, _)| *s == Side::Ask)
+                .map(|(_, p)| p.0)
+                .max(),
+        };
+        let anchor = same_side_extreme.unwrap_or(fill_price.0);
+        let extension_price = match fill_side {
+            Side::Bid => Price(anchor * (Decimal::ONE - step_dec)),
+            Side::Ask => Price(anchor * (Decimal::ONE + step_dec)),
+        };
+        self.orders.push((fill_side, extension_price));
+
+        // 4. Drop the outermost order on the OPPOSITE side so it stays
+        //    at `levels_per_side` (the new TP just bumped it to N+1).
+        //    "Outermost" = furthest from mid → highest ask, lowest bid.
+        //    Capture the price so we can look up its QuoteId in
+        //    `open_quotes` and emit a targeted Cancel (preserving queue
+        //    priority on the surviving orders).
+        let opp_outermost = self
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, _))| *s == opp_side)
+            .reduce(|acc, cur| {
+                let acc_outer = match opp_side {
+                    Side::Ask => acc.1.1.0 > cur.1.1.0,
+                    Side::Bid => acc.1.1.0 < cur.1.1.0,
+                };
+                if acc_outer { acc } else { cur }
+            })
+            .map(|(i, (s, p))| (i, *s, *p));
+
+        let mut actions: Vec<Action> = Vec::with_capacity(3);
+        if let Some((idx, drop_side, drop_price)) = opp_outermost {
+            self.orders.remove(idx);
+            // Resolve the QuoteId from the runner-supplied snapshot. If
+            // it can't be matched (e.g. the prior fill hasn't been
+            // ack'd yet) fall back to CancelAll so we stay correct
+            // rather than leaving a stale order on the book.
+            if let Some(id) = open_quotes
+                .iter()
+                .find(|(_, q)| q.side == drop_side && q.price == drop_price)
+                .map(|(id, _)| *id)
+            {
+                actions.push(Action::Cancel(id));
+            } else {
+                actions.push(Action::CancelAll);
+                // CancelAll wipes everything → replay the surviving mirror
+                // PLUS the about-to-be-added TP + extension below.
+                for (side, price) in self.orders.clone() {
+                    actions.push(self.make_quote(symbol, side, price));
+                }
+            }
+        }
+
+        // 5. Emit the TP + extension as fresh Quotes.
+        actions.push(self.make_quote(symbol, opp_side, tp_price));
+        actions.push(self.make_quote(symbol, fill_side, extension_price));
+        actions
     }
 }
 
@@ -163,7 +265,7 @@ impl Strategy for LayeredGrid {
                 self.place_initial(ctx.symbol, mid)
             }
             MarketEvent::Fill(f) if f.symbol_matches(ctx.symbol) => {
-                self.on_fill(ctx.symbol, f.side, f.price)
+                self.on_fill(ctx.symbol, f.side, f.price, ctx.open_quotes)
             }
             // After cold-start, BookUpdate / Trade / Heartbeat don't change
             // grid state. The strategy is purely fill-driven.
@@ -189,7 +291,10 @@ impl FillSymbolExt for tikr_core::Fill {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Fill, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp, VenueId};
+    use tikr_core::{
+        Asset, Fill, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp,
+        VenueId,
+    };
     use tikr_venue::QuoteId;
 
     fn sym() -> Symbol {
@@ -253,7 +358,12 @@ mod tests {
         let p = flat_pos(&s);
         let c = ctx(&s, &p, &snap);
         let mut strat = LayeredGrid::new(cfg());
-        let actions = strat.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = strat.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         // 1 CancelAll + 6 Quote
         assert_eq!(actions.len(), 7);
         assert!(matches!(actions[0], Action::CancelAll));
@@ -278,23 +388,53 @@ mod tests {
         let p = flat_pos(&s);
         let c = ctx(&s, &p, &snap);
         let mut strat = LayeredGrid::new(cfg());
-        let _ = strat.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let _ = strat.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         // Second event should be no-op (grid is purely fill-driven after cold start).
-        let actions = strat.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = strat.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         assert!(actions.is_empty());
     }
 
     #[test]
-    fn fill_emits_reentry_on_opposite_side() {
+    fn fill_rolls_ladder_one_step() {
         let s = sym();
         let snap = book(&s, 1000, 1001);
         let p = flat_pos(&s);
-        let c = ctx(&s, &p, &snap);
         let mut strat = LayeredGrid::new(cfg());
-        let _ = strat.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
-        // Simulate a buy fill at the inner buy price ≈ 1000.5 × (1 − 6bps) = 999.9003
-        // We compute it the same way the strategy did:
-        let mid = Decimal::new(10005, 1); // 1000.5
+        let cold_actions = strat.on_event(
+            &ctx(&s, &p, &snap),
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        // Build a fake `open_quotes` from the cold-start placements so
+        // the diff-Cancel path has QuoteIds to resolve.
+        let open_quotes: Vec<(QuoteId, QuoteIntent)> = cold_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some((QuoteId::new(), q.clone())),
+                _ => None,
+            })
+            .collect();
+        let fill_ctx = StrategyContext {
+            symbol: &s,
+            now: Timestamp(1000),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &open_quotes,
+        };
+
+        let mid = Decimal::new(10005, 1);
         let inner_bp = Decimal::from(6) / Decimal::from(10_000);
         let buy_price = Price(mid * (Decimal::ONE - inner_bp));
         let fill = Fill {
@@ -307,16 +447,26 @@ mod tests {
             side: Side::Bid,
             ts: Timestamp(1000),
         };
-        let actions = strat.on_event(&c, &MarketEvent::Fill(fill));
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
+        let actions = strat.on_event(&fill_ctx, &MarketEvent::Fill(fill));
+        // Diff path: Cancel(highest_ask) + Quote(TP) + Quote(extension) = 3
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], Action::Cancel(_)));
+        match &actions[1] {
             Action::Quote(q) => {
                 assert_eq!(q.side, Side::Ask);
-                // Re-entry should be ~3bps above the fill price
-                let expected = buy_price.0 * (Decimal::ONE + Decimal::from(3) / Decimal::from(10_000));
-                assert_eq!(q.price.0, expected);
+                let reentry = Decimal::from(3) / Decimal::from(10_000);
+                assert_eq!(q.price.0, buy_price.0 * (Decimal::ONE + reentry));
             }
-            _ => panic!("expected Quote"),
+            _ => panic!("expected TP Quote on Ask"),
+        }
+        match &actions[2] {
+            Action::Quote(q) => {
+                assert_eq!(q.side, Side::Bid);
+                let step = Decimal::from(3) / Decimal::from(10_000);
+                let outer = mid * (Decimal::ONE - Decimal::from(12) / Decimal::from(10_000));
+                assert_eq!(q.price.0, outer * (Decimal::ONE - step));
+            }
+            _ => panic!("expected extension Quote on Bid"),
         }
     }
 }

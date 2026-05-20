@@ -39,8 +39,21 @@ use polars::prelude::*;
     about = "Layered fixed-fiat grid with re-entry scalping (always N orders/side)"
 )]
 struct Args {
+    /// Single parquet path. Mutually exclusive with `--symbols`.
     #[arg(long, default_value = "./data/klines/eth_1m_90d.parquet")]
     data: PathBuf,
+    /// Comma-separated symbols (e.g. `BTCUSDT,ETHUSDT,SAHARAUSDT`).
+    /// Resolves each to `{data-dir}/{lower-strip-USDT}_1m_1d.parquet`.
+    /// Overrides `--data` when set.
+    #[arg(long, default_value = "")]
+    symbols: String,
+    /// Base directory for `--symbols` lookup.
+    #[arg(long, default_value = "./data/klines")]
+    data_dir: PathBuf,
+    /// Filename suffix after the lowercase base. Path becomes
+    /// `{data-dir}/{base}{suffix}`. E.g. `_1m_1d.parquet`, `_1m_1y.parquet`.
+    #[arg(long, default_value = "_1m_1d.parquet")]
+    file_suffix: String,
     /// Fixed fiat notional per order. Coin quantity = notional / price.
     #[arg(long, default_value_t = 100.0_f64)]
     notional_per_order: f64,
@@ -275,8 +288,14 @@ fn print_summary(args: &Args, stats: &Stats, orders: &[Order], last_close: f64, 
         args.maker_bps
     );
     println!("{}", "-".repeat(96));
-    println!("fills total       : {}  ({} buy, {} sell)", stats.fills, stats.buy_fills, stats.sell_fills);
-    println!("realized cash-flow: {:>14.4}  (fiat_received − fiat_spent)", stats.realized_usdt);
+    println!(
+        "fills total       : {}  ({} buy, {} sell)",
+        stats.fills, stats.buy_fills, stats.sell_fills
+    );
+    println!(
+        "realized cash-flow: {:>14.4}  (fiat_received − fiat_spent)",
+        stats.realized_usdt
+    );
     println!("fees              : {:>14.4}", stats.fees);
     let realized_net = stats.realized_usdt - stats.fees;
     println!("realized − fees   : {:>14.4}", realized_net);
@@ -292,7 +311,8 @@ fn print_summary(args: &Args, stats: &Stats, orders: &[Order], last_close: f64, 
     let mtm = realized_net + base_value;
     println!("TOTAL MTM PnL     : {:>14.4}", mtm);
     println!("max drawdown      : {:>14.4}", stats.max_drawdown);
-    println!("open orders end   : {}  ({} buys, {} sells)",
+    println!(
+        "open orders end   : {}  ({} buys, {} sells)",
         orders.len(),
         orders.iter().filter(|o| o.side == Side::Buy).count(),
         orders.iter().filter(|o| o.side == Side::Sell).count(),
@@ -315,16 +335,116 @@ fn print_summary(args: &Args, stats: &Stats, orders: &[Order], last_close: f64, 
     }
 }
 
+fn parse_symbols(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn symbol_to_path(data_dir: &PathBuf, sym: &str, suffix: &str) -> PathBuf {
+    let base = sym.trim_end_matches("USDT").to_lowercase();
+    data_dir.join(format!("{base}{suffix}"))
+}
+
+fn print_table_header(args: &Args) {
+    println!(
+        "\nLayered-grid sweep  |  notional/order=${}  levels={}  inner={}bps  step={}bps  reentry={}bps  maker={}bps",
+        args.notional_per_order,
+        args.levels_per_side,
+        args.inner_bps,
+        args.step_bps,
+        args.reentry_bps,
+        args.maker_bps
+    );
+    println!("{}", "-".repeat(96));
+    println!(
+        "{:<14} {:>7} {:>12} {:>10} {:>10} {:>10} {:>10}",
+        "SYMBOL", "FILLS", "REAL-FEE", "BASE_USDT", "MTM", "DD", "ACCT%"
+    );
+}
+
+fn print_table_row(sym: &str, stats: &Stats, last_close: f64, budget: f64) {
+    let realized_net = stats.realized_usdt - stats.fees;
+    let base_value = stats.base_position * last_close;
+    let mtm = realized_net + base_value;
+    let acct_pct = if budget > 0.0 {
+        format!("{:+.2}%", mtm / budget * 100.0)
+    } else {
+        "-".to_string()
+    };
+    println!(
+        "{:<14} {:>7} {:>12.4} {:>10.4} {:>10.4} {:>10.4} {:>10}",
+        sym, stats.fills, realized_net, base_value, mtm, stats.max_drawdown, acct_pct
+    );
+}
+
+fn run_one(path: &PathBuf, args: &Args) -> Result<(Stats, f64), Box<dyn std::error::Error>> {
+    let candles = load_candles(path)?;
+    let (stats, _, last_close, _) = simulate(&candles, args);
+    Ok((stats, last_close))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let candles = load_candles(&args.data)?;
-    eprintln!("loaded {} candles from {}", candles.len(), args.data.display());
-    if !candles.is_empty() {
-        let span_ms = candles.last().unwrap().open_ts_ms - candles[0].open_ts_ms;
-        let span_d = span_ms as f64 / (24.0 * 60.0 * 60_000.0);
-        eprintln!("span: {:.1} days", span_d);
+    let symbols = parse_symbols(&args.symbols);
+
+    if symbols.is_empty() {
+        let candles = load_candles(&args.data)?;
+        eprintln!(
+            "loaded {} candles from {}",
+            candles.len(),
+            args.data.display()
+        );
+        if !candles.is_empty() {
+            let span_ms = candles.last().unwrap().open_ts_ms - candles[0].open_ts_ms;
+            let span_d = span_ms as f64 / (24.0 * 60.0 * 60_000.0);
+            eprintln!("span: {:.1} days", span_d);
+        }
+        let (stats, orders, last_close, max_notional) = simulate(&candles, &args);
+        print_summary(&args, &stats, &orders, last_close, max_notional);
+        return Ok(());
     }
-    let (stats, orders, last_close, max_notional) = simulate(&candles, &args);
-    print_summary(&args, &stats, &orders, last_close, max_notional);
+
+    print_table_header(&args);
+    let mut totals_mtm = 0.0;
+    let mut totals_real_fee = 0.0;
+    let mut totals_dd = 0.0;
+    let mut wins = 0usize;
+    for sym in &symbols {
+        let path = symbol_to_path(&args.data_dir, sym, &args.file_suffix);
+        match run_one(&path, &args) {
+            Ok((stats, last_close)) => {
+                let realized_net = stats.realized_usdt - stats.fees;
+                let mtm = realized_net + stats.base_position * last_close;
+                if mtm > 0.0 {
+                    wins += 1;
+                }
+                totals_mtm += mtm;
+                totals_real_fee += realized_net;
+                totals_dd += stats.max_drawdown;
+                print_table_row(sym, &stats, last_close, args.budget);
+            }
+            Err(e) => {
+                eprintln!("{sym}: load failed ({} — {e})", path.display());
+            }
+        }
+    }
+    let n = symbols.len() as f64;
+    println!("{}", "-".repeat(96));
+    println!(
+        "MEAN ({} sym, {} wins): real-fee={:.4}  mtm={:.4}  dd={:.4}",
+        symbols.len(),
+        wins,
+        totals_real_fee / n,
+        totals_mtm / n,
+        totals_dd / n
+    );
+    if args.budget > 0.0 {
+        println!(
+            "Aggregate acct% (sum mtm / (n × budget)): {:+.2}%",
+            totals_mtm / (n * args.budget) * 100.0
+        );
+    }
     Ok(())
 }

@@ -141,7 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handles: Vec<JoinHandle<(String, PaperReport)>> = Vec::new();
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "naive-grid 5bps",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "naive-grid 5bps",
         NaiveGrid::new(NaiveGridConfig {
             levels_per_side: 1,
             base_spread_bps: 5,
@@ -154,7 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "naive-grid 2bps",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "naive-grid 2bps",
         NaiveGrid::new(NaiveGridConfig {
             levels_per_side: 1,
             base_spread_bps: 2,
@@ -167,7 +173,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "A-S γ=0.1 5bps",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "A-S γ=0.1 5bps",
         AvellanedaStoikov::new(AvellanedaStoikovConfig {
             gamma: Decimal::from_str("0.1")?,
             base_spread_bps: 5,
@@ -182,7 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "GLFT γ=0.1 5bps",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "GLFT γ=0.1 5bps",
         Glft::new(GlftConfig {
             gamma: Decimal::from_str("0.1")?,
             base_spread_bps: 5,
@@ -196,7 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB improve=1 noskew",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB improve=1 noskew",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -211,7 +226,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB pure-join",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB pure-join",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -226,7 +244,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(10,0.005)",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB improve=1 skew(10,0.005)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -241,7 +262,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(20,0.005)",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB improve=1 skew(20,0.005)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -258,7 +282,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for max_imb in [3u32, 5, 7, 10, 20] {
         let name = format!("TOB improve=1 imb({max_imb})");
         spawn_preset(
-            &mut handles, &shared_data, &symbol, &name,
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &name,
             TopOfBook::new(TopOfBookConfig {
                 size_per_quote,
                 tick_size: tick,
@@ -274,7 +301,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(10) + imb(5)",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB improve=1 skew(10) + imb(5)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -289,7 +319,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB improve=1 noskew (BNB)",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB improve=1 noskew (BNB)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -304,7 +337,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(10,0.005) (BNB)",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "TOB improve=1 skew(10,0.005) (BNB)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -324,7 +360,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for half in [1u32, 2, 3, 5] {
         let name = format!("micro-price half={half}t");
         spawn_preset(
-            &mut handles, &shared_data, &symbol, &name,
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &name,
             MicroPrice::new(MicroPriceConfig {
                 size_per_quote,
                 tick_size: tick,
@@ -340,7 +379,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Micro-price + inventory skew combined.
     spawn_preset(
-        &mut handles, &shared_data, &symbol, "micro-price half=2t skew(10,0.005)",
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "micro-price half=2t skew(10,0.005)",
         MicroPrice::new(MicroPriceConfig {
             size_per_quote,
             tick_size: tick,
@@ -356,21 +398,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Layered grid sweep — re-entry-scalping ladder, fill-driven. Re-entry
     // bps dominates per-cycle PnL (must clear 2× maker fee or it's a loser).
     // notional_per_order is dollars per limit; coin qty = notional / price.
-    for (label, inner, step, reentry) in [
-        ("LG inner=6 step=3 re=8", 6u32, 3u32, 8u32),
-        ("LG inner=6 step=3 re=12", 6, 3, 12),
-        ("LG inner=10 step=5 re=12", 10, 5, 12),
-        ("LG inner=10 step=5 re=20", 10, 5, 20),
-        ("LG inner=6 step=1 re=20", 6, 1, 20),
-    ] {
+    // Levels-per-side sweep at the best re-entry from the prior sweep
+    // (re=20 peaked on the 2h BTC sample). More levels = more capital
+    // committed (each level adds $100 of resting orders on both sides),
+    // but also more chances to catch the spread.
+    for levels in [1u32, 3, 5, 7, 10] {
+        let label = format!("LG inner=6 step=1 re=20 levels={levels}");
         spawn_preset(
-            &mut handles, &shared_data, &symbol, label,
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &label,
             LayeredGrid::new(LayeredGridConfig {
                 notional_per_order: Decimal::from(100),
-                levels_per_side: 3,
-                inner_bps: inner,
-                step_bps: step,
-                reentry_bps: reentry,
+                levels_per_side: levels,
+                inner_bps: 6,
+                step_bps: 1,
+                reentry_bps: 20,
             }),
             fees,
             skim_cfg,
@@ -378,7 +422,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let sweep_start = std::time::Instant::now();
-    info!(presets = handles.len(), "awaiting parallel preset completion");
+    info!(
+        presets = handles.len(),
+        "awaiting parallel preset completion"
+    );
     let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(handles.len());
     for h in handles {
         results.push(h.await?);
@@ -461,8 +508,9 @@ fn spawn_preset<S: Strategy + Send + 'static>(
 }
 
 fn print_table(results: &[(String, PaperReport)]) {
-    let skim_active = results.iter().any(|(_, r)| r.skim_count > 0
-        || decimal_to_f64(&r.final_perp_balance.0) != 0.0);
+    let skim_active = results
+        .iter()
+        .any(|(_, r)| r.skim_count > 0 || decimal_to_f64(&r.final_perp_balance.0) != 0.0);
 
     // Detect base asset label from any preset with skim active. Empty
     // (no skim) → header reads generic "base stack".
@@ -481,7 +529,15 @@ fn print_table(results: &[(String, PaperReport)]) {
     if skim_active {
         println!(
             "{:<36} {:>7} {:>9} {:>11} {:>11} {:>6} {:>11} {:>12} {:>12}",
-            "preset", "fills", "fills/min", "realized", "fees", "skims", base_label, "perp+unreal", "TOTAL ACCT"
+            "preset",
+            "fills",
+            "fills/min",
+            "realized",
+            "fees",
+            "skims",
+            base_label,
+            "perp+unreal",
+            "TOTAL ACCT"
         );
         println!("{}", "-".repeat(120));
     } else {

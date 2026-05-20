@@ -43,8 +43,17 @@ struct PendingOp {
 }
 
 enum Op {
-    Place(QuoteIntent),
-    Replace { id: QuoteId, intent: QuoteIntent },
+    Place {
+        intent: QuoteIntent,
+        /// Live mode: the venue already returned its own `QuoteId`. Use it
+        /// here so `live_quotes_for` exposes venue ids back to the strategy.
+        /// `None` in paper mode → FillSim mints a fresh id.
+        override_id: Option<QuoteId>,
+    },
+    Replace {
+        id: QuoteId,
+        intent: QuoteIntent,
+    },
     Cancel(QuoteId),
     CancelAll,
 }
@@ -136,12 +145,51 @@ impl FillSim {
         }
     }
 
+    /// Snapshot of currently-resting orders for `symbol` as
+    /// `(quote_id, intent)` pairs. Mirrors what
+    /// [`tikr_strategy::StrategyContext::open_quotes`] expects so the
+    /// runner can populate strategy context for fill-aware logic
+    /// (e.g. LayeredGrid's ladder roll emits Cancel for specific orders
+    /// rather than CancelAll + replay).
+    ///
+    /// `size_remaining` carries the live remaining size, NOT the original
+    /// intent size — important for strategies that look up partial state.
+    pub fn live_quotes_for(&self, symbol: &Symbol) -> Vec<(QuoteId, QuoteIntent)> {
+        self.live_quotes
+            .iter()
+            .filter(|q| &q.symbol == symbol)
+            .map(|q| {
+                (
+                    q.id,
+                    QuoteIntent {
+                        symbol: q.symbol.clone(),
+                        side: q.side,
+                        price: q.price,
+                        size: q.size_remaining,
+                        // Live resting orders are by construction post-only
+                        // here (FillSim's IOC/FOK paths return immediately
+                        // and never enter live_quotes). Stamp PostOnly so
+                        // strategies don't have to special-case.
+                        tif: TimeInForce::PostOnly,
+                        kind: tikr_core::QuoteKind::Point,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Schedule a strategy action for venue submission at `now + appropriate_latency_ms`.
     pub fn on_action(&mut self, action: Action, now: Timestamp) {
         let submit_ns = self.cfg.submit_latency_ms.saturating_mul(1_000_000);
         let cancel_ns = self.cfg.cancel_latency_ms.saturating_mul(1_000_000);
         let (scheduled, op) = match action {
-            Action::Quote(intent) => (now.0.saturating_add(submit_ns), Op::Place(intent)),
+            Action::Quote(intent) => (
+                now.0.saturating_add(submit_ns),
+                Op::Place {
+                    intent,
+                    override_id: None,
+                },
+            ),
             Action::Requote { id, intent } => {
                 (now.0.saturating_add(submit_ns), Op::Replace { id, intent })
             }
@@ -154,6 +202,28 @@ impl FillSim {
             op,
         });
         // Stable sort preserves FIFO within identical scheduled_ts_ns.
+        self.pending.sort_by_key(|p| p.scheduled_ts_ns);
+    }
+
+    /// Live-mode variant: enqueue a Place using a venue-supplied `QuoteId`
+    /// instead of letting FillSim mint a fresh one. Use this from the runner
+    /// when the venue has already returned an id for a successful `quote()`.
+    /// `live_quotes_for` will then return venue ids — so strategy-emitted
+    /// `Cancel(id)` actions reference ids the venue knows about.
+    pub fn enqueue_place_with_id(
+        &mut self,
+        intent: QuoteIntent,
+        now: Timestamp,
+        venue_id: QuoteId,
+    ) {
+        let submit_ns = self.cfg.submit_latency_ms.saturating_mul(1_000_000);
+        self.pending.push(PendingOp {
+            scheduled_ts_ns: now.0.saturating_add(submit_ns),
+            op: Op::Place {
+                intent,
+                override_id: Some(venue_id),
+            },
+        });
         self.pending.sort_by_key(|p| p.scheduled_ts_ns);
     }
 
@@ -190,14 +260,21 @@ impl FillSim {
         let mut fills = Vec::new();
         for p in ready {
             match p.op {
-                Op::Place(intent) => {
-                    if let Some(f) = self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns)) {
+                Op::Place {
+                    intent,
+                    override_id,
+                } => {
+                    if let Some(f) =
+                        self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns), override_id)
+                    {
                         fills.push(f);
                     }
                 }
                 Op::Replace { id, intent } => {
                     self.cancel_id(id);
-                    if let Some(f) = self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns)) {
+                    if let Some(f) =
+                        self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns), None)
+                    {
                         fills.push(f);
                     }
                 }
@@ -208,7 +285,12 @@ impl FillSim {
         fills
     }
 
-    fn place_or_reject(&mut self, intent: QuoteIntent, ts: Timestamp) -> Option<Fill> {
+    fn place_or_reject(
+        &mut self,
+        intent: QuoteIntent,
+        ts: Timestamp,
+        override_id: Option<QuoteId>,
+    ) -> Option<Fill> {
         if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
             return None;
         }
@@ -217,17 +299,12 @@ impl FillSim {
         // (IOC = unfilled remainder gets cancelled; we treat 0 fill as full
         // cancel). Partial-fill modeling for IOC is a future refinement.
         if matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK) {
-            let st = self
-                .book_state
-                .entry(intent.symbol.clone())
-                .or_default();
+            let st = self.book_state.entry(intent.symbol.clone()).or_default();
             let touch = match intent.side {
                 Side::Bid => st.best_ask(),
                 Side::Ask => st.best_bid(),
             };
-            let Some(touch_price) = touch else {
-                return None;
-            };
+            let touch_price = touch?;
             let crosses = match intent.side {
                 Side::Bid => intent.price.0 >= touch_price.0,
                 Side::Ask => intent.price.0 <= touch_price.0,
@@ -237,8 +314,7 @@ impl FillSim {
             }
             let fill_size = intent.size.0;
             // Taker fee is always positive (no rebate). cfg.fees.taker_bps is u32.
-            let fee_amount = touch_price.0 * fill_size
-                * Decimal::from(self.cfg.fees.taker_bps)
+            let fee_amount = touch_price.0 * fill_size * Decimal::from(self.cfg.fees.taker_bps)
                 / Decimal::from(10_000);
             // Decrement the touched side's aggregate so subsequent cancel
             // attribution doesn't see the consumed liquidity as a cancel.
@@ -266,7 +342,7 @@ impl FillSim {
             .get(&intent.symbol)
             .map(|b| b.level_size(intent.side, intent.price))
             .unwrap_or(Decimal::ZERO);
-        let id = QuoteId::new();
+        let id = override_id.unwrap_or_default();
         self.live_quotes.push(LiveQuote {
             id,
             symbol: intent.symbol,
@@ -906,8 +982,8 @@ mod tests {
         assert_eq!(fills[0].size.0, Decimal::from(1));
         assert_eq!(fills[0].side, Side::Bid);
         // Taker fee = 101 * 1 * 5 / 10000 = 0.0505
-        let expected_fee = Decimal::from(101) * Decimal::from(1) * Decimal::from(5)
-            / Decimal::from(10_000);
+        let expected_fee =
+            Decimal::from(101) * Decimal::from(1) * Decimal::from(5) / Decimal::from(10_000);
         assert_eq!(fills[0].fee_amount, expected_fee);
         // No resting quote left.
         assert_eq!(sim.live_quotes.len(), 0);

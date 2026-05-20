@@ -78,7 +78,11 @@ async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Default log level: WARN in release, DEBUG in debug. RUST_LOG overrides
     // when set (e.g. `RUST_LOG=info,tikr_binance=debug` for surgical traces).
-    let default_level = if cfg!(debug_assertions) { "debug" } else { "warn" };
+    let default_level = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "warn"
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -138,7 +142,16 @@ async fn main() {
         let rx = shutdown_tx.subscribe();
 
         handles.push(tokio::spawn(async move {
-            let result = run_recorder(env, symbol, base_name, sym_label.clone(), hours, out_dir, rx).await;
+            let result = run_recorder(
+                env,
+                symbol,
+                base_name,
+                sym_label.clone(),
+                hours,
+                out_dir,
+                rx,
+            )
+            .await;
             (sym_label, result)
         }));
     }
