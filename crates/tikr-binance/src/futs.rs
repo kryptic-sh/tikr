@@ -232,6 +232,65 @@ pub async fn get_exchange_info(
     Ok(info)
 }
 
+/// Fetch the current position size for `symbol` (USD-M Perp).
+///
+/// Endpoint: `GET /fapi/v2/positionRisk?symbol=...`
+///
+/// Returns the signed `positionAmt` as a [`Decimal`]. Positive = long,
+/// negative = short, zero = flat. In one-way mode the API returns a single
+/// row per symbol; hedge mode returns two — we sum them which collapses to
+/// the net position either way.
+pub async fn get_position_amount(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+) -> Result<tikr_core::Decimal, VenueError> {
+    let params = format!("symbol={symbol}");
+    let signed = append_auth_dispatch(&params, key_material);
+
+    let url = format!("{base_url}/fapi/v2/positionRisk?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "positionRisk: expected array",
+        )))
+    })?;
+
+    let mut net = tikr_core::Decimal::ZERO;
+    for row in arr {
+        let Some(amt_str) = row.get("positionAmt").and_then(Value::as_str) else {
+            continue;
+        };
+        let amt = <tikr_core::Decimal as std::str::FromStr>::from_str(amt_str).map_err(|e| {
+            VenueError::Internal(Box::new(std::io::Error::other(format!(
+                "positionRisk parse '{amt_str}': {e}"
+            ))))
+        })?;
+        net += amt;
+    }
+    Ok(net)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

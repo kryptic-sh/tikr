@@ -507,6 +507,26 @@ impl Venue for BinanceClient {
     /// (futures) or account endpoint (spot) is a follow-up item.
     async fn position(&self, symbol: &Symbol) -> Result<Position, VenueError> {
         use tikr_core::Notional;
+        // Spot: no native position concept — return flat. Futures: query
+        // /fapi/v2/positionRisk for the real signed amount.
+        if self.env.is_futures() {
+            let sym_str = binance_symbol(symbol);
+            let base_url = self.env.rest_base_url();
+            let amount = crate::futs::get_position_amount(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.key_material,
+                &sym_str,
+            )
+            .await?;
+            return Ok(Position {
+                symbol: symbol.clone(),
+                size: SignedSize(amount),
+                avg_entry: Price(tikr_core::Decimal::ZERO),
+                realized_pnl: Notional(tikr_core::Decimal::ZERO),
+            });
+        }
         Ok(Position {
             symbol: symbol.clone(),
             size: SignedSize(tikr_core::Decimal::ZERO),
