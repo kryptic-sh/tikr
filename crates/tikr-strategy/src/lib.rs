@@ -143,6 +143,22 @@ pub trait Strategy: Send {
     fn on_shutdown(&mut self, _ctx: &StrategyContext<'_>) -> Vec<Action> {
         vec![Action::CancelAll]
     }
+
+    /// Called by the runner when a `Quote` action it just dispatched was
+    /// rejected by the venue (post-only would cross, min-notional fail,
+    /// risk limit, etc). Lets the strategy recover — typically by
+    /// re-anchoring on current book mid and emitting fresh actions.
+    ///
+    /// Default: no-op. Strategies that want fallback behavior should
+    /// override.
+    fn on_quote_rejected(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        _intent: &tikr_venue::QuoteIntent,
+        _reason: &str,
+    ) -> Vec<Action> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +291,24 @@ impl Strategy for NaiveGrid {
 
     fn name(&self) -> &str {
         "naive-grid"
+    }
+
+    fn on_quote_rejected(
+        &mut self,
+        ctx: &StrategyContext<'_>,
+        _intent: &tikr_venue::QuoteIntent,
+        _reason: &str,
+    ) -> Vec<Action> {
+        // A post-only / cross / min-notional rejection means our anchor is
+        // stale (market moved past our intended price). Re-anchor on the
+        // current book mid and emit a fresh pair — this also cancels any
+        // remaining lopsided open order on the other side.
+        let Some(mid) = compute_mid(ctx.latest_book, self.last_trade_price) else {
+            return Vec::new();
+        };
+        self.last_quoted_mid = Some(mid);
+        self.last_requote_ts = Some(ctx.now);
+        self.build_quotes(ctx.symbol, mid, ctx.open_quotes)
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {

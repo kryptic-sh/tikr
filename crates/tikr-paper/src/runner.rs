@@ -24,7 +24,7 @@ use tikr_core::{
 };
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
-use tikr_venue::Venue;
+use tikr_venue::{QuoteIntent, Venue};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -313,11 +313,13 @@ where
     // but its synthesized fills are discarded; real fills come from `external_fills`.
     let live_mode = external_fills.is_some();
 
-    // 1 Hz status-line ticker. First tick fires immediately; we skip it so
-    // the loop only emits status starting at +1s.
+    // 1 Hz status sampler. Only emits when something changed since the last
+    // print — fills, open-quote counts, or position size. Idle ticks are
+    // silent so logs don't fill with redundant lines.
     let mut status_tick = tokio::time::interval(Duration::from_secs(1));
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     status_tick.tick().await;
+    let mut last_status_fingerprint: Option<(u64, u32, u32, Decimal)> = None;
 
     loop {
         // Poll the external fill receiver when in live mode. We use an async
@@ -600,6 +602,7 @@ where
                     open_quotes: &post_fill_quotes,
                 };
                 let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
+                let mut rejected_intents: Vec<(QuoteIntent, String)> = Vec::new();
                 for action in fill_actions {
                     match &action {
                         tikr_strategy::Action::Quote(intent) => {
@@ -615,7 +618,10 @@ where
                                         qid,
                                     );
                                 }
-                                Err(e) => warn!(error = ?e, "live: venue.quote failed (post-fill)"),
+                                Err(e) => {
+                                    warn!(error = ?e, "live: venue.quote failed (post-fill)");
+                                    rejected_intents.push((intent.clone(), format!("{e:?}")));
+                                }
                             }
                         }
                         tikr_strategy::Action::Requote { id, intent } => {
@@ -638,10 +644,61 @@ where
                         tikr_strategy::Action::NoOp => {}
                     }
                 }
+                // Recovery: any Quote actions that the venue rejected get
+                // bounced back to the strategy via on_quote_rejected. The
+                // strategy typically re-anchors on current book mid and
+                // emits a fresh pair. Only one recovery round — if recovery
+                // quotes also reject, log and move on.
+                for (rej_intent, rej_reason) in rejected_intents {
+                    let recovery_quotes = fill_sim.live_quotes_for(&symbol);
+                    let rec_ctx = StrategyContext {
+                        symbol: &symbol,
+                        now: fill_clone.ts,
+                        position: &post_fill_pos,
+                        recent_fills: &[],
+                        latest_book: &current_book,
+                        open_quotes: &recovery_quotes,
+                    };
+                    let recovery_actions =
+                        strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
+                    for action in recovery_actions {
+                        match &action {
+                            tikr_strategy::Action::Quote(intent) => {
+                                match venue.quote(intent.clone()).await {
+                                    Ok(qid) => {
+                                        info!(
+                                            side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                                            quote_id = ?qid, "live: order placed (recovery)"
+                                        );
+                                        fill_sim.enqueue_place_with_id(
+                                            intent.clone(),
+                                            fill_clone.ts,
+                                            qid,
+                                        );
+                                    }
+                                    Err(e) => warn!(error = ?e, "live: venue.quote failed (recovery)"),
+                                }
+                            }
+                            tikr_strategy::Action::Cancel(id) => {
+                                if let Err(e) = venue.cancel(*id).await {
+                                    warn!(error = ?e, "live: venue.cancel failed (recovery)");
+                                }
+                                fill_sim.on_action(action, fill_clone.ts);
+                            }
+                            tikr_strategy::Action::CancelAll => {
+                                if let Err(e) = venue.cancel_all(&symbol).await {
+                                    warn!(error = ?e, "live: venue.cancel_all failed (recovery)");
+                                }
+                                fill_sim.on_action(action, fill_clone.ts);
+                            }
+                            tikr_strategy::Action::Requote { .. }
+                            | tikr_strategy::Action::NoOp => {}
+                        }
+                    }
+                }
             }
             _ = status_tick.tick() => {
                 let pos = tracker.snapshot();
-                let pnl = tracker.report(last_mid);
                 let quotes = fill_sim.live_quotes_for(&symbol);
                 let (open_buys, open_sells) = quotes.iter().fold((0u32, 0u32), |(b, s), (_, q)| {
                     match q.side {
@@ -649,6 +706,12 @@ where
                         tikr_core::Side::Ask => (b, s + 1),
                     }
                 });
+                let fingerprint = (fills_emitted, open_buys, open_sells, pos.size.0);
+                if last_status_fingerprint.as_ref() == Some(&fingerprint) {
+                    continue;
+                }
+                last_status_fingerprint = Some(fingerprint);
+                let pnl = tracker.report(last_mid);
                 let elapsed = started.elapsed().as_secs() + resumed_runtime_secs;
                 let fills_per_min = if elapsed > 0 {
                     (fills_emitted as f64) * 60.0 / (elapsed as f64)

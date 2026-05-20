@@ -23,6 +23,25 @@ fi
 SYMBOLS_ARG="${1:-BTCUSDT}"
 IFS=',' read -ra SYMBOLS <<< "$SYMBOLS_ARG"
 
+# Per-symbol size targets ~$25 notional on Binance USD-M Futures testnet so
+# every order clears the per-symbol minNotional ($20 BTC/ETH, $5 alts).
+size_for() {
+  case "$1" in
+    BTCUSDT)   echo "0.001"   ;;  # ~$77 @ 77k
+    ETHUSDT)   echo "0.01"    ;;  # ~$21
+    BNBUSDT)   echo "0.05"    ;;  # ~$32
+    SOLUSDT)   echo "0.3"     ;;  # ~$25
+    DOGEUSDT)  echo "300"     ;;  # ~$30
+    XRPUSDT)   echo "10"      ;;  # ~$25
+    ADAUSDT)   echo "30"      ;;  # ~$25
+    LINKUSDT)  echo "1.5"     ;;  # ~$25
+    LTCUSDT)   echo "0.3"     ;;  # ~$25
+    TRXUSDT)   echo "100"     ;;  # ~$25
+    BCHUSDT)   echo "0.05"    ;;  # ~$25
+    *)         echo "0.001"   ;;  # fallback — may reject if minNotional > price * 0.001
+  esac
+}
+
 echo "==> building (release) ..."
 cargo build --release --example run_perp -p tikr-binance
 
@@ -46,11 +65,13 @@ trap cleanup INT TERM
 for sym in "${SYMBOLS[@]}"; do
   sym_clean="${sym// /}"
   [[ -z "$sym_clean" ]] && continue
+  size=$(size_for "$sym_clean")
   log="/tmp/tikr_paper_${sym_clean}.log"
-  echo "==> launching ${sym_clean} (log: ${log})"
+  echo "==> launching ${sym_clean} (size=${size}, log: ${log})"
   cargo run --release --example run_perp -p tikr-binance -- \
     --env futures-testnet \
     --symbol "${sym_clean}" \
+    --size "${size}" \
     --strategy naive-grid \
     --minutes 0 \
     > "${log}" 2>&1 &
