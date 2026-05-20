@@ -57,7 +57,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 # Direct dep so the recorder bins can install a CryptoProvider before any TLS
 # use — reqwest's rustls-tls + tokio-tungstenite's rustls-tls-webpki-roots
 # pull conflicting provider defaults, leaving rustls 0.23 ambiguous at runtime.
