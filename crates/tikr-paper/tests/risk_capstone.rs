@@ -30,13 +30,13 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_core::{
-    Asset, Decimal, Level, MarketEvent, MarketKind, Notional, Price, Size, Snapshot, Symbol,
-    Timestamp, VenueId,
+    Asset, Decimal, Level, MarketEvent, MarketKind, Notional, Price, QuoteKind, Side, Size,
+    Snapshot, Symbol, TimeInForce, Timestamp, VenueId,
 };
 use tikr_paper::alerts::{Alert, AlertError, AlertSink};
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_risk::{BasicRiskGate, RiskGate, RiskLimits, RiskState};
-use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
+use tikr_strategy::{Action, Strategy, StrategyContext};
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
 
@@ -124,15 +124,65 @@ fn make_symbol() -> Symbol {
     }
 }
 
-/// NaiveGrid with very tight requote interval so every BookUpdate triggers quoting.
-fn naive_grid_aggressive() -> NaiveGrid {
-    NaiveGrid::new(NaiveGridConfig {
-        levels_per_side: 1,
-        base_spread_bps: 50, // 0.5% half-spread
-        level_step_bps: 10,
-        size_per_quote: Size(Decimal::from(1)),
-        min_requote_interval_ms: 0, // requote on every mid change — maximises activity
-    })
+/// Minimal test strategy that re-quotes on EVERY BookUpdate so the risk gate
+/// is checked on every price move. Mirrors the old NaiveGrid aggressive config
+/// used before NaiveGrid removal. Only used in risk_capstone tests.
+struct AggressiveTestStrategy {
+    spread_bps: u32,
+    size: Size,
+}
+
+impl AggressiveTestStrategy {
+    fn new(spread_bps: u32, size: Size) -> Self {
+        Self { spread_bps, size }
+    }
+}
+
+impl Strategy for AggressiveTestStrategy {
+    type Config = ();
+    fn new(_config: Self::Config) -> Self {
+        unreachable!()
+    }
+    fn name(&self) -> &str {
+        "aggressive-test"
+    }
+    fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        match event {
+            MarketEvent::BookUpdate { snapshot } => {
+                let best_bid = snapshot.bids.first().map(|l| l.price.0);
+                let best_ask = snapshot.asks.first().map(|l| l.price.0);
+                let (Some(b), Some(a)) = (best_bid, best_ask) else {
+                    return Vec::new();
+                };
+                let mid = (b + a) / Decimal::from(2);
+                let offset = Decimal::from(self.spread_bps) / Decimal::from(10_000);
+                let bid = Price(mid * (Decimal::from(1) - offset));
+                let ask = Price(mid * (Decimal::from(1) + offset));
+                let mut actions = Vec::new();
+                for (id, _) in ctx.open_quotes {
+                    actions.push(Action::Cancel(*id));
+                }
+                for (side, price) in [(Side::Bid, bid), (Side::Ask, ask)] {
+                    actions.push(Action::Quote(QuoteIntent {
+                        symbol: ctx.symbol.clone(),
+                        side,
+                        price,
+                        size: self.size,
+                        tif: TimeInForce::PostOnly,
+                        kind: QuoteKind::Point,
+                    }));
+                }
+                actions
+            }
+            MarketEvent::Fill(_) | MarketEvent::Trade { .. } | MarketEvent::Heartbeat { .. } => {
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn layered_grid_aggressive() -> AggressiveTestStrategy {
+    AggressiveTestStrategy::new(50, Size(Decimal::from(1)))
 }
 
 /// Zero-latency fill sim so quotes land instantly and trades fill immediately.
@@ -150,17 +200,14 @@ fn fill_sim_with_zero_latency() -> FillSim {
 // ---------------------------------------------------------------------------
 // Synthetic event stream — Phase 1: force a losing long position
 //
-// Strategy:
-//   1. Feed a full book at 100/101 → NaiveGrid quotes bid@99.5 and ask@100.5
+// Strategy (AggressiveTestStrategy — re-quotes on every BookUpdate):
+//   1. Feed a full book at 100/101 → strategy quotes bid@99.5 and ask@100.5
 //      (0 latency → lands immediately on next event)
-//   2. Trade event (ask-side taker at 99.5) → fills our bid → long 1 BTC @ 99.5
+//   2. Trade event (ask-side taker at 99) → fills our bid → long 1 BTC @ 99.5
 //   3. BookUpdate at 49/50 → last_mid drops to 49.5 → unrealized = -50, net = -50
-//   4. A second BookUpdate at 49/50 → NaiveGrid tries to requote → risk gate
-//      checks pnl.net = -50 <= -50 → HALT emitted
+//   4. Strategy re-quotes at the new mid → risk gate checks pnl.net = -50 ≤ -50 → HALT
 //
-// The sequence yields ~200 events as required by the spec.  We repeat the
-// "low-book + requote-attempt" cycle until the stream ends; the halt fires on
-// the first requote attempt after the price drop.
+// The sequence yields ~200 events as required by the spec.
 // ---------------------------------------------------------------------------
 
 fn make_book_event(symbol: &Symbol, bid: i64, ask: i64, ts_ns: u64) -> MarketEvent {
@@ -195,14 +242,14 @@ fn make_trade_event(
     }
 }
 
-/// Builds ~200 events that drive NaiveGrid to accumulate a long BTC position
-/// then mark it to a loss ≥ $50 so the drawdown gate fires.
+/// Builds ~200 events that drive `AggressiveTestStrategy` to accumulate a long
+/// BTC position then mark it to a loss ≥ $50 so the drawdown gate fires.
 ///
 /// Sequence:
-///   Events 0..1  — book at 100/101 (cold-start quote: bid@99.5, ask@100.5 placed)
-///   Event 2      — ask-side trade at 99.5 → fills our bid → long 1 BTC @ 99.5
-///   Events 3..N  — book at 49/50 (mid=49.5) → net=-50 → risk gate halts on first
-///                  requote attempt
+///   Events 0..1  — book at 100/101 (strategy quotes bid@99.5, ask@100.5)
+///   Event 2      — ask-side trade at 99 → fills our bid → long 1 BTC @ 99.5
+///   Events 3..N  — book at 49/50 (mid=49.5) → net=-50 → risk gate halts on
+///                  the first re-quote attempt
 fn events_that_force_losing_position(symbol: &Symbol, count: usize) -> Vec<MarketEvent> {
     assert!(
         count >= 4,
@@ -210,32 +257,29 @@ fn events_that_force_losing_position(symbol: &Symbol, count: usize) -> Vec<Marke
     );
     let mut events = Vec::with_capacity(count);
 
-    // Seed the book at a high price so NaiveGrid issues an initial quote.
+    // Seed the book at a high price so the strategy issues an initial quote.
     // Two BookUpdates: the first builds the mid; the quote intent is submitted
     // at ts=0 with 0 submit_latency so it lands before the next event.
     events.push(make_book_event(symbol, 100, 101, 0));
     events.push(make_book_event(symbol, 100, 101, 1_000_000)); // 1ms later
 
-    // Ask-side taker trade at 99.5 → fills our resting bid @99.5 → long 1 BTC.
+    // Ask-side taker trade at 99 → fills our resting bid → long 1 BTC.
     // taker_side = Ask means someone SOLD into the book (the taker is on the Ask).
     // FillSim: our Bid is matched when taker_side == Ask and trade_price <= quote_price.
+    // AggressiveTestStrategy at mid=100.5, spread_bps=50 → bid = 100.5*(1-0.005) = 99.9975.
+    // Trade at 99 is well below the bid — eligible to fill.
     events.push(make_trade_event(
         symbol,
-        // NaiveGrid at mid=100.5, spread=50bps → bid = 100.5 * (1 - 0.005) = 99.9975
-        // We need a trade at a price <= our bid.  Use 99 which is well below any
-        // reasonable bid the grid places.  Actually NaiveGrid bid = mid*(1-0.005).
-        // mid = (100+101)/2 = 100.5 → bid = 100.5*0.995 = 99.9975 ≈ 99.9975
-        // We want the trade price ≤ 99.9975 to match.  Use 99.
         99,
         tikr_core::Side::Ask, // ask-side taker = someone sold = fills our resting bid
         2_000_000,
     ));
 
-    // Fill the rest with book-at-49/50 updates.  Net = unrealized = (49.5 - 99.9975) * 1 ≈ -50.4975
-    // Actual bid price: 100.5 * (1 - 50/10000) = 100.5 * 0.995 = 99.9975
+    // Fill the rest with book-at-49/50 updates.
+    // Strategy bid price: 100.5 * (1 - 50/10000) = 100.5 * 0.995 = 99.9975
     // avg_entry = 99.9975 (the price we actually bought at)
     // mid after low book = (49+50)/2 = 49.5
-    // unrealized = (49.5 - 99.9975) * 1 = -50.4975 → net ≈ -50.4975 < -50 ✓
+    // unrealized = (49.5 - 99.9975) * 1 ≈ -50.4975 → net ≈ -50.4975 < -50 ✓
     let remaining = count.saturating_sub(3);
     for i in 0..remaining {
         let ts_ns = 3_000_000 + (i as u64) * 1_000_000;
@@ -245,14 +289,15 @@ fn events_that_force_losing_position(symbol: &Symbol, count: usize) -> Vec<Marke
     events
 }
 
-/// Builds ~50 events at a stable mid that would cause NaiveGrid to quote
-/// if not suppressed by a halt.  Used in phases 3 and 4.
+/// Builds ~50 events at a stable mid that would cause `AggressiveTestStrategy`
+/// to re-quote on every BookUpdate if not suppressed by a halt.
+/// Used in phases 3 and 4.
 ///
 /// The stream alternates BookUpdates with Trade events.  In Phase 3 (halted),
 /// Quote actions are suppressed before FillSim so no fills occur.  In Phase 4
 /// (clear_halt), Quote actions go through and FillSim can match trades → fills.
 ///
-/// NaiveGrid with bid=199.0 (approx 200.5 * (1-0.005) ≈ 199.5).  Trade at 199
+/// AggressiveTestStrategy bid ≈ 200.5*(1-0.005) = 199.5.  Trade at 199
 /// (ask-side taker) fills our bid → Fill.  This proves recovery in Phase 4.
 fn events_that_would_normally_quote(symbol: &Symbol, count: usize) -> Vec<MarketEvent> {
     let mut events = Vec::with_capacity(count);
@@ -262,7 +307,7 @@ fn events_that_would_normally_quote(symbol: &Symbol, count: usize) -> Vec<Market
     let half = count / 2;
     for i in 0..half {
         let ts_ns = base_ts + (i as u64) * 2_000_000;
-        // BookUpdate at 200/201 → mid=200.5 → NaiveGrid bids ≈ 199.5, asks ≈ 201.5
+        // BookUpdate at 200/201 → mid=200.5 → strategy bids ≈ 199.5
         events.push(make_book_event(symbol, 200, 201, ts_ns));
         // Ask-side trade at 199 → fills a resting bid (199 ≤ 199.5) when gate is open
         events.push(make_trade_event(
@@ -310,7 +355,7 @@ async fn risk_resume_alerting_capstone() {
 
     let recording1: Arc<Mutex<Vec<Alert>>> = Arc::new(Mutex::new(Vec::new()));
     let venue1 = MockVenue::finite(events_that_force_losing_position(&symbol, 200));
-    let strategy1 = naive_grid_aggressive();
+    let strategy1 = layered_grid_aggressive();
     let fill_sim1 = fill_sim_with_zero_latency();
     let risk_gate1: Box<dyn RiskGate> = Box::new(BasicRiskGate::new(phase_limits()));
     let alert_sink1: Box<dyn AlertSink> = Box::new(RecordingSink::new(recording1.clone()));
@@ -374,7 +419,7 @@ async fn risk_resume_alerting_capstone() {
 
     let recording2: Arc<Mutex<Vec<Alert>>> = Arc::new(Mutex::new(Vec::new()));
     let venue2 = MockVenue::finite(events_that_would_normally_quote(&symbol, 50));
-    let strategy2 = naive_grid_aggressive();
+    let strategy2 = layered_grid_aggressive();
     let fill_sim2 = fill_sim_with_zero_latency();
     // Reconstruct gate from persisted halted state — simulates operator restart.
     let risk_gate2: Box<dyn RiskGate> = Box::new(BasicRiskGate::from_state(
@@ -442,7 +487,7 @@ async fn risk_resume_alerting_capstone() {
 
     let recording3: Arc<Mutex<Vec<Alert>>> = Arc::new(Mutex::new(Vec::new()));
     let venue3 = MockVenue::finite(events_that_would_normally_quote(&symbol, 50));
-    let strategy3 = naive_grid_aggressive();
+    let strategy3 = layered_grid_aggressive();
     let fill_sim3 = fill_sim_with_zero_latency();
     let alert_sink3: Box<dyn AlertSink> = Box::new(RecordingSink::new(recording3.clone()));
     let (_tx3, rx3) = watch::channel(false);

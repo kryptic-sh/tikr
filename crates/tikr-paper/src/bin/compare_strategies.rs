@@ -20,8 +20,7 @@ use tikr_core::{
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, MicroPrice, MicroPriceConfig, NaiveGrid, NaiveGridConfig, Strategy,
-    TopOfBook, TopOfBookConfig,
+    LayeredGridConfig, MicroPrice, MicroPriceConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -89,11 +88,6 @@ struct Args {
     /// LayeredGrid sweep: comma-separated `levels_per_side` values.
     #[arg(long, default_value = "1,3,5,10")]
     lg_levels_list: String,
-
-    /// NaiveGrid sweep: comma-separated `base_spread_bps` values (one
-    /// preset per entry, level_step_bps=1 throughout).
-    #[arg(long, default_value = "1,2,5,10,20")]
-    ng_bps_list: String,
 
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
@@ -179,27 +173,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // per preset (derived from the preset name) so concurrent snapshot /
     // resume writes don't collide.
     let mut handles: Vec<JoinHandle<(String, PaperReport)>> = Vec::new();
-
-    let ng_bps_sweep = parse_u32_list(&args.ng_bps_list)?;
-    for bps in &ng_bps_sweep {
-        let label = format!("naive-grid {bps}bps");
-        spawn_preset(
-            &mut handles,
-            &shared_data,
-            &symbol,
-            &label,
-            NaiveGrid::new(NaiveGridConfig {
-                levels_per_side: 1,
-                base_spread_bps: *bps,
-                level_step_bps: 1,
-                size_per_quote,
-                min_requote_interval_ms: 1000,
-            }),
-            fees,
-            skim_cfg,
-            funding_cfg,
-        );
-    }
 
     spawn_preset(
         &mut handles,

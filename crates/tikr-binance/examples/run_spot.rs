@@ -47,9 +47,9 @@ use tikr_binance::{
     load_credentials_from_file, load_key_material_from_env, product_var,
     user_stream::subscribe_user_data_stream,
 };
-use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
-use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
+use tikr_strategy::{LayeredGrid, LayeredGridConfig, Strategy};
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -97,13 +97,6 @@ struct Args {
     /// Run duration in minutes. 0 = run until Ctrl-C.
     #[arg(long, default_value_t = 0u32)]
     minutes: u32,
-
-    /// Order size per quote. Default 0.001 (works for BTCUSDT @ $76k).
-    /// ETHUSDT needs ≥ 0.01 (minNotional $20 / ~$2100 ETH); BNBUSDT
-    /// needs ≥ 0.01 (minQty). Other symbols vary — check
-    /// `/api/v3/exchangeInfo`.
-    #[arg(long, default_value = "0.001")]
-    size: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,17 +217,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // NaiveGrid: 1 level per side, 2bps spread.
-    // Matches run_perp NaiveGrid defaults for apples-to-apples comparison.
-    let strategy = NaiveGrid::new(NaiveGridConfig {
+    // LayeredGrid: 1 level per side, 6bps inner spread, 20bps re-entry.
+    // $25 notional clears Spot minNotional on majors; size arg unused here
+    // (notional_per_order drives qty = notional / price).
+    let strategy = LayeredGrid::new(LayeredGridConfig {
+        notional_per_order: Decimal::from(25),
         levels_per_side: 1,
-        base_spread_bps: 2,
-        level_step_bps: 1,
-        size_per_quote: Size(
-            Decimal::from_str_exact(&args.size)
-                .map_err(|e| format!("--size '{}' invalid: {}", args.size, e))?,
-        ),
-        min_requote_interval_ms: 5000,
+        inner_bps: 6,
+        step_bps: 1,
+        reentry_bps: 20,
     });
 
     let fill_sim = FillSim::new(FillSimConfig {

@@ -60,7 +60,7 @@ use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, NaiveGrid, NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    LayeredGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::signal;
@@ -81,9 +81,6 @@ enum EnvArg {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum StrategyArg {
-    /// NaiveGrid — symmetric grid around mid, no inventory awareness.
-    #[value(name = "naive-grid")]
-    NaiveGrid,
     /// Avellaneda-Stoikov — inventory-aware finite-horizon optimal MM.
     #[value(name = "avellaneda-stoikov", alias = "as")]
     AvellanedaStoikov,
@@ -131,7 +128,7 @@ struct Args {
     minutes: u32,
 
     /// Strategy to run.
-    #[arg(long, value_enum, default_value = "naive-grid")]
+    #[arg(long, value_enum, default_value = "layered-grid")]
     strategy: StrategyArg,
 
     /// Order size per quote. Default 0.001 (works for BTCUSDT @ $76k).
@@ -421,30 +418,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch on strategy enum. Each branch builds its concrete Strategy
     // impl and hands it to run_with_resume.
     let report = match args.strategy {
-        StrategyArg::NaiveGrid => {
-            // 2bps/side = 4bps round trip. Tight for testnet smoke; bump for
-            // live capital where 2bps maker fee eats the spread.
-            let strategy = NaiveGrid::new(NaiveGridConfig {
-                levels_per_side: 1,
-                base_spread_bps: 2,
-                level_step_bps: 1,
-                size_per_quote,
-                min_requote_interval_ms: 5000,
-            });
-            run_with_resume(
-                venue,
-                strategy,
-                fill_sim,
-                symbol,
-                shutdown_rx,
-                runner_config,
-                None,
-                None,
-                None,
-                Some(fill_rx),
-            )
-            .await
-        }
         StrategyArg::AvellanedaStoikov => {
             // γ controls inventory-skew (reservation price); --spread-bps controls width.
             let strategy = AvellanedaStoikov::new(AvellanedaStoikovConfig {

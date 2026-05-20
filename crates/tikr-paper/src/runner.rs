@@ -849,48 +849,67 @@ async fn dispatch_post_fill_actions<V, S>(
         }
     }
 
-    // Recovery: any Quote actions that the venue rejected get bounced back
-    // to the strategy via on_quote_rejected. The strategy typically
-    // re-anchors on current book mid and emits a fresh pair. Only one
-    // recovery round — if recovery quotes also reject, log and move on.
-    for (rej_intent, rej_reason) in rejected_intents {
-        let recovery_quotes = fill_sim.live_quotes_for(symbol);
-        let rec_ctx = StrategyContext {
-            symbol,
-            now: ts,
-            position: post_fill_pos,
-            recent_fills: &[],
-            latest_book: current_book,
-            open_quotes: &recovery_quotes,
-        };
-        let recovery_actions = strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
-        for action in recovery_actions {
-            match &action {
-                tikr_strategy::Action::Quote(intent) => match venue.quote(intent.clone()).await {
-                    Ok(qid) => {
-                        info!(
-                            side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
-                            quote_id = ?qid, "live: order placed (recovery)"
-                        );
-                        fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
+    // Recovery: any Quote actions the venue rejected get bounced back to
+    // the strategy via `on_quote_rejected`. The strategy typically
+    // re-anchors on current book mid and emits a fresh pair. We iterate
+    // until no Quote actions remain rejected or `MAX_RECOVERY_ROUNDS` is
+    // hit (defensive cap against an infinite reject loop in a fast move).
+    const MAX_RECOVERY_ROUNDS: usize = 5;
+    let mut round = 0;
+    while !rejected_intents.is_empty() && round < MAX_RECOVERY_ROUNDS {
+        round += 1;
+        let pending = std::mem::take(&mut rejected_intents);
+        for (rej_intent, rej_reason) in pending {
+            let recovery_quotes = fill_sim.live_quotes_for(symbol);
+            let rec_ctx = StrategyContext {
+                symbol,
+                now: ts,
+                position: post_fill_pos,
+                recent_fills: &[],
+                latest_book: current_book,
+                open_quotes: &recovery_quotes,
+            };
+            let recovery_actions = strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
+            for action in recovery_actions {
+                match &action {
+                    tikr_strategy::Action::Quote(intent) => {
+                        match venue.quote(intent.clone()).await {
+                            Ok(qid) => {
+                                info!(
+                                    side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                                    quote_id = ?qid, round, "live: order placed (recovery)"
+                                );
+                                fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
+                            }
+                            Err(e) => {
+                                warn!(error = ?e, round, "live: venue.quote failed (recovery)");
+                                rejected_intents.push((intent.clone(), format!("{e:?}")));
+                            }
+                        }
                     }
-                    Err(e) => warn!(error = ?e, "live: venue.quote failed (recovery)"),
-                },
-                tikr_strategy::Action::Cancel(id) => {
-                    if let Err(e) = venue.cancel(*id).await {
-                        warn!(error = ?e, "live: venue.cancel failed (recovery)");
+                    tikr_strategy::Action::Cancel(id) => {
+                        if let Err(e) = venue.cancel(*id).await {
+                            warn!(error = ?e, round, "live: venue.cancel failed (recovery)");
+                        }
+                        fill_sim.on_action(action, ts);
                     }
-                    fill_sim.on_action(action, ts);
+                    tikr_strategy::Action::CancelAll => {
+                        if let Err(e) = venue.cancel_all(symbol).await {
+                            warn!(error = ?e, round, "live: venue.cancel_all failed (recovery)");
+                        }
+                        fill_sim.on_action(action, ts);
+                    }
+                    tikr_strategy::Action::Requote { .. } | tikr_strategy::Action::NoOp => {}
                 }
-                tikr_strategy::Action::CancelAll => {
-                    if let Err(e) = venue.cancel_all(symbol).await {
-                        warn!(error = ?e, "live: venue.cancel_all failed (recovery)");
-                    }
-                    fill_sim.on_action(action, ts);
-                }
-                tikr_strategy::Action::Requote { .. } | tikr_strategy::Action::NoOp => {}
             }
         }
+    }
+    if !rejected_intents.is_empty() {
+        warn!(
+            remaining = rejected_intents.len(),
+            rounds = MAX_RECOVERY_ROUNDS,
+            "recovery cap hit — some sides may be empty on the book"
+        );
     }
 }
 
@@ -1029,7 +1048,7 @@ mod tests {
     use tempfile::TempDir;
     use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
     use tikr_core::{Asset, Level, MarketKind, Notional, Size, VenueId};
-    use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
+    use tikr_strategy::{LayeredGrid, LayeredGridConfig, Strategy};
     use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
     use tokio::sync::watch;
 
@@ -1128,13 +1147,13 @@ mod tests {
         }
     }
 
-    fn naive_grid() -> NaiveGrid {
-        NaiveGrid::new(NaiveGridConfig {
+    fn layered_grid() -> LayeredGrid {
+        LayeredGrid::new(LayeredGridConfig {
+            notional_per_order: Decimal::from(25),
             levels_per_side: 1,
-            base_spread_bps: 50,
-            level_step_bps: 10,
-            size_per_quote: Size(Decimal::from(1)),
-            min_requote_interval_ms: 100_000,
+            inner_bps: 20,
+            step_bps: 1,
+            reentry_bps: 20,
         })
     }
 
@@ -1182,7 +1201,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let report = run(
             venue,
-            naive_grid(),
+            layered_grid(),
             fill_sim(),
             make_symbol(),
             rx,
@@ -1208,7 +1227,7 @@ mod tests {
 
         let report = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            run(venue, naive_grid(), fill_sim(), make_symbol(), rx, cfg),
+            run(venue, layered_grid(), fill_sim(), make_symbol(), rx, cfg),
         )
         .await
         .expect("runner did not exit within 2s");
@@ -1243,7 +1262,7 @@ mod tests {
         let venue = MockVenue::finite(events);
         let (_tx, rx) = watch::channel(false);
         let cfg = test_config(temp.path().into());
-        let report = run(venue, naive_grid(), fill_sim(), symbol, rx, cfg).await;
+        let report = run(venue, layered_grid(), fill_sim(), symbol, rx, cfg).await;
 
         assert_eq!(report.events_processed, 120);
         assert_eq!(report.schema_version, SCHEMA_VERSION);
@@ -1292,7 +1311,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let report = run_with_resume(
             venue,
-            naive_grid(),
+            layered_grid(),
             fill_sim(),
             make_symbol(),
             rx,
@@ -1338,7 +1357,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let _ = run_with_resume(
             venue,
-            naive_grid(),
+            layered_grid(),
             fill_sim(),
             make_symbol(),
             rx,
@@ -1382,7 +1401,7 @@ mod tests {
         let fut_a: Pin<Box<dyn Future<Output = PaperReport> + Send>> = Box::pin(async move {
             run(
                 MockVenue::finite(events_a),
-                naive_grid(),
+                layered_grid(),
                 fill_sim(),
                 symbol_a_clone,
                 rx_a,
@@ -1393,7 +1412,7 @@ mod tests {
         let fut_b: Pin<Box<dyn Future<Output = PaperReport> + Send>> = Box::pin(async move {
             run(
                 MockVenue::finite(events_b),
-                naive_grid(),
+                layered_grid(),
                 fill_sim(),
                 symbol_b_clone,
                 rx_b,
@@ -1430,7 +1449,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn live_mode_dispatches_actions_to_venue() {
         let symbol = make_symbol();
-        // Two BookUpdates so NaiveGrid emits CancelAll + Quote on the second.
+        // Two BookUpdates so LayeredGrid emits a cold-start Quote on the first full book.
         let events = vec![
             MarketEvent::BookUpdate {
                 snapshot: Snapshot {
@@ -1466,12 +1485,12 @@ mod tests {
         let quote_log = venue.quote_calls.clone();
         let cancel_all_log = venue.cancel_all_calls.clone();
 
-        let strategy = NaiveGrid::new(NaiveGridConfig {
+        let strategy = LayeredGrid::new(LayeredGridConfig {
+            notional_per_order: Decimal::from(25),
             levels_per_side: 1,
-            base_spread_bps: 50,
-            level_step_bps: 10,
-            size_per_quote: Size(Decimal::from(1)),
-            min_requote_interval_ms: 0,
+            inner_bps: 20,
+            step_bps: 1,
+            reentry_bps: 20,
         });
         let fill_sim = FillSim::new(FillSimConfig {
             submit_latency_ms: 0,
@@ -1510,8 +1529,7 @@ mod tests {
 
         assert_eq!(report.events_processed, 2);
 
-        // NaiveGrid emits Quotes on every book update (Cancel(id) appears
-        // from the second update onward once `ctx.open_quotes` is populated).
+        // LayeredGrid emits Quotes on the first book update.
         // Verify live mode dispatched Quotes to the venue.
         let _ = cancel_all_log;
         let quote_count = quote_log.lock().unwrap().len();
@@ -1544,12 +1562,12 @@ mod tests {
         let quote_log = venue.quote_calls.clone();
         let cancel_all_log = venue.cancel_all_calls.clone();
 
-        let strategy = NaiveGrid::new(NaiveGridConfig {
+        let strategy = LayeredGrid::new(LayeredGridConfig {
+            notional_per_order: Decimal::from(25),
             levels_per_side: 1,
-            base_spread_bps: 50,
-            level_step_bps: 10,
-            size_per_quote: Size(Decimal::from(1)),
-            min_requote_interval_ms: 0,
+            inner_bps: 20,
+            step_bps: 1,
+            reentry_bps: 20,
         });
         let fill_sim = FillSim::new(FillSimConfig {
             submit_latency_ms: 0,

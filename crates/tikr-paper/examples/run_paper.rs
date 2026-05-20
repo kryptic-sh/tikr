@@ -18,14 +18,14 @@ use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv};
 use tikr_paper::{RunnerConfig, run};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
-    NaiveGridConfig, Strategy,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
+    LayeredGridConfig, Strategy,
 };
 use tokio::sync::watch;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum StrategyKind {
-    NaiveGrid,
+    LayeredGrid,
     AvellanedaStoikov,
     Glft,
 }
@@ -55,7 +55,7 @@ struct Args {
     #[arg(long, default_value = "BTC")]
     symbol: String,
     /// Strategy to run.
-    #[arg(long, value_enum, default_value_t = StrategyKind::NaiveGrid)]
+    #[arg(long, value_enum, default_value_t = StrategyKind::LayeredGrid)]
     strategy: StrategyKind,
     /// How many minutes to run. 0 = until SIGINT.
     #[arg(long, default_value_t = 60u32)]
@@ -68,13 +68,13 @@ struct Args {
     user_address: Option<String>,
 }
 
-fn naive_grid_config() -> NaiveGridConfig {
-    NaiveGridConfig {
-        levels_per_side: 3,
-        base_spread_bps: 10,
-        level_step_bps: 5,
-        size_per_quote: Size(Decimal::try_from(0.01).unwrap()),
-        min_requote_interval_ms: 1000,
+fn layered_grid_config() -> LayeredGridConfig {
+    LayeredGridConfig {
+        notional_per_order: Decimal::from(25),
+        levels_per_side: 1,
+        inner_bps: 6,
+        step_bps: 1,
+        reentry_bps: 20,
     }
 }
 
@@ -158,8 +158,8 @@ async fn main() {
     }
 
     let report = match args.strategy {
-        StrategyKind::NaiveGrid => {
-            let s = NaiveGrid::new(naive_grid_config());
+        StrategyKind::LayeredGrid => {
+            let s = LayeredGrid::new(layered_grid_config());
             run(venue, s, fill_sim, symbol, rx, RunnerConfig::default()).await
         }
         StrategyKind::AvellanedaStoikov => {

@@ -6,10 +6,10 @@
 use std::time::Duration;
 use tempfile::TempDir;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv};
 use tikr_paper::{RunnerConfig, run};
-use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
+use tikr_strategy::{LayeredGrid, LayeredGridConfig, Strategy};
 use tokio::sync::watch;
 
 #[ignore]
@@ -27,12 +27,12 @@ async fn paper_runner_against_testnet_5min() {
         env: HyperliquidEnv::Testnet,
         ..Default::default()
     });
-    let strategy = NaiveGrid::new(NaiveGridConfig {
+    let strategy = LayeredGrid::new(LayeredGridConfig {
+        notional_per_order: Decimal::from(25),
         levels_per_side: 1,
-        base_spread_bps: 50,
-        level_step_bps: 10,
-        size_per_quote: Size(Decimal::try_from(0.01).unwrap()),
-        min_requote_interval_ms: 5000,
+        inner_bps: 20,
+        step_bps: 1,
+        reentry_bps: 20,
     });
     let fill_sim = FillSim::new(FillSimConfig {
         submit_latency_ms: 50,

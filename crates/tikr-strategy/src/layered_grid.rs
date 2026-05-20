@@ -298,8 +298,11 @@ impl Strategy for LayeredGrid {
         // Recovery path: market moved so far that our re-quote couldn't be
         // posted as maker. Wipe everything with `CancelAll` (vs per-id
         // Cancels which race with the venue's still-in-flight ack) and
-        // place a fresh ladder anchored on current book mid. Accepts a
-        // brief naked-book gap — we're already in failure-recovery mode.
+        // place a fresh symmetric ladder anchored on current book mid.
+        // Preserves equal `inner_bps` / `step_bps` spacing. If the new
+        // pair also rejects (market still ripping), the runner re-invokes
+        // this hook until either both sides land or the retry cap fires.
+        // TODO: we need to make sure the latest_book.bids and asks are up to date
         let bid = ctx.latest_book.bids.first().map(|l| l.price.0);
         let ask = ctx.latest_book.asks.first().map(|l| l.price.0);
         let (Some(b), Some(a)) = (bid, ask) else {

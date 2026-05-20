@@ -24,8 +24,8 @@ use tikr_backtest::replay::{ParquetReplay, ReplayConfig};
 use tikr_backtest::runner::run;
 use tikr_core::{Asset, Decimal, MarketKind, Notional, Size, Symbol, VenueId};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
-    NaiveGridConfig, Strategy,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
+    LayeredGridConfig, Strategy,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,13 +63,13 @@ fn build_book_rows() -> Vec<(u64, i64, f64, f64, u64)> {
     rows
 }
 
-fn naive_grid_config() -> NaiveGridConfig {
-    NaiveGridConfig {
+fn layered_grid_config() -> LayeredGridConfig {
+    LayeredGridConfig {
+        notional_per_order: Decimal::from(100), // $100 → ~1 BTC qty at price 100
         levels_per_side: 1,
-        base_spread_bps: 50, // 0.5% → bid=99.5, ask=100.5 at mid=100
-        level_step_bps: 10,
-        size_per_quote: Size(Decimal::from(1)),
-        min_requote_interval_ms: 100_000, // 100s > test horizon → quote once
+        inner_bps: 50, // 0.5% → bid≈99.5 at mid=100
+        step_bps: 1,
+        reentry_bps: 50,
     }
 }
 
@@ -145,8 +145,8 @@ async fn run_strategy<S: Strategy>(strategy: S) -> PnLReport {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn naive_grid_runs() {
-    let report = run_strategy(NaiveGrid::new(naive_grid_config())).await;
+async fn layered_grid_runs() {
+    let report = run_strategy(LayeredGrid::new(layered_grid_config())).await;
     assert_eq!(
         report.fees,
         Notional(Decimal::ZERO),
@@ -191,7 +191,9 @@ async fn glft_runs() {
 
 #[tokio::test]
 async fn all_three_strategies_produce_distinct_pnl() {
-    let net_ng = run_strategy(NaiveGrid::new(naive_grid_config())).await.net;
+    let net_lg = run_strategy(LayeredGrid::new(layered_grid_config()))
+        .await
+        .net;
     let net_as = run_strategy(AvellanedaStoikov::new(avellaneda_stoikov_config()))
         .await
         .net;
@@ -200,9 +202,9 @@ async fn all_three_strategies_produce_distinct_pnl() {
     // their net P&L would coincide. We only require ONE pair to differ —
     // synthetic 1-trade data can't justify a stronger claim.
     assert!(
-        net_ng != net_as || net_as != net_glft,
+        net_lg != net_as || net_as != net_glft,
         "at least one pair of strategy net P&L values should differ \
-         (net_ng={net_ng:?}, net_as={net_as:?}, net_glft={net_glft:?}) — \
+         (net_lg={net_lg:?}, net_as={net_as:?}, net_glft={net_glft:?}) — \
          possible degeneration bug"
     );
 }

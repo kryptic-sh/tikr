@@ -24,7 +24,7 @@ use tikr_core::{
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
-    MicroPriceConfig, NaiveGrid, NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    MicroPriceConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -32,8 +32,6 @@ use tracing::info;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum StrategyArg {
-    #[value(name = "naive-grid")]
-    NaiveGrid,
     #[value(name = "avellaneda-stoikov", alias = "as")]
     AvellanedaStoikov,
     #[value(name = "glft")]
@@ -60,7 +58,7 @@ struct Args {
     symbol: String,
 
     /// Strategy to run.
-    #[arg(long, value_enum, default_value = "naive-grid")]
+    #[arg(long, value_enum, default_value = "avellaneda-stoikov")]
     strategy: StrategyArg,
 
     /// Order size per quote.
@@ -76,8 +74,8 @@ struct Args {
     #[arg(long, default_value_t = 5u32)]
     taker_bps: u32,
 
-    // --- NaiveGrid / A-S / GLFT spread ---
-    /// Half-spread in bps (used by naive-grid + A-S + GLFT).
+    // --- A-S / GLFT spread ---
+    /// Half-spread in bps (used by A-S + GLFT).
     #[arg(long, default_value_t = 5u32)]
     spread_bps: u32,
 
@@ -174,28 +172,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let report = match args.strategy {
-        StrategyArg::NaiveGrid => {
-            let strategy = NaiveGrid::new(NaiveGridConfig {
-                levels_per_side: 1,
-                base_spread_bps: args.spread_bps,
-                level_step_bps: 1,
-                size_per_quote,
-                min_requote_interval_ms: 1000,
-            });
-            run_with_resume(
-                venue,
-                strategy,
-                fill_sim,
-                symbol,
-                shutdown_rx,
-                runner_config,
-                None,
-                None,
-                None,
-                external_fills,
-            )
-            .await
-        }
         StrategyArg::AvellanedaStoikov => {
             let strategy = AvellanedaStoikov::new(AvellanedaStoikovConfig {
                 gamma: Decimal::from_str(&args.gamma)?,

@@ -45,10 +45,10 @@ use alloy_signer_local::PrivateKeySigner;
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketKind, Symbol, VenueId};
 use tikr_hyperliquid::{Hyperliquid, HyperliquidConfig, HyperliquidEnv, subscribe_user_events};
 use tikr_paper::{RunnerConfig, run_with_resume};
-use tikr_strategy::{NaiveGrid, NaiveGridConfig, Strategy};
+use tikr_strategy::{LayeredGrid, LayeredGridConfig, Strategy};
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -196,14 +196,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // NaiveGrid strategy with sensible defaults for live trading.
-    // levels_per_side=1 for minimal exposure in v0.
-    let strategy = NaiveGrid::new(NaiveGridConfig {
+    // LayeredGrid strategy with sensible defaults for live trading.
+    // notional_per_order controls exposure; 25 USDC clears HL minNotional.
+    let strategy = LayeredGrid::new(LayeredGridConfig {
+        notional_per_order: Decimal::from(25),
         levels_per_side: 1,
-        base_spread_bps: 20, // 0.20% spread
-        level_step_bps: 5,
-        size_per_quote: Size(Decimal::from_str_exact("0.001").unwrap()),
-        min_requote_interval_ms: 5000,
+        inner_bps: 6, // 0.06% half-spread
+        step_bps: 1,
+        reentry_bps: 20,
     });
 
     // FillSim is required by the runner trait but synthesized fills are
