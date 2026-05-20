@@ -167,14 +167,33 @@ impl LayeredGrid {
             Side::Ask => Side::Bid,
         };
 
-        // 2. Place TP on opposite side at fill_price ± reentry_bps.
+        // 2. Capture the existing outermost OPPOSITE before adding the new
+        //    TP — otherwise the TP itself (which sits between the fill
+        //    price and mid on the opp side) would be picked as "outermost"
+        //    on small ladders and we'd cancel our just-placed TP.
+        //    "Outermost" = furthest from mid → highest ask, lowest bid.
+        let opp_outermost = self
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, _))| *s == opp_side)
+            .reduce(|acc, cur| {
+                let acc_outer = match opp_side {
+                    Side::Ask => acc.1.1.0 > cur.1.1.0,
+                    Side::Bid => acc.1.1.0 < cur.1.1.0,
+                };
+                if acc_outer { acc } else { cur }
+            })
+            .map(|(i, (s, p))| (i, *s, *p));
+
+        // 3. Place TP on opposite side at fill_price ± reentry_bps.
         let tp_price = match fill_side {
             Side::Bid => Price(fill_price.0 * (Decimal::ONE + reentry_dec)),
             Side::Ask => Price(fill_price.0 * (Decimal::ONE - reentry_dec)),
         };
         self.orders.push((opp_side, tp_price));
 
-        // 3. Extend the FILLED side outward at the same step gap. Anchor
+        // 4. Extend the FILLED side outward at the same step gap. Anchor
         //    on the outermost existing order on that side. Falls back to
         //    fill_price if no same-side orders remain (degenerate case).
         let same_side_extreme = match fill_side {
@@ -198,26 +217,6 @@ impl LayeredGrid {
         };
         self.orders.push((fill_side, extension_price));
 
-        // 4. Drop the outermost order on the OPPOSITE side so it stays
-        //    at `levels_per_side` (the new TP just bumped it to N+1).
-        //    "Outermost" = furthest from mid → highest ask, lowest bid.
-        //    Capture the price so we can look up its QuoteId in
-        //    `open_quotes` and emit a targeted Cancel (preserving queue
-        //    priority on the surviving orders).
-        let opp_outermost = self
-            .orders
-            .iter()
-            .enumerate()
-            .filter(|(_, (s, _))| *s == opp_side)
-            .reduce(|acc, cur| {
-                let acc_outer = match opp_side {
-                    Side::Ask => acc.1.1.0 > cur.1.1.0,
-                    Side::Bid => acc.1.1.0 < cur.1.1.0,
-                };
-                if acc_outer { acc } else { cur }
-            })
-            .map(|(i, (s, p))| (i, *s, *p));
-
         let mut actions: Vec<Action> = Vec::with_capacity(3);
 
         // 5. Emit the TP + extension as fresh Quotes FIRST so the venue
@@ -228,9 +227,9 @@ impl LayeredGrid {
 
         // 6. Drop the outermost opposite by id (preserves queue priority
         //    on surviving orders). Fall back to CancelAll only when the
-        //    QuoteId can't be resolved — and in that fallback path we
-        //    have to replay the surviving mirror because CancelAll
-        //    nukes the just-placed TP + extension too.
+        //    QuoteId can't be resolved — in that fallback we replay the
+        //    surviving mirror entries (which already include the
+        //    just-pushed TP + extension), so DON'T re-emit those.
         if let Some((idx, drop_side, drop_price)) = opp_outermost {
             self.orders.remove(idx);
             if let Some(id) = open_quotes
@@ -245,8 +244,6 @@ impl LayeredGrid {
                 for (side, price) in self.orders.clone() {
                     actions.push(self.make_quote(symbol, side, price));
                 }
-                actions.push(self.make_quote(symbol, opp_side, tp_price));
-                actions.push(self.make_quote(symbol, fill_side, extension_price));
             }
         }
         actions
