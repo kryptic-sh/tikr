@@ -83,14 +83,19 @@ pub struct LayeredGrid {
 }
 
 impl LayeredGrid {
-    fn place_initial(&mut self, symbol: &Symbol, mid: Price) -> Vec<Action> {
+    fn place_initial(
+        &mut self,
+        symbol: &Symbol,
+        mid: Price,
+        open_quotes: &[(QuoteId, QuoteIntent)],
+    ) -> Vec<Action> {
         let mut actions: Vec<Action> =
-            Vec::with_capacity(self.config.levels_per_side as usize * 2 + 1);
-        // Cancel any stray quotes first (defensive — usually a no-op on cold start).
-        actions.push(Action::CancelAll);
+            Vec::with_capacity(self.config.levels_per_side as usize * 2 + open_quotes.len());
         self.orders.clear();
 
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
+        // Place the new ladder FIRST so the venue sees fresh resting orders
+        // before any cancels — avoids the naked-book gap.
         for k in 0..self.config.levels_per_side {
             let bps = self.config.inner_bps + self.config.step_bps * k;
             let bp_dec = bps_to_decimal(bps);
@@ -102,6 +107,11 @@ impl LayeredGrid {
             actions.push(self.make_quote(symbol, Side::Ask, sell_price));
             self.orders.push((Side::Bid, buy_price));
             self.orders.push((Side::Ask, sell_price));
+        }
+        // Then cancel any prior open quotes by id. On cold start the
+        // runner-supplied list is empty, so no cancels emit.
+        for (id, _) in open_quotes {
+            actions.push(Action::Cancel(*id));
         }
         self.placed = true;
         actions
@@ -209,12 +219,20 @@ impl LayeredGrid {
             .map(|(i, (s, p))| (i, *s, *p));
 
         let mut actions: Vec<Action> = Vec::with_capacity(3);
+
+        // 5. Emit the TP + extension as fresh Quotes FIRST so the venue
+        //    sees the new resting orders before any cancels arrive — no
+        //    naked-book gap (mirrors NaiveGrid fix).
+        actions.push(self.make_quote(symbol, opp_side, tp_price));
+        actions.push(self.make_quote(symbol, fill_side, extension_price));
+
+        // 6. Drop the outermost opposite by id (preserves queue priority
+        //    on surviving orders). Fall back to CancelAll only when the
+        //    QuoteId can't be resolved — and in that fallback path we
+        //    have to replay the surviving mirror because CancelAll
+        //    nukes the just-placed TP + extension too.
         if let Some((idx, drop_side, drop_price)) = opp_outermost {
             self.orders.remove(idx);
-            // Resolve the QuoteId from the runner-supplied snapshot. If
-            // it can't be matched (e.g. the prior fill hasn't been
-            // ack'd yet) fall back to CancelAll so we stay correct
-            // rather than leaving a stale order on the book.
             if let Some(id) = open_quotes
                 .iter()
                 .find(|(_, q)| q.side == drop_side && q.price == drop_price)
@@ -222,18 +240,15 @@ impl LayeredGrid {
             {
                 actions.push(Action::Cancel(id));
             } else {
+                actions.clear();
                 actions.push(Action::CancelAll);
-                // CancelAll wipes everything → replay the surviving mirror
-                // PLUS the about-to-be-added TP + extension below.
                 for (side, price) in self.orders.clone() {
                     actions.push(self.make_quote(symbol, side, price));
                 }
+                actions.push(self.make_quote(symbol, opp_side, tp_price));
+                actions.push(self.make_quote(symbol, fill_side, extension_price));
             }
         }
-
-        // 5. Emit the TP + extension as fresh Quotes.
-        actions.push(self.make_quote(symbol, opp_side, tp_price));
-        actions.push(self.make_quote(symbol, fill_side, extension_price));
         actions
     }
 }
@@ -262,7 +277,7 @@ impl Strategy for LayeredGrid {
                     return Vec::new();
                 };
                 let mid = Price((b + a) / Decimal::from(2));
-                self.place_initial(ctx.symbol, mid)
+                self.place_initial(ctx.symbol, mid, ctx.open_quotes)
             }
             MarketEvent::Fill(f) if f.symbol_matches(ctx.symbol) => {
                 self.on_fill(ctx.symbol, f.side, f.price, ctx.open_quotes)
@@ -290,7 +305,7 @@ impl Strategy for LayeredGrid {
         };
         let mid = Price((b + a) / Decimal::from(2));
         self.placed = false;
-        self.place_initial(ctx.symbol, mid)
+        self.place_initial(ctx.symbol, mid, ctx.open_quotes)
     }
 }
 
@@ -384,9 +399,12 @@ mod tests {
                 snapshot: snap.clone(),
             },
         );
-        // 1 CancelAll + 6 Quote
-        assert_eq!(actions.len(), 7);
-        assert!(matches!(actions[0], Action::CancelAll));
+        // Cold start: no prior open quotes → 6 Quote actions (3 per side),
+        // no Cancels (Quote-first ordering; no naked-book gap).
+        assert_eq!(actions.len(), 6);
+        for a in &actions {
+            assert!(matches!(a, Action::Quote(_)));
+        }
         let quotes: Vec<&QuoteIntent> = actions
             .iter()
             .filter_map(|a| match a {
@@ -469,10 +487,9 @@ mod tests {
             is_full: true,
         };
         let actions = strat.on_event(&fill_ctx, &MarketEvent::Fill(fill));
-        // Diff path: Cancel(highest_ask) + Quote(TP) + Quote(extension) = 3
+        // Quote-first ordering: Quote(TP) + Quote(extension) + Cancel(outermost_opp) = 3
         assert_eq!(actions.len(), 3);
-        assert!(matches!(actions[0], Action::Cancel(_)));
-        match &actions[1] {
+        match &actions[0] {
             Action::Quote(q) => {
                 assert_eq!(q.side, Side::Ask);
                 let reentry = Decimal::from(3) / Decimal::from(10_000);
@@ -480,7 +497,7 @@ mod tests {
             }
             _ => panic!("expected TP Quote on Ask"),
         }
-        match &actions[2] {
+        match &actions[1] {
             Action::Quote(q) => {
                 assert_eq!(q.side, Side::Bid);
                 let step = Decimal::from(3) / Decimal::from(10_000);
@@ -489,5 +506,6 @@ mod tests {
             }
             _ => panic!("expected extension Quote on Bid"),
         }
+        assert!(matches!(actions[2], Action::Cancel(_)));
     }
 }
