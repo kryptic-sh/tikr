@@ -17,7 +17,7 @@ use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
     VenueId,
 };
-use tikr_paper::{PaperReport, RunnerConfig, SkimConfig, run_with_resume};
+use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
     LayeredGridConfig, MicroPrice, MicroPriceConfig, NaiveGrid, NaiveGridConfig, Strategy,
@@ -77,6 +77,37 @@ struct Args {
     /// `0.0` = no spot buys, all profits stay in perp.
     #[arg(long, default_value_t = 1.0_f64)]
     skim_ratio: f64,
+
+    /// LayeredGrid sweep: comma-separated `inner_bps` values.
+    #[arg(long, default_value = "3,6,10,20")]
+    lg_inner_bps_list: String,
+
+    /// LayeredGrid sweep: comma-separated `reentry_bps` values.
+    #[arg(long, default_value = "10,20,50")]
+    lg_reentry_bps_list: String,
+
+    /// LayeredGrid sweep: comma-separated `levels_per_side` values.
+    #[arg(long, default_value = "1,3,5,10")]
+    lg_levels_list: String,
+
+    /// NaiveGrid sweep: comma-separated `base_spread_bps` values (one
+    /// preset per entry, level_step_bps=1 throughout).
+    #[arg(long, default_value = "1,2,5,10,20")]
+    ng_bps_list: String,
+
+    /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
+    /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
+    /// to disable funding accrual entirely.
+    #[arg(long, default_value_t = 1i32)]
+    funding_bps_per_8h: i32,
+}
+
+fn parse_u32_list(s: &str) -> Result<Vec<u32>, String> {
+    s.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse::<u32>().map_err(|e| format!("bad u32 '{t}': {e}")))
+        .collect()
 }
 
 #[tokio::main]
@@ -119,6 +150,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Perp funding model. Disabled when rate == 0.
+    let funding_cfg: Option<FundingConfig> = if args.funding_bps_per_8h != 0 {
+        Some(FundingConfig {
+            rate_bps_per_8h: args.funding_bps_per_8h,
+        })
+    } else {
+        None
+    };
 
     // Load + sort + validate parquet once; share across all presets via Arc.
     let load_start = std::time::Instant::now();
@@ -127,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbols: vec![symbol.clone()],
         data_dir: args.data_dir.clone(),
         tick_size: tick,
+        allow_seq_gaps: true,
     })?;
     info!(
         events = shared_data.len(),
@@ -140,37 +180,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resume writes don't collide.
     let mut handles: Vec<JoinHandle<(String, PaperReport)>> = Vec::new();
 
-    spawn_preset(
-        &mut handles,
-        &shared_data,
-        &symbol,
-        "naive-grid 5bps",
-        NaiveGrid::new(NaiveGridConfig {
-            levels_per_side: 1,
-            base_spread_bps: 5,
-            level_step_bps: 1,
-            size_per_quote,
-            min_requote_interval_ms: 1000,
-        }),
-        fees,
-        skim_cfg,
-    );
-
-    spawn_preset(
-        &mut handles,
-        &shared_data,
-        &symbol,
-        "naive-grid 2bps",
-        NaiveGrid::new(NaiveGridConfig {
-            levels_per_side: 1,
-            base_spread_bps: 2,
-            level_step_bps: 1,
-            size_per_quote,
-            min_requote_interval_ms: 1000,
-        }),
-        fees,
-        skim_cfg,
-    );
+    let ng_bps_sweep = parse_u32_list(&args.ng_bps_list)?;
+    for bps in &ng_bps_sweep {
+        let label = format!("naive-grid {bps}bps");
+        spawn_preset(
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &label,
+            NaiveGrid::new(NaiveGridConfig {
+                levels_per_side: 1,
+                base_spread_bps: *bps,
+                level_step_bps: 1,
+                size_per_quote,
+                min_requote_interval_ms: 1000,
+            }),
+            fees,
+            skim_cfg,
+            funding_cfg,
+        );
+    }
 
     spawn_preset(
         &mut handles,
@@ -188,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -205,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -223,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -241,6 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -259,6 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -277,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     for max_imb in [3u32, 5, 7, 10, 20] {
@@ -297,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             fees,
             skim_cfg,
+            funding_cfg,
         );
     }
 
@@ -316,6 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -334,6 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         bnb_fees,
         skim_cfg,
+        funding_cfg,
     );
 
     spawn_preset(
@@ -352,6 +390,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         bnb_fees,
         skim_cfg,
+        funding_cfg,
     );
 
     // Micro-price sweep: half-spread 1/2/3/5 ticks. Direct comparable against
@@ -374,6 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
             fees,
             skim_cfg,
+            funding_cfg,
         );
     }
 
@@ -393,6 +433,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         fees,
         skim_cfg,
+        funding_cfg,
     );
 
     // Layered grid sweep — re-entry-scalping ladder, fill-driven. Re-entry
@@ -402,23 +443,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (re=20 peaked on the 2h BTC sample). More levels = more capital
     // committed (each level adds $100 of resting orders on both sides),
     // but also more chances to catch the spread.
-    for levels in [1u32, 3, 5, 7, 10] {
-        let label = format!("LG inner=6 step=1 re=20 levels={levels}");
-        spawn_preset(
-            &mut handles,
-            &shared_data,
-            &symbol,
-            &label,
-            LayeredGrid::new(LayeredGridConfig {
-                notional_per_order: Decimal::from(100),
-                levels_per_side: levels,
-                inner_bps: 6,
-                step_bps: 1,
-                reentry_bps: 20,
-            }),
-            fees,
-            skim_cfg,
-        );
+    let lg_inner_sweep = parse_u32_list(&args.lg_inner_bps_list)?;
+    let lg_re_sweep = parse_u32_list(&args.lg_reentry_bps_list)?;
+    let lg_levels_sweep = parse_u32_list(&args.lg_levels_list)?;
+    for &inner in &lg_inner_sweep {
+        for &re in &lg_re_sweep {
+            for &levels in &lg_levels_sweep {
+                let label = format!("LG in={inner} re={re} lv={levels}");
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    LayeredGrid::new(LayeredGridConfig {
+                        notional_per_order: Decimal::from(100),
+                        levels_per_side: levels,
+                        inner_bps: inner,
+                        step_bps: 1,
+                        reentry_bps: re,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                );
+            }
+        }
     }
 
     let sweep_start = std::time::Instant::now();
@@ -446,6 +495,7 @@ async fn run_one<S: Strategy>(
     strategy: S,
     fees: VenueFees,
     skim: Option<SkimConfig>,
+    funding: Option<FundingConfig>,
 ) -> PaperReport {
     let replay = ParquetReplay::from_shared(shared_data);
     let venue = BacktestVenue::new(replay);
@@ -458,6 +508,7 @@ async fn run_one<S: Strategy>(
         state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
         snapshot_every_n_events: 0,
         skim,
+        funding,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -493,6 +544,7 @@ fn spawn_preset<S: Strategy + Send + 'static>(
     strategy: S,
     fees: VenueFees,
     skim: Option<SkimConfig>,
+    funding: Option<FundingConfig>,
 ) {
     let sd = Arc::clone(shared_data);
     let sym = symbol.clone();
@@ -502,7 +554,7 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
     handles.push(tokio::spawn(async move {
-        let r = run_one(sd, sym, state_id, strategy, fees, skim).await;
+        let r = run_one(sd, sym, state_id, strategy, fees, skim, funding).await;
         (display, r)
     }));
 }

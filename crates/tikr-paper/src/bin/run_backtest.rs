@@ -139,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbols: vec![symbol.clone()],
         data_dir: args.data_dir.clone(),
         tick_size: Decimal::from_str(&args.tick_size)?,
+        allow_seq_gaps: true,
     })?;
 
     let venue = BacktestVenue::new(replay);
@@ -157,6 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_dir: args.state_dir.clone(),
         snapshot_every_n_events: 0, // backtest = no snapshots
         skim: None,
+        funding: None,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.

@@ -38,6 +38,10 @@ pub struct ReplayConfig {
     /// profiling. All symbols are assumed to share this tick (single-symbol
     /// is the only path that exercises it today).
     pub tick_size: Decimal,
+    /// Tolerate gaps in per-symbol book-delta `seq` numbers (warn instead
+    /// of erroring out). Real recordings often have gaps from WS
+    /// disconnect/reconnect or between recording sessions.
+    pub allow_seq_gaps: bool,
 }
 
 impl Default for ReplayConfig {
@@ -47,6 +51,7 @@ impl Default for ReplayConfig {
             symbols: Vec::new(),
             data_dir: PathBuf::new(),
             tick_size: Decimal::ONE,
+            allow_seq_gaps: false,
         }
     }
 }
@@ -175,12 +180,22 @@ impl LoadedReplayData {
                     if let Some(prev) = last_seq {
                         let expected = prev + 1;
                         if *seq != expected {
-                            return Err(ReplayError::SeqGap {
-                                symbol: symbol.base.0.to_string(),
-                                ts_ns: ev.ts_ns,
-                                expected,
-                                got: *seq,
-                            });
+                            if cfg.allow_seq_gaps {
+                                tracing::warn!(
+                                    symbol = %symbol.base.0,
+                                    ts_ns = ev.ts_ns,
+                                    expected,
+                                    got = *seq,
+                                    "seq gap in book deltas (continuing)"
+                                );
+                            } else {
+                                return Err(ReplayError::SeqGap {
+                                    symbol: symbol.base.0.to_string(),
+                                    ts_ns: ev.ts_ns,
+                                    expected,
+                                    got: *seq,
+                                });
+                            }
                         }
                     }
                     last_seq = Some(*seq);
@@ -641,6 +656,7 @@ mod tests {
             symbols: vec![],
             data_dir: tmp.path().to_path_buf(),
             tick_size: Decimal::ONE,
+            allow_seq_gaps: false,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
         assert!(r.next().await.is_none());
@@ -669,6 +685,7 @@ mod tests {
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
             tick_size: Decimal::ONE,
+            allow_seq_gaps: false,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 
@@ -728,6 +745,7 @@ mod tests {
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
             tick_size: Decimal::ONE,
+            allow_seq_gaps: false,
         };
         let err = ParquetReplay::new(cfg)
             .err()
@@ -768,6 +786,7 @@ mod tests {
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
             tick_size: Decimal::ONE,
+            allow_seq_gaps: false,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 
@@ -819,6 +838,7 @@ mod tests {
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
             tick_size: Decimal::ONE,
+            allow_seq_gaps: false,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 

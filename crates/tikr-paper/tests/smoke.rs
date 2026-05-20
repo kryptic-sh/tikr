@@ -46,6 +46,7 @@ async fn paper_runner_against_testnet_5min() {
         state_dir: temp.path().to_path_buf(),
         snapshot_every_n_events: 100,
         skim: None,
+        funding: None,
     };
 
     let (tx, rx) = watch::channel(false);

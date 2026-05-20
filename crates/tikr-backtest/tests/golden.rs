@@ -60,6 +60,7 @@ async fn golden_naive_grid_btc_single_fill() {
         symbols: vec![symbol.clone()],
         data_dir: temp.path().to_path_buf(),
         tick_size: tikr_core::Decimal::ONE,
+        allow_seq_gaps: false,
     })
     .unwrap();
 

@@ -74,6 +74,14 @@ impl PositionTracker {
         }
     }
 
+    /// Apply a perp funding payment. `amount` is signed in quote currency:
+    /// positive means we received funding (short with positive rate, or long
+    /// with negative rate), negative means we paid. Caller computes the
+    /// amount as `position × mark_price × funding_rate × direction_sign`.
+    pub fn accrue_funding(&mut self, amount: Decimal) {
+        self.funding_accrued = Notional(self.funding_accrued.0 + amount);
+    }
+
     /// Apply `fill` to the running state. WACC math, fees accumulated separately.
     pub fn apply(&mut self, fill: &Fill) {
         let delta = side_delta(fill.side, fill.size);

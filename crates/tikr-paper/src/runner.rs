@@ -41,6 +41,21 @@ pub struct RunnerConfig {
     /// "moved" to a spot wallet that buys the base asset at the last seen
     /// mid. `None` disables. See [`SkimConfig`] for semantics.
     pub skim: Option<SkimConfig>,
+    /// Optional perp funding model. When `Some`, the runner accrues funding
+    /// continuously against the open position at each event:
+    /// `Δfunding = −position × mark × rate × (dt_secs / 28800)`.
+    /// `None` disables (back-compat: no funding cost on backtests/paper).
+    pub funding: Option<FundingConfig>,
+}
+
+/// Perp funding accrual parameters. Binance USD-M typically pays/charges
+/// every 8h at 00:00 / 08:00 / 16:00 UTC; this model is continuous (smooth
+/// over time) for backtest simplicity. Positive rate = longs pay shorts.
+#[derive(Debug, Clone, Copy)]
+pub struct FundingConfig {
+    /// Funding rate per 8h interval, as a signed bps value. Binance default
+    /// cap is ±75 bps but typical mid-cap pairs sit at ±1 bps (~0.01%).
+    pub rate_bps_per_8h: i32,
 }
 
 /// Profit-skim parameters. When enabled the runner reports `base_stacked`,
@@ -66,6 +81,7 @@ impl Default for RunnerConfig {
             state_dir: PathBuf::from("./paper_state"),
             snapshot_every_n_events: 100,
             skim: None,
+            funding: None,
         }
     }
 }
@@ -271,6 +287,11 @@ where
     // data-time duration, not wall-clock replay speed.
     let mut first_event_ts: Option<Timestamp> = None;
     let mut last_event_ts: Option<Timestamp> = None;
+    // Funding accrual state: timestamp of the last event we accrued through.
+    // On each subsequent event we apply `position × mark × rate × dt/28800s`
+    // continuously, then advance.
+    let funding_cfg = config.funding;
+    let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
     info!(
@@ -341,6 +362,28 @@ where
                     if let (Some(b), Some(a)) = (snapshot.bids.first(), snapshot.asks.first()) {
                         last_mid = Price((b.price.0 + a.price.0) / Decimal::from(2));
                     }
+                }
+
+                // Funding accrual: continuous model. On each event, charge
+                // (or credit) `position × mark × rate × (dt / 28800s)`. The
+                // sign convention: positive funding rate → longs pay,
+                // shorts receive (`amount = −size × mark × rate × dt/8h`).
+                if let Some(fcfg) = funding_cfg
+                    && last_mid.0 > Decimal::ZERO
+                {
+                    if let Some(prev_ts) = last_funding_ts {
+                        let dt_ns = ts.0.saturating_sub(prev_ts.0);
+                        if dt_ns > 0 {
+                            let dt_secs = Decimal::from(dt_ns) / Decimal::from(1_000_000_000u64);
+                            let rate_per_8h =
+                                Decimal::from(fcfg.rate_bps_per_8h) / Decimal::from(10_000);
+                            let interval = Decimal::from(28_800u64);
+                            let pos_size = tracker.snapshot().size.0;
+                            let amount = -pos_size * last_mid.0 * rate_per_8h * (dt_secs / interval);
+                            tracker.accrue_funding(amount);
+                        }
+                    }
+                    last_funding_ts = Some(ts);
                 }
 
                 let pos = tracker.snapshot();
@@ -1111,6 +1154,7 @@ mod tests {
             state_dir,
             snapshot_every_n_events: 100,
             skim: None,
+            funding: None,
         }
     }
 
@@ -1443,6 +1487,7 @@ mod tests {
             state_dir: temp.path().to_path_buf(),
             snapshot_every_n_events: 100,
             skim: None,
+            funding: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -1520,6 +1565,7 @@ mod tests {
             state_dir: temp.path().to_path_buf(),
             snapshot_every_n_events: 100,
             skim: None,
+            funding: None,
         };
         let (_tx, rx) = watch::channel(false);
 

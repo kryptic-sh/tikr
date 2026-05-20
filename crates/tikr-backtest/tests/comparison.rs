@@ -133,6 +133,7 @@ async fn run_strategy<S: Strategy>(strategy: S) -> PnLReport {
         symbols: vec![symbol.clone()],
         data_dir: temp.path().to_path_buf(),
         tick_size: tikr_core::Decimal::ONE,
+        allow_seq_gaps: false,
     })
     .unwrap();
     let fill_sim = FillSim::new(fill_sim_config());

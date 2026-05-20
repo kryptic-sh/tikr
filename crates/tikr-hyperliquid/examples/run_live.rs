@@ -221,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_dir: args.state_dir,
         snapshot_every_n_events: 100,
         skim: None,
+        funding: None,
     };
 
     let report = run_with_resume(
