@@ -57,12 +57,12 @@ use tikr_binance::{
     user_stream::subscribe_user_data_stream,
 };
 use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
-use tikr_venue::Venue;
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
     LayeredGridConfig, NaiveGrid, NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
+use tikr_venue::Venue;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -213,7 +213,12 @@ async fn reset_symbol_state(venue: &BinanceClient, symbol: &Symbol, phase: &str)
     if let Err(e) = venue.cancel_all(symbol).await {
         warn!(phase, error = ?e, "cancel_all failed (continuing)");
     } else {
-        info!(phase, "cancelled all open orders for {}{}", symbol.base.0.as_ref(), symbol.quote.0.as_ref());
+        info!(
+            phase,
+            "cancelled all open orders for {}{}",
+            symbol.base.0.as_ref(),
+            symbol.quote.0.as_ref()
+        );
     }
     match venue.position(symbol).await {
         Ok(pos) if pos.size.0 != Decimal::ZERO => {
@@ -530,9 +535,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 1.2× buffer covers the post-only safety margin where the
             // strategy posts at fill_price ± inner_bps and price ticks
             // could put us slightly under the floor.
-            let requested = Decimal::from_str(&args.lg_notional).map_err(|e| {
-                format!("--lg-notional '{}' invalid: {}", args.lg_notional, e)
-            })?;
+            let requested = Decimal::from_str(&args.lg_notional)
+                .map_err(|e| format!("--lg-notional '{}' invalid: {}", args.lg_notional, e))?;
             let mut notional = requested;
             if let Some(min_n) = venue.min_notional(&symbol) {
                 let floor = min_n * Decimal::from_str("1.2").unwrap();

@@ -37,11 +37,11 @@
 //! order book.* Quantitative Finance. <https://www.math.nyu.edu/~avellane/HighFrequencyTrading.pdf>
 
 use crate::volatility::{EwmaConfig, EwmaVolatility, WARMUP_COUNT};
-use crate::{Action, Strategy, StrategyContext};
-use tikr_core::{
-    Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp,
+use crate::{
+    Action, Strategy, StrategyContext, compute_mid_strict, make_post_only_intent,
+    should_requote_drift,
 };
-use tikr_venue::QuoteIntent;
+use tikr_core::{Decimal, MarketEvent, Price, Side, Size, Timestamp};
 
 /// Configuration for [`AvellanedaStoikov`].
 #[derive(Clone, Debug)]
@@ -105,14 +105,14 @@ impl Strategy for AvellanedaStoikov {
         let MarketEvent::BookUpdate { snapshot } = event else {
             return Vec::new(); // A-S ignores trades/fills/heartbeats
         };
-        let Some(mid) = compute_mid(snapshot) else {
+        let Some(mid) = compute_mid_strict(snapshot) else {
             return Vec::new(); // empty book side — nothing actionable
         };
         self.estimator.on_book_update(mid, snapshot.ts);
         if self.estimator.samples_seen() < WARMUP_COUNT {
             return Vec::new();
         }
-        if !should_requote(
+        if !should_requote_drift(
             self.last_requote_ts,
             self.last_quoted_mid,
             mid,
@@ -134,58 +134,19 @@ impl Strategy for AvellanedaStoikov {
         self.last_quoted_mid = Some(mid);
         vec![
             Action::CancelAll,
-            Action::Quote(make_intent(
+            Action::Quote(make_post_only_intent(
                 ctx.symbol,
                 Side::Bid,
                 Price(r - delta),
                 self.config.size_per_quote,
             )),
-            Action::Quote(make_intent(
+            Action::Quote(make_post_only_intent(
                 ctx.symbol,
                 Side::Ask,
                 Price(r + delta),
                 self.config.size_per_quote,
             )),
         ]
-    }
-}
-
-fn compute_mid(snapshot: &tikr_core::Snapshot) -> Option<Price> {
-    let best_bid = snapshot.bids.first()?.price;
-    let best_ask = snapshot.asks.first()?.price;
-    Some(Price((best_bid.0 + best_ask.0) / Decimal::from(2)))
-}
-
-fn should_requote(
-    last_ts: Option<Timestamp>,
-    last_mid: Option<Price>,
-    new_mid: Price,
-    now: Timestamp,
-    min_interval_ms: u64,
-    level_step_bps: u32,
-) -> bool {
-    let (Some(prev_ts), Some(prev_mid)) = (last_ts, last_mid) else {
-        return true;
-    };
-    let elapsed_ns = now.0.saturating_sub(prev_ts.0);
-    let interval_ns = min_interval_ms.saturating_mul(1_000_000);
-    if elapsed_ns >= interval_ns {
-        return true;
-    }
-    let drift = (new_mid.0 - prev_mid.0).abs();
-    let threshold =
-        prev_mid.0 * (Decimal::from(level_step_bps) / Decimal::from(2)) / Decimal::from(10_000);
-    drift > threshold
-}
-
-fn make_intent(symbol: &Symbol, side: Side, price: Price, size: Size) -> QuoteIntent {
-    QuoteIntent {
-        symbol: symbol.clone(),
-        side,
-        price,
-        size,
-        tif: TimeInForce::PostOnly,
-        kind: QuoteKind::Point,
     }
 }
 
@@ -197,7 +158,8 @@ fn make_intent(symbol: &Symbol, side: Side, price: Price, size: Size) -> QuoteIn
 mod tests {
     use super::*;
     use tikr_core::{
-        Asset, Decimal, Level, MarketKind, Notional, Position, SignedSize, Snapshot, VenueId,
+        Asset, Decimal, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Symbol,
+        Timestamp, VenueId,
     };
 
     fn make_symbol() -> Symbol {

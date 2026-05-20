@@ -277,6 +277,62 @@ fn compute_mid(snapshot: &Snapshot, last_trade_price: Option<Price>) -> Option<P
     }
 }
 
+/// Compute the mid-price strictly from both sides of the book (no trade fallback).
+/// Used by inventory-aware strategies ([`AvellanedaStoikov`], [`Glft`]) that
+/// require a real spread to be present before quoting.
+/// Returns `None` if either side of the book is empty.
+pub(crate) fn compute_mid_strict(snapshot: &Snapshot) -> Option<Price> {
+    let best_bid = snapshot.bids.first()?.price;
+    let best_ask = snapshot.asks.first()?.price;
+    Some(Price((best_bid.0 + best_ask.0) / Decimal::from(2)))
+}
+
+/// Decide whether to re-emit quotes based on elapsed time and mid-price drift.
+///
+/// Returns `true` immediately when no prior requote has occurred. Otherwise,
+/// returns `true` when either:
+/// - `now - last_ts >= min_interval_ms` (time gate), or
+/// - `|new_mid - prev_mid| / prev_mid > (level_step_bps / 2) / 10_000` (drift gate).
+pub(crate) fn should_requote_drift(
+    last_ts: Option<Timestamp>,
+    last_mid: Option<Price>,
+    new_mid: Price,
+    now: Timestamp,
+    min_interval_ms: u64,
+    level_step_bps: u32,
+) -> bool {
+    let (Some(prev_ts), Some(prev_mid)) = (last_ts, last_mid) else {
+        return true;
+    };
+    let elapsed_ns = now.0.saturating_sub(prev_ts.0);
+    let interval_ns = min_interval_ms.saturating_mul(1_000_000);
+    if elapsed_ns >= interval_ns {
+        return true;
+    }
+    let drift = (new_mid.0 - prev_mid.0).abs();
+    let threshold =
+        prev_mid.0 * (Decimal::from(level_step_bps) / Decimal::from(2)) / Decimal::from(10_000);
+    drift > threshold
+}
+
+/// Build a post-only point-quote intent for the given symbol, side, price, and size.
+/// Used by inventory-aware strategies ([`AvellanedaStoikov`], [`Glft`]).
+pub(crate) fn make_post_only_intent(
+    symbol: &Symbol,
+    side: Side,
+    price: Price,
+    size: Size,
+) -> QuoteIntent {
+    QuoteIntent {
+        symbol: symbol.clone(),
+        side,
+        price,
+        size,
+        tif: TimeInForce::PostOnly,
+        kind: QuoteKind::Point,
+    }
+}
+
 impl Strategy for NaiveGrid {
     type Config = NaiveGridConfig;
 

@@ -487,9 +487,18 @@ where
                             open_quotes: &post_fill_quotes,
                         };
                         let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
-                        for action in fill_actions {
-                            fill_sim.on_action(action, ts);
-                        }
+                        dispatch_post_fill_actions(
+                            fill_actions,
+                            &venue,
+                            &mut fill_sim,
+                            &mut strategy,
+                            &symbol,
+                            ts,
+                            &post_fill_pos,
+                            &current_book,
+                            false,
+                        )
+                        .await;
                     }
                 } else {
                     // Still call on_market_event so FillSim internal state advances.
@@ -590,6 +599,8 @@ where
                 // Notify the strategy of its own fill so re-entry / rolling
                 // ladder logic fires. Dispatch resulting actions to the venue
                 // (Quote => place + record id in fill_sim; Cancel => cancel).
+                // Recovery: rejected Quotes are bounced to on_quote_rejected
+                // for one recovery round inside dispatch_post_fill_actions.
                 let post_fill_pos = tracker.snapshot();
                 let post_fill_quotes = fill_sim.live_quotes_for(&symbol);
                 let fill_event = MarketEvent::Fill(fill_clone.clone());
@@ -602,100 +613,18 @@ where
                     open_quotes: &post_fill_quotes,
                 };
                 let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
-                let mut rejected_intents: Vec<(QuoteIntent, String)> = Vec::new();
-                for action in fill_actions {
-                    match &action {
-                        tikr_strategy::Action::Quote(intent) => {
-                            match venue.quote(intent.clone()).await {
-                                Ok(qid) => {
-                                    info!(
-                                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
-                                        quote_id = ?qid, "live: order placed (post-fill)"
-                                    );
-                                    fill_sim.enqueue_place_with_id(
-                                        intent.clone(),
-                                        fill_clone.ts,
-                                        qid,
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(error = ?e, "live: venue.quote failed (post-fill)");
-                                    rejected_intents.push((intent.clone(), format!("{e:?}")));
-                                }
-                            }
-                        }
-                        tikr_strategy::Action::Requote { id, intent } => {
-                            if let Err(e) = venue.requote(*id, intent.clone()).await {
-                                warn!(error = ?e, "live: venue.requote failed (post-fill)");
-                            }
-                        }
-                        tikr_strategy::Action::Cancel(id) => {
-                            if let Err(e) = venue.cancel(*id).await {
-                                warn!(error = ?e, "live: venue.cancel failed (post-fill)");
-                            }
-                            fill_sim.on_action(action, fill_clone.ts);
-                        }
-                        tikr_strategy::Action::CancelAll => {
-                            if let Err(e) = venue.cancel_all(&symbol).await {
-                                warn!(error = ?e, "live: venue.cancel_all failed (post-fill)");
-                            }
-                            fill_sim.on_action(action, fill_clone.ts);
-                        }
-                        tikr_strategy::Action::NoOp => {}
-                    }
-                }
-                // Recovery: any Quote actions that the venue rejected get
-                // bounced back to the strategy via on_quote_rejected. The
-                // strategy typically re-anchors on current book mid and
-                // emits a fresh pair. Only one recovery round — if recovery
-                // quotes also reject, log and move on.
-                for (rej_intent, rej_reason) in rejected_intents {
-                    let recovery_quotes = fill_sim.live_quotes_for(&symbol);
-                    let rec_ctx = StrategyContext {
-                        symbol: &symbol,
-                        now: fill_clone.ts,
-                        position: &post_fill_pos,
-                        recent_fills: &[],
-                        latest_book: &current_book,
-                        open_quotes: &recovery_quotes,
-                    };
-                    let recovery_actions =
-                        strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
-                    for action in recovery_actions {
-                        match &action {
-                            tikr_strategy::Action::Quote(intent) => {
-                                match venue.quote(intent.clone()).await {
-                                    Ok(qid) => {
-                                        info!(
-                                            side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
-                                            quote_id = ?qid, "live: order placed (recovery)"
-                                        );
-                                        fill_sim.enqueue_place_with_id(
-                                            intent.clone(),
-                                            fill_clone.ts,
-                                            qid,
-                                        );
-                                    }
-                                    Err(e) => warn!(error = ?e, "live: venue.quote failed (recovery)"),
-                                }
-                            }
-                            tikr_strategy::Action::Cancel(id) => {
-                                if let Err(e) = venue.cancel(*id).await {
-                                    warn!(error = ?e, "live: venue.cancel failed (recovery)");
-                                }
-                                fill_sim.on_action(action, fill_clone.ts);
-                            }
-                            tikr_strategy::Action::CancelAll => {
-                                if let Err(e) = venue.cancel_all(&symbol).await {
-                                    warn!(error = ?e, "live: venue.cancel_all failed (recovery)");
-                                }
-                                fill_sim.on_action(action, fill_clone.ts);
-                            }
-                            tikr_strategy::Action::Requote { .. }
-                            | tikr_strategy::Action::NoOp => {}
-                        }
-                    }
-                }
+                dispatch_post_fill_actions(
+                    fill_actions,
+                    &venue,
+                    &mut fill_sim,
+                    &mut strategy,
+                    &symbol,
+                    fill_clone.ts,
+                    &post_fill_pos,
+                    &current_book,
+                    true,
+                )
+                .await;
             }
             _ = status_tick.tick() => {
                 let pos = tracker.snapshot();
@@ -802,6 +731,124 @@ where
         "paper runner done"
     );
     report
+}
+
+/// Dispatch a list of post-fill strategy actions into `fill_sim` and,
+/// optionally, the live venue.
+///
+/// **Paper mode** (`live_mode == false`): every action is fed directly to
+/// `fill_sim.on_action`; no venue calls are made.
+///
+/// **Live mode** (`live_mode == true`): Quote actions are submitted to the
+/// venue and the returned `QuoteId` is threaded back into `fill_sim` via
+/// `enqueue_place_with_id`. Requote/Cancel/CancelAll also hit the venue.
+/// Any Quote that the venue rejects is collected and handed to
+/// `strategy.on_quote_rejected` for one recovery round; if the recovery
+/// quotes also fail, the error is logged and we move on (no recursion).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_post_fill_actions<V, S>(
+    actions: Vec<tikr_strategy::Action>,
+    venue: &V,
+    fill_sim: &mut FillSim,
+    strategy: &mut S,
+    symbol: &Symbol,
+    ts: Timestamp,
+    post_fill_pos: &tikr_core::Position,
+    current_book: &tikr_core::Snapshot,
+    live_mode: bool,
+) where
+    V: Venue,
+    S: Strategy,
+{
+    if !live_mode {
+        // Paper mode: pipe all actions straight into FillSim.
+        for action in actions {
+            fill_sim.on_action(action, ts);
+        }
+        return;
+    }
+
+    // Live mode: dispatch to venue; track rejected Quote intents for recovery.
+    let mut rejected_intents: Vec<(QuoteIntent, String)> = Vec::new();
+    for action in actions {
+        match &action {
+            tikr_strategy::Action::Quote(intent) => match venue.quote(intent.clone()).await {
+                Ok(qid) => {
+                    info!(
+                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                        quote_id = ?qid, "live: order placed (post-fill)"
+                    );
+                    fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
+                }
+                Err(e) => {
+                    warn!(error = ?e, "live: venue.quote failed (post-fill)");
+                    rejected_intents.push((intent.clone(), format!("{e:?}")));
+                }
+            },
+            tikr_strategy::Action::Requote { id, intent } => {
+                if let Err(e) = venue.requote(*id, intent.clone()).await {
+                    warn!(error = ?e, "live: venue.requote failed (post-fill)");
+                }
+            }
+            tikr_strategy::Action::Cancel(id) => {
+                if let Err(e) = venue.cancel(*id).await {
+                    warn!(error = ?e, "live: venue.cancel failed (post-fill)");
+                }
+                fill_sim.on_action(action, ts);
+            }
+            tikr_strategy::Action::CancelAll => {
+                if let Err(e) = venue.cancel_all(symbol).await {
+                    warn!(error = ?e, "live: venue.cancel_all failed (post-fill)");
+                }
+                fill_sim.on_action(action, ts);
+            }
+            tikr_strategy::Action::NoOp => {}
+        }
+    }
+
+    // Recovery: any Quote actions that the venue rejected get bounced back
+    // to the strategy via on_quote_rejected. The strategy typically
+    // re-anchors on current book mid and emits a fresh pair. Only one
+    // recovery round — if recovery quotes also reject, log and move on.
+    for (rej_intent, rej_reason) in rejected_intents {
+        let recovery_quotes = fill_sim.live_quotes_for(symbol);
+        let rec_ctx = StrategyContext {
+            symbol,
+            now: ts,
+            position: post_fill_pos,
+            recent_fills: &[],
+            latest_book: current_book,
+            open_quotes: &recovery_quotes,
+        };
+        let recovery_actions = strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
+        for action in recovery_actions {
+            match &action {
+                tikr_strategy::Action::Quote(intent) => match venue.quote(intent.clone()).await {
+                    Ok(qid) => {
+                        info!(
+                            side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                            quote_id = ?qid, "live: order placed (recovery)"
+                        );
+                        fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
+                    }
+                    Err(e) => warn!(error = ?e, "live: venue.quote failed (recovery)"),
+                },
+                tikr_strategy::Action::Cancel(id) => {
+                    if let Err(e) = venue.cancel(*id).await {
+                        warn!(error = ?e, "live: venue.cancel failed (recovery)");
+                    }
+                    fill_sim.on_action(action, ts);
+                }
+                tikr_strategy::Action::CancelAll => {
+                    if let Err(e) = venue.cancel_all(symbol).await {
+                        warn!(error = ?e, "live: venue.cancel_all failed (recovery)");
+                    }
+                    fill_sim.on_action(action, ts);
+                }
+                tikr_strategy::Action::Requote { .. } | tikr_strategy::Action::NoOp => {}
+            }
+        }
+    }
 }
 
 /// Apply a fill to the tracker, update the risk gate, emit alerts.
