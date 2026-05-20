@@ -272,6 +272,26 @@ impl Strategy for LayeredGrid {
             _ => Vec::new(),
         }
     }
+
+    fn on_quote_rejected(
+        &mut self,
+        ctx: &StrategyContext<'_>,
+        _intent: &QuoteIntent,
+        _reason: &str,
+    ) -> Vec<Action> {
+        // Re-anchor on current book mid and rebuild the full ladder. Any
+        // remaining open quotes get cancelled inside `place_initial` via
+        // its leading `CancelAll`. Resets `placed` so the next BookUpdate
+        // also won't re-trigger cold start.
+        let bid = ctx.latest_book.bids.first().map(|l| l.price.0);
+        let ask = ctx.latest_book.asks.first().map(|l| l.price.0);
+        let (Some(b), Some(a)) = (bid, ask) else {
+            return Vec::new();
+        };
+        let mid = Price((b + a) / Decimal::from(2));
+        self.placed = false;
+        self.place_initial(ctx.symbol, mid)
+    }
 }
 
 /// Helper: does the [`tikr_core::Fill`] belong to our symbol? FillSim

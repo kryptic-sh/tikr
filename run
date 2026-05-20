@@ -72,7 +72,7 @@ for sym in "${SYMBOLS[@]}"; do
     --env futures-testnet \
     --symbol "${sym_clean}" \
     --size "${size}" \
-    --strategy naive-grid \
+    --strategy layered-grid \
     --minutes 0 \
     > "${log}" 2>&1 &
   PIDS+=($!)

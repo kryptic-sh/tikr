@@ -57,10 +57,11 @@ use tikr_binance::{
     user_stream::subscribe_user_data_stream,
 };
 use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
+use tikr_venue::Venue;
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
-    NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
+    LayeredGridConfig, NaiveGrid, NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tokio::signal;
 use tokio::sync::watch;
@@ -92,6 +93,9 @@ enum StrategyArg {
     /// TopOfBook — join or improve at best bid/ask. Post-only safe.
     #[value(name = "top-of-book", alias = "tob")]
     TopOfBook,
+    /// LayeredGrid — fixed-fiat rolling ladder with re-entry scalping.
+    #[value(name = "layered-grid", alias = "lg")]
+    LayeredGrid,
 }
 
 #[derive(Parser, Debug)]
@@ -178,6 +182,22 @@ struct Args {
     /// book imbalance (bid-heavy) shifts both quotes UP. 0 disables.
     #[arg(long, default_value_t = 0u32)]
     max_imbalance_ticks: u32,
+    /// LayeredGrid: fiat notional per order. Default $25 to clear Binance
+    /// USD-M Futures testnet's $20 minNotional on majors.
+    #[arg(long, default_value = "25")]
+    lg_notional: String,
+    /// LayeredGrid: orders per side (1 = 1 buy + 1 sell, the 2h-sweep winner).
+    #[arg(long, default_value_t = 1u32)]
+    lg_levels: u32,
+    /// LayeredGrid: inner spread from mid in bps.
+    #[arg(long, default_value_t = 6u32)]
+    lg_inner_bps: u32,
+    /// LayeredGrid: step between levels in bps.
+    #[arg(long, default_value_t = 1u32)]
+    lg_step_bps: u32,
+    /// LayeredGrid: re-entry spread in bps (TP distance from fill price).
+    #[arg(long, default_value_t = 20u32)]
+    lg_reentry_bps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +283,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     info!(venue = ?venue, "BinanceClient ready");
+
+    // Startup cleanup: cancel any existing open orders for this symbol and
+    // flatten any open perp position. Without this, restarts inherit stale
+    // resting orders and an unknown inventory which the strategy didn't
+    // place and won't track correctly.
+    if let Err(e) = venue.cancel_all(&symbol).await {
+        warn!(error = ?e, "startup cancel_all failed (continuing)");
+    } else {
+        info!("startup: cancelled all open orders for {}", args.symbol);
+    }
+    match venue.position(&symbol).await {
+        Ok(pos) if pos.size.0 != Decimal::ZERO => {
+            // Place an IOC opposite-side market-like order at touch to flatten.
+            let qty = pos.size.0.abs();
+            let close_side = if pos.size.0 > Decimal::ZERO {
+                tikr_core::Side::Ask
+            } else {
+                tikr_core::Side::Bid
+            };
+            // Pull a current top-of-book snapshot to price the close order
+            // through the spread (Binance rejects pure-market on testnet).
+            let snap = venue.snapshot(&symbol).await.ok();
+            let close_price = snap.as_ref().and_then(|s| match close_side {
+                tikr_core::Side::Bid => s.asks.first().map(|l| l.price),
+                tikr_core::Side::Ask => s.bids.first().map(|l| l.price),
+            });
+            if let Some(price) = close_price {
+                let close_intent = tikr_venue::QuoteIntent {
+                    symbol: symbol.clone(),
+                    side: close_side,
+                    price,
+                    size: tikr_core::Size(qty),
+                    tif: tikr_core::TimeInForce::IOC,
+                    kind: tikr_core::QuoteKind::Point,
+                };
+                match venue.quote(close_intent).await {
+                    Ok(qid) => info!(
+                        side = ?close_side, qty = %qty, quote_id = ?qid,
+                        "startup: position flatten IOC submitted"
+                    ),
+                    Err(e) => warn!(error = ?e, "startup: position flatten failed (continuing)"),
+                }
+            } else {
+                warn!("startup: no book snapshot — cannot flatten position");
+            }
+        }
+        Ok(_) => info!("startup: no open position to flatten"),
+        Err(e) => warn!(error = ?e, "startup: venue.position failed (continuing)"),
+    }
 
     // Subscribe to userDataStream for fills (separate HttpClient — cheap).
     // Pass the Binance symbol string so fills for OTHER symbols on the same
@@ -423,6 +492,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|e| format!("--skew-unit '{}' invalid: {}", args.skew_unit, e))?,
                 ),
                 max_imbalance_ticks: args.max_imbalance_ticks,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::LayeredGrid => {
+            let strategy = LayeredGrid::new(LayeredGridConfig {
+                notional_per_order: Decimal::from_str(&args.lg_notional).map_err(|e| {
+                    format!("--lg-notional '{}' invalid: {}", args.lg_notional, e)
+                })?,
+                levels_per_side: args.lg_levels,
+                inner_bps: args.lg_inner_bps,
+                step_bps: args.lg_step_bps,
+                reentry_bps: args.lg_reentry_bps,
             });
             run_with_resume(
                 venue,
