@@ -201,6 +201,59 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Cancel every open order for `symbol`, THEN flatten any open position
+/// at touch via IOC. Used at both startup and shutdown.
+///
+/// Order is load-bearing: cancelling first prevents resting orders from
+/// fighting the flatten IOC across the spread.
+async fn reset_symbol_state(venue: &BinanceClient, symbol: &Symbol, phase: &str) {
+    if let Err(e) = venue.cancel_all(symbol).await {
+        warn!(phase, error = ?e, "cancel_all failed (continuing)");
+    } else {
+        info!(phase, "cancelled all open orders for {}{}", symbol.base.0.as_ref(), symbol.quote.0.as_ref());
+    }
+    match venue.position(symbol).await {
+        Ok(pos) if pos.size.0 != Decimal::ZERO => {
+            let qty = pos.size.0.abs();
+            let close_side = if pos.size.0 > Decimal::ZERO {
+                tikr_core::Side::Ask
+            } else {
+                tikr_core::Side::Bid
+            };
+            let snap = venue.snapshot(symbol).await.ok();
+            let close_price = snap.as_ref().and_then(|s| match close_side {
+                tikr_core::Side::Bid => s.asks.first().map(|l| l.price),
+                tikr_core::Side::Ask => s.bids.first().map(|l| l.price),
+            });
+            if let Some(price) = close_price {
+                let close_intent = tikr_venue::QuoteIntent {
+                    symbol: symbol.clone(),
+                    side: close_side,
+                    price,
+                    size: tikr_core::Size(qty),
+                    tif: tikr_core::TimeInForce::IOC,
+                    kind: tikr_core::QuoteKind::Point,
+                };
+                match venue.quote(close_intent).await {
+                    Ok(qid) => info!(
+                        phase, side = ?close_side, qty = %qty, quote_id = ?qid,
+                        "position flatten IOC submitted"
+                    ),
+                    Err(e) => warn!(phase, error = ?e, "position flatten failed (continuing)"),
+                }
+            } else {
+                warn!(phase, "no book snapshot — cannot flatten position");
+            }
+        }
+        Ok(_) => info!(phase, "no open position to flatten"),
+        Err(e) => warn!(phase, error = ?e, "venue.position failed (continuing)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -266,7 +319,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the venue. Wrap key_material in Arc so it can be shared with the
     // user-stream pump (futures path doesn't use it, but the API requires it).
     let api_key_for_user_stream = api_key.clone();
+    let api_key_for_shutdown = api_key.clone();
     let key_material = Arc::new(key_material);
+    let key_material_for_shutdown = key_material.clone();
+    let symbol_for_shutdown = symbol.clone();
     let venue = BinanceClient::with_credentials(
         env,
         api_key,
@@ -284,54 +340,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(venue = ?venue, "BinanceClient ready");
 
-    // Startup cleanup: cancel any existing open orders for this symbol and
-    // flatten any open perp position. Without this, restarts inherit stale
-    // resting orders and an unknown inventory which the strategy didn't
-    // place and won't track correctly.
-    if let Err(e) = venue.cancel_all(&symbol).await {
-        warn!(error = ?e, "startup cancel_all failed (continuing)");
-    } else {
-        info!("startup: cancelled all open orders for {}", args.symbol);
-    }
-    match venue.position(&symbol).await {
-        Ok(pos) if pos.size.0 != Decimal::ZERO => {
-            // Place an IOC opposite-side market-like order at touch to flatten.
-            let qty = pos.size.0.abs();
-            let close_side = if pos.size.0 > Decimal::ZERO {
-                tikr_core::Side::Ask
-            } else {
-                tikr_core::Side::Bid
-            };
-            // Pull a current top-of-book snapshot to price the close order
-            // through the spread (Binance rejects pure-market on testnet).
-            let snap = venue.snapshot(&symbol).await.ok();
-            let close_price = snap.as_ref().and_then(|s| match close_side {
-                tikr_core::Side::Bid => s.asks.first().map(|l| l.price),
-                tikr_core::Side::Ask => s.bids.first().map(|l| l.price),
-            });
-            if let Some(price) = close_price {
-                let close_intent = tikr_venue::QuoteIntent {
-                    symbol: symbol.clone(),
-                    side: close_side,
-                    price,
-                    size: tikr_core::Size(qty),
-                    tif: tikr_core::TimeInForce::IOC,
-                    kind: tikr_core::QuoteKind::Point,
-                };
-                match venue.quote(close_intent).await {
-                    Ok(qid) => info!(
-                        side = ?close_side, qty = %qty, quote_id = ?qid,
-                        "startup: position flatten IOC submitted"
-                    ),
-                    Err(e) => warn!(error = ?e, "startup: position flatten failed (continuing)"),
-                }
-            } else {
-                warn!("startup: no book snapshot — cannot flatten position");
-            }
-        }
-        Ok(_) => info!("startup: no open position to flatten"),
-        Err(e) => warn!(error = ?e, "startup: venue.position failed (continuing)"),
-    }
+    // Startup cleanup: orders first, then position. Without this, restarts
+    // inherit stale resting orders and unknown inventory which the
+    // strategy didn't place and won't track correctly.
+    reset_symbol_state(&venue, &symbol, "startup").await;
 
     // Subscribe to userDataStream for fills (separate HttpClient — cheap).
     // Pass the Binance symbol string so fills for OTHER symbols on the same
@@ -549,6 +561,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
     };
+
+    // Shutdown cleanup: mirror the startup cleanup so we never leave
+    // orphan orders or open inventory on the venue when this instance
+    // exits (--minutes cap, SIGINT, stream EOF, …). Symbol-scoped, so
+    // other symbols on the same account are not touched. The original
+    // venue handle was consumed by run_with_resume, so we rebuild a
+    // fresh client from saved credentials.
+    let shutdown_venue = BinanceClient::with_credentials(
+        env,
+        api_key_for_shutdown,
+        match key_material_for_shutdown.as_ref() {
+            BinanceKeyMaterial::Hmac { secret } => BinanceKeyMaterial::Hmac {
+                secret: secret.clone(),
+            },
+            BinanceKeyMaterial::Ed25519 { signing_key } => BinanceKeyMaterial::Ed25519 {
+                signing_key: signing_key.clone(),
+            },
+        },
+        Some(&symbol_for_shutdown),
+    )
+    .await?;
+    reset_symbol_state(&shutdown_venue, &symbol_for_shutdown, "shutdown").await;
 
     let report_json = serde_json::to_string_pretty(&report)
         .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
