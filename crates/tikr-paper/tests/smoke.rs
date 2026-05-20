@@ -45,6 +45,7 @@ async fn paper_runner_against_testnet_5min() {
     let config = RunnerConfig {
         state_dir: temp.path().to_path_buf(),
         snapshot_every_n_events: 100,
+        skim: None,
     };
 
     let (tx, rx) = watch::channel(false);

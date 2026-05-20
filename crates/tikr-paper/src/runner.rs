@@ -36,6 +36,28 @@ pub struct RunnerConfig {
     pub state_dir: PathBuf,
     /// Snapshot cadence in events. Default 100.
     pub snapshot_every_n_events: u32,
+    /// Optional profit-skim accounting: every time perp realized P&L (net
+    /// of fees + prior skims) grows by `budget × skim_pct`, that chunk is
+    /// "moved" to a spot wallet that buys the base asset at the last seen
+    /// mid. `None` disables. See [`SkimConfig`] for semantics.
+    pub skim: Option<SkimConfig>,
+}
+
+/// Profit-skim parameters. When enabled the runner reports `base_stacked`,
+/// `skim_count`, `skim_total_usdt`, and the final mark-to-market account
+/// value alongside the regular PnL fields.
+#[derive(Debug, Clone, Copy)]
+pub struct SkimConfig {
+    /// Starting USDT budget held in the perp account.
+    pub budget: Decimal,
+    /// Skim threshold as a fraction of `budget`. `0.05` = skim every 5%
+    /// gain. Each gain chunk consumes exactly `budget × skim_pct` of
+    /// `profit_since_skim`.
+    pub skim_pct: Decimal,
+    /// Fraction of each skim chunk that moves to spot. `1.0` (classic):
+    /// all profit chunk → spot. `0.5`: half → spot, half stays in perp
+    /// account (compounds trading capital). `0.0`: never skim, all stays.
+    pub skim_ratio: Decimal,
 }
 
 impl Default for RunnerConfig {
@@ -43,6 +65,7 @@ impl Default for RunnerConfig {
         Self {
             state_dir: PathBuf::from("./paper_state"),
             snapshot_every_n_events: 100,
+            skim: None,
         }
     }
 }
@@ -211,10 +234,40 @@ where
     let mut events_processed: u64 = resume.as_ref().map(|r| r.events_processed).unwrap_or(0);
     let mut fills_emitted: u64 = resume.as_ref().map(|r| r.fills_emitted).unwrap_or(0);
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
+    let resumed_sim_duration_secs: u64 =
+        resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
+
+    // Skim-mode state. Tracks profit accumulated since the last skim. When it
+    // crosses `budget × skim_pct`, that chunk is split into a spot buy (size
+    // = chunk × skim_ratio) plus an amount that stays in the perp account
+    // (chunk × (1 − skim_ratio)) — the retained piece compounds trading
+    // capital. skim_ratio=1 keeps the original "skim all" behavior.
+    let skim_cfg = config.skim;
+    let mut skim_threshold = Decimal::ZERO;
+    let mut skim_ratio = Decimal::ONE;
+    if let Some(sc) = skim_cfg {
+        skim_threshold = sc.budget * sc.skim_pct;
+        skim_ratio = sc.skim_ratio;
+    }
+    let mut profit_since_skim = Decimal::ZERO;
+    let mut last_net_seen = Decimal::ZERO;
+    let mut skim_count: u64 = resume.as_ref().map(|r| r.skim_count).unwrap_or(0);
+    let mut skim_total_usdt: Decimal = resume
+        .as_ref()
+        .map(|r| r.skim_total_usdt.0)
+        .unwrap_or(Decimal::ZERO);
+    let mut base_stacked: Decimal = resume
+        .as_ref()
+        .map(|r| r.base_stacked.0)
+        .unwrap_or(Decimal::ZERO);
 
     let mut current_book = empty_snapshot(&symbol);
     let mut last_mid = Price(Decimal::ZERO);
     let started = Instant::now();
+    // Track sim-time span from event timestamps so backtest reports show
+    // data-time duration, not wall-clock replay speed.
+    let mut first_event_ts: Option<Timestamp> = None;
+    let mut last_event_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
     info!(
@@ -237,8 +290,17 @@ where
                 events_processed,
                 fills_emitted,
                 &risk_gate,
+                first_event_ts,
+                last_event_ts,
+                skim_cfg,
+                skim_count,
+                skim_total_usdt,
+                base_stacked,
+                &symbol,
             );
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
+            report.sim_duration_secs =
+                resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
             return report;
         }
     };
@@ -258,6 +320,10 @@ where
                     break;
                 };
                 let ts = event_ts(&event);
+                if first_event_ts.is_none() {
+                    first_event_ts = Some(ts);
+                }
+                last_event_ts = Some(ts);
 
                 if let MarketEvent::BookUpdate { snapshot } = &event {
                     current_book = snapshot.clone();
@@ -361,6 +427,7 @@ where
                 if !live_mode {
                     let fills = fill_sim.on_market_event(&event, ts);
                     for fill in fills {
+                        let fill_clone = fill.clone();
                         apply_fill(
                             fill,
                             &mut tracker,
@@ -370,10 +437,55 @@ where
                             &symbol,
                         )
                         .await;
+                        // Notify strategy of its own fill so re-entry / SAR /
+                        // ladder-rebuild logic can react synchronously. Action
+                        // results queue through fill_sim and process on the
+                        // NEXT market event (no infinite-recursion risk).
+                        let post_fill_pos = tracker.snapshot();
+                        let fill_event = MarketEvent::Fill(fill_clone.clone());
+                        let fill_ctx = StrategyContext {
+                            symbol: &symbol,
+                            now: ts,
+                            position: &post_fill_pos,
+                            recent_fills: std::slice::from_ref(&fill_clone),
+                            latest_book: &current_book,
+                            open_quotes: &[],
+                        };
+                        let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
+                        for action in fill_actions {
+                            fill_sim.on_action(action, ts);
+                        }
                     }
                 } else {
                     // Still call on_market_event so FillSim internal state advances.
                     let _ = fill_sim.on_market_event(&event, ts);
+                }
+
+                // Skim-mode: after fills land this tick, check whether net
+                // realized P&L (excluding skimmed dollars) crossed the next
+                // threshold and convert that chunk to base asset at last_mid.
+                if skim_cfg.is_some() && last_mid.0 > Decimal::ZERO {
+                    let rep = tracker.report(last_mid);
+                    let net_now = rep.realized.0 + rep.funding.0 - rep.fees.0 - skim_total_usdt;
+                    let gain = net_now - last_net_seen;
+                    if gain > Decimal::ZERO {
+                        profit_since_skim += gain;
+                    }
+                    while profit_since_skim >= skim_threshold && skim_threshold > Decimal::ZERO {
+                        let spot_amount = skim_threshold * skim_ratio;
+                        if spot_amount > Decimal::ZERO {
+                            let btc_bought = spot_amount / last_mid.0;
+                            base_stacked += btc_bought;
+                            skim_total_usdt += spot_amount;
+                        }
+                        // Retained piece (chunk × (1 − skim_ratio)) stays in
+                        // perp by NOT being subtracted from realized. The
+                        // full chunk is consumed from profit_since_skim so we
+                        // don't re-trigger on the same gain.
+                        skim_count += 1;
+                        profit_since_skim -= skim_threshold;
+                    }
+                    last_net_seen = rep.realized.0 + rep.funding.0 - rep.fees.0 - skim_total_usdt;
                 }
                 events_processed += 1;
 
@@ -388,8 +500,17 @@ where
                         events_processed,
                         fills_emitted,
                         &risk_gate,
+                        first_event_ts,
+                        last_event_ts,
+                        skim_cfg,
+                        skim_count,
+                        skim_total_usdt,
+                        base_stacked,
+                        &symbol,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
+                    report.sim_duration_secs =
+                        resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
                     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
                         warn!("snapshot write failed: {}", e);
                     }
@@ -451,8 +572,17 @@ where
         events_processed,
         fills_emitted,
         &risk_gate,
+        first_event_ts,
+        last_event_ts,
+        skim_cfg,
+        skim_count,
+        skim_total_usdt,
+        base_stacked,
+        &symbol,
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
+    report.sim_duration_secs =
+        resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
     }
@@ -498,6 +628,7 @@ async fn apply_fill(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     tracker: &PositionTracker,
     last_mid: Price,
@@ -505,8 +636,26 @@ fn finalize(
     events_processed: u64,
     fills_emitted: u64,
     risk_gate: &Option<Box<dyn RiskGate>>,
+    first_event_ts: Option<Timestamp>,
+    last_event_ts: Option<Timestamp>,
+    skim_cfg: Option<SkimConfig>,
+    skim_count: u64,
+    skim_total_usdt: Decimal,
+    base_stacked: Decimal,
+    symbol: &Symbol,
 ) -> PaperReport {
     let base = tracker.report(last_mid);
+    let sim_duration_secs = match (first_event_ts, last_event_ts) {
+        (Some(a), Some(b)) if b.0 >= a.0 => (b.0 - a.0) / 1_000_000_000,
+        _ => 0,
+    };
+    let final_perp_balance = match skim_cfg {
+        Some(sc) => sc.budget + base.realized.0 + base.funding.0 - base.fees.0
+            - skim_total_usdt
+            + base.unrealized.0,
+        None => Decimal::ZERO,
+    };
+    let final_base_value = base_stacked * last_mid.0;
     PaperReport {
         schema_version: SCHEMA_VERSION,
         realized: base.realized,
@@ -515,9 +664,20 @@ fn finalize(
         funding: base.funding,
         net: base.net,
         runtime_secs: started.elapsed().as_secs(),
+        sim_duration_secs,
         events_processed,
         fills_emitted,
         risk_state: risk_gate.as_ref().map(|g| g.state().clone()),
+        skim_count,
+        skim_total_usdt: Notional(skim_total_usdt),
+        base_stacked: Notional(base_stacked),
+        final_perp_balance: Notional(final_perp_balance),
+        final_base_value: Notional(final_base_value),
+        base_asset: if skim_cfg.is_some() {
+            symbol.base.0.as_ref().to_string()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -688,6 +848,7 @@ mod tests {
         RunnerConfig {
             state_dir,
             snapshot_every_n_events: 100,
+            skim: None,
         }
     }
 
@@ -810,9 +971,16 @@ mod tests {
             funding: Notional(Decimal::ZERO),
             net: Notional(Decimal::from(4)),
             runtime_secs: 100,
+            sim_duration_secs: 100,
             events_processed: 50,
             fills_emitted: 3,
             risk_state: None,
+            skim_count: 0,
+            skim_total_usdt: Notional(Decimal::ZERO),
+            base_stacked: Notional(Decimal::ZERO),
+            final_perp_balance: Notional(Decimal::ZERO),
+            final_base_value: Notional(Decimal::ZERO),
+            base_asset: String::new(),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -849,9 +1017,16 @@ mod tests {
             funding: Notional(Decimal::ZERO),
             net: Notional(Decimal::ZERO),
             runtime_secs: 0,
+            sim_duration_secs: 0,
             events_processed: 0,
             fills_emitted: 0,
             risk_state: None,
+            skim_count: 0,
+            skim_total_usdt: Notional(Decimal::ZERO),
+            base_stacked: Notional(Decimal::ZERO),
+            final_perp_balance: Notional(Decimal::ZERO),
+            final_base_value: Notional(Decimal::ZERO),
+            base_asset: String::new(),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -1005,6 +1180,7 @@ mod tests {
         let config = RunnerConfig {
             state_dir: temp.path().to_path_buf(),
             snapshot_every_n_events: 100,
+            skim: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -1084,6 +1260,7 @@ mod tests {
         let config = RunnerConfig {
             state_dir: temp.path().to_path_buf(),
             snapshot_every_n_events: 100,
+            skim: None,
         };
         let (_tx, rx) = watch::channel(false);
 

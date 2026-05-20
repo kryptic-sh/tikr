@@ -249,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runner_config = RunnerConfig {
         state_dir: args.state_dir,
         snapshot_every_n_events: 100,
+        skim: None,
     };
 
     let report = run_with_resume(

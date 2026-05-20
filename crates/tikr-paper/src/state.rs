@@ -28,9 +28,16 @@ mod tests {
             funding: Notional(Decimal::ZERO),
             net: Notional(Decimal::from(14)),
             runtime_secs: 100,
+            sim_duration_secs: 3600,
             events_processed: 500,
             fills_emitted: 3,
             risk_state: None,
+            skim_count: 0,
+            skim_total_usdt: Notional(Decimal::ZERO),
+            base_stacked: Notional(Decimal::ZERO),
+            final_perp_balance: Notional(Decimal::ZERO),
+            final_base_value: Notional(Decimal::ZERO),
+            base_asset: String::new(),
         }
     }
 

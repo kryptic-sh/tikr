@@ -47,5 +47,5 @@ pub use alerts::{
 pub use metrics::MetricRegistry;
 pub use multi::{MultiPaperReport, MultiSymbolRun, run_multi};
 pub use report::{PaperReport, SCHEMA_VERSION};
-pub use runner::{RunnerConfig, run, run_with_resume};
+pub use runner::{RunnerConfig, SkimConfig, run, run_with_resume};
 pub use state::write_snapshot;

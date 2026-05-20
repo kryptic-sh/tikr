@@ -317,6 +317,7 @@ async fn risk_resume_alerting_capstone() {
     let config = RunnerConfig {
         state_dir: temp.path().to_path_buf(),
         snapshot_every_n_events: 50,
+        skim: None,
     };
     let (_tx1, rx1) = watch::channel(false);
 

@@ -66,8 +66,19 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
     let mut funding = Decimal::ZERO;
     let mut net = Decimal::ZERO;
     let mut max_runtime = 0u64;
+    let mut max_sim_duration = 0u64;
     let mut total_events = 0u64;
     let mut total_fills = 0u64;
+    // Skim aggregation: sum across symbols. Note base_stacked sums across
+    // symbols on the assumption all skim runs accumulate the SAME base
+    // asset (e.g. BTC). For mixed-asset skim portfolios this aggregate is
+    // misleading — caller should use per_symbol[s].base_stacked instead.
+    let mut total_skim_count = 0u64;
+    let mut total_skim_usdt = Decimal::ZERO;
+    let mut total_base_stacked = Decimal::ZERO;
+    let mut total_perp_balance = Decimal::ZERO;
+    let mut total_base_value = Decimal::ZERO;
+    let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in reports {
         realized += r.realized.0;
         unrealized += r.unrealized.0;
@@ -75,9 +86,26 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         funding += r.funding.0;
         net += r.net.0;
         max_runtime = max_runtime.max(r.runtime_secs);
+        max_sim_duration = max_sim_duration.max(r.sim_duration_secs);
         total_events += r.events_processed;
         total_fills += r.fills_emitted;
+        total_skim_count += r.skim_count;
+        total_skim_usdt += r.skim_total_usdt.0;
+        total_base_stacked += r.base_stacked.0;
+        total_perp_balance += r.final_perp_balance.0;
+        total_base_value += r.final_base_value.0;
+        if !r.base_asset.is_empty() {
+            bases.insert(r.base_asset.as_str());
+        }
     }
+    // Aggregate base_asset label: empty if no skim, single name if all
+    // symbols share a base, "MIXED" if heterogeneous (in which case the
+    // summed base_stacked is meaningless — see struct docs).
+    let aggregate_base = match bases.len() {
+        0 => String::new(),
+        1 => bases.iter().next().unwrap().to_string(),
+        _ => "MIXED".to_string(),
+    };
     PaperReport {
         schema_version: SCHEMA_VERSION,
         realized: Notional(realized),
@@ -86,8 +114,15 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         funding: Notional(funding),
         net: Notional(net),
         runtime_secs: max_runtime,
+        sim_duration_secs: max_sim_duration,
         events_processed: total_events,
         fills_emitted: total_fills,
         risk_state: None,
+        skim_count: total_skim_count,
+        skim_total_usdt: Notional(total_skim_usdt),
+        base_stacked: Notional(total_base_stacked),
+        final_perp_balance: Notional(total_perp_balance),
+        final_base_value: Notional(total_base_value),
+        base_asset: aggregate_base,
     }
 }

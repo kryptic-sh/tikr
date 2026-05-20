@@ -31,8 +31,15 @@ pub struct PaperReport {
     pub funding: Notional,
     /// Net P&L: `realized + unrealized - fees + funding`.
     pub net: Notional,
-    /// Total runtime in seconds. On resume, accumulates across incarnations.
+    /// Wall-clock runtime in seconds (engine execution time). On resume,
+    /// accumulates across incarnations. For per-time metrics on backtests
+    /// (e.g. fills/min), prefer [`Self::sim_duration_secs`].
     pub runtime_secs: u64,
+    /// Simulated-time span in seconds, derived from the first → last event
+    /// timestamps. In live mode this tracks wall-clock; in backtest it
+    /// tracks the data span (1h of recorded data → ~3600 here regardless
+    /// of how fast we replayed). Accumulates across resumed incarnations.
+    pub sim_duration_secs: u64,
     /// Total `MarketEvent` count processed by the runner.
     pub events_processed: u64,
     /// Total `Fill` count emitted by [`FillSim`][tikr_backtest::fill_sim::FillSim].
@@ -40,6 +47,24 @@ pub struct PaperReport {
     /// Persisted risk-gate state, present when a [`tikr_risk::RiskGate`] was
     /// supplied to [`crate::runner::run_with_resume`]; `None` otherwise.
     pub risk_state: Option<RiskState>,
+    /// Number of profit-skims executed. `0` when skim mode disabled (no
+    /// [`crate::runner::SkimConfig`] supplied) or when realized PnL never
+    /// crossed the skim threshold.
+    pub skim_count: u64,
+    /// Cumulative USDT moved from perp account to spot via skim.
+    pub skim_total_usdt: Notional,
+    /// Base-asset quantity accumulated via skim spot buys.
+    pub base_stacked: Notional,
+    /// Perp account value at end, marked to market on any open position.
+    /// `budget + realized − fees − skim_total + unrealized`. Meaningful
+    /// only when skim mode enabled.
+    pub final_perp_balance: Notional,
+    /// `base_stacked × last_mid`. Spot leg of the final account value.
+    pub final_base_value: Notional,
+    /// Symbol of base asset accumulated via skim (e.g. "BTC", "ETH").
+    /// Empty when skim disabled. For cross-base aggregates in
+    /// [`crate::multi`], may be `"MIXED"`.
+    pub base_asset: String,
 }
 
 // --- serde wire format ---------------------------------------------------
@@ -53,10 +78,24 @@ struct PaperReportWire {
     funding: String,
     net: String,
     runtime_secs: u64,
+    #[serde(default)]
+    sim_duration_secs: u64,
     events_processed: u64,
     fills_emitted: u64,
     #[serde(default)]
     risk_state: Option<RiskState>,
+    #[serde(default)]
+    skim_count: u64,
+    #[serde(default)]
+    skim_total_usdt: String,
+    #[serde(default)]
+    base_stacked: String,
+    #[serde(default)]
+    final_perp_balance: String,
+    #[serde(default)]
+    final_base_value: String,
+    #[serde(default)]
+    base_asset: String,
 }
 
 impl Serialize for PaperReport {
@@ -69,9 +108,16 @@ impl Serialize for PaperReport {
             funding: self.funding.0.to_string(),
             net: self.net.0.to_string(),
             runtime_secs: self.runtime_secs,
+            sim_duration_secs: self.sim_duration_secs,
             events_processed: self.events_processed,
             fills_emitted: self.fills_emitted,
             risk_state: self.risk_state.clone(),
+            skim_count: self.skim_count,
+            skim_total_usdt: self.skim_total_usdt.0.to_string(),
+            base_stacked: self.base_stacked.0.to_string(),
+            final_perp_balance: self.final_perp_balance.0.to_string(),
+            final_base_value: self.final_base_value.0.to_string(),
+            base_asset: self.base_asset.clone(),
         }
         .serialize(serializer)
     }
@@ -99,9 +145,32 @@ impl<'de> Deserialize<'de> for PaperReport {
             funding: parse(&wire.funding)?,
             net: parse(&wire.net)?,
             runtime_secs: wire.runtime_secs,
+            sim_duration_secs: wire.sim_duration_secs,
             events_processed: wire.events_processed,
             fills_emitted: wire.fills_emitted,
             risk_state: wire.risk_state,
+            skim_count: wire.skim_count,
+            skim_total_usdt: if wire.skim_total_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.skim_total_usdt)?
+            },
+            base_stacked: if wire.base_stacked.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.base_stacked)?
+            },
+            final_perp_balance: if wire.final_perp_balance.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.final_perp_balance)?
+            },
+            final_base_value: if wire.final_base_value.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.final_base_value)?
+            },
+            base_asset: wire.base_asset,
         })
     }
 }
