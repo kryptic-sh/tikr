@@ -508,10 +508,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         StrategyArg::LayeredGrid => {
+            // Auto-bump --lg-notional to clear per-symbol minNotional from
+            // exchangeInfo cache (BTC=$50, ETH=$20, alts=$5 on testnet).
+            // 1.2× buffer covers the post-only safety margin where the
+            // strategy posts at fill_price ± inner_bps and price ticks
+            // could put us slightly under the floor.
+            let requested = Decimal::from_str(&args.lg_notional).map_err(|e| {
+                format!("--lg-notional '{}' invalid: {}", args.lg_notional, e)
+            })?;
+            let mut notional = requested;
+            if let Some(min_n) = venue.min_notional(&symbol) {
+                let floor = min_n * Decimal::from_str("1.2").unwrap();
+                if notional < floor {
+                    warn!(
+                        requested = %requested, min_notional = %min_n, bumped_to = %floor,
+                        "lg-notional below symbol minNotional × 1.2 — auto-bumping"
+                    );
+                    notional = floor;
+                }
+            }
             let strategy = LayeredGrid::new(LayeredGridConfig {
-                notional_per_order: Decimal::from_str(&args.lg_notional).map_err(|e| {
-                    format!("--lg-notional '{}' invalid: {}", args.lg_notional, e)
-                })?,
+                notional_per_order: notional,
                 levels_per_side: args.lg_levels,
                 inner_bps: args.lg_inner_bps,
                 step_bps: args.lg_step_bps,

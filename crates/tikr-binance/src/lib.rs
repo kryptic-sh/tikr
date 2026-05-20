@@ -245,6 +245,16 @@ impl BinanceClient {
     // Helpers
     // -------------------------------------------------------------------
 
+    /// Look up the minimum order notional (price × size floor) cached
+    /// from `exchangeInfo`. Returns `None` if the symbol wasn't seen
+    /// during cache construction.
+    pub fn min_notional(&self, symbol: &Symbol) -> Option<tikr_core::Decimal> {
+        let sym_str = binance_symbol(symbol);
+        self.exchange_info_cache
+            .get(&sym_str)
+            .map(|f| f.min_notional)
+    }
+
     /// Enforce mainnet gate before any write action.
     fn check_mainnet_gate(&self) -> Result<(), VenueError> {
         if self.env.is_mainnet() && !self.mainnet_writes_enabled {
@@ -298,14 +308,51 @@ impl Venue for BinanceClient {
         }
     }
 
-    /// Fetch the current order-book snapshot.
+    /// Fetch the current order-book snapshot via REST.
     ///
-    /// Delegated to the depth stream's first event for simplicity in v0.
-    /// (A dedicated REST snapshot endpoint could replace this in a follow-up.)
+    /// Uses `/fapi/v1/depth?symbol=...&limit=5` for futures and
+    /// `/api/v3/depth?symbol=...&limit=5` for spot. Returns the top 5
+    /// levels per side — enough to price an IOC at touch for startup
+    /// flatten without paying for a full 20-level fetch.
     async fn snapshot(&self, symbol: &Symbol) -> Result<Snapshot, VenueError> {
-        // v0: return an empty snapshot; the live runner relies on subscribe().
-        // A proper REST snapshot call (`/api/v3/depth` or `/fapi/v1/depth`)
-        // is a follow-up item.
+        let sym_str = binance_symbol(symbol);
+        let base_url = self.env.rest_base_url();
+        let path = if self.env.is_futures() {
+            "fapi/v1/depth"
+        } else {
+            "api/v3/depth"
+        };
+        let url = format!("{base_url}/{path}?symbol={sym_str}&limit=5");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| VenueError::Internal(Box::new(e)))?;
+
+        fn parse_levels(arr: Option<&Vec<serde_json::Value>>) -> Vec<tikr_core::Level> {
+            arr.map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let a = row.as_array()?;
+                        let p = a.first()?.as_str()?.parse::<tikr_core::Decimal>().ok()?;
+                        let s = a.get(1)?.as_str()?.parse::<tikr_core::Decimal>().ok()?;
+                        Some(tikr_core::Level {
+                            price: Price(p),
+                            size: tikr_core::Size(s),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+        }
+
+        let bids = parse_levels(body.get("bids").and_then(serde_json::Value::as_array));
+        let asks = parse_levels(body.get("asks").and_then(serde_json::Value::as_array));
         let ts = Timestamp(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -314,8 +361,8 @@ impl Venue for BinanceClient {
         );
         Ok(Snapshot {
             symbol: symbol.clone(),
-            bids: vec![],
-            asks: vec![],
+            bids,
+            asks,
             ts,
         })
     }
@@ -357,6 +404,7 @@ impl Venue for BinanceClient {
                 &price_str,
                 &size_str,
                 &coid,
+                intent.tif,
             )
             .await?;
         } else {

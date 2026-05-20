@@ -15,7 +15,7 @@
 
 use reqwest::Client as HttpClient;
 use serde_json::Value;
-use tikr_core::{QuoteId, Side};
+use tikr_core::{QuoteId, Side, TimeInForce};
 use tikr_venue::VenueError;
 use tracing::info;
 use uuid::Uuid;
@@ -45,14 +45,22 @@ pub async fn place_order(
     price: &str,
     quantity: &str,
     client_order_id: &str,
+    tif: TimeInForce,
 ) -> Result<QuoteId, VenueError> {
     let side_str = match side {
         Side::Bid => "BUY",
         Side::Ask => "SELL",
     };
+    // Binance Futures TIF strings: GTC, IOC, FOK, GTX (post-only).
+    let tif_str = match tif {
+        TimeInForce::PostOnly => "GTX",
+        TimeInForce::IOC => "IOC",
+        TimeInForce::FOK => "FOK",
+        TimeInForce::GTC => "GTC",
+    };
 
     let params = format!(
-        "symbol={symbol}&side={side_str}&type=LIMIT&timeInForce=GTX\
+        "symbol={symbol}&side={side_str}&type=LIMIT&timeInForce={tif_str}\
          &quantity={quantity}&price={price}\
          &newClientOrderId={client_order_id}"
     );
