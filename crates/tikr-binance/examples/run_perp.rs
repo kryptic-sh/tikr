@@ -93,6 +93,9 @@ enum StrategyArg {
     /// LayeredGrid — fixed-fiat rolling ladder with re-entry scalping.
     #[value(name = "layered-grid", alias = "lg")]
     LayeredGrid,
+    /// StaticGrid — passive grid that rebuilds only when batch is consumed.
+    #[value(name = "static-grid", alias = "sg")]
+    StaticGrid,
 }
 
 #[derive(Parser, Debug)]
@@ -190,6 +193,18 @@ struct Args {
     /// TP distance on fill, and same-side extension step (all the same).
     #[arg(long, default_value_t = 6u32)]
     lg_bps: u32,
+    /// StaticGrid: fiat notional per order. Auto-bumped if below symbol minNotional × 1.2.
+    #[arg(long, default_value = "25")]
+    sg_notional: String,
+    /// StaticGrid: orders per side. Default 3 = 6 total open at start.
+    #[arg(long, default_value_t = 3u32)]
+    sg_levels: u32,
+    /// StaticGrid: inner spread from mid in bps (nearest level on each side).
+    #[arg(long, default_value_t = 3u32)]
+    sg_inner_bps: u32,
+    /// StaticGrid: step between consecutive levels on the same side in bps.
+    #[arg(long, default_value_t = 3u32)]
+    sg_step_bps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +536,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 notional_per_order: notional,
                 levels_per_side: args.lg_levels,
                 inner_bps: args.lg_bps,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::StaticGrid => {
+            // Same auto-bump dance as LG — symbol-aware minNotional × 1.2 buffer.
+            let requested = Decimal::from_str(&args.sg_notional)
+                .map_err(|e| format!("--sg-notional '{}' invalid: {}", args.sg_notional, e))?;
+            let mut notional = requested;
+            if let Some(min_n) = venue.min_notional(&symbol) {
+                let floor = min_n * Decimal::from_str("1.2").unwrap();
+                if notional < floor {
+                    warn!(
+                        requested = %requested, min_notional = %min_n, bumped_to = %floor,
+                        "sg-notional below symbol minNotional × 1.2 — auto-bumping"
+                    );
+                    notional = floor;
+                }
+            }
+            let strategy = tikr_strategy::StaticGrid::new(tikr_strategy::StaticGridConfig {
+                notional_per_order: notional,
+                levels_per_side: args.sg_levels,
+                inner_bps: args.sg_inner_bps,
+                step_bps: args.sg_step_bps,
             });
             run_with_resume(
                 venue,

@@ -20,7 +20,8 @@ use tikr_core::{
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, MicroPrice, MicroPriceConfig, Strategy, TopOfBook, TopOfBookConfig,
+    LayeredGridConfig, MicroPrice, MicroPriceConfig, StaticGrid, StaticGridConfig, Strategy,
+    TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -84,6 +85,18 @@ struct Args {
     /// LayeredGrid sweep: comma-separated `levels` values.
     #[arg(long, default_value = "1,2,3,4,5")]
     lg_levels_list: String,
+
+    /// StaticGrid sweep: comma-separated `inner_bps` values.
+    #[arg(long, default_value = "3,6,10")]
+    sg_inner_bps_list: String,
+
+    /// StaticGrid sweep: comma-separated `step_bps` values.
+    #[arg(long, default_value = "3,6")]
+    sg_step_bps_list: String,
+
+    /// StaticGrid sweep: comma-separated `levels_per_side` values.
+    #[arg(long, default_value = "3,5")]
+    sg_levels_list: String,
 
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
@@ -431,6 +444,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 skim_cfg,
                 funding_cfg,
             );
+        }
+    }
+
+    // StaticGrid sweep — place-once-then-sit grid. Triggers a fresh batch
+    // when remaining open quotes are <= 2 OR one side is empty. Pure passive
+    // accumulation vs the rolling re-anchor of LG.
+    let sg_inner_sweep = parse_u32_list(&args.sg_inner_bps_list)?;
+    let sg_step_sweep = parse_u32_list(&args.sg_step_bps_list)?;
+    let sg_levels_sweep = parse_u32_list(&args.sg_levels_list)?;
+    for &inner in &sg_inner_sweep {
+        for &step in &sg_step_sweep {
+            for &levels in &sg_levels_sweep {
+                let label = format!("SG in={inner} st={step} lv={levels}");
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    StaticGrid::new(StaticGridConfig {
+                        notional_per_order: Decimal::from(100),
+                        levels_per_side: levels,
+                        inner_bps: inner,
+                        step_bps: step,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                );
+            }
         }
     }
 
