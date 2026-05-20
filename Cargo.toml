@@ -26,3 +26,10 @@ tikr-risk = { path = "crates/tikr-risk" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Profile-friendly release build. Inherits release optimizations + adds debug
+# line tables so samply / flamegraph can map sampled PCs back to source.
+[profile.profiling]
+inherits = "release"
+debug = 1
+split-debuginfo = "off"
