@@ -40,6 +40,34 @@ path = "src/bin/backtest_dca_bands.rs"
 name = "backtest_layered_grid"
 path = "src/bin/backtest_layered_grid.rs"
 
+[[bin]]
+name = "backtest_donchian"
+path = "src/bin/backtest_donchian.rs"
+
+[[bin]]
+name = "backtest_naive_rolling"
+path = "src/bin/backtest_naive_rolling.rs"
+
+[[bin]]
+name = "backtest_atr_grid"
+path = "src/bin/backtest_atr_grid.rs"
+
+[[bin]]
+name = "backtest_bollinger"
+path = "src/bin/backtest_bollinger.rs"
+
+[[bin]]
+name = "backtest_pairs"
+path = "src/bin/backtest_pairs.rs"
+
+[[bin]]
+name = "record_liquidations"
+path = "src/bin/record_liquidations.rs"
+
+[[bin]]
+name = "backtest_liquidation_cascade"
+path = "src/bin/backtest_liquidation_cascade.rs"
+
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"

@@ -418,6 +418,47 @@ pub struct Position {
 }
 
 // ---------------------------------------------------------------------------
+// LiquidationEvent
+// ---------------------------------------------------------------------------
+
+/// A forced liquidation event broadcast by Binance USD-M Futures.
+///
+/// The `!forceOrder@arr` stream emits one frame per liquidated position.
+/// When many liquidations pile up on the same side in a short window it
+/// signals a "cascade" — the price typically overshoots and then reverts.
+///
+/// ## Side semantics
+///
+/// The `side` field carries the **liquidation order** side (the direction of
+/// the force-close market order):
+/// - [`Side::Ask`] (`"SELL"`) — a long position was force-closed.
+///   The exchange dumped base → price moved down → mean-revert entry is LONG.
+/// - [`Side::Bid`] (`"BUY"`) — a short position was force-closed.
+///   The exchange bought base → price moved up → mean-revert entry is SHORT.
+///
+/// ## Symbol
+///
+/// `symbol` is the raw Binance ticker (e.g. `"BTCUSDT"`). It is kept as a
+/// plain `String` because the stream covers all symbols simultaneously;
+/// resolving to a typed [`Symbol`] is the caller's responsibility.
+#[derive(Debug, Clone)]
+pub struct LiquidationEvent {
+    /// Raw Binance symbol string, e.g. `"BTCUSDT"`.
+    pub symbol: String,
+    /// Direction of the force-close order.
+    /// [`Side::Ask`] = long liquidated; [`Side::Bid`] = short liquidated.
+    pub side: Side,
+    /// Liquidated quantity (base asset).
+    pub qty: Decimal,
+    /// Average fill price (`ap` field) — the actual execution price.
+    pub price: Price,
+    /// Pre-computed notional value: `qty × price` (USDT).
+    pub notional: Decimal,
+    /// Event timestamp (nanoseconds since UNIX epoch), derived from `T` (ms).
+    pub ts: Timestamp,
+}
+
+// ---------------------------------------------------------------------------
 // MarketEvent
 // ---------------------------------------------------------------------------
 
