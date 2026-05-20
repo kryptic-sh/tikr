@@ -554,6 +554,7 @@ where
                     info!("external fill channel closed");
                     break;
                 };
+                let fill_clone = fill.clone();
                 apply_fill(
                     fill,
                     &mut tracker,
@@ -565,6 +566,63 @@ where
                     &symbol,
                 )
                 .await;
+                // Sync FillSim: drop the consumed quote so `live_quotes_for`
+                // returns the correct open count for the strategy.
+                fill_sim.drop_quote(fill_clone.quote_id);
+
+                // Notify the strategy of its own fill so re-entry / rolling
+                // ladder logic fires. Dispatch resulting actions to the venue
+                // (Quote => place + record id in fill_sim; Cancel => cancel).
+                let post_fill_pos = tracker.snapshot();
+                let post_fill_quotes = fill_sim.live_quotes_for(&symbol);
+                let fill_event = MarketEvent::Fill(fill_clone.clone());
+                let fill_ctx = StrategyContext {
+                    symbol: &symbol,
+                    now: fill_clone.ts,
+                    position: &post_fill_pos,
+                    recent_fills: std::slice::from_ref(&fill_clone),
+                    latest_book: &current_book,
+                    open_quotes: &post_fill_quotes,
+                };
+                let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
+                for action in fill_actions {
+                    match &action {
+                        tikr_strategy::Action::Quote(intent) => {
+                            match venue.quote(intent.clone()).await {
+                                Ok(qid) => {
+                                    info!(
+                                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                                        quote_id = ?qid, "live: order placed (post-fill)"
+                                    );
+                                    fill_sim.enqueue_place_with_id(
+                                        intent.clone(),
+                                        fill_clone.ts,
+                                        qid,
+                                    );
+                                }
+                                Err(e) => warn!(error = ?e, "live: venue.quote failed (post-fill)"),
+                            }
+                        }
+                        tikr_strategy::Action::Requote { id, intent } => {
+                            if let Err(e) = venue.requote(*id, intent.clone()).await {
+                                warn!(error = ?e, "live: venue.requote failed (post-fill)");
+                            }
+                        }
+                        tikr_strategy::Action::Cancel(id) => {
+                            if let Err(e) = venue.cancel(*id).await {
+                                warn!(error = ?e, "live: venue.cancel failed (post-fill)");
+                            }
+                            fill_sim.on_action(action, fill_clone.ts);
+                        }
+                        tikr_strategy::Action::CancelAll => {
+                            if let Err(e) = venue.cancel_all(&symbol).await {
+                                warn!(error = ?e, "live: venue.cancel_all failed (post-fill)");
+                            }
+                            fill_sim.on_action(action, fill_clone.ts);
+                        }
+                        tikr_strategy::Action::NoOp => {}
+                    }
+                }
             }
             _ = status_tick.tick() => {
                 let pos = tracker.snapshot();

@@ -369,6 +369,13 @@ impl FillSim {
         self.live_quotes.retain(|q| q.id != id);
     }
 
+    /// Live mode: an external venue fill consumed one of our resting orders.
+    /// Drop the corresponding `LiveQuote` so `live_quotes_for` and queue
+    /// state stay in sync with the real exchange.
+    pub fn drop_quote(&mut self, id: QuoteId) {
+        self.cancel_id(id);
+    }
+
     fn update_book_state(&mut self, snapshot: &Snapshot) {
         // Cancel attribution: any LiveQuote at a level whose aggregate
         // SHRANK between the previous BookState snapshot and this one had

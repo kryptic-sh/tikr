@@ -286,16 +286,19 @@ impl Strategy for NaiveGrid {
                 self.last_trade_price = Some(*price);
                 Vec::new()
             }
-            MarketEvent::Fill(_) => {
-                // A fill consumed one of our resting orders. Re-quote at the
-                // ORIGINAL anchor mid so refills land at the same prices.
-                // `build_quotes` cancels any remaining open quotes from the
-                // prior cycle (only the un-filled side) and places a fresh
-                // pair at the anchor levels.
-                let Some(mid) = self.last_quoted_mid else {
-                    return Vec::new();
-                };
-                self.build_quotes(ctx.symbol, mid, ctx.open_quotes)
+            MarketEvent::Fill(fill) => {
+                // Rolling-mid: each fill shifts the anchor halfway toward
+                // the fill price. With symmetric `base_spread_bps`, a buy
+                // fill drifts mid down by half the spread (so the next
+                // buy steps deeper, the next sell becomes a tight TP) and
+                // a sell fill drifts it up. `build_quotes` places fresh
+                // orders first, then cancels any remaining old open quote
+                // on the opposite side from `ctx.open_quotes`.
+                let prev_mid = self.last_quoted_mid.unwrap_or(fill.price);
+                let new_mid = Price((prev_mid.0 + fill.price.0) / Decimal::from(2));
+                self.last_quoted_mid = Some(new_mid);
+                self.last_requote_ts = Some(fill.ts);
+                self.build_quotes(ctx.symbol, new_mid, ctx.open_quotes)
             }
             MarketEvent::Heartbeat { ts } => {
                 if self.last_quoted_mid.is_some() {
