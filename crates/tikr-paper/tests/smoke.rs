@@ -31,8 +31,6 @@ async fn paper_runner_against_testnet_5min() {
         notional_per_order: Decimal::from(25),
         levels_per_side: 1,
         inner_bps: 20,
-        step_bps: 1,
-        reentry_bps: 20,
     });
     let fill_sim = FillSim::new(FillSimConfig {
         submit_latency_ms: 50,

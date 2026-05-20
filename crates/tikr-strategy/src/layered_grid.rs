@@ -18,13 +18,14 @@
 //! dollar, higher sells release less coin per dollar — a built-in long
 //! bias before any price movement.
 //!
-//! **Re-entry on fill** (rolling ladder, keeps symmetric counts):
+//! **Re-entry on fill** (rolling ladder, keeps symmetric counts). All
+//! spacing is controlled by the single `inner_bps` parameter:
 //!
 //! 1. Drop the filled order from the local mirror.
-//! 2. Place a TP order on the OPPOSITE side at `fill_price ± reentry_bps`.
+//! 2. Place a TP order on the OPPOSITE side at `fill_price ± inner_bps`.
 //! 3. Extend the FILLED side outward — buys add a new entry at
-//!    `lowest_existing_buy × (1 − step_bps/10000)`; sells at
-//!    `highest_existing_sell × (1 + step_bps/10000)`.
+//!    `lowest_existing_buy × (1 − inner_bps/10000)`; sells at
+//!    `highest_existing_sell × (1 + inner_bps/10000)`.
 //! 4. Drop the outermost opposite-side order (highest ask on buy fill,
 //!    lowest bid on sell fill) so both sides stay at `levels_per_side`.
 //!
@@ -59,15 +60,13 @@ pub struct LayeredGridConfig {
     pub notional_per_order: Decimal,
     /// Number of orders per side. Total open orders = `2 × levels_per_side`.
     pub levels_per_side: u32,
-    /// Inner spread from mid in bps. First buy at `mid × (1 − inner/10000)`,
-    /// first sell at `mid × (1 + inner/10000)`.
+    /// Single spacing parameter in bps. Controls all three layouts:
+    /// - Cold-start level k (0-indexed): `mid × (1 ± (k+1) · inner/10000)`
+    /// - TP after a fill at `P`: `P × (1 ± inner/10000)`
+    /// - Extension on the filled side: `outermost_same_side × (1 ∓ inner/10000)`
+    ///
+    /// Each round-trip captures `inner_bps` minus `2 × maker_bps` in fees.
     pub inner_bps: u32,
-    /// Step between levels in bps. Each successive outer order is `step`
-    /// further from the inner pair.
-    pub step_bps: u32,
-    /// Re-entry spread in bps. When a buy fills at `P`, a new sell is
-    /// placed at `P × (1 + reentry/10000)`. Mirror for sell fills.
-    pub reentry_bps: u32,
 }
 
 /// Layered-grid strategy state.
@@ -95,9 +94,10 @@ impl LayeredGrid {
 
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
         // Place the new ladder FIRST so the venue sees fresh resting orders
-        // before any cancels — avoids the naked-book gap.
+        // before any cancels — avoids the naked-book gap. Level k (0-indexed)
+        // sits at `(k+1) × inner_bps` from mid — uniform `inner_bps` spacing.
         for k in 0..self.config.levels_per_side {
-            let bps = self.config.inner_bps + self.config.step_bps * k;
+            let bps = self.config.inner_bps * (k + 1);
             let bp_dec = bps_to_decimal(bps);
 
             let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
@@ -160,8 +160,9 @@ impl LayeredGrid {
             self.orders.remove(pos);
         }
 
-        let reentry_dec = Decimal::from(self.config.reentry_bps) / Decimal::from(10_000);
-        let step_dec = Decimal::from(self.config.step_bps) / Decimal::from(10_000);
+        // Single spacing parameter — TP distance and extension step are
+        // both `inner_bps`.
+        let inner_dec = Decimal::from(self.config.inner_bps) / Decimal::from(10_000);
         let opp_side = match fill_side {
             Side::Bid => Side::Ask,
             Side::Ask => Side::Bid,
@@ -188,8 +189,8 @@ impl LayeredGrid {
 
         // 3. Place TP on opposite side at fill_price ± reentry_bps.
         let tp_price = match fill_side {
-            Side::Bid => Price(fill_price.0 * (Decimal::ONE + reentry_dec)),
-            Side::Ask => Price(fill_price.0 * (Decimal::ONE - reentry_dec)),
+            Side::Bid => Price(fill_price.0 * (Decimal::ONE + inner_dec)),
+            Side::Ask => Price(fill_price.0 * (Decimal::ONE - inner_dec)),
         };
         self.orders.push((opp_side, tp_price));
 
@@ -212,8 +213,8 @@ impl LayeredGrid {
         };
         let anchor = same_side_extreme.unwrap_or(fill_price.0);
         let extension_price = match fill_side {
-            Side::Bid => Price(anchor * (Decimal::ONE - step_dec)),
-            Side::Ask => Price(anchor * (Decimal::ONE + step_dec)),
+            Side::Bid => Price(anchor * (Decimal::ONE - inner_dec)),
+            Side::Ask => Price(anchor * (Decimal::ONE + inner_dec)),
         };
         self.orders.push((fill_side, extension_price));
 
@@ -299,10 +300,13 @@ impl Strategy for LayeredGrid {
         // posted as maker. Wipe everything with `CancelAll` (vs per-id
         // Cancels which race with the venue's still-in-flight ack) and
         // place a fresh symmetric ladder anchored on current book mid.
-        // Preserves equal `inner_bps` / `step_bps` spacing. If the new
+        // Preserves equal `inner_bps` spacing on both sides. If the new
         // pair also rejects (market still ripping), the runner re-invokes
         // this hook until either both sides land or the retry cap fires.
-        // TODO: we need to make sure the latest_book.bids and asks are up to date
+        // `ctx.latest_book` is refreshed by the runner via
+        // `venue.snapshot` immediately before each recovery round so the
+        // mid below reflects the venue's current state, not the stale
+        // cached snapshot that caused the original reject.
         let bid = ctx.latest_book.bids.first().map(|l| l.price.0);
         let ask = ctx.latest_book.asks.first().map(|l| l.price.0);
         let (Some(b), Some(a)) = (bid, ask) else {
@@ -315,7 +319,7 @@ impl Strategy for LayeredGrid {
         let mut actions = vec![Action::CancelAll];
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
         for k in 0..self.config.levels_per_side {
-            let bps = self.config.inner_bps + self.config.step_bps * k;
+            let bps = self.config.inner_bps * (k + 1);
             let bp_dec = bps_to_decimal(bps);
             let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
             let sell_price = Price(mid.0 * (Decimal::ONE + bp_dec));
@@ -390,8 +394,6 @@ mod tests {
             notional_per_order: Decimal::from(100),
             levels_per_side: 3,
             inner_bps: 6,
-            step_bps: 3,
-            reentry_bps: 3,
         }
     }
 
@@ -512,17 +514,18 @@ mod tests {
         match &actions[0] {
             Action::Quote(q) => {
                 assert_eq!(q.side, Side::Ask);
-                let reentry = Decimal::from(3) / Decimal::from(10_000);
-                assert_eq!(q.price.0, buy_price.0 * (Decimal::ONE + reentry));
+                // TP distance == inner_bps (collapsed-spacing model).
+                assert_eq!(q.price.0, buy_price.0 * (Decimal::ONE + inner_bp));
             }
             _ => panic!("expected TP Quote on Ask"),
         }
         match &actions[1] {
             Action::Quote(q) => {
                 assert_eq!(q.side, Side::Bid);
-                let step = Decimal::from(3) / Decimal::from(10_000);
-                let outer = mid * (Decimal::ONE - Decimal::from(12) / Decimal::from(10_000));
-                assert_eq!(q.price.0, outer * (Decimal::ONE - step));
+                // Extension == outermost surviving Bid × (1 − inner_bps).
+                // Outermost = level 2 = mid × (1 − 18bps).
+                let outer = mid * (Decimal::ONE - Decimal::from(18) / Decimal::from(10_000));
+                assert_eq!(q.price.0, outer * (Decimal::ONE - inner_bp));
             }
             _ => panic!("expected extension Quote on Bid"),
         }

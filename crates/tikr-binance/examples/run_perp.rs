@@ -183,18 +183,13 @@ struct Args {
     /// USD-M Futures testnet's $20 minNotional on majors.
     #[arg(long, default_value = "25")]
     lg_notional: String,
-    /// LayeredGrid: orders per side (1 = 1 buy + 1 sell, the 2h-sweep winner).
+    /// LayeredGrid: orders per side (1 = 1 buy + 1 sell).
     #[arg(long, default_value_t = 1u32)]
     lg_levels: u32,
-    /// LayeredGrid: inner spread from mid in bps.
+    /// LayeredGrid: spacing in bps. Controls cold-start level spacing,
+    /// TP distance on fill, and same-side extension step (all the same).
     #[arg(long, default_value_t = 6u32)]
-    lg_inner_bps: u32,
-    /// LayeredGrid: step between levels in bps.
-    #[arg(long, default_value_t = 1u32)]
-    lg_step_bps: u32,
-    /// LayeredGrid: re-entry spread in bps (TP distance from fill price).
-    #[arg(long, default_value_t = 20u32)]
-    lg_reentry_bps: u32,
+    lg_bps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -525,9 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let strategy = LayeredGrid::new(LayeredGridConfig {
                 notional_per_order: notional,
                 levels_per_side: args.lg_levels,
-                inner_bps: args.lg_inner_bps,
-                step_bps: args.lg_step_bps,
-                reentry_bps: args.lg_reentry_bps,
+                inner_bps: args.lg_bps,
             });
             run_with_resume(
                 venue,

@@ -77,16 +77,12 @@ struct Args {
     #[arg(long, default_value_t = 1.0_f64)]
     skim_ratio: f64,
 
-    /// LayeredGrid sweep: comma-separated `inner_bps` values.
-    #[arg(long, default_value = "3,6,10,20")]
-    lg_inner_bps_list: String,
+    /// LayeredGrid sweep: comma-separated `bps` values (single spacing param).
+    #[arg(long, default_value = "2,4,6,8,10")]
+    lg_bps_list: String,
 
-    /// LayeredGrid sweep: comma-separated `reentry_bps` values.
-    #[arg(long, default_value = "10,20,50")]
-    lg_reentry_bps_list: String,
-
-    /// LayeredGrid sweep: comma-separated `levels_per_side` values.
-    #[arg(long, default_value = "1,3,5,10")]
+    /// LayeredGrid sweep: comma-separated `levels` values.
+    #[arg(long, default_value = "1,2,3,4,5")]
     lg_levels_list: String,
 
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
@@ -416,30 +412,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (re=20 peaked on the 2h BTC sample). More levels = more capital
     // committed (each level adds $100 of resting orders on both sides),
     // but also more chances to catch the spread.
-    let lg_inner_sweep = parse_u32_list(&args.lg_inner_bps_list)?;
-    let lg_re_sweep = parse_u32_list(&args.lg_reentry_bps_list)?;
+    let lg_bps_sweep = parse_u32_list(&args.lg_bps_list)?;
     let lg_levels_sweep = parse_u32_list(&args.lg_levels_list)?;
-    for &inner in &lg_inner_sweep {
-        for &re in &lg_re_sweep {
-            for &levels in &lg_levels_sweep {
-                let label = format!("LG in={inner} re={re} lv={levels}");
-                spawn_preset(
-                    &mut handles,
-                    &shared_data,
-                    &symbol,
-                    &label,
-                    LayeredGrid::new(LayeredGridConfig {
-                        notional_per_order: Decimal::from(100),
-                        levels_per_side: levels,
-                        inner_bps: inner,
-                        step_bps: 1,
-                        reentry_bps: re,
-                    }),
-                    fees,
-                    skim_cfg,
-                    funding_cfg,
-                );
-            }
+    for &bps in &lg_bps_sweep {
+        for &levels in &lg_levels_sweep {
+            let label = format!("LG bps={bps} lv={levels}");
+            spawn_preset(
+                &mut handles,
+                &shared_data,
+                &symbol,
+                &label,
+                LayeredGrid::new(LayeredGridConfig {
+                    notional_per_order: Decimal::from(100),
+                    levels_per_side: levels,
+                    inner_bps: bps,
+                }),
+                fees,
+                skim_cfg,
+                funding_cfg,
+            );
         }
     }
 

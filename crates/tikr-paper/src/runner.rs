@@ -858,6 +858,19 @@ async fn dispatch_post_fill_actions<V, S>(
     let mut round = 0;
     while !rejected_intents.is_empty() && round < MAX_RECOVERY_ROUNDS {
         round += 1;
+        // Refresh the book BEFORE each recovery round. The cached
+        // `current_book` was last updated whenever the runner saw a
+        // `MarketEvent::BookUpdate` — by the time on_quote_rejected
+        // fires, that snapshot is often hundreds of ms stale (which
+        // is exactly what caused the reject). Pull a fresh top-of-book
+        // from the venue so the strategy's mid is current.
+        let fresh_book = match venue.snapshot(symbol).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = ?e, round, "live: venue.snapshot failed (recovery) — using stale book");
+                current_book.clone()
+            }
+        };
         let pending = std::mem::take(&mut rejected_intents);
         for (rej_intent, rej_reason) in pending {
             let recovery_quotes = fill_sim.live_quotes_for(symbol);
@@ -866,7 +879,7 @@ async fn dispatch_post_fill_actions<V, S>(
                 now: ts,
                 position: post_fill_pos,
                 recent_fills: &[],
-                latest_book: current_book,
+                latest_book: &fresh_book,
                 open_quotes: &recovery_quotes,
             };
             let recovery_actions = strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
@@ -1152,8 +1165,6 @@ mod tests {
             notional_per_order: Decimal::from(25),
             levels_per_side: 1,
             inner_bps: 20,
-            step_bps: 1,
-            reentry_bps: 20,
         })
     }
 
@@ -1489,8 +1500,6 @@ mod tests {
             notional_per_order: Decimal::from(25),
             levels_per_side: 1,
             inner_bps: 20,
-            step_bps: 1,
-            reentry_bps: 20,
         });
         let fill_sim = FillSim::new(FillSimConfig {
             submit_latency_ms: 0,
@@ -1566,8 +1575,6 @@ mod tests {
             notional_per_order: Decimal::from(25),
             levels_per_side: 1,
             inner_bps: 20,
-            step_bps: 1,
-            reentry_bps: 20,
         });
         let fill_sim = FillSim::new(FillSimConfig {
             submit_latency_ms: 0,

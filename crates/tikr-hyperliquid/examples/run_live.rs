@@ -202,8 +202,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notional_per_order: Decimal::from(25),
         levels_per_side: 1,
         inner_bps: 6, // 0.06% half-spread
-        step_bps: 1,
-        reentry_bps: 20,
     });
 
     // FillSim is required by the runner trait but synthesized fills are

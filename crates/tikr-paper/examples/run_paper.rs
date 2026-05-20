@@ -73,8 +73,6 @@ fn layered_grid_config() -> LayeredGridConfig {
         notional_per_order: Decimal::from(25),
         levels_per_side: 1,
         inner_bps: 6,
-        step_bps: 1,
-        reentry_bps: 20,
     }
 }
 

@@ -132,11 +132,23 @@ pub struct BinanceClient {
     key_material: BinanceKeyMaterial,
     mainnet_writes_enabled: bool,
     exchange_info_cache: ExchangeInfoCache,
-    /// Tracks `QuoteId → binance symbol string` for every open order placed
-    /// via `quote()`. Required because the `Venue::cancel(id)` trait method
-    /// doesn't pass the symbol but Binance's DELETE endpoint requires it.
+    /// Tracks every open order placed via `quote()` keyed by the
+    /// **venue-assigned** `QuoteId` (derived from Binance's `orderId`),
+    /// value = `(binance_symbol, clientOrderId_we_sent_at_place)`.
+    ///
+    /// Two values stored:
+    /// 1. **symbol** — needed because `Venue::cancel(id)` doesn't pass it
+    ///    but Binance's DELETE endpoint requires `symbol=`.
+    /// 2. **clientOrderId** — the random hex we sent at placement.
+    ///    `cancel` calls `DELETE …?origClientOrderId=<this>`. Storing it
+    ///    here means our internal `QuoteId` (which equals the order_id-
+    ///    derived `QuoteId` returned from `place_order`) is decoupled from
+    ///    the random `clientOrderId` we used at placement — `QuoteId` now
+    ///    matches the one the `userDataStream` fill parser produces, so
+    ///    `FillSim::drop_quote(fill.quote_id)` finally has a hit.
+    ///
     /// Entries are removed on successful cancel.
-    quote_symbols: Arc<Mutex<HashMap<QuoteId, String>>>,
+    quote_symbols: Arc<Mutex<HashMap<QuoteId, (String, String)>>>,
 }
 
 impl fmt::Debug for BinanceClient {
@@ -387,13 +399,17 @@ impl Venue for BinanceClient {
         let size = round_size(&self.exchange_info_cache, &sym_str, intent.size)?;
         validate_qty(&self.exchange_info_cache, &sym_str, size, price)?;
 
-        let quote_id = QuoteId::new();
-        let coid = Self::client_order_id(quote_id);
+        // The `clientOrderId` we send at place-time is derived from a random
+        // QuoteId. We don't return THIS one to the runner — we return the
+        // order_id-derived `venue_qid` that `place_order` produces, so it
+        // matches the QuoteId the userDataStream parser stamps on fill events.
+        let placement_qid = QuoteId::new();
+        let coid = Self::client_order_id(placement_qid);
         let price_str = Self::format_decimal(price.0);
         let size_str = Self::format_decimal(size.0);
         let base_url = self.env.rest_base_url();
 
-        if self.env.is_futures() {
+        let venue_qid = if self.env.is_futures() {
             crate::futs::place_order(
                 &self.http,
                 base_url,
@@ -406,7 +422,7 @@ impl Venue for BinanceClient {
                 &coid,
                 intent.tif,
             )
-            .await?;
+            .await?
         } else {
             crate::spot::place_order(
                 &self.http,
@@ -419,16 +435,17 @@ impl Venue for BinanceClient {
                 &size_str,
                 &coid,
             )
-            .await?;
-        }
+            .await?
+        };
 
-        // Record symbol for this quote so `cancel(id)` can look it up later
-        // — the Venue trait doesn't pass symbol to `cancel`.
+        // Record (venue_qid → (symbol, clientOrderId)) so `cancel(venue_qid)`
+        // can find both the symbol AND the original clientOrderId the venue
+        // accepts as `origClientOrderId=…`.
         if let Ok(mut map) = self.quote_symbols.lock() {
-            map.insert(quote_id, sym_str.clone());
+            map.insert(venue_qid, (sym_str.clone(), coid));
         }
 
-        Ok(quote_id)
+        Ok(venue_qid)
     }
 
     /// Cancel the old quote then place a new one.
@@ -480,14 +497,13 @@ impl Venue for BinanceClient {
     /// to no-op.
     async fn cancel(&self, id: QuoteId) -> Result<(), VenueError> {
         self.check_mainnet_gate()?;
-        let coid = Self::client_order_id(id);
-        let sym_str = match self.quote_symbols.lock() {
+        let entry = match self.quote_symbols.lock() {
             Ok(map) => map.get(&id).cloned(),
             Err(_) => None,
         };
-        let Some(sym_str) = sym_str else {
+        let Some((sym_str, coid)) = entry else {
             tracing::debug!(
-                client_order_id = %coid,
+                ?id,
                 "BinanceClient::cancel: unknown QuoteId — treating as already cancelled"
             );
             return Ok(());
