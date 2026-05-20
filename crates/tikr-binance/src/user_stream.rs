@@ -790,6 +790,13 @@ fn parse_execution_report(v: &serde_json::Value, symbol_filter: &str) -> Option<
     if exec_type != "FILL" {
         return None;
     }
+    // Spot order status field. Treat anything other than FILLED as partial
+    // so strategies don't re-quote until the resting order is fully consumed.
+    let status = v
+        .get("X")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("FILLED");
+    let is_full = status == "FILLED";
 
     let order_id = v.get("i").and_then(serde_json::Value::as_u64)?;
     let side_str = v.get("S").and_then(serde_json::Value::as_str)?;
@@ -825,6 +832,7 @@ fn parse_execution_report(v: &serde_json::Value, symbol_filter: &str) -> Option<
         fee_quote: Notional(commission),
         side,
         ts: Timestamp(ts_ms.saturating_mul(1_000_000)),
+        is_full,
     })
 }
 
@@ -876,6 +884,7 @@ fn parse_order_trade_update(v: &serde_json::Value, symbol_filter: &str) -> Optio
         Side::Ask
     };
     let quote_id = QuoteId::from_uuid(Uuid::from_u128(order_id as u128));
+    let is_full = status == "FILLED";
 
     Some(Fill {
         quote_id,
@@ -886,6 +895,7 @@ fn parse_order_trade_update(v: &serde_json::Value, symbol_filter: &str) -> Optio
         fee_quote: Notional(commission),
         side,
         ts: Timestamp(ts_ms.saturating_mul(1_000_000)),
+        is_full,
     })
 }
 

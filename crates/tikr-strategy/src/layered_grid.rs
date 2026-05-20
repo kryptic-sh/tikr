@@ -446,6 +446,7 @@ mod tests {
             fee_quote: Notional(Decimal::ZERO),
             side: Side::Bid,
             ts: Timestamp(1000),
+            is_full: true,
         };
         let actions = strat.on_event(&fill_ctx, &MarketEvent::Fill(fill));
         // Diff path: Cancel(highest_ask) + Quote(TP) + Quote(extension) = 3

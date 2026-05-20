@@ -165,12 +165,12 @@ fn simulate(candles: &[Candle], args: &Args) -> (Stats, f64) {
             if buy_first {
                 let fill_price = pair.buy_price;
                 record_buy_fill(&mut stats, fill_price, notional, maker_rate);
-                mid = (mid + fill_price) / 2.0;
+                mid = fill_price;
                 pair = place_pair(mid, args.spread_bps);
             } else {
                 let fill_price = pair.sell_price;
                 record_sell_fill(&mut stats, fill_price, notional, maker_rate);
-                mid = (mid + fill_price) / 2.0;
+                mid = fill_price;
                 pair = place_pair(mid, args.spread_bps);
             }
         }

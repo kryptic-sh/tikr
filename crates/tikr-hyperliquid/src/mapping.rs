@@ -170,5 +170,9 @@ pub fn fill_from_user_fill(f: &UserFillEntry) -> Fill {
         fee_quote: Notional(fee),
         side,
         ts: Timestamp(ms_to_ns(f.time)),
+        // Hyperliquid userFill events don't expose a per-fill remaining-size
+        // status here; conservatively treat each as full. Refine when the
+        // adapter exposes partial-fill metadata.
+        is_full: true,
     }
 }

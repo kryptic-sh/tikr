@@ -332,6 +332,9 @@ impl FillSim {
                 fee_quote: Notional(fee_amount),
                 side: intent.side,
                 ts,
+                // IOC taker fills the full intent in one shot (model
+                // simplification: no partial IOC).
+                is_full: true,
             });
         }
         // Snapshot queue position at our price level when placed. We're
@@ -493,6 +496,7 @@ impl FillSim {
             // fee_amount is signed; positive = paid, negative = rebated.
             let fee_amount = fill_price.0 * fill_amount * Decimal::from(self.cfg.fees.maker_bps)
                 / Decimal::from(10_000);
+            let is_full = fill_amount >= q.size_remaining.0;
             out.push(Fill {
                 quote_id: q.id,
                 price: fill_price,
@@ -502,6 +506,7 @@ impl FillSim {
                 fee_quote: Notional(fee_amount),
                 side: q.side,
                 ts: trade_ts,
+                is_full,
             });
             q.size_remaining = Size(q.size_remaining.0 - fill_amount);
             trade_remaining -= fill_amount;

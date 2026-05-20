@@ -450,6 +450,7 @@ where
                     let fills = fill_sim.on_market_event(&event, ts);
                     for fill in fills {
                         let fill_clone = fill.clone();
+                        let fill_is_full = fill_clone.is_full;
                         apply_fill(
                             fill,
                             &mut tracker,
@@ -461,6 +462,13 @@ where
                             &symbol,
                         )
                         .await;
+                        // Partial: the LiveQuote is still on the book (FillSim
+                        // keeps it around with reduced size_remaining). Don't
+                        // notify the strategy so it won't move/cancel a still-
+                        // valid resting order.
+                        if !fill_is_full {
+                            continue;
+                        }
                         // Notify strategy of its own fill so re-entry / SAR /
                         // ladder-rebuild logic can react synchronously. Action
                         // results queue through fill_sim and process on the
@@ -555,6 +563,7 @@ where
                     break;
                 };
                 let fill_clone = fill.clone();
+                let fill_is_full = fill_clone.is_full;
                 apply_fill(
                     fill,
                     &mut tracker,
@@ -566,6 +575,12 @@ where
                     &symbol,
                 )
                 .await;
+                // Partial fill: order is still resting on the book, do not
+                // drop from FillSim and do not notify the strategy — the
+                // strategy should keep waiting for the remaining size.
+                if !fill_is_full {
+                    continue;
+                }
                 // Sync FillSim: drop the consumed quote so `live_quotes_for`
                 // returns the correct open count for the strategy.
                 fill_sim.drop_quote(fill_clone.quote_id);

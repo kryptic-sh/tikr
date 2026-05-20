@@ -584,6 +584,7 @@ pub fn fill_from_limit_order_filled(
         fee_quote: Notional(fee),
         side,
         ts: Timestamp(ts_ns),
+        is_full: true,
     }
 }
 

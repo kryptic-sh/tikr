@@ -393,6 +393,11 @@ pub struct Fill {
     pub side: Side,
     /// Timestamp of the fill.
     pub ts: Timestamp,
+    /// `true` when this fill consumed the entire remaining size of the
+    /// resting order (Binance `X=FILLED`, FillSim `size_remaining==0`).
+    /// `false` for partial fills — the order is still resting on the book
+    /// and strategies should not re-quote.
+    pub is_full: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +562,7 @@ mod tests {
             fee_quote: Notional(dec(3, 0)),
             side: Side::Bid,
             ts,
+            is_full: true,
         });
         let hb = MarketEvent::Heartbeat { ts };
 

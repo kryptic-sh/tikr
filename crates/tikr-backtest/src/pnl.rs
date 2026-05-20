@@ -197,6 +197,7 @@ mod tests {
             fee_quote: Notional(Decimal::from(fee_quote)),
             side,
             ts: Timestamp(0),
+            is_full: true,
         }
     }
 

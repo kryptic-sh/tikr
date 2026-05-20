@@ -797,6 +797,7 @@ pub fn fill_from_user_event(_coin: &str, f: &UserEventFill) -> Fill {
         fee_amount: fee,
         fee_quote: Notional(fee),
         side,
+        is_full: true,
         ts: Timestamp(f.time.saturating_mul(1_000_000)),
     }
 }
