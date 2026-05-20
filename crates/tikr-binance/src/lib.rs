@@ -470,12 +470,14 @@ impl Venue for BinanceClient {
         Ok(())
     }
 
-    /// Cancel a single quote by id.
+    /// Cancel a single quote by id. Idempotent — an unknown id is treated
+    /// as already cancelled (returns `Ok`).
     ///
-    /// Looks up the symbol from the internal `quote_symbols` map populated
-    /// by `quote()`. Returns `VenueError::Rejected` if the id is unknown —
-    /// that means the order was either never placed via this client or was
-    /// already cancelled. On success removes the entry from the map.
+    /// The symbol-lookup map is populated by `quote()`. A miss happens
+    /// when the order was already cancelled (the entry is removed on
+    /// successful cancel) or when a strategy emits a recovery `Cancel`
+    /// that raced with an earlier successful one. Both cases are safe
+    /// to no-op.
     async fn cancel(&self, id: QuoteId) -> Result<(), VenueError> {
         self.check_mainnet_gate()?;
         let coid = Self::client_order_id(id);
@@ -484,12 +486,11 @@ impl Venue for BinanceClient {
             Err(_) => None,
         };
         let Some(sym_str) = sym_str else {
-            return Err(VenueError::Rejected {
-                reason: format!(
-                    "BinanceClient::cancel: unknown QuoteId (no symbol recorded). \
-                     clientOrderId={coid}"
-                ),
-            });
+            tracing::debug!(
+                client_order_id = %coid,
+                "BinanceClient::cancel: unknown QuoteId — treating as already cancelled"
+            );
+            return Ok(());
         };
         let base_url = self.env.rest_base_url();
         let result = if self.env.is_futures() {

@@ -294,10 +294,11 @@ impl Strategy for LayeredGrid {
         _intent: &QuoteIntent,
         _reason: &str,
     ) -> Vec<Action> {
-        // Re-anchor on current book mid and rebuild the full ladder. Any
-        // remaining open quotes get cancelled inside `place_initial` via
-        // its leading `CancelAll`. Resets `placed` so the next BookUpdate
-        // also won't re-trigger cold start.
+        // Recovery path: market moved so far that our re-quote couldn't be
+        // posted as maker. Wipe everything with `CancelAll` (vs per-id
+        // Cancels which race with the venue's still-in-flight ack) and
+        // place a fresh ladder anchored on current book mid. Accepts a
+        // brief naked-book gap — we're already in failure-recovery mode.
         let bid = ctx.latest_book.bids.first().map(|l| l.price.0);
         let ask = ctx.latest_book.asks.first().map(|l| l.price.0);
         let (Some(b), Some(a)) = (bid, ask) else {
@@ -305,7 +306,22 @@ impl Strategy for LayeredGrid {
         };
         let mid = Price((b + a) / Decimal::from(2));
         self.placed = false;
-        self.place_initial(ctx.symbol, mid, ctx.open_quotes)
+        self.orders.clear();
+
+        let mut actions = vec![Action::CancelAll];
+        let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
+        for k in 0..self.config.levels_per_side {
+            let bps = self.config.inner_bps + self.config.step_bps * k;
+            let bp_dec = bps_to_decimal(bps);
+            let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
+            let sell_price = Price(mid.0 * (Decimal::ONE + bp_dec));
+            actions.push(self.make_quote(ctx.symbol, Side::Bid, buy_price));
+            actions.push(self.make_quote(ctx.symbol, Side::Ask, sell_price));
+            self.orders.push((Side::Bid, buy_price));
+            self.orders.push((Side::Ask, sell_price));
+        }
+        self.placed = true;
+        actions
     }
 }
 

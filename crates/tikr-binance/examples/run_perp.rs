@@ -259,6 +259,11 @@ async fn reset_symbol_state(venue: &BinanceClient, symbol: &Symbol, phase: &str)
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the rustls crypto provider before any TLS use. With multiple
+    // crates pulling rustls (reqwest, tokio-tungstenite), the provider must
+    // be selected explicitly. Ignore the result — re-installing is harmless.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Load .env (ignore missing — env-only setups still work).
     let _ = dotenvy::dotenv();
 
