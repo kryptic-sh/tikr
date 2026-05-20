@@ -333,6 +333,96 @@ pub(crate) fn make_post_only_intent(
     }
 }
 
+/// Emit `[CancelAll, Quote(Bid), Quote(Ask)]` as post-only point quotes.
+/// Used by [`TopOfBook`] and [`MicroPrice`] — the only difference between
+/// their `build_quotes` bodies was the `bid`/`ask` prices, which are
+/// parameters here.
+pub(crate) fn post_only_pair(symbol: &Symbol, bid: Price, ask: Price, size: Size) -> Vec<Action> {
+    let mut actions = Vec::with_capacity(3);
+    actions.push(Action::CancelAll);
+    for (side, price) in [(Side::Bid, bid), (Side::Ask, ask)] {
+        actions.push(Action::Quote(QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price,
+            size,
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        }));
+    }
+    actions
+}
+
+/// Decide whether to re-emit quotes based on elapsed time or price drift ≥
+/// `tick_size` on either side.
+///
+/// Returns `true` on cold start (any `None` input). Otherwise returns `true`
+/// when either:
+/// - `now - last_ts >= interval_ms` (time gate), or
+/// - `|new_bid - last_bid| >= tick_size` or `|new_ask - last_ask| >= tick_size`
+///   (drift gate).
+///
+/// Used by [`TopOfBook`] and [`MicroPrice`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn should_requote_on_tick_drift(
+    last_bid: Option<Price>,
+    last_ask: Option<Price>,
+    last_ts: Option<Timestamp>,
+    new_bid: Price,
+    new_ask: Price,
+    now: Timestamp,
+    interval_ms: u64,
+    tick_size: Decimal,
+) -> bool {
+    let (Some(last_bid), Some(last_ask)) = (last_bid, last_ask) else {
+        return true;
+    };
+    // Time-forced requote.
+    if let Some(ts) = last_ts {
+        let elapsed_ns = now.0.saturating_sub(ts.0);
+        let interval_ns = interval_ms.saturating_mul(1_000_000);
+        if elapsed_ns >= interval_ns {
+            return true;
+        }
+    }
+    // Drift gate: ≥ 1 tick movement on either side.
+    let bid_drift = (new_bid.0 - last_bid.0).abs();
+    let ask_drift = (new_ask.0 - last_ask.0).abs();
+    bid_drift >= tick_size || ask_drift >= tick_size
+}
+
+/// Inventory-skew price shift (signed, in price units).
+///
+/// Returns `−sign(pos) × floor(|pos| / skew_unit × max_skew_ticks) × tick_size`.
+///
+/// Long position → negative shift (quotes drift down); short → positive
+/// (quotes drift up). Returns zero when position is flat, `max_skew_ticks`
+/// is 0, or `skew_unit` is non-positive.
+///
+/// Used by [`TopOfBook`] and [`MicroPrice`].
+pub(crate) fn inventory_skew_price(
+    pos: Decimal,
+    max_skew_ticks: u32,
+    skew_unit: Decimal,
+    tick_size: Decimal,
+) -> Decimal {
+    if max_skew_ticks == 0 || pos == Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    if skew_unit <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let max = Decimal::from(max_skew_ticks);
+    let ratio = (pos.abs() / skew_unit).min(Decimal::from(1));
+    let ticks_shifted = (ratio * max).floor();
+    let magnitude = ticks_shifted * tick_size;
+    if pos > Decimal::ZERO {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
 impl Strategy for NaiveGrid {
     type Config = NaiveGridConfig;
 
@@ -377,6 +467,12 @@ impl Strategy for NaiveGrid {
                 Vec::new()
             }
             MarketEvent::Fill(fill) => {
+                // Belt-and-suspenders: the runner already gates `is_full`,
+                // but ignore partials here too so a partial-fill leak
+                // wouldn't cancel the still-resting remainder.
+                if !fill.is_full {
+                    return Vec::new();
+                }
                 // Anchor the next pair on the fill price directly. The fill
                 // price is by definition within (or at) the current touch,
                 // so new orders at `fill ± spread_bps` land maker-safe even

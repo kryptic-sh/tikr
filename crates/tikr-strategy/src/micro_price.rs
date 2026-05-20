@@ -26,13 +26,12 @@
 //! Optional inventory skew mirrors [`crate::TopOfBook`] — long → both shift
 //! DOWN, short → both shift UP — to mean-revert position.
 
-use tikr_core::{
-    Decimal, MarketEvent, Position, Price, QuoteKind, Side, Size, Snapshot, Symbol, TimeInForce,
-    Timestamp,
-};
-use tikr_venue::QuoteIntent;
+use tikr_core::{Decimal, MarketEvent, Position, Price, Size, Snapshot, Timestamp};
 
-use crate::{Action, Strategy, StrategyContext};
+use crate::{
+    Action, Strategy, StrategyContext, inventory_skew_price, post_only_pair,
+    should_requote_on_tick_drift,
+};
 
 /// Configuration for [`MicroPrice`].
 #[derive(Debug, Clone)]
@@ -92,7 +91,12 @@ impl MicroPrice {
         let mut ask = Price((raw_ask / tick).ceil() * tick);
 
         // Inventory skew (mirrors TopOfBook). Long → shift both DOWN.
-        let skew_ticks = self.compute_inventory_skew(position);
+        let skew_ticks = inventory_skew_price(
+            position.size.0,
+            self.config.max_skew_ticks,
+            self.config.skew_unit.0,
+            self.config.tick_size,
+        );
         if !skew_ticks.is_zero() {
             bid = Price(bid.0 + skew_ticks);
             ask = Price(ask.0 + skew_ticks);
@@ -110,64 +114,6 @@ impl MicroPrice {
             bid = Price(ask.0 - tick);
         }
         Some((bid, ask))
-    }
-
-    fn compute_inventory_skew(&self, position: &Position) -> Decimal {
-        if self.config.max_skew_ticks == 0 {
-            return Decimal::ZERO;
-        }
-        let unit = self.config.skew_unit.0;
-        if unit <= Decimal::ZERO {
-            return Decimal::ZERO;
-        }
-        let pos = position.size.0;
-        let max = Decimal::from(self.config.max_skew_ticks);
-        let scaled = (pos.abs() / unit).min(Decimal::from(1));
-        let ticks = scaled * max;
-        let signed_ticks = if pos > Decimal::ZERO { -ticks } else { ticks };
-        // Convert ticks to price units.
-        signed_ticks * self.config.tick_size
-    }
-
-    fn should_requote(&self, new_bid: Price, new_ask: Price, ts: Timestamp) -> bool {
-        let Some(last_bid) = self.last_bid else {
-            return true;
-        };
-        let Some(last_ask) = self.last_ask else {
-            return true;
-        };
-
-        // Time-forced requote.
-        if let Some(last_ts) = self.last_requote_ts {
-            let elapsed_ns = ts.0.saturating_sub(last_ts.0);
-            let min_ns = self
-                .config
-                .min_requote_interval_ms
-                .saturating_mul(1_000_000);
-            if elapsed_ns >= min_ns {
-                return true;
-            }
-        }
-
-        let bid_drift = (new_bid.0 - last_bid.0).abs();
-        let ask_drift = (new_ask.0 - last_ask.0).abs();
-        bid_drift >= self.config.tick_size || ask_drift >= self.config.tick_size
-    }
-
-    fn build_quotes(&self, symbol: &Symbol, bid: Price, ask: Price) -> Vec<Action> {
-        let mut actions = Vec::with_capacity(3);
-        actions.push(Action::CancelAll);
-        for (side, price) in [(Side::Bid, bid), (Side::Ask, ask)] {
-            actions.push(Action::Quote(QuoteIntent {
-                symbol: symbol.clone(),
-                side,
-                price,
-                size: self.config.size_per_quote,
-                tif: TimeInForce::PostOnly,
-                kind: QuoteKind::Point,
-            }));
-        }
-        actions
     }
 }
 
@@ -194,11 +140,20 @@ impl Strategy for MicroPrice {
                 let Some((bid, ask)) = self.compute_targets(ctx.latest_book, ctx.position) else {
                     return Vec::new();
                 };
-                if self.should_requote(bid, ask, *ts) {
+                if should_requote_on_tick_drift(
+                    self.last_bid,
+                    self.last_ask,
+                    self.last_requote_ts,
+                    bid,
+                    ask,
+                    *ts,
+                    self.config.min_requote_interval_ms,
+                    self.config.tick_size,
+                ) {
                     self.last_bid = Some(bid);
                     self.last_ask = Some(ask);
                     self.last_requote_ts = Some(*ts);
-                    self.build_quotes(ctx.symbol, bid, ask)
+                    post_only_pair(ctx.symbol, bid, ask, self.config.size_per_quote)
                 } else {
                     vec![Action::NoOp]
                 }
@@ -207,11 +162,20 @@ impl Strategy for MicroPrice {
                 let Some((bid, ask)) = self.compute_targets(snapshot, ctx.position) else {
                     return Vec::new();
                 };
-                if self.should_requote(bid, ask, snapshot.ts) {
+                if should_requote_on_tick_drift(
+                    self.last_bid,
+                    self.last_ask,
+                    self.last_requote_ts,
+                    bid,
+                    ask,
+                    snapshot.ts,
+                    self.config.min_requote_interval_ms,
+                    self.config.tick_size,
+                ) {
                     self.last_bid = Some(bid);
                     self.last_ask = Some(ask);
                     self.last_requote_ts = Some(snapshot.ts);
-                    self.build_quotes(ctx.symbol, bid, ask)
+                    post_only_pair(ctx.symbol, bid, ask, self.config.size_per_quote)
                 } else {
                     vec![Action::NoOp]
                 }
@@ -223,7 +187,7 @@ impl Strategy for MicroPrice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Level, MarketKind, Notional, Position, SignedSize, VenueId};
+    use tikr_core::{Asset, Level, MarketKind, Notional, Position, SignedSize, Symbol, VenueId};
 
     fn sym() -> Symbol {
         Symbol {

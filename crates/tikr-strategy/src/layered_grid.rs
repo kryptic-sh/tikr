@@ -279,7 +279,11 @@ impl Strategy for LayeredGrid {
                 let mid = Price((b + a) / Decimal::from(2));
                 self.place_initial(ctx.symbol, mid, ctx.open_quotes)
             }
-            MarketEvent::Fill(f) if f.symbol_matches(ctx.symbol) => {
+            MarketEvent::Fill(f) if f.symbol_matches(ctx.symbol) && f.is_full => {
+                // Belt-and-suspenders: the runner already gates `is_full`,
+                // but guard here too so a future caller (test, alt runner)
+                // can't accidentally feed a partial fill — which would
+                // cause `on_fill` to cancel the still-resting remainder.
                 self.on_fill(ctx.symbol, f.side, f.price, ctx.open_quotes)
             }
             // After cold-start, BookUpdate / Trade / Heartbeat don't change
