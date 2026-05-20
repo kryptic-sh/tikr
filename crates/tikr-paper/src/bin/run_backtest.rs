@@ -23,8 +23,8 @@ use tikr_core::{
 };
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
-    NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
+    MicroPriceConfig, NaiveGrid, NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -40,6 +40,8 @@ enum StrategyArg {
     Glft,
     #[value(name = "top-of-book", alias = "tob")]
     TopOfBook,
+    #[value(name = "micro-price", alias = "mp")]
+    MicroPrice,
 }
 
 #[derive(Parser, Debug)]
@@ -105,6 +107,10 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     max_imbalance_ticks: u32,
 
+    /// MicroPrice: half-spread in ticks.
+    #[arg(long, default_value_t = 1u32)]
+    micro_half_spread_ticks: u32,
+
     /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
     #[arg(long, default_value_t = 1000u64)]
     heartbeat_ms: u64,
@@ -132,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_ms: args.heartbeat_ms,
         symbols: vec![symbol.clone()],
         data_dir: args.data_dir.clone(),
+        tick_size: Decimal::from_str(&args.tick_size)?,
     })?;
 
     let venue = BacktestVenue::new(replay);
@@ -149,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runner_config = RunnerConfig {
         state_dir: args.state_dir.clone(),
         snapshot_every_n_events: 0, // backtest = no snapshots
+        skim: None,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.
@@ -248,6 +256,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_skew_ticks: args.max_skew_ticks,
                 skew_unit: Size(Decimal::from_str(&args.skew_unit)?),
                 max_imbalance_ticks: args.max_imbalance_ticks,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+            )
+            .await
+        }
+        StrategyArg::MicroPrice => {
+            let strategy = MicroPrice::new(MicroPriceConfig {
+                size_per_quote,
+                tick_size: Decimal::from_str(&args.tick_size)?,
+                half_spread_ticks: args.micro_half_spread_ticks,
+                min_requote_interval_ms: 1000,
+                max_skew_ticks: args.max_skew_ticks,
+                skew_unit: Size(Decimal::from_str(&args.skew_unit)?),
             });
             run_with_resume(
                 venue,

@@ -6,24 +6,26 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use clap::Parser;
 use futures::stream::{self, BoxStream};
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_backtest::replay::{ParquetReplay, ReplayConfig};
+use tikr_backtest::replay::{LoadedReplayData, ParquetReplay, ReplayConfig};
 use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
     VenueId,
 };
-use tikr_paper::{PaperReport, RunnerConfig, run_with_resume};
+use tikr_paper::{PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, NaiveGrid,
-    NaiveGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
+    LayeredGridConfig, MicroPrice, MicroPriceConfig, NaiveGrid, NaiveGridConfig, Strategy,
+    TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -59,6 +61,22 @@ struct Args {
     /// Tick size for TopOfBook presets.
     #[arg(long, default_value = "0.1")]
     tick_size: String,
+
+    /// Skim mode: starting USDT budget per preset. `0` disables (default).
+    /// When enabled, each preset's perp account starts at this budget and
+    /// profit is moved to spot in `skim_pct` chunks.
+    #[arg(long, default_value_t = 0.0_f64)]
+    budget: f64,
+
+    /// Skim threshold as percent of budget. `5` = skim every 5% gain.
+    #[arg(long, default_value_t = 5.0_f64)]
+    skim_pct: f64,
+
+    /// Fraction of each skim chunk that moves to spot. `1.0` = classic
+    /// (all → spot). `0.5` = half to spot, half compounds in perp.
+    /// `0.0` = no spot buys, all profits stay in perp.
+    #[arg(long, default_value_t = 1.0_f64)]
+    skim_ratio: f64,
 }
 
 #[tokio::main]
@@ -91,12 +109,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_var: Decimal::from_str("0.000001")?,
     };
 
-    let mut results: Vec<(String, PaperReport)> = Vec::new();
+    // Skim mode (per-preset, shared config). Disabled when budget==0.
+    let skim_cfg: Option<SkimConfig> = if args.budget > 0.0 {
+        Some(SkimConfig {
+            budget: Decimal::try_from(args.budget)?,
+            skim_pct: Decimal::try_from(args.skim_pct / 100.0)?,
+            skim_ratio: Decimal::try_from(args.skim_ratio)?,
+        })
+    } else {
+        None
+    };
 
-    // Preset: NaiveGrid at 5 bps half-spread.
-    let r = run_one(
-        &args,
-        &symbol,
+    // Load + sort + validate parquet once; share across all presets via Arc.
+    let load_start = std::time::Instant::now();
+    let shared_data = LoadedReplayData::load(ReplayConfig {
+        heartbeat_ms: args.heartbeat_ms,
+        symbols: vec![symbol.clone()],
+        data_dir: args.data_dir.clone(),
+        tick_size: tick,
+    })?;
+    info!(
+        events = shared_data.len(),
+        elapsed_ms = load_start.elapsed().as_millis() as u64,
+        "parquet load done"
+    );
+
+    // Build all preset handles up front; each runs as a tokio task. The
+    // multi-thread runtime fans them across cores. State dirs are unique
+    // per preset (derived from the preset name) so concurrent snapshot /
+    // resume writes don't collide.
+    let mut handles: Vec<JoinHandle<(String, PaperReport)>> = Vec::new();
+
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "naive-grid 5bps",
         NaiveGrid::new(NaiveGridConfig {
             levels_per_side: 1,
             base_spread_bps: 5,
@@ -105,14 +150,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
         }),
         fees,
-    )
-    .await?;
-    results.push(("naive-grid 5bps".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: NaiveGrid at 2 bps half-spread.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "naive-grid 2bps",
         NaiveGrid::new(NaiveGridConfig {
             levels_per_side: 1,
             base_spread_bps: 2,
@@ -121,14 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             min_requote_interval_ms: 1000,
         }),
         fees,
-    )
-    .await?;
-    results.push(("naive-grid 2bps".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: Avellaneda-Stoikov γ=0.1, 5 bps.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "A-S γ=0.1 5bps",
         AvellanedaStoikov::new(AvellanedaStoikovConfig {
             gamma: Decimal::from_str("0.1")?,
             base_spread_bps: 5,
@@ -139,14 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             volatility: ewma.clone(),
         }),
         fees,
-    )
-    .await?;
-    results.push(("A-S γ=0.1 5bps".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: GLFT γ=0.1, 5 bps.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "GLFT γ=0.1 5bps",
         Glft::new(GlftConfig {
             gamma: Decimal::from_str("0.1")?,
             base_spread_bps: 5,
@@ -156,14 +192,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             volatility: ewma.clone(),
         }),
         fees,
-    )
-    .await?;
-    results.push(("GLFT γ=0.1 5bps".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: TOB 1-tick improve, no skew.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB improve=1 noskew",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -174,14 +207,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 0,
         }),
         fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 noskew".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: TOB pure-join (never improves), no skew.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB pure-join",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -192,14 +222,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 0,
         }),
         fees,
-    )
-    .await?;
-    results.push(("TOB pure-join".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: TOB 1-tick improve + skew(10, 0.005).
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(10,0.005)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -210,14 +237,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 0,
         }),
         fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 skew(10,0.005)".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: TOB 1-tick improve + skew(20, 0.005).
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(20,0.005)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -228,32 +252,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 0,
         }),
         fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 skew(20,0.005)".into(), r));
+        skim_cfg,
+    );
 
-    // Preset: TOB + imbalance shift (5 ticks max), no inventory skew.
-    let r = run_one(
-        &args,
-        &symbol,
-        TopOfBook::new(TopOfBookConfig {
-            size_per_quote,
-            tick_size: tick,
-            improve_when_spread_gt_ticks: 1,
-            min_requote_interval_ms: 1000,
-            max_skew_ticks: 0,
-            skew_unit: Size(Decimal::from(1)),
-            max_imbalance_ticks: 5,
-        }),
-        fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 imbalance(5)".into(), r));
+    for max_imb in [3u32, 5, 7, 10, 20] {
+        let name = format!("TOB improve=1 imb({max_imb})");
+        spawn_preset(
+            &mut handles, &shared_data, &symbol, &name,
+            TopOfBook::new(TopOfBookConfig {
+                size_per_quote,
+                tick_size: tick,
+                improve_when_spread_gt_ticks: 1,
+                min_requote_interval_ms: 1000,
+                max_skew_ticks: 0,
+                skew_unit: Size(Decimal::from(1)),
+                max_imbalance_ticks: max_imb,
+            }),
+            fees,
+            skim_cfg,
+        );
+    }
 
-    // Preset: TOB + imbalance + inventory skew combined.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(10) + imb(5)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -264,14 +285,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 5,
         }),
         fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 skew(10) + imb(5)".into(), r));
+        skim_cfg,
+    );
 
-    // BNB-discount duplicates of the top TOB presets.
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB improve=1 noskew (BNB)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -282,13 +300,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 0,
         }),
         bnb_fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 noskew (BNB)".into(), r));
+        skim_cfg,
+    );
 
-    let r = run_one(
-        &args,
-        &symbol,
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "TOB improve=1 skew(10,0.005) (BNB)",
         TopOfBook::new(TopOfBookConfig {
             size_per_quote,
             tick_size: tick,
@@ -299,25 +315,92 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_imbalance_ticks: 0,
         }),
         bnb_fees,
-    )
-    .await?;
-    results.push(("TOB improve=1 skew(10,0.005) (BNB)".into(), r));
+        skim_cfg,
+    );
+
+    // Micro-price sweep: half-spread 1/2/3/5 ticks. Direct comparable against
+    // the TOB imbalance sweep — both react to top-of-book size imbalance, but
+    // micro-price uses a continuous weighted mid instead of discrete tick shifts.
+    for half in [1u32, 2, 3, 5] {
+        let name = format!("micro-price half={half}t");
+        spawn_preset(
+            &mut handles, &shared_data, &symbol, &name,
+            MicroPrice::new(MicroPriceConfig {
+                size_per_quote,
+                tick_size: tick,
+                half_spread_ticks: half,
+                min_requote_interval_ms: 1000,
+                max_skew_ticks: 0,
+                skew_unit: Size(Decimal::from(1)),
+            }),
+            fees,
+            skim_cfg,
+        );
+    }
+
+    // Micro-price + inventory skew combined.
+    spawn_preset(
+        &mut handles, &shared_data, &symbol, "micro-price half=2t skew(10,0.005)",
+        MicroPrice::new(MicroPriceConfig {
+            size_per_quote,
+            tick_size: tick,
+            half_spread_ticks: 2,
+            min_requote_interval_ms: 1000,
+            max_skew_ticks: 10,
+            skew_unit: Size(Decimal::from_str("0.005")?),
+        }),
+        fees,
+        skim_cfg,
+    );
+
+    // Layered grid sweep — re-entry-scalping ladder, fill-driven. Re-entry
+    // bps dominates per-cycle PnL (must clear 2× maker fee or it's a loser).
+    // notional_per_order is dollars per limit; coin qty = notional / price.
+    for (label, inner, step, reentry) in [
+        ("LG inner=6 step=3 re=8", 6u32, 3u32, 8u32),
+        ("LG inner=6 step=3 re=12", 6, 3, 12),
+        ("LG inner=10 step=5 re=12", 10, 5, 12),
+        ("LG inner=10 step=5 re=20", 10, 5, 20),
+        ("LG inner=6 step=1 re=20", 6, 1, 20),
+    ] {
+        spawn_preset(
+            &mut handles, &shared_data, &symbol, label,
+            LayeredGrid::new(LayeredGridConfig {
+                notional_per_order: Decimal::from(100),
+                levels_per_side: 3,
+                inner_bps: inner,
+                step_bps: step,
+                reentry_bps: reentry,
+            }),
+            fees,
+            skim_cfg,
+        );
+    }
+
+    let sweep_start = std::time::Instant::now();
+    info!(presets = handles.len(), "awaiting parallel preset completion");
+    let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(handles.len());
+    for h in handles {
+        results.push(h.await?);
+    }
+    info!(
+        elapsed_ms = sweep_start.elapsed().as_millis() as u64,
+        "all presets done"
+    );
 
     print_table(&results);
     Ok(())
 }
 
 async fn run_one<S: Strategy>(
-    args: &Args,
-    symbol: &Symbol,
+    shared_data: Arc<LoadedReplayData>,
+    symbol: Symbol,
+    state_id: String,
     strategy: S,
     fees: VenueFees,
-) -> Result<PaperReport, Box<dyn std::error::Error>> {
-    let replay = ParquetReplay::new(ReplayConfig {
-        heartbeat_ms: args.heartbeat_ms,
-        symbols: vec![symbol.clone()],
-        data_dir: args.data_dir.clone(),
-    })?;
+    skim: Option<SkimConfig>,
+) -> PaperReport {
+    let replay = ParquetReplay::from_shared(shared_data);
     let venue = BacktestVenue::new(replay);
     let fill_sim = FillSim::new(FillSimConfig {
         submit_latency_ms: 0,
@@ -325,17 +408,18 @@ async fn run_one<S: Strategy>(
         fees,
     });
     let runner_config = RunnerConfig {
-        state_dir: PathBuf::from("./state/backtest_compare"),
+        state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
         snapshot_every_n_events: 0,
+        skim,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
-    info!(strategy = strategy.name(), "preset start");
+    info!(strategy = strategy.name(), preset = %state_id, "preset start");
     let report = run_with_resume(
         venue,
         strategy,
         fill_sim,
-        symbol.clone(),
+        symbol,
         rx,
         runner_config,
         None,
@@ -345,43 +429,111 @@ async fn run_one<S: Strategy>(
     )
     .await;
     info!(
+        preset = %state_id,
         events = report.events_processed,
         fills = report.fills_emitted,
         "preset done"
     );
-    Ok(report)
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_preset<S: Strategy + Send + 'static>(
+    handles: &mut Vec<JoinHandle<(String, PaperReport)>>,
+    shared_data: &Arc<LoadedReplayData>,
+    symbol: &Symbol,
+    name: &str,
+    strategy: S,
+    fees: VenueFees,
+    skim: Option<SkimConfig>,
+) {
+    let sd = Arc::clone(shared_data);
+    let sym = symbol.clone();
+    let display = name.to_string();
+    let state_id = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    handles.push(tokio::spawn(async move {
+        let r = run_one(sd, sym, state_id, strategy, fees, skim).await;
+        (display, r)
+    }));
 }
 
 fn print_table(results: &[(String, PaperReport)]) {
+    let skim_active = results.iter().any(|(_, r)| r.skim_count > 0
+        || decimal_to_f64(&r.final_perp_balance.0) != 0.0);
+
+    // Detect base asset label from any preset with skim active. Empty
+    // (no skim) → header reads generic "base stack".
+    let base_label = results
+        .iter()
+        .find_map(|(_, r)| {
+            if r.base_asset.is_empty() {
+                None
+            } else {
+                Some(format!("{} stack", r.base_asset))
+            }
+        })
+        .unwrap_or_else(|| "base stack".to_string());
+
     println!();
-    println!(
-        "{:<36} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11}",
-        "preset", "fills", "fills/min", "realized", "fees", "NET", "$/fill"
-    );
-    println!("{}", "-".repeat(100));
+    if skim_active {
+        println!(
+            "{:<36} {:>7} {:>9} {:>11} {:>11} {:>6} {:>11} {:>12} {:>12}",
+            "preset", "fills", "fills/min", "realized", "fees", "skims", base_label, "perp+unreal", "TOTAL ACCT"
+        );
+        println!("{}", "-".repeat(120));
+    } else {
+        println!(
+            "{:<36} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11}",
+            "preset", "fills", "fills/min", "realized", "fees", "NET", "$/fill"
+        );
+        println!("{}", "-".repeat(100));
+    }
     for (name, r) in results {
-        let runtime_min = (r.runtime_secs as f64) / 60.0;
-        let fills_per_min = if runtime_min > 0.0 {
-            r.fills_emitted as f64 / runtime_min
+        // Use sim_duration (data-time span) not runtime_secs (wall-clock
+        // replay speed) so fills/min reflects market-time throughput.
+        let sim_min = (r.sim_duration_secs as f64) / 60.0;
+        let fills_per_min = if sim_min > 0.0 {
+            r.fills_emitted as f64 / sim_min
         } else {
             0.0
         };
         let net = decimal_to_f64(&r.net.0);
-        let dollars_per_fill = if r.fills_emitted > 0 {
-            net / r.fills_emitted as f64
+        if skim_active {
+            let perp = decimal_to_f64(&r.final_perp_balance.0);
+            let btc_v = decimal_to_f64(&r.final_base_value.0);
+            let total = perp + btc_v;
+            println!(
+                "{:<36} {:>7} {:>9.2} {:>11.4} {:>11.4} {:>6} {:>10.6} {:>12.4} {:>12.4}",
+                name,
+                r.fills_emitted,
+                fills_per_min,
+                decimal_to_f64(&r.realized.0),
+                decimal_to_f64(&r.fees.0),
+                r.skim_count,
+                decimal_to_f64(&r.base_stacked.0),
+                perp,
+                total,
+            );
         } else {
-            0.0
-        };
-        println!(
-            "{:<36} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.5}",
-            name,
-            r.fills_emitted,
-            fills_per_min,
-            decimal_to_f64(&r.realized.0),
-            decimal_to_f64(&r.fees.0),
-            net,
-            dollars_per_fill,
-        );
+            let dollars_per_fill = if r.fills_emitted > 0 {
+                net / r.fills_emitted as f64
+            } else {
+                0.0
+            };
+            println!(
+                "{:<36} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.5}",
+                name,
+                r.fills_emitted,
+                fills_per_min,
+                decimal_to_f64(&r.realized.0),
+                decimal_to_f64(&r.fees.0),
+                net,
+                dollars_per_fill,
+            );
+        }
     }
     println!();
     // Footer: best/worst NET.
