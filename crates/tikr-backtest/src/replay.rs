@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use polars::prelude::*;
@@ -31,6 +32,12 @@ pub struct ReplayConfig {
     pub symbols: Vec<Symbol>,
     /// Directory containing the parquet files (see SCHEMA.md for naming).
     pub data_dir: PathBuf,
+    /// Venue tick size used to pre-convert prices to integer ticks for the
+    /// per-symbol BookState BTreeMap key. i64 keys are ~150× cheaper to
+    /// compare than `Decimal`, which dominated the per-event hot path on
+    /// profiling. All symbols are assumed to share this tick (single-symbol
+    /// is the only path that exercises it today).
+    pub tick_size: Decimal,
 }
 
 impl Default for ReplayConfig {
@@ -39,15 +46,29 @@ impl Default for ReplayConfig {
             heartbeat_ms: 1000,
             symbols: Vec::new(),
             data_dir: PathBuf::new(),
+            tick_size: Decimal::ONE,
         }
     }
 }
 
 /// Per-symbol order-book running state, updated as book deltas are emitted.
+/// Keyed by integer **ticks** (price / tick_size) so BTreeMap comparisons are
+/// i64 instead of `Decimal`. Values cache the pre-computed `Price(Decimal)`
+/// alongside the size so snapshot emission is a flat clone — no
+/// `Decimal::from(i64) * tick` work per level per event.
+///
+/// `last_applied_ts` tracks the timestamp of the last applied delta. Binance
+/// `@depth20@100ms` (and similar venue endpoints) deliver **full snapshots**
+/// per ts boundary, not incremental deltas — so when ts changes we clear
+/// both sides before applying the new snapshot's rows. Without this, stale
+/// levels from older snapshots accumulate, and `bids.last()` / `asks.first()`
+/// return all-time extremes instead of the current touch (which breaks any
+/// IOC strategy that reads the cached top from FillSim).
 #[derive(Debug, Default)]
 struct BookState {
-    bids: BTreeMap<Decimal, Decimal>,
-    asks: BTreeMap<Decimal, Decimal>,
+    bids: BTreeMap<i64, Level>,
+    asks: BTreeMap<i64, Level>,
+    last_applied_ts: u64,
 }
 
 /// In-memory representation of one historical event.
@@ -62,7 +83,9 @@ struct LoadedEvent {
 enum EventPayload {
     BookDelta {
         side: u8,
-        price: Decimal,
+        /// Price as integer ticks. Conversion happens once at parquet load
+        /// (see [`load_book_parquet`]) so the per-event hot path is i64.
+        price_ticks: i64,
         size: Decimal,
         seq: u64,
     },
@@ -73,36 +96,24 @@ enum EventPayload {
     },
 }
 
-/// Parquet-backed [`Replay`] implementation.
+/// Shared, immutable replay payload. Built once by [`LoadedReplayData::load`]
+/// and shared across replay instances via `Arc`. Holds the parquet-decoded +
+/// sorted + seq-validated event vector plus the config used to load it.
 ///
-/// All events are loaded into memory and sorted once at construction time.
-/// Sort key: `(ts_ns, base-asset-alphabetical, payload-discriminator)`.
-/// This is the v0 simple path; a streaming/chunked variant can replace it
-/// when datasets outgrow RAM.
-pub struct ParquetReplay {
+/// `compare_strategies`-style sweeps wrap this in `Arc` and hand it to each
+/// preset's [`ParquetReplay::from_shared`] so file I/O and the big sort run
+/// exactly once.
+pub struct LoadedReplayData {
     cfg: ReplayConfig,
-    /// Sort order applied to `cfg.symbols` for deterministic tiebreaks
-    /// (alphabetical by `base.0`). Indices below refer to `cfg.symbols`.
     events: Vec<LoadedEvent>,
-    books: Vec<BookState>,
-    cursor: usize,
-    last_emitted_ts: Option<u64>,
 }
 
-impl ParquetReplay {
-    /// Construct a new parquet replay from `cfg`.
-    ///
-    /// Loads all parquet files matching `book_<BASE>_*.parquet` and
-    /// `trades_<BASE>_*.parquet` for each configured symbol, sorts by
-    /// `(ts_ns, base-alphabetical)`, and validates per-symbol `seq`
-    /// monotonicity on the book stream. Missing files are not an error.
-    pub fn new(cfg: ReplayConfig) -> Result<Self, ReplayError> {
+impl LoadedReplayData {
+    /// Load + sort + validate all parquet files for `cfg.symbols` from
+    /// `cfg.data_dir`. Returns an `Arc` so callers can cheaply hand it to
+    /// many [`ParquetReplay`] instances.
+    pub fn load(cfg: ReplayConfig) -> Result<Arc<Self>, ReplayError> {
         let mut events: Vec<LoadedEvent> = Vec::new();
-        let mut books: Vec<BookState> = Vec::with_capacity(cfg.symbols.len());
-
-        for _ in 0..cfg.symbols.len() {
-            books.push(BookState::default());
-        }
 
         // Build (base_str, symbol_idx) pairs for the alphabetical tiebreak.
         let mut bases: Vec<(String, usize)> = cfg
@@ -138,7 +149,7 @@ impl ParquetReplay {
                     }
                     let path = entry.path();
                     if name.starts_with(&book_prefix) {
-                        load_book_parquet(&path, symbol_idx, &mut events)?;
+                        load_book_parquet(&path, symbol_idx, cfg.tick_size, &mut events)?;
                     } else if name.starts_with(&trade_prefix) {
                         load_trades_parquet(&path, symbol_idx, &mut events)?;
                     }
@@ -177,13 +188,57 @@ impl ParquetReplay {
             }
         }
 
-        Ok(Self {
-            cfg,
-            events,
+        Ok(Arc::new(Self { cfg, events }))
+    }
+
+    /// Number of loaded events (post-sort, pre-replay). Useful for logging.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// True if no events were loaded.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+/// Parquet-backed [`Replay`] implementation.
+///
+/// All events are loaded into memory and sorted once at construction time.
+/// Sort key: `(ts_ns, base-asset-alphabetical, payload-discriminator)`.
+/// This is the v0 simple path; a streaming/chunked variant can replace it
+/// when datasets outgrow RAM.
+pub struct ParquetReplay {
+    data: Arc<LoadedReplayData>,
+    books: Vec<BookState>,
+    cursor: usize,
+    last_emitted_ts: Option<u64>,
+}
+
+impl ParquetReplay {
+    /// Construct a new parquet replay from `cfg`. Loads + sorts on each call.
+    ///
+    /// For multi-preset sweeps over the same data prefer
+    /// [`LoadedReplayData::load`] + [`ParquetReplay::from_shared`] to avoid
+    /// re-decoding the parquet files per preset.
+    pub fn new(cfg: ReplayConfig) -> Result<Self, ReplayError> {
+        Ok(Self::from_shared(LoadedReplayData::load(cfg)?))
+    }
+
+    /// Build a fresh replay over pre-loaded data. Each instance has its own
+    /// running [`BookState`] + cursor so multiple presets can replay the same
+    /// shared event vector independently.
+    pub fn from_shared(data: Arc<LoadedReplayData>) -> Self {
+        let mut books: Vec<BookState> = Vec::with_capacity(data.cfg.symbols.len());
+        for _ in 0..data.cfg.symbols.len() {
+            books.push(BookState::default());
+        }
+        Self {
+            data,
             books,
             cursor: 0,
             last_emitted_ts: None,
-        })
+        }
     }
 }
 
@@ -203,6 +258,7 @@ fn payload_rank(p: &EventPayload) -> u8 {
 fn load_book_parquet(
     path: &Path,
     symbol_idx: usize,
+    tick_size: Decimal,
     out: &mut Vec<LoadedEvent>,
 ) -> Result<(), ReplayError> {
     let df = read_parquet_df(path)?;
@@ -231,18 +287,34 @@ fn load_book_parquet(
         let seq = seq_col
             .get(i)
             .ok_or_else(|| ReplayError::Schema("null seq".into()))?;
+        let price_ticks = price_to_ticks(price, tick_size).ok_or_else(|| {
+            ReplayError::Schema(format!(
+                "price {price} not representable as i64 ticks at tick_size {tick_size}"
+            ))
+        })?;
         out.push(LoadedEvent {
             ts_ns,
             symbol_idx,
             payload: EventPayload::BookDelta {
                 side,
-                price,
+                price_ticks,
                 size,
                 seq,
             },
         });
     }
     Ok(())
+}
+
+/// Convert a `Decimal` price to integer ticks. Returns `None` if the
+/// division isn't representable as `i64` or doesn't divide evenly.
+fn price_to_ticks(price: Decimal, tick_size: Decimal) -> Option<i64> {
+    use rust_decimal::prelude::ToPrimitive;
+    if tick_size <= Decimal::ZERO {
+        return None;
+    }
+    let ratio = price / tick_size;
+    ratio.round().to_i64()
 }
 
 /// Read a trades parquet file and append rows as [`LoadedEvent`]s.
@@ -374,16 +446,16 @@ fn column_as_decimal(df: &DataFrame, name: &str) -> Result<Vec<Decimal>, ReplayE
 #[async_trait]
 impl Replay for ParquetReplay {
     async fn next(&mut self) -> Option<MarketEvent> {
-        if self.cursor >= self.events.len() {
+        if self.cursor >= self.data.events.len() {
             return None;
         }
 
-        let next_event_ts = self.events[self.cursor].ts_ns;
+        let next_event_ts = self.data.events[self.cursor].ts_ns;
 
         // Heartbeat synthesis: if last_emitted_ts + heartbeat_ms strictly
         // precedes next_event_ts, emit a heartbeat at that slot.
         if let Some(last_ts) = self.last_emitted_ts {
-            let hb_ns = self.cfg.heartbeat_ms.saturating_mul(1_000_000);
+            let hb_ns = self.data.cfg.heartbeat_ms.saturating_mul(1_000_000);
             if hb_ns > 0 {
                 let next_hb_ts = last_ts.saturating_add(hb_ns);
                 if next_hb_ts < next_event_ts {
@@ -399,45 +471,47 @@ impl Replay for ParquetReplay {
         let cursor = self.cursor;
         self.cursor += 1;
         self.last_emitted_ts = Some(next_event_ts);
-        let ev = &self.events[cursor];
+        let ev = &self.data.events[cursor];
         let ts = Timestamp(ev.ts_ns);
-        let symbol = self.cfg.symbols[ev.symbol_idx].clone();
+        let symbol = self.data.cfg.symbols[ev.symbol_idx].clone();
 
         match &ev.payload {
             EventPayload::BookDelta {
                 side,
-                price,
+                price_ticks,
                 size,
                 seq: _,
             } => {
                 let book = &mut self.books[ev.symbol_idx];
+                // ts boundary → new full snapshot from the recorder (Binance
+                // @depth20@100ms semantics). Clear both sides before applying
+                // the first row of the new snapshot so stale levels from the
+                // prior snapshot don't linger.
+                if ev.ts_ns != book.last_applied_ts {
+                    book.bids.clear();
+                    book.asks.clear();
+                    book.last_applied_ts = ev.ts_ns;
+                }
                 let levels = if *side == 0 {
                     &mut book.bids
                 } else {
                     &mut book.asks
                 };
                 if size.is_zero() {
-                    levels.remove(price);
+                    levels.remove(price_ticks);
                 } else {
-                    levels.insert(*price, *size);
+                    let tick = self.data.cfg.tick_size;
+                    let price = Price(Decimal::from(*price_ticks) * tick);
+                    levels.insert(
+                        *price_ticks,
+                        Level {
+                            price,
+                            size: Size(*size),
+                        },
+                    );
                 }
-                let bids = book
-                    .bids
-                    .iter()
-                    .rev()
-                    .map(|(p, s)| Level {
-                        price: Price(*p),
-                        size: Size(*s),
-                    })
-                    .collect();
-                let asks = book
-                    .asks
-                    .iter()
-                    .map(|(p, s)| Level {
-                        price: Price(*p),
-                        size: Size(*s),
-                    })
-                    .collect();
+                let bids = book.bids.values().rev().cloned().collect();
+                let asks = book.asks.values().cloned().collect();
                 Some(MarketEvent::BookUpdate {
                     snapshot: Snapshot {
                         symbol,
@@ -566,6 +640,7 @@ mod tests {
             heartbeat_ms: 1000,
             symbols: vec![],
             data_dir: tmp.path().to_path_buf(),
+            tick_size: Decimal::ONE,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
         assert!(r.next().await.is_none());
@@ -575,11 +650,16 @@ mod tests {
     async fn iterates_in_timestamp_order() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("book_BTC_2026-05-18.parquet");
+        // Both rows live under ts=1_000 (one logical full snapshot — bid +
+        // ask). Recorder semantics: each ts_ns block is a complete snapshot
+        // that replaces the prior BookState. A second snapshot at ts=2_000
+        // would clear and start fresh.
         write_book_parquet(
             &path,
             &[
-                (1_000, 0, 100.0, 1.0, 1), // bid level
-                (2_000, 1, 101.0, 2.0, 2), // ask level
+                (1_000, 0, 100.0, 1.0, 1), // bid level @ ts=1000
+                (1_000, 1, 101.0, 2.0, 2), // ask level @ ts=1000
+                (2_000, 0, 99.0, 3.0, 3),  // new snapshot @ ts=2000 — clears prior
             ],
         )
         .unwrap();
@@ -588,6 +668,7 @@ mod tests {
             heartbeat_ms: 0, // disable heartbeats for this test
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
+            tick_size: Decimal::ONE,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 
@@ -596,7 +677,7 @@ mod tests {
             MarketEvent::BookUpdate { snapshot } => {
                 assert_eq!(snapshot.ts, Timestamp(1_000));
                 assert_eq!(snapshot.bids.len(), 1);
-                assert_eq!(snapshot.asks.len(), 0);
+                assert_eq!(snapshot.asks.len(), 0); // ask not seen yet
                 assert_eq!(snapshot.bids[0].price.0, Decimal::try_from(100.0).unwrap());
             }
             other => panic!("expected BookUpdate, got {other:?}"),
@@ -605,10 +686,22 @@ mod tests {
         let e2 = r.next().await.expect("second event");
         match e2 {
             MarketEvent::BookUpdate { snapshot } => {
-                assert_eq!(snapshot.ts, Timestamp(2_000));
+                assert_eq!(snapshot.ts, Timestamp(1_000));
                 assert_eq!(snapshot.bids.len(), 1);
                 assert_eq!(snapshot.asks.len(), 1);
                 assert_eq!(snapshot.asks[0].price.0, Decimal::try_from(101.0).unwrap());
+            }
+            other => panic!("expected BookUpdate, got {other:?}"),
+        }
+
+        let e3 = r.next().await.expect("third event");
+        match e3 {
+            MarketEvent::BookUpdate { snapshot } => {
+                // New ts → fresh snapshot. Prior asks cleared.
+                assert_eq!(snapshot.ts, Timestamp(2_000));
+                assert_eq!(snapshot.bids.len(), 1);
+                assert_eq!(snapshot.asks.len(), 0);
+                assert_eq!(snapshot.bids[0].price.0, Decimal::try_from(99.0).unwrap());
             }
             other => panic!("expected BookUpdate, got {other:?}"),
         }
@@ -634,6 +727,7 @@ mod tests {
             heartbeat_ms: 0,
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
+            tick_size: Decimal::ONE,
         };
         let err = ParquetReplay::new(cfg)
             .err()
@@ -673,6 +767,7 @@ mod tests {
             heartbeat_ms: 1000,
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
+            tick_size: Decimal::ONE,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 
@@ -723,6 +818,7 @@ mod tests {
             heartbeat_ms: 0,
             symbols: vec![btc_symbol()],
             data_dir: tmp.path().to_path_buf(),
+            tick_size: Decimal::ONE,
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 

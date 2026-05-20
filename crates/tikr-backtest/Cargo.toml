@@ -23,6 +23,9 @@ path = "src/bin/record_binance.rs"
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"
+# Direct dep so we can use the `ToPrimitive` trait for the BookState tick
+# conversion (tikr-core re-exports the type but not the prelude traits).
+rust_decimal = { version = "1", default-features = false }
 tikr-strategy = "0.1"
 tikr-hyperliquid = "0.1"
 tikr-binance = "0.1"
@@ -35,6 +38,10 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+# Direct dep so the recorder bins can install a CryptoProvider before any TLS
+# use — reqwest's rustls-tls + tokio-tungstenite's rustls-tls-webpki-roots
+# pull conflicting provider defaults, leaving rustls 0.23 ambiguous at runtime.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

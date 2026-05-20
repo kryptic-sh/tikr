@@ -4,7 +4,7 @@
 //!
 //! [issue #11]: https://github.com/kryptic-sh/tikr/issues/11
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use tikr_core::{
     Decimal, Fill, MarketEvent, Notional, Price, Side, Size, Snapshot, Symbol, TimeInForce,
@@ -63,20 +63,33 @@ struct LiveQuote {
     ts_submitted: Timestamp,
 }
 
+/// Per-symbol book aggregates for queue-priority + cancel attribution.
+///
+/// Stored as `HashMap` rather than `BTreeMap` — the only ordered operations
+/// we need are `best_bid` / `best_ask`, which we cache explicitly. Decimal
+/// keys make BTreeMap comparisons dominate the profile; HashMap sidesteps
+/// that entirely.
 #[derive(Default, Clone)]
 struct BookState {
     /// Per-level aggregate size on the bid side, keyed by price.
-    bids: BTreeMap<Decimal, Decimal>,
+    bids: HashMap<Decimal, Decimal>,
     /// Per-level aggregate size on the ask side, keyed by price.
-    asks: BTreeMap<Decimal, Decimal>,
+    asks: HashMap<Decimal, Decimal>,
+    /// Cached top-of-book. Refreshed by `set_top` on snapshot rebuild.
+    best_bid: Option<Price>,
+    best_ask: Option<Price>,
 }
 
 impl BookState {
     fn best_bid(&self) -> Option<Price> {
-        self.bids.keys().next_back().copied().map(Price)
+        self.best_bid
     }
     fn best_ask(&self) -> Option<Price> {
-        self.asks.keys().next().copied().map(Price)
+        self.best_ask
+    }
+    fn set_top(&mut self, best_bid: Option<Price>, best_ask: Option<Price>) {
+        self.best_bid = best_bid;
+        self.best_ask = best_ask;
     }
     fn level_size(&self, side: Side, price: Price) -> Decimal {
         let map = match side {
@@ -145,13 +158,13 @@ impl FillSim {
     }
 
     /// Match queued open quotes against `ev`; emit fills for any quotes
-    /// taken out by the trade-through model.
+    /// taken out by the trade-through model. Also emits taker fills for any
+    /// pending IOC/FOK ops that became eligible this tick.
     pub fn on_market_event(&mut self, ev: &MarketEvent, now: Timestamp) -> Vec<Fill> {
-        self.apply_pending(now);
+        let mut fills = self.apply_pending(now);
         match ev {
             MarketEvent::BookUpdate { snapshot } => {
                 self.update_book_state(snapshot);
-                Vec::new()
             }
             MarketEvent::Trade {
                 symbol,
@@ -159,34 +172,91 @@ impl FillSim {
                 size,
                 side: taker_side,
                 ts,
-            } => self.match_trade(symbol, *price, *size, *taker_side, *ts),
-            MarketEvent::Heartbeat { .. } | MarketEvent::Fill(_) => Vec::new(),
+            } => {
+                fills.extend(self.match_trade(symbol, *price, *size, *taker_side, *ts));
+            }
+            MarketEvent::Heartbeat { .. } | MarketEvent::Fill(_) => {}
         }
+        fills
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn apply_pending(&mut self, now: Timestamp) {
+    fn apply_pending(&mut self, now: Timestamp) -> Vec<Fill> {
         let pivot = self.pending.partition_point(|p| p.scheduled_ts_ns <= now.0);
         let ready: Vec<_> = self.pending.drain(..pivot).collect();
+        let mut fills = Vec::new();
         for p in ready {
             match p.op {
-                Op::Place(intent) => self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns)),
+                Op::Place(intent) => {
+                    if let Some(f) = self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns)) {
+                        fills.push(f);
+                    }
+                }
                 Op::Replace { id, intent } => {
                     self.cancel_id(id);
-                    self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns));
+                    if let Some(f) = self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns)) {
+                        fills.push(f);
+                    }
                 }
                 Op::Cancel(id) => self.cancel_id(id),
                 Op::CancelAll => self.live_quotes.clear(),
             }
         }
+        fills
     }
 
-    fn place_or_reject(&mut self, intent: QuoteIntent, ts: Timestamp) {
+    fn place_or_reject(&mut self, intent: QuoteIntent, ts: Timestamp) -> Option<Fill> {
         if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
-            return;
+            return None;
+        }
+        // IOC / FOK: if the intent crosses the live touch, fill immediately
+        // at the touch price as a taker. If it doesn't cross, drop silently
+        // (IOC = unfilled remainder gets cancelled; we treat 0 fill as full
+        // cancel). Partial-fill modeling for IOC is a future refinement.
+        if matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK) {
+            let st = self
+                .book_state
+                .entry(intent.symbol.clone())
+                .or_default();
+            let touch = match intent.side {
+                Side::Bid => st.best_ask(),
+                Side::Ask => st.best_bid(),
+            };
+            let Some(touch_price) = touch else {
+                return None;
+            };
+            let crosses = match intent.side {
+                Side::Bid => intent.price.0 >= touch_price.0,
+                Side::Ask => intent.price.0 <= touch_price.0,
+            };
+            if !crosses {
+                return None;
+            }
+            let fill_size = intent.size.0;
+            // Taker fee is always positive (no rebate). cfg.fees.taker_bps is u32.
+            let fee_amount = touch_price.0 * fill_size
+                * Decimal::from(self.cfg.fees.taker_bps)
+                / Decimal::from(10_000);
+            // Decrement the touched side's aggregate so subsequent cancel
+            // attribution doesn't see the consumed liquidity as a cancel.
+            let touched_side = match intent.side {
+                Side::Bid => Side::Ask,
+                Side::Ask => Side::Bid,
+            };
+            st.decrement_level(touched_side, touch_price, fill_size);
+            return Some(Fill {
+                quote_id: QuoteId::new(),
+                price: touch_price,
+                size: Size(fill_size),
+                fee_asset: intent.symbol.quote.clone(),
+                fee_amount,
+                fee_quote: Notional(fee_amount),
+                side: intent.side,
+                ts,
+            });
         }
         // Snapshot queue position at our price level when placed. We're
         // appended to the back, so queue_ahead = current aggregate at that
@@ -206,6 +276,7 @@ impl FillSim {
             queue_ahead,
             ts_submitted: ts,
         });
+        None
     }
 
     fn would_cross(&self, intent: &QuoteIntent) -> bool {
@@ -230,8 +301,27 @@ impl FillSim {
         // (new_agg / prev_agg). Trade-attributed shrinkage is excluded
         // because match_trade decrements book_state aggregates inline before
         // the next BookUpdate arrives.
-        let prev = self.book_state.get(&snapshot.symbol).cloned();
+        //
+        // Window check: the replay caps snapshot depth, so quotes resting
+        // outside the visible price range can't be distinguished from "level
+        // vanished due to cancel" — skip attribution for those to avoid
+        // phantom queue collapses. In-window edges: deepest visible bid /
+        // ask price on each side.
         let st = self.book_state.entry(snapshot.symbol.clone()).or_default();
+        let deepest_bid = snapshot.bids.last().map(|l| l.price.0);
+        let deepest_ask = snapshot.asks.last().map(|l| l.price.0);
+        let prev_aggs: Vec<(usize, Decimal)> = self
+            .live_quotes
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.symbol == snapshot.symbol)
+            .filter(|(_, q)| match q.side {
+                Side::Bid => deepest_bid.is_some_and(|d| q.price.0 >= d),
+                Side::Ask => deepest_ask.is_some_and(|d| q.price.0 <= d),
+            })
+            .map(|(i, q)| (i, st.level_size(q.side, q.price)))
+            .collect();
+
         st.bids.clear();
         st.asks.clear();
         for lvl in &snapshot.bids {
@@ -240,18 +330,19 @@ impl FillSim {
         for lvl in &snapshot.asks {
             st.asks.insert(lvl.price.0, lvl.size.0);
         }
-        let Some(prev) = prev else {
-            return;
-        };
-        for q in &mut self.live_quotes {
-            if q.symbol != snapshot.symbol {
-                continue;
-            }
-            let prev_agg = prev.level_size(q.side, q.price);
-            let new_agg = st.level_size(q.side, q.price);
+        // Refresh cached top-of-book — snapshot.bids is sorted descending,
+        // snapshot.asks ascending (invariant declared on Snapshot).
+        st.set_top(
+            snapshot.bids.first().map(|l| l.price),
+            snapshot.asks.first().map(|l| l.price),
+        );
+
+        for (i, prev_agg) in prev_aggs {
             if prev_agg <= Decimal::ZERO {
                 continue;
             }
+            let q = &mut self.live_quotes[i];
+            let new_agg = st.level_size(q.side, q.price);
             if new_agg >= prev_agg {
                 // Aggregate grew (or held) — only new arrivals behind us,
                 // no impact on queue_ahead.
@@ -768,5 +859,91 @@ mod tests {
         assert_eq!(fills[0].fee_quote, Notional(expected));
         assert_eq!(fills[0].fee_amount, expected);
         assert!(expected < Decimal::ZERO, "rebate must be negative");
+    }
+
+    #[tokio::test]
+    async fn ioc_fills_at_touch_when_crosses() {
+        let sym = make_symbol();
+        let cfg = FillSimConfig {
+            submit_latency_ms: 0,
+            cancel_latency_ms: 0,
+            fees: VenueFees {
+                maker_bps: 0,
+                taker_bps: 5,
+            },
+        };
+        let mut sim = FillSim::new(cfg);
+        // Seed the book via a snapshot: best_bid=99, best_ask=101.
+        let snap = MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: sym.clone(),
+                bids: vec![tikr_core::Level {
+                    price: Price(Decimal::from(99)),
+                    size: Size(Decimal::from(10)),
+                }],
+                asks: vec![tikr_core::Level {
+                    price: Price(Decimal::from(101)),
+                    size: Size(Decimal::from(10)),
+                }],
+                ts: Timestamp(0),
+            },
+        };
+        let _ = sim.on_market_event(&snap, Timestamp(0));
+        // IOC bid at 200 — way above ask 101 → fills at touch 101.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 200, 1, TimeInForce::IOC)),
+            Timestamp(1_000_000),
+        );
+        // Trigger apply_pending via a heartbeat.
+        let fills = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(2_000_000),
+            },
+            Timestamp(2_000_000),
+        );
+        assert_eq!(fills.len(), 1, "IOC should fill immediately at touch");
+        assert_eq!(fills[0].price.0, Decimal::from(101));
+        assert_eq!(fills[0].size.0, Decimal::from(1));
+        assert_eq!(fills[0].side, Side::Bid);
+        // Taker fee = 101 * 1 * 5 / 10000 = 0.0505
+        let expected_fee = Decimal::from(101) * Decimal::from(1) * Decimal::from(5)
+            / Decimal::from(10_000);
+        assert_eq!(fills[0].fee_amount, expected_fee);
+        // No resting quote left.
+        assert_eq!(sim.live_quotes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ioc_drops_silently_when_does_not_cross() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+        let snap = MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: sym.clone(),
+                bids: vec![tikr_core::Level {
+                    price: Price(Decimal::from(99)),
+                    size: Size(Decimal::from(10)),
+                }],
+                asks: vec![tikr_core::Level {
+                    price: Price(Decimal::from(101)),
+                    size: Size(Decimal::from(10)),
+                }],
+                ts: Timestamp(0),
+            },
+        };
+        let _ = sim.on_market_event(&snap, Timestamp(0));
+        // IOC bid at 50 — below ask 101 → does not cross → no fill, no rest.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 50, 1, TimeInForce::IOC)),
+            Timestamp(1_000_000),
+        );
+        let fills = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(2_000_000),
+            },
+            Timestamp(2_000_000),
+        );
+        assert!(fills.is_empty());
+        assert_eq!(sim.live_quotes.len(), 0);
     }
 }

@@ -59,6 +59,7 @@ async fn golden_naive_grid_btc_single_fill() {
         heartbeat_ms: 0, // suppress for golden — fewer events to reason about
         symbols: vec![symbol.clone()],
         data_dir: temp.path().to_path_buf(),
+        tick_size: tikr_core::Decimal::ONE,
     })
     .unwrap();
 

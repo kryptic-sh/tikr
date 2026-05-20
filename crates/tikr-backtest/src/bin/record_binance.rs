@@ -57,6 +57,10 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() {
+    // reqwest + tokio-tungstenite both pull rustls 0.23 with different
+    // provider defaults; install ring explicitly so TLS handshakes don't
+    // panic at first use.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
