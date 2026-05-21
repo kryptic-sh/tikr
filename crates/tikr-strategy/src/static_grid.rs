@@ -403,7 +403,31 @@ impl Strategy for StaticGrid {
                     self.placed = true;
                     return self.build_batch(ctx.symbol, mid, best_bid, best_ask, ratio);
                 }
-                vec![Action::NoOp]
+                // Self-heal on book updates: if a side has gone empty
+                // since the last fill arrived (e.g. a fill event was
+                // dropped, or the reconciliation tick cleaned up a
+                // ghost that the venue silently cancelled / expired)
+                // the strategy is otherwise blind to that state — it
+                // only acts on Fill events. Re-running rebuild_decision
+                // on every BookUpdate makes the bot self-correct within
+                // one book tick (~100ms on a busy symbol).
+                let pos_usdt = ctx.position.size.0 * mid.0;
+                let cur_ratio = self.pos_ratio(pos_usdt);
+                match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
+                    RebuildDecision::None => vec![Action::NoOp],
+                    RebuildDecision::FullRebuild => {
+                        let mut actions =
+                            Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
+                        actions.push(Action::CancelAll);
+                        actions.extend(
+                            self.build_batch(ctx.symbol, mid, best_bid, best_ask, cur_ratio),
+                        );
+                        actions
+                    }
+                    RebuildDecision::RefillSide(side) => {
+                        self.build_one_side(ctx.symbol, mid, best_bid, best_ask, cur_ratio, side)
+                    }
+                }
             }
             MarketEvent::Fill(f) => {
                 // Count EVERY fill (partial + full) in the fpm window —
