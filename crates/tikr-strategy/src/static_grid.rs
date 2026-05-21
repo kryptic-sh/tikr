@@ -103,6 +103,16 @@ pub struct StaticGrid {
     /// `fillrate_window_secs` on every fill; used to compute the
     /// adaptive bps scale.
     fill_ts: VecDeque<u64>,
+    /// Timestamp of the first event seen (ns). Used for the adaptive
+    /// scale ramp-up: during the first `fillrate_window_secs` the
+    /// effective window is `now - session_start`, not the full window
+    /// — so a fast-fill open isn't masked by dividing by a 60s window
+    /// when only 5s have elapsed.
+    session_start_ts: Option<u64>,
+    /// Latest event timestamp seen. Used as "now" by `adaptive_scale`
+    /// when computing effective window length (since the scaler is
+    /// called from `build_batch` which doesn't take ts directly).
+    last_event_ts: Option<u64>,
 }
 
 impl StaticGrid {
@@ -134,25 +144,33 @@ impl StaticGrid {
     /// Adaptive scale multiplier from rolling fill rate vs target.
     ///
     /// `scale = (actual_fpm / target_fpm).clamp(scale_min, scale_max)`.
-    /// Returns `1.0` when adaptive is disabled (target = 0) or when the
-    /// window is empty.
+    /// Returns `1.0` when adaptive is disabled (target = 0), when the
+    /// window is empty, or when no events have been seen yet (neutral
+    /// boot — let the strategy start at configured bps).
+    ///
+    /// During the first `fillrate_window_secs` of a session the
+    /// effective denominator is `now - session_start` (capped at the
+    /// window) — so a hot open with 5 fills in 3 seconds reports
+    /// `5 / (3/60) = 100 fpm`, not `5 / 1.0 = 5 fpm`.
     fn adaptive_scale(&self) -> Decimal {
         if self.config.target_fills_per_min <= Decimal::ZERO {
             return Decimal::ONE;
         }
         let count = self.fill_ts.len();
         if count == 0 {
-            return self
-                .config
-                .scale_min
-                .max(Decimal::ONE)
-                .min(self.config.scale_max);
-        }
-        let window_min = Decimal::from(self.config.fillrate_window_secs) / Decimal::from(60);
-        if window_min <= Decimal::ZERO {
             return Decimal::ONE;
         }
-        let actual_fpm = Decimal::from(count as u64) / window_min;
+        let (Some(start), Some(now)) = (self.session_start_ts, self.last_event_ts) else {
+            return Decimal::ONE;
+        };
+        let window_ns = (self.config.fillrate_window_secs as u64).saturating_mul(1_000_000_000);
+        if window_ns == 0 {
+            return Decimal::ONE;
+        }
+        let elapsed_ns = now.saturating_sub(start);
+        let effective_ns = elapsed_ns.min(window_ns).max(1);
+        let effective_min = Decimal::from(effective_ns) / Decimal::from(60u64 * 1_000_000_000u64);
+        let actual_fpm = Decimal::from(count as u64) / effective_min;
         let raw = actual_fpm / self.config.target_fills_per_min;
         raw.clamp(self.config.scale_min, self.config.scale_max)
     }
@@ -180,7 +198,6 @@ impl StaticGrid {
         let buy_scale = Decimal::ONE + pos_ratio * self.config.skew_strength;
         let sell_scale = Decimal::ONE - pos_ratio * self.config.skew_strength;
         let adaptive = self.adaptive_scale();
-        let one_bp = Decimal::ONE / bp_unit;
         for k in 0..self.config.levels_per_side {
             let base_bps =
                 Decimal::from(self.config.inner_bps + self.config.step_bps * k) * adaptive;
@@ -188,9 +205,6 @@ impl StaticGrid {
             let sell_bps = (base_bps * sell_scale).max(Decimal::ONE);
             let buy = Price(mid.0 * (Decimal::ONE - buy_bps / bp_unit));
             let sell = Price(mid.0 * (Decimal::ONE + sell_bps / bp_unit));
-            // Defensive: keep at least 1 bp inside if floor kicked in to
-            // avoid zero-spread placements.
-            let _ = one_bp;
             actions.push(self.make_quote(symbol, Side::Bid, buy));
             actions.push(self.make_quote(symbol, Side::Ask, sell));
         }
@@ -228,12 +242,20 @@ impl Strategy for StaticGrid {
     type Config = StaticGridConfig;
 
     fn new(config: Self::Config) -> Self {
+        assert!(
+            config.scale_min <= config.scale_max,
+            "StaticGridConfig: scale_min ({}) must be <= scale_max ({})",
+            config.scale_min,
+            config.scale_max
+        );
         Self {
             config,
             placed: false,
             last_mid: None,
             last_pos_ratio: Decimal::ZERO,
             fill_ts: VecDeque::new(),
+            session_start_ts: None,
+            last_event_ts: None,
         }
     }
 
@@ -242,6 +264,21 @@ impl Strategy for StaticGrid {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        // Session timestamps: anchor session_start on first event, refresh
+        // last_event_ts on every event. Both feed adaptive_scale's
+        // effective-window calc so a fast-fill open isn't masked by
+        // dividing observed fills by the full configured window.
+        let event_ts = match event {
+            MarketEvent::BookUpdate { snapshot } => Some(snapshot.ts.0),
+            MarketEvent::Trade { ts, .. } => Some(ts.0),
+            MarketEvent::Fill(f) => Some(f.ts.0),
+            MarketEvent::Heartbeat { ts } => Some(ts.0),
+        };
+        if let Some(ts) = event_ts {
+            self.session_start_ts.get_or_insert(ts);
+            self.last_event_ts = Some(ts);
+        }
+
         match event {
             MarketEvent::BookUpdate { snapshot } => {
                 let bid = snapshot.bids.first().map(|l| l.price.0);
@@ -260,11 +297,15 @@ impl Strategy for StaticGrid {
                 }
                 vec![Action::NoOp]
             }
-            MarketEvent::Fill(f) if f.is_full => {
-                // Defense-in-depth: runner already gates partials, but we also
-                // ignore here so a leak can't rebuild prematurely.
+            MarketEvent::Fill(f) => {
+                // Count EVERY fill (partial + full) in the fpm window —
+                // partials are real toxic-flow signal too. Only full fills
+                // trigger the rebuild check below.
                 self.fill_ts.push_back(f.ts.0);
                 self.prune_fills(f.ts.0);
+                if !f.is_full {
+                    return Vec::new();
+                }
                 let Some(mid) = self.last_mid else {
                     return Vec::new();
                 };
@@ -313,5 +354,114 @@ impl Strategy for StaticGrid {
         actions.push(Action::CancelAll);
         actions.extend(self.build_batch(ctx.symbol, mid, ratio));
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn cfg(target_fpm: &str, window_secs: u32, sc_min: &str, sc_max: &str) -> StaticGridConfig {
+        StaticGridConfig {
+            notional_per_order: Decimal::from(100),
+            levels_per_side: 2,
+            inner_bps: 3,
+            step_bps: 2,
+            skew_strength: Decimal::ZERO,
+            target_inventory_usdt: Decimal::from(50),
+            rebuild_pos_ratio_delta: Decimal::from_str("0.3").unwrap(),
+            target_fills_per_min: Decimal::from_str(target_fpm).unwrap(),
+            fillrate_window_secs: window_secs,
+            scale_min: Decimal::from_str(sc_min).unwrap(),
+            scale_max: Decimal::from_str(sc_max).unwrap(),
+        }
+    }
+
+    #[test]
+    fn scaler_disabled_returns_one() {
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert_eq!(g.adaptive_scale(), Decimal::ONE);
+    }
+
+    #[test]
+    fn scaler_empty_window_returns_one() {
+        let g = StaticGrid::new(cfg("5", 60, "1", "4"));
+        assert_eq!(g.adaptive_scale(), Decimal::ONE);
+    }
+
+    #[test]
+    fn scaler_no_session_returns_one() {
+        // Has a fill but no session ts (shouldn't happen via on_event,
+        // but the guard exists).
+        let mut g = StaticGrid::new(cfg("5", 60, "1", "4"));
+        g.fill_ts.push_back(1_000_000_000);
+        assert_eq!(g.adaptive_scale(), Decimal::ONE);
+    }
+
+    #[test]
+    fn scaler_at_target_returns_one() {
+        let mut g = StaticGrid::new(cfg("5", 60, "1", "4"));
+        // Session spans 60s (full window). 5 fills = 5 fpm = target.
+        g.session_start_ts = Some(0);
+        g.last_event_ts = Some(60_000_000_000);
+        for i in 0..5 {
+            g.fill_ts.push_back(i * 12_000_000_000);
+        }
+        assert_eq!(g.adaptive_scale(), Decimal::ONE);
+    }
+
+    #[test]
+    fn scaler_above_target_widens() {
+        let mut g = StaticGrid::new(cfg("5", 60, "1", "4"));
+        // 20 fills in 60s = 20 fpm, target 5 → raw 4.0 → clamped at 4.0.
+        g.session_start_ts = Some(0);
+        g.last_event_ts = Some(60_000_000_000);
+        for _ in 0..20 {
+            g.fill_ts.push_back(60_000_000_000);
+        }
+        assert_eq!(g.adaptive_scale(), Decimal::from(4));
+    }
+
+    #[test]
+    fn scaler_clamps_at_max() {
+        let mut g = StaticGrid::new(cfg("5", 60, "1", "4"));
+        // 200 fills → 40fpm → raw 8.0 → clamped at 4.0.
+        g.session_start_ts = Some(0);
+        g.last_event_ts = Some(60_000_000_000);
+        for _ in 0..200 {
+            g.fill_ts.push_back(60_000_000_000);
+        }
+        assert_eq!(g.adaptive_scale(), Decimal::from(4));
+    }
+
+    #[test]
+    fn scaler_clamps_at_min_below_one() {
+        let mut g = StaticGrid::new(cfg("10", 60, "0.5", "4"));
+        // 1 fill in 60s = 1 fpm, target 10 → raw 0.1 → clamped at 0.5.
+        g.session_start_ts = Some(0);
+        g.last_event_ts = Some(60_000_000_000);
+        g.fill_ts.push_back(60_000_000_000);
+        assert_eq!(g.adaptive_scale(), Decimal::from_str("0.5").unwrap());
+    }
+
+    #[test]
+    fn scaler_rampup_uses_elapsed_not_window() {
+        let mut g = StaticGrid::new(cfg("5", 60, "1", "4"));
+        // Only 6 seconds elapsed (10% of window), 5 fills.
+        // Naive (count/window): 5/1.0 = 5fpm → scale 1.0
+        // Correct (count/elapsed): 5/(6/60) = 50fpm → scale 4.0 (clamped)
+        g.session_start_ts = Some(0);
+        g.last_event_ts = Some(6_000_000_000);
+        for _ in 0..5 {
+            g.fill_ts.push_back(6_000_000_000);
+        }
+        assert_eq!(g.adaptive_scale(), Decimal::from(4));
+    }
+
+    #[test]
+    #[should_panic(expected = "scale_min")]
+    fn invalid_scale_bounds_panic_on_new() {
+        StaticGrid::new(cfg("5", 60, "5", "2"));
     }
 }
