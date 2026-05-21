@@ -500,6 +500,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     skew_strength: skew,
                                     target_inventory_usdt: target,
                                     rebuild_pos_ratio_delta: rebuild_delta,
+                                    target_fills_per_min: Decimal::ZERO,
+                                    fillrate_window_secs: 60,
+                                    scale_min: Decimal::ONE,
+                                    scale_max: Decimal::from(4),
                                 }),
                                 fees,
                                 skim_cfg,
@@ -636,10 +640,10 @@ fn print_table(results: &[(String, PaperReport)]) {
         println!("{}", "-".repeat(120));
     } else {
         println!(
-            "{:<36} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11}",
-            "preset", "fills", "fills/min", "realized", "fees", "NET", "$/fill"
+            "{:<36} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11} {:>11}",
+            "preset", "fills", "fills/min", "realized", "unrealized", "fees", "NET", "$/fill"
         );
-        println!("{}", "-".repeat(100));
+        println!("{}", "-".repeat(110));
     }
     for (name, r) in results {
         // Use sim_duration (data-time span) not runtime_secs (wall-clock
@@ -674,11 +678,12 @@ fn print_table(results: &[(String, PaperReport)]) {
                 0.0
             };
             println!(
-                "{:<36} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.5}",
+                "{:<36} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.4} {:>11.5}",
                 name,
                 r.fills_emitted,
                 fills_per_min,
                 decimal_to_f64(&r.realized.0),
+                decimal_to_f64(&r.unrealized.0),
                 decimal_to_f64(&r.fees.0),
                 net,
                 dollars_per_fill,

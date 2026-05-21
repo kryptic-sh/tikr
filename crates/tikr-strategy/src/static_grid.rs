@@ -35,6 +35,8 @@
 //! Anchored on the current book mid each time — the grid "follows" big
 //! moves in a coarse step-wise way, not smoothly like [`LayeredGrid`].
 
+use std::collections::VecDeque;
+
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::{QuoteId, QuoteIntent};
 
@@ -67,6 +69,21 @@ pub struct StaticGridConfig {
     /// fresh batch placement at the newly-skewed prices.
     /// Default 0.3 (i.e. 30% saturation move). Set high to disable.
     pub rebuild_pos_ratio_delta: Decimal,
+    /// Adaptive fill-rate scaler. Widens `inner_bps`/`step_bps` when
+    /// realised fills/min exceed `target_fills_per_min`. `0` disables
+    /// (no scaling applied). Default `5.0` fills/min target — tune to
+    /// match the symbol's natural taker-flow rate.
+    pub target_fills_per_min: Decimal,
+    /// Rolling window (seconds) over which fills/min is measured.
+    /// Default `60` — one minute of memory.
+    pub fillrate_window_secs: u32,
+    /// Lower bound on the adaptive scale multiplier. `1.0` = never
+    /// tighten below configured bps (safer); `<1.0` allows tightening
+    /// when flow is slow. Default `1.0`.
+    pub scale_min: Decimal,
+    /// Upper bound on the adaptive scale multiplier. Default `4.0` =
+    /// up to 4× widening under heavy fill pressure.
+    pub scale_max: Decimal,
 }
 
 /// Static grid state.
@@ -82,6 +99,10 @@ pub struct StaticGrid {
     /// `[-1.0, 1.0]`. Used by `rebuild_needed` to fire a fresh batch when
     /// inventory has drifted by more than `rebuild_pos_ratio_delta`.
     last_pos_ratio: Decimal,
+    /// Rolling window of fill timestamps (ns since epoch). Pruned to
+    /// `fillrate_window_secs` on every fill; used to compute the
+    /// adaptive bps scale.
+    fill_ts: VecDeque<u64>,
 }
 
 impl StaticGrid {
@@ -95,6 +116,45 @@ impl StaticGrid {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
+    }
+
+    /// Prune fill_ts to entries within the rolling window of `now_ns`.
+    fn prune_fills(&mut self, now_ns: u64) {
+        let window_ns = (self.config.fillrate_window_secs as u64).saturating_mul(1_000_000_000);
+        let cutoff = now_ns.saturating_sub(window_ns);
+        while let Some(&front) = self.fill_ts.front() {
+            if front < cutoff {
+                self.fill_ts.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Adaptive scale multiplier from rolling fill rate vs target.
+    ///
+    /// `scale = (actual_fpm / target_fpm).clamp(scale_min, scale_max)`.
+    /// Returns `1.0` when adaptive is disabled (target = 0) or when the
+    /// window is empty.
+    fn adaptive_scale(&self) -> Decimal {
+        if self.config.target_fills_per_min <= Decimal::ZERO {
+            return Decimal::ONE;
+        }
+        let count = self.fill_ts.len();
+        if count == 0 {
+            return self
+                .config
+                .scale_min
+                .max(Decimal::ONE)
+                .min(self.config.scale_max);
+        }
+        let window_min = Decimal::from(self.config.fillrate_window_secs) / Decimal::from(60);
+        if window_min <= Decimal::ZERO {
+            return Decimal::ONE;
+        }
+        let actual_fpm = Decimal::from(count as u64) / window_min;
+        let raw = actual_fpm / self.config.target_fills_per_min;
+        raw.clamp(self.config.scale_min, self.config.scale_max)
     }
 
     /// Compute position ratio in `[-1, 1]`. Positive = long, negative = short.
@@ -119,9 +179,11 @@ impl StaticGrid {
         let bp_unit = Decimal::from(10_000);
         let buy_scale = Decimal::ONE + pos_ratio * self.config.skew_strength;
         let sell_scale = Decimal::ONE - pos_ratio * self.config.skew_strength;
+        let adaptive = self.adaptive_scale();
         let one_bp = Decimal::ONE / bp_unit;
         for k in 0..self.config.levels_per_side {
-            let base_bps = Decimal::from(self.config.inner_bps + self.config.step_bps * k);
+            let base_bps =
+                Decimal::from(self.config.inner_bps + self.config.step_bps * k) * adaptive;
             let buy_bps = (base_bps * buy_scale).max(Decimal::ONE);
             let sell_bps = (base_bps * sell_scale).max(Decimal::ONE);
             let buy = Price(mid.0 * (Decimal::ONE - buy_bps / bp_unit));
@@ -171,6 +233,7 @@ impl Strategy for StaticGrid {
             placed: false,
             last_mid: None,
             last_pos_ratio: Decimal::ZERO,
+            fill_ts: VecDeque::new(),
         }
     }
 
@@ -200,6 +263,8 @@ impl Strategy for StaticGrid {
             MarketEvent::Fill(f) if f.is_full => {
                 // Defense-in-depth: runner already gates partials, but we also
                 // ignore here so a leak can't rebuild prematurely.
+                self.fill_ts.push_back(f.ts.0);
+                self.prune_fills(f.ts.0);
                 let Some(mid) = self.last_mid else {
                     return Vec::new();
                 };

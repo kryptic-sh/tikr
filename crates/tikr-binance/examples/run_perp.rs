@@ -215,6 +215,20 @@ struct Args {
     /// StaticGrid: rebuild on inventory drift > this ratio since last placement.
     #[arg(long, default_value = "0.3")]
     sg_rebuild_pos_delta: String,
+    /// StaticGrid: target fills-per-minute (adaptive bps scaler). `0` disables.
+    /// When realised fpm exceeds target, inner/step bps widen by
+    /// `(actual/target)` clamped to `[scale_min, scale_max]`.
+    #[arg(long, default_value = "5")]
+    sg_target_fills_per_min: String,
+    /// StaticGrid: rolling window (seconds) for fill-rate measurement.
+    #[arg(long, default_value_t = 60u32)]
+    sg_fillrate_window_secs: u32,
+    /// StaticGrid: lower bound on adaptive scale multiplier (default 1.0 = never tighten).
+    #[arg(long, default_value = "1.0")]
+    sg_scale_min: String,
+    /// StaticGrid: upper bound on adaptive scale multiplier (default 4.0).
+    #[arg(long, default_value = "4.0")]
+    sg_scale_max: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -576,34 +590,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     notional = floor;
                 }
             }
-            let strategy = tikr_strategy::StaticGrid::new(tikr_strategy::StaticGridConfig {
-                notional_per_order: notional,
-                levels_per_side: args.sg_levels,
-                inner_bps: args.sg_inner_bps,
-                step_bps: args.sg_step_bps,
-                skew_strength: Decimal::from_str(&args.sg_skew_strength).map_err(|e| {
-                    format!(
-                        "--sg-skew-strength '{}' invalid: {}",
-                        args.sg_skew_strength, e
-                    )
-                })?,
-                target_inventory_usdt: Decimal::from_str(&args.sg_target_inventory).map_err(
-                    |e| {
+            let strategy =
+                tikr_strategy::StaticGrid::new(tikr_strategy::StaticGridConfig {
+                    notional_per_order: notional,
+                    levels_per_side: args.sg_levels,
+                    inner_bps: args.sg_inner_bps,
+                    step_bps: args.sg_step_bps,
+                    skew_strength: Decimal::from_str(&args.sg_skew_strength).map_err(|e| {
                         format!(
-                            "--sg-target-inventory '{}' invalid: {}",
-                            args.sg_target_inventory, e
+                            "--sg-skew-strength '{}' invalid: {}",
+                            args.sg_skew_strength, e
                         )
-                    },
-                )?,
-                rebuild_pos_ratio_delta: Decimal::from_str(&args.sg_rebuild_pos_delta).map_err(
-                    |e| {
-                        format!(
-                            "--sg-rebuild-pos-delta '{}' invalid: {}",
-                            args.sg_rebuild_pos_delta, e
-                        )
-                    },
-                )?,
-            });
+                    })?,
+                    target_inventory_usdt: Decimal::from_str(&args.sg_target_inventory).map_err(
+                        |e| {
+                            format!(
+                                "--sg-target-inventory '{}' invalid: {}",
+                                args.sg_target_inventory, e
+                            )
+                        },
+                    )?,
+                    rebuild_pos_ratio_delta: Decimal::from_str(&args.sg_rebuild_pos_delta)
+                        .map_err(|e| {
+                            format!(
+                                "--sg-rebuild-pos-delta '{}' invalid: {}",
+                                args.sg_rebuild_pos_delta, e
+                            )
+                        })?,
+                    target_fills_per_min: Decimal::from_str(&args.sg_target_fills_per_min)
+                        .map_err(|e| {
+                            format!(
+                                "--sg-target-fills-per-min '{}' invalid: {}",
+                                args.sg_target_fills_per_min, e
+                            )
+                        })?,
+                    fillrate_window_secs: args.sg_fillrate_window_secs,
+                    scale_min: Decimal::from_str(&args.sg_scale_min).map_err(|e| {
+                        format!("--sg-scale-min '{}' invalid: {}", args.sg_scale_min, e)
+                    })?,
+                    scale_max: Decimal::from_str(&args.sg_scale_max).map_err(|e| {
+                        format!("--sg-scale-max '{}' invalid: {}", args.sg_scale_max, e)
+                    })?,
+                });
             run_with_resume(
                 venue,
                 strategy,
