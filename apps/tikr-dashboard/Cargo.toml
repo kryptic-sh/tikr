@@ -49,6 +49,9 @@ hjkl-picker = "0.27"
 hjkl-keymap = "0.27"
 hjkl-clipboard = "0.27"
 
+# OSC52 base64 encoding (for SSH/terminal clipboard pass-through)
+base64 = "0.22"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

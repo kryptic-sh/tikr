@@ -149,27 +149,63 @@ pub fn finalize_copy(sel: &mut MouseSelection, buf: &Buffer) -> Option<String> {
         return None;
     }
 
-    // Best-effort copy. The clipboard handle is built per-call here —
-    // hjkl-clipboard's backend probe is cheap (no native handle until
-    // .set() actually fires) and lets us recover from transient
-    // failures (e.g. no DISPLAY) without a long-lived error state.
-    match Clipboard::new() {
-        Ok(cb) => match cb.set(ClipSelection::Clipboard, MimeType::Text, text.as_bytes()) {
-            Ok(()) => {
-                tracing::info!(
-                    chars = text.chars().count(),
-                    "copied selection to clipboard"
-                );
-                Some(text)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "clipboard set failed");
-                None
-            }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "clipboard backend init failed");
-            None
-        }
+    // Two-pronged copy:
+    //   1. OSC52 escape via stdout — passes through SSH to the LOCAL
+    //      terminal's clipboard. This is what enables paste on the
+    //      operator's local machine when the dashboard runs over SSH.
+    //   2. hjkl-clipboard native backend — sets the host's clipboard
+    //      (Wayland / X11 / NSPasteboard / Win32). Useful when the
+    //      operator is running the dashboard locally.
+    //
+    // Both fire because OSC52 alone may not work in terminals that
+    // don't honor the escape (Apple Terminal default), and the native
+    // backend alone is useless over SSH (sets the remote clipboard).
+    let osc52_ok = emit_osc52(&text).is_ok();
+    let native_ok = match Clipboard::new() {
+        Ok(cb) => cb
+            .set(ClipSelection::Clipboard, MimeType::Text, text.as_bytes())
+            .is_ok(),
+        Err(_) => false,
+    };
+    tracing::info!(
+        chars = text.chars().count(),
+        osc52 = osc52_ok,
+        native = native_ok,
+        "copied selection to clipboard"
+    );
+    if osc52_ok || native_ok {
+        Some(text)
+    } else {
+        tracing::warn!("clipboard copy failed via both OSC52 and native backend");
+        None
     }
+}
+
+/// Emit an OSC 52 escape to stdout so the user's terminal emulator
+/// (local OR upstream of an SSH session) captures the text into its
+/// native clipboard.
+///
+/// Format:
+/// - Plain terminal: `\x1b]52;c;<base64>\x07`
+/// - Inside tmux:    `\x1bPtmux;\x1b\x1b]52;c;<base64>\x07\x1b\\`
+///   (DCS passthrough — tmux strips one ESC layer)
+///
+/// The terminal must support OSC52. Modern emulators do: kitty, wezterm,
+/// alacritty, iTerm2 (with permission), foot, xterm (with `allowWindowOps`).
+/// Apple Terminal default config does NOT support OSC52.
+fn emit_osc52(text: &str) -> std::io::Result<()> {
+    use base64::Engine;
+    use std::io::Write;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let in_tmux = std::env::var_os("TMUX").is_some();
+    let payload = if in_tmux {
+        format!("\x1bPtmux;\x1b\x1b]52;c;{encoded}\x07\x1b\\")
+    } else {
+        format!("\x1b]52;c;{encoded}\x07")
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(payload.as_bytes())?;
+    out.flush()
 }
