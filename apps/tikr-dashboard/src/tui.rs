@@ -654,7 +654,7 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
             BotStatus::Starting => (Color::Cyan, v.status.tag()),
         };
         let active = i == ui.active_tab;
-        let label = format!(" {} [{}] ", v.symbol, tag);
+        let label = format!(" {} ({}) [{}] ", v.symbol, v.strategy, tag);
         let w = label.chars().count() as u16;
         let style = if active {
             Style::default()

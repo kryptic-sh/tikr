@@ -22,13 +22,14 @@ pub enum BotStatus {
 }
 
 impl BotStatus {
-    /// Single-letter compact tag for the tabs header.
+    /// Short word for the tabs header — `on` / `off` / `restarting`
+    /// / `starting`. Lower-case to match the user-facing convention.
     pub fn tag(&self) -> &'static str {
         match self {
-            Self::Starting => "···",
-            Self::Running => "ON",
-            Self::Crashed(_) => "X",
-            Self::Restarting(_) => "↻",
+            Self::Starting => "starting",
+            Self::Running => "on",
+            Self::Crashed(_) => "off",
+            Self::Restarting(_) => "restarting",
         }
     }
 }
