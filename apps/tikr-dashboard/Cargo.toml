@@ -46,6 +46,7 @@ crossterm = "0.28"
 
 # hjkl vim-like primitives
 hjkl-picker = "0.27"
+hjkl-keymap = "0.27"
 
 # Logging
 tracing = "0.1"

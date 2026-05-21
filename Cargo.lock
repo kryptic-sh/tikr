@@ -5501,6 +5501,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "futures",
+ "hjkl-keymap",
  "hjkl-picker",
  "ratatui",
  "reqwest 0.12.28",

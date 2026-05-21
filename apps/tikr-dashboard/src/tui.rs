@@ -28,43 +28,86 @@ use crate::state::{AccountAggregate, BotStatus, BotViewSnapshot, SharedBotState}
 /// the tokio runtime), so we're not stealing time from bot tasks.
 const FRAME_BUDGET_MS: u64 = 16;
 
-/// UI input mode (vim-style).
-enum Mode {
-    /// Default mode: tab navigation, log scroll, leader keys.
+/// UI input mode (vim-style). Only `Normal` is exercised by the
+/// keymap today; `Ex` and `Picker` are reserved so future bindings
+/// can install per-mode chords (e.g. picker `j/k` movement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+enum AppMode {
     Normal,
-    /// `:`-prefixed Ex command — buffer is what the user has typed so far.
+    Ex,
+    Picker,
+}
+
+/// Normal-mode chord targets, dispatched by `hjkl_keymap::Keymap`.
+#[derive(Debug, Clone)]
+enum NormalAction {
+    EnterEx,
+    TabNext,
+    TabPrev,
+    LeaderPicker,
+    LogPageUp,
+    LogPageDown,
+    LogTop,
+    LogBottom,
+}
+
+/// Either the chord-bound `Normal` mode, or one of the inline modal
+/// states (`Ex`, `Picker`) that capture text input directly.
+enum ModeState {
+    Normal,
     Ex { buffer: String },
-    /// `<Space><Space>` fuzzy bot picker.
     Picker { query: String, selected: usize },
+}
+
+/// Log viewport anchor — sticky semantics for the log pane.
+///
+/// `Follow` auto-pins to the newest line (default). `Anchored(top)`
+/// keeps the first visible line at absolute index `top` even as new
+/// log lines arrive — so scrolling up and then receiving new entries
+/// doesn't shift the display.
+#[derive(Debug, Clone, Copy)]
+enum LogView {
+    Follow,
+    Anchored(usize),
 }
 
 /// UI state owned by the render loop.
 struct UiState {
     active_tab: usize,
-    /// Offset from the newest log line. 0 = pinned to bottom.
-    log_scroll: usize,
+    /// Log viewport mode + anchor.
+    log_view: LogView,
     /// Last-drawn rects so mouse events can hit-test.
     last_tab_rect: Option<Rect>,
     last_log_rect: Option<Rect>,
     /// Per-tab `(start_x, end_x)` in absolute terminal coords.
     last_tab_ranges: Vec<(u16, u16)>,
-    /// Current input mode.
-    mode: Mode,
-    /// Timestamp of the last `<Space>` press — for the `<Space><Space>`
-    /// leader sequence. Cleared after 800ms.
-    leader_pending: Option<Instant>,
+    /// Last drawn log pane height (visible row count incl. borders) —
+    /// captured so chord actions can compute "page up / page down" in
+    /// proportion to what the user actually sees.
+    last_log_visible: usize,
+    /// Current modal state.
+    mode: ModeState,
+    /// Keymap for chord dispatch in Normal mode.
+    keymap: hjkl_keymap::Keymap<NormalAction, AppMode>,
+    /// Timestamp of the last keymap-relevant key so we can call
+    /// `timeout_resolve` after the ambiguity window expires.
+    last_key_ts: Option<Instant>,
 }
 
 impl UiState {
     fn new() -> Self {
+        let keymap = build_keymap();
         Self {
             active_tab: 0,
-            log_scroll: 0,
+            log_view: LogView::Follow,
             last_tab_rect: None,
             last_log_rect: None,
             last_tab_ranges: Vec::new(),
-            mode: Mode::Normal,
-            leader_pending: None,
+            last_log_visible: 0,
+            mode: ModeState::Normal,
+            keymap,
+            last_key_ts: None,
         }
     }
 
@@ -141,6 +184,12 @@ pub fn run(
                     Event::Resize(_, _) => dirty = true,
                     _ => {}
                 }
+            } else {
+                // No event arrived this tick — check whether the keymap
+                // has a pending chord whose timeout expired (so a bare
+                // `g` fires after the ambiguity window).
+                let views = state.views();
+                drain_keymap_timeout(&mut ui, &views);
             }
 
             // Frame budget exhausted → redraw (forced) even if the UI
@@ -173,9 +222,124 @@ pub fn run(
     res
 }
 
-/// Leader-key window: a second `<Space>` within this many ms triggers
-/// the picker. Mirrors vim's `:set timeoutlen=800`.
-const LEADER_WINDOW_MS: u128 = 800;
+/// Build the Normal-mode keymap.
+///
+/// Uses `<Space>` as leader so `<Space><Space>` resolves the picker
+/// (`Chord::parse` expands `<leader>` to the configured leader).
+fn build_keymap() -> hjkl_keymap::Keymap<NormalAction, AppMode> {
+    let mut km = hjkl_keymap::Keymap::new(' ');
+    let m = AppMode::Normal;
+    // Failures here would be a programmer error in chord syntax.
+    km.add(m, ":", NormalAction::EnterEx, "ex command").unwrap();
+    km.add(m, "H", NormalAction::TabPrev, "prev tab").unwrap();
+    km.add(m, "L", NormalAction::TabNext, "next tab").unwrap();
+    km.add(m, "gg", NormalAction::LogTop, "log top").unwrap();
+    km.add(m, "G", NormalAction::LogBottom, "log bottom")
+        .unwrap();
+    km.add(m, "<leader><leader>", NormalAction::LeaderPicker, "picker")
+        .unwrap();
+    km.add(m, "<PageUp>", NormalAction::LogPageUp, "log page up")
+        .unwrap();
+    km.add(m, "<PageDown>", NormalAction::LogPageDown, "log page down")
+        .unwrap();
+    km
+}
+
+/// Translate a crossterm key event into `hjkl_keymap::KeyEvent`.
+fn to_hjkl_key(k: &crossterm::event::KeyEvent) -> Option<hjkl_keymap::KeyEvent> {
+    use crossterm::event::KeyModifiers as Cm;
+    use hjkl_keymap::{KeyCode as Hc, KeyModifiers as Hm};
+    let code = match k.code {
+        KeyCode::Char(c) => Hc::Char(c),
+        KeyCode::Enter => Hc::Enter,
+        KeyCode::Esc => Hc::Esc,
+        KeyCode::Tab => Hc::Tab,
+        KeyCode::Backspace => Hc::Backspace,
+        KeyCode::Delete => Hc::Delete,
+        KeyCode::Insert => Hc::Insert,
+        KeyCode::Up => Hc::Up,
+        KeyCode::Down => Hc::Down,
+        KeyCode::Left => Hc::Left,
+        KeyCode::Right => Hc::Right,
+        KeyCode::Home => Hc::Home,
+        KeyCode::End => Hc::End,
+        KeyCode::PageUp => Hc::PageUp,
+        KeyCode::PageDown => Hc::PageDown,
+        KeyCode::F(n) => Hc::F(n),
+        _ => return None,
+    };
+    let mut mods = Hm::NONE;
+    if k.modifiers.contains(Cm::SHIFT) {
+        mods |= Hm::SHIFT;
+    }
+    if k.modifiers.contains(Cm::CONTROL) {
+        mods |= Hm::CTRL;
+    }
+    if k.modifiers.contains(Cm::ALT) {
+        mods |= Hm::ALT;
+    }
+    Some(hjkl_keymap::KeyEvent::new(code, mods))
+}
+
+fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mut UiState) -> bool {
+    match action {
+        NormalAction::EnterEx => {
+            ui.mode = ModeState::Ex {
+                buffer: String::new(),
+            };
+        }
+        NormalAction::TabPrev if !views.is_empty() => {
+            ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
+            ui.log_view = LogView::Follow;
+        }
+        NormalAction::TabNext if !views.is_empty() => {
+            ui.active_tab = (ui.active_tab + 1) % views.len();
+            ui.log_view = LogView::Follow;
+        }
+        NormalAction::LeaderPicker => {
+            ui.mode = ModeState::Picker {
+                query: String::new(),
+                selected: 0,
+            };
+        }
+        NormalAction::LogPageUp => scroll_log(ui, -10),
+        NormalAction::LogPageDown => scroll_log(ui, 10),
+        NormalAction::LogTop => ui.log_view = LogView::Anchored(0),
+        NormalAction::LogBottom => ui.log_view = LogView::Follow,
+        _ => {}
+    }
+    false
+}
+
+/// Move the log viewport by `delta` lines. Negative = scroll up
+/// (toward older lines), positive = scroll down (toward newest).
+fn scroll_log(ui: &mut UiState, delta: i64) {
+    let visible = ui.last_log_visible.max(1);
+    match ui.log_view {
+        LogView::Follow => {
+            if delta < 0 {
+                // First scroll up: anchor just above the current bottom.
+                // `total` is unknown here, but caller uses log_top relative
+                // to total at render time; choose a high "from top" that
+                // gets clamped down to (total - visible) on render.
+                ui.log_view = LogView::Anchored(usize::MAX);
+                // Now apply the requested upward step.
+                scroll_log(ui, delta);
+            }
+        }
+        LogView::Anchored(top) => {
+            let new_top = if delta < 0 {
+                top.saturating_sub((-delta) as usize)
+            } else {
+                top.saturating_add(delta as usize)
+            };
+            ui.log_view = LogView::Anchored(new_top);
+            // Tail snap-back handled at render time by detecting that the
+            // anchor is at-or-past the live tail position.
+            let _ = visible;
+        }
+    }
+}
 
 fn handle_key(
     key: crossterm::event::KeyEvent,
@@ -191,20 +355,22 @@ fn handle_key(
         return true;
     }
 
+    ui.last_key_ts = Some(Instant::now());
+
     match &mut ui.mode {
-        Mode::Ex { buffer } => {
+        ModeState::Ex { buffer } => {
             match key.code {
-                KeyCode::Esc => ui.mode = Mode::Normal,
+                KeyCode::Esc => ui.mode = ModeState::Normal,
                 KeyCode::Enter => {
                     let cmd = buffer.trim().to_string();
-                    ui.mode = Mode::Normal;
+                    ui.mode = ModeState::Normal;
                     if cmd == "q" || cmd == "quit" {
                         return true;
                     }
                 }
                 KeyCode::Backspace => {
                     if buffer.pop().is_none() {
-                        ui.mode = Mode::Normal;
+                        ui.mode = ModeState::Normal;
                     }
                 }
                 KeyCode::Char(c) => buffer.push(c),
@@ -212,16 +378,16 @@ fn handle_key(
             }
             return false;
         }
-        Mode::Picker { query, selected } => {
+        ModeState::Picker { query, selected } => {
             let filtered = filter_views(views, query);
             match key.code {
-                KeyCode::Esc => ui.mode = Mode::Normal,
+                KeyCode::Esc => ui.mode = ModeState::Normal,
                 KeyCode::Enter => {
                     if let Some((idx, _, _)) = filtered.get(*selected) {
                         ui.active_tab = *idx;
-                        ui.log_scroll = 0;
+                        ui.log_view = LogView::Follow;
                     }
-                    ui.mode = Mode::Normal;
+                    ui.mode = ModeState::Normal;
                 }
                 KeyCode::Up => {
                     if *selected > 0 {
@@ -255,62 +421,34 @@ fn handle_key(
             }
             return false;
         }
-        Mode::Normal => {}
+        ModeState::Normal => {}
     }
 
-    // Normal mode. Leader-key (`<Space>`) state is cleared by any
-    // non-`<Space>` keystroke so a stale leader from earlier doesn't
-    // wrongly trigger the picker on the next `<Space>`.
-    let was_space = matches!(key.code, KeyCode::Char(' '));
-    if !was_space {
-        ui.leader_pending = None;
+    // Normal mode — dispatch through the hjkl-keymap trie.
+    let Some(hjkl_key) = to_hjkl_key(&key) else {
+        return false;
+    };
+    match ui.keymap.feed(AppMode::Normal, hjkl_key, Instant::now()) {
+        hjkl_keymap::KeyResolve::Match(b) => apply_normal_action(&b.action, views, ui),
+        hjkl_keymap::KeyResolve::Pending | hjkl_keymap::KeyResolve::Ambiguous => false,
+        hjkl_keymap::KeyResolve::Unbound(_) => false,
     }
-    match key.code {
-        KeyCode::Char(':') => {
-            ui.mode = Mode::Ex {
-                buffer: String::new(),
-            }
-        }
-        // Shift+H / Shift+L → tab nav (capital letters arrive directly).
-        KeyCode::Char('H') if !views.is_empty() => {
-            ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
-            ui.log_scroll = 0;
-        }
-        KeyCode::Char('L') if !views.is_empty() => {
-            ui.active_tab = (ui.active_tab + 1) % views.len();
-            ui.log_scroll = 0;
-        }
-        KeyCode::Char(' ') => {
-            let now = Instant::now();
-            let leader_active = ui
-                .leader_pending
-                .map(|t| now.duration_since(t).as_millis() < LEADER_WINDOW_MS)
-                .unwrap_or(false);
-            if leader_active {
-                ui.leader_pending = None;
-                ui.mode = Mode::Picker {
-                    query: String::new(),
-                    selected: 0,
-                };
-            } else {
-                ui.leader_pending = Some(now);
-            }
-        }
-        KeyCode::Tab | KeyCode::Right if !views.is_empty() => {
-            ui.active_tab = (ui.active_tab + 1) % views.len();
-            ui.log_scroll = 0;
-        }
-        KeyCode::BackTab | KeyCode::Left if !views.is_empty() => {
-            ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
-            ui.log_scroll = 0;
-        }
-        KeyCode::PageUp => ui.log_scroll = ui.log_scroll.saturating_add(10),
-        KeyCode::PageDown => ui.log_scroll = ui.log_scroll.saturating_sub(10),
-        KeyCode::Home => ui.log_scroll = usize::MAX,
-        KeyCode::End => ui.log_scroll = 0,
-        _ => {}
+}
+
+/// If the keymap has buffered chord state and the ambiguity timeout has
+/// expired, force a resolution (used to fire single-`g` after the
+/// timeout window when `gg` was not completed).
+fn drain_keymap_timeout(ui: &mut UiState, views: &[BotViewSnapshot]) {
+    let Some(last) = ui.last_key_ts else { return };
+    if last.elapsed() < ui.keymap.timeout_duration() {
+        return;
     }
-    false
+    if matches!(ui.mode, ModeState::Normal)
+        && let hjkl_keymap::KeyResolve::Match(b) = ui.keymap.timeout_resolve(AppMode::Normal)
+    {
+        apply_normal_action(&b.action, views, ui);
+    }
+    ui.last_key_ts = None;
 }
 
 /// Filter + score bot views by `query` (fuzzy, via `hjkl_picker::score`).
@@ -332,7 +470,7 @@ fn filter_views(views: &[BotViewSnapshot], query: &str) -> Vec<(usize, i64, Vec<
 fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
     // Modal modes swallow mouse events so they don't manipulate the
     // underlying tabs/log pane.
-    if !matches!(ui.mode, Mode::Normal) {
+    if !matches!(ui.mode, ModeState::Normal) {
         return;
     }
     match mev.kind {
@@ -341,14 +479,14 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
                 && idx < views.len()
             {
                 ui.active_tab = idx;
-                ui.log_scroll = 0;
+                ui.log_view = LogView::Follow;
             }
         }
         MouseEventKind::ScrollUp if ui.in_log_pane(mev.column, mev.row) => {
-            ui.log_scroll = ui.log_scroll.saturating_add(3);
+            scroll_log(ui, -3);
         }
         MouseEventKind::ScrollDown if ui.in_log_pane(mev.column, mev.row) => {
-            ui.log_scroll = ui.log_scroll.saturating_sub(3);
+            scroll_log(ui, 3);
         }
         _ => {}
     }
@@ -375,11 +513,7 @@ fn draw(
     draw_footer(f, outer[2], &ui.mode);
 
     // Modal overlays.
-    if let Mode::Picker {
-        query: _,
-        selected: _,
-    } = &ui.mode
-    {
+    if matches!(&ui.mode, ModeState::Picker { .. }) {
         draw_picker_overlay(f, views, ui);
     }
 }
@@ -390,7 +524,7 @@ fn draw_picker_overlay(f: &mut Frame<'_>, views: &[BotViewSnapshot], ui: &UiStat
     f.render_widget(ratatui::widgets::Clear, area);
 
     let (query, selected) = match &ui.mode {
-        Mode::Picker { query, selected } => (query.clone(), *selected),
+        ModeState::Picker { query, selected } => (query.clone(), *selected),
         _ => return,
     };
     let filtered = filter_views(views, &query);
@@ -401,7 +535,7 @@ fn draw_picker_overlay(f: &mut Frame<'_>, views: &[BotViewSnapshot], ui: &UiStat
         .split(area);
 
     // Query input.
-    let input = Paragraph::new(format!("  {}_", query)).block(
+    let input = Paragraph::new(format!("  {query}_")).block(
         Block::default()
             .borders(Borders::ALL)
             .title(" pick bot (Esc cancel, Enter open) ")
@@ -649,23 +783,35 @@ fn draw_logs(
 ) {
     let total = log_lines.len();
     let visible = area.height.saturating_sub(2) as usize; // borders eat 2 rows
-    // Clamp scroll: 0 = pinned to newest; max = oldest visible at top.
-    let max_scroll = total.saturating_sub(visible);
-    if ui.log_scroll > max_scroll {
-        ui.log_scroll = max_scroll;
-    }
-    let scroll_str = if ui.log_scroll == 0 {
-        " (live) ".to_string()
-    } else {
-        format!(" ↑{} ", ui.log_scroll)
+    ui.last_log_visible = visible;
+
+    // Resolve viewport. Anchored(top) is sticky — new lines arriving don't
+    // shift the displayed range. Snap back to Follow when the anchor has
+    // caught up to the tail (i.e. the bottom visible line IS the last
+    // line). max_top is the largest valid `top` that still fills the
+    // window without leaving blank space below — beyond it, we auto-snap.
+    let max_top = total.saturating_sub(visible);
+    let (start, scroll_label) = match ui.log_view {
+        LogView::Follow => (max_top, " (live) ".to_string()),
+        LogView::Anchored(top) => {
+            let clamped = top.min(max_top);
+            if clamped >= max_top {
+                // Caught up to tail → resume live follow.
+                ui.log_view = LogView::Follow;
+                (max_top, " (live) ".to_string())
+            } else {
+                ui.log_view = LogView::Anchored(clamped);
+                let from_tail = total.saturating_sub(clamped + visible);
+                (clamped, format!(" ↑{from_tail} "))
+            }
+        }
     };
+    let end = (start + visible).min(total);
+
     let title = match active {
-        Some(v) => format!(" {} logs{}", v.symbol, scroll_str),
+        Some(v) => format!(" {} logs{scroll_label}", v.symbol),
         None => " logs ".to_string(),
     };
-
-    let end = total.saturating_sub(ui.log_scroll);
-    let start = end.saturating_sub(visible);
     let slice = &log_lines[start..end];
 
     let items: Vec<ListItem> = slice
@@ -681,37 +827,37 @@ fn format_log_line(ln: &LogLine) -> Line<'static> {
     let (lvl_tag, lvl_color) = match ln.level {
         Level::ERROR => ("ERROR", Color::Red),
         Level::WARN => ("WARN ", Color::Yellow),
-        Level::INFO => ("INFO ", Color::Green),
-        Level::DEBUG => ("DEBUG", Color::Cyan),
-        Level::TRACE => ("TRACE", Color::DarkGray),
+        Level::INFO => ("INFO ", Color::LightGreen),
+        Level::DEBUG => ("DEBUG", Color::LightBlue),
+        Level::TRACE => ("TRACE", Color::Gray),
     };
-    let body_style = if ln.from_system {
-        // System events (no symbol span) get a dimmed body so they
-        // don't visually drown out the active bot's own log stream.
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM)
+    // Body: bright by default. System events (events from library tasks
+    // spawned with `tokio::spawn` that lost the bot symbol span) get a
+    // single-step dimmer fg (Gray vs LightGray) so the eye can pick the
+    // bot's own stream out without losing readability.
+    let body_color = if ln.from_system {
+        Color::Gray
     } else {
         match ln.level {
-            Level::ERROR => Style::default().fg(Color::Red),
-            Level::WARN => Style::default().fg(Color::Yellow),
-            Level::INFO => Style::default().fg(Color::White),
-            Level::DEBUG => Style::default().fg(Color::Cyan),
-            Level::TRACE => Style::default().fg(Color::DarkGray),
+            Level::ERROR => Color::LightRed,
+            Level::WARN => Color::LightYellow,
+            Level::INFO => Color::White,
+            Level::DEBUG => Color::LightCyan,
+            Level::TRACE => Color::Gray,
         }
     };
     let prefix = if ln.from_system { "·" } else { " " };
     Line::from(vec![
         Span::styled(
             format!("{prefix}[{}] ", ln.ts),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
         Span::styled(
             lvl_tag,
             Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(ln.body.clone(), body_style),
+        Span::styled(ln.body.clone(), Style::default().fg(body_color)),
     ])
 }
 
@@ -919,18 +1065,18 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &Mode) {
+fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &ModeState) {
     let text = match mode {
-        Mode::Normal => {
-            " :q quit  H/L tab  <Space><Space> picker  PgUp/PgDn scroll  click/wheel".to_string()
+        ModeState::Normal => {
+            " :q  H/L tab  <Spc><Spc> picker  gg/G top/bot  PgUp/PgDn  click/wheel".to_string()
         }
-        Mode::Ex { buffer } => format!(":{buffer}_"),
-        Mode::Picker { .. } => " Esc cancel  Enter open  ↑/↓ or Ctrl-P/N".to_string(),
+        ModeState::Ex { buffer } => format!(":{buffer}_"),
+        ModeState::Picker { .. } => " Esc cancel  Enter open  ↑/↓ or Ctrl-P/N".to_string(),
     };
     let style = match mode {
-        Mode::Normal => Style::default().fg(Color::DarkGray),
-        Mode::Ex { .. } => Style::default().fg(Color::Yellow),
-        Mode::Picker { .. } => Style::default().fg(Color::Cyan),
+        ModeState::Normal => Style::default().fg(Color::Gray),
+        ModeState::Ex { .. } => Style::default().fg(Color::Yellow),
+        ModeState::Picker { .. } => Style::default().fg(Color::Cyan),
     };
     let p = Paragraph::new(text).style(style);
     f.render_widget(p, area);
