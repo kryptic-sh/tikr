@@ -1,0 +1,45 @@
+# Example tikr-dashboard config — mirrors the manual `run_perp` invocations
+# the user was running across 7 testnet shells.
+
+[account]
+env = "futures-testnet"
+state_dir = "./state"
+# key_file = "./keys/binance-testnet.txt"   # optional; env vars take precedence
+
+# Each [[bot]] entry spawns one in-process bot when the dashboard starts.
+# StaticGrid example with defaults overridden:
+
+[[bot]]
+symbol = "BTCUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }
+
+[[bot]]
+symbol = "ETHUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }
+
+[[bot]]
+symbol = "BNBUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2, skew_strength = "0.5" }
+
+[[bot]]
+symbol = "SOLUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 3, inner_bps = 3, step_bps = 2 }
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }
+
+[[bot]]
+symbol = "HYPERUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2, skew_strength = "0.5" }
+
+[[bot]]
+symbol = "PROMPTUSDT"
+strategy = "static-grid"
+sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }

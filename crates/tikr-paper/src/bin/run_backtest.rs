@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_every_n_events: 0, // backtest = no snapshots
         skim: None,
         funding: None,
+        snapshot_tap: None,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.

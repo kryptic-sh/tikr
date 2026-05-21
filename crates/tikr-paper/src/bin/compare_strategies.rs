@@ -588,6 +588,7 @@ async fn run_one<S: Strategy>(
         snapshot_every_n_events: 0,
         skim,
         funding,
+        snapshot_tap: None,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;

@@ -46,6 +46,12 @@ pub struct RunnerConfig {
     /// `Δfunding = −position × mark × rate × (dt_secs / 28800)`.
     /// `None` disables (back-compat: no funding cost on backtests/paper).
     pub funding: Option<FundingConfig>,
+    /// Optional live snapshot publication target. When `Some`, the runner
+    /// writes a fresh [`PaperReport`] into the lock on the same cadence
+    /// as on-disk snapshots (`snapshot_every_n_events`). Lets a dashboard
+    /// or supervisor read live PnL/position state without polling
+    /// `state_dir`. `None` (default) disables — runner behaves as before.
+    pub snapshot_tap: Option<std::sync::Arc<std::sync::RwLock<Option<crate::PaperReport>>>>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -82,6 +88,7 @@ impl Default for RunnerConfig {
             snapshot_every_n_events: 100,
             skim: None,
             funding: None,
+            snapshot_tap: None,
         }
     }
 }
@@ -325,6 +332,11 @@ where
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
                 resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
+            if let Some(ref tap) = config.snapshot_tap
+                && let Ok(mut guard) = tap.write()
+            {
+                *guard = Some(report.clone());
+            }
             return report;
         }
     };
@@ -631,6 +643,11 @@ where
                     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
                         warn!("snapshot write failed: {}", e);
                     }
+                    if let Some(ref tap) = config.snapshot_tap
+                        && let Ok(mut guard) = tap.write()
+                    {
+                        *guard = Some(report.clone());
+                    }
                 }
             }
             // Live mode: process real exchange fills.
@@ -795,6 +812,11 @@ where
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
+    }
+    if let Some(ref tap) = config.snapshot_tap
+        && let Ok(mut guard) = tap.write()
+    {
+        *guard = Some(report.clone());
     }
     info!(
         runtime_secs = report.runtime_secs,
@@ -1215,6 +1237,7 @@ mod tests {
             snapshot_every_n_events: 100,
             skim: None,
             funding: None,
+            snapshot_tap: None,
         }
     }
 
@@ -1546,6 +1569,7 @@ mod tests {
             snapshot_every_n_events: 100,
             skim: None,
             funding: None,
+            snapshot_tap: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -1621,6 +1645,7 @@ mod tests {
             snapshot_every_n_events: 100,
             skim: None,
             funding: None,
+            snapshot_tap: None,
         };
         let (_tx, rx) = watch::channel(false);
 

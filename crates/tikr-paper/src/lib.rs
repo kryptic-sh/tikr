@@ -39,6 +39,7 @@ pub mod metrics;
 pub mod multi;
 pub mod report;
 pub mod runner;
+pub mod spawn;
 pub mod state;
 
 pub use alerts::{
@@ -48,4 +49,5 @@ pub use metrics::MetricRegistry;
 pub use multi::{MultiPaperReport, MultiSymbolRun, run_multi};
 pub use report::{PaperReport, SCHEMA_VERSION};
 pub use runner::{FundingConfig, RunnerConfig, SkimConfig, run, run_with_resume};
+pub use spawn::{BotHandle, BotSpec, StrategyChoice, live_runner_config, spawn_bot};
 pub use state::write_snapshot;
