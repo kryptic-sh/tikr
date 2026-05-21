@@ -50,7 +50,7 @@ use tikr_core::{
 };
 use tikr_venue::VenueError;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -333,10 +333,52 @@ pub async fn subscribe_user_data_stream(
     kind: MarketKind,
     symbol_filter: String,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
+    subscribe_user_data_stream_cancellable(
+        http,
+        env,
+        api_key,
+        key_material,
+        kind,
+        symbol_filter,
+        None,
+    )
+    .await
+}
+
+/// Like [`subscribe_user_data_stream`] but accepts a `shutdown_rx` so the
+/// internally-spawned tasks (keepalive PUT loop and WS read pump) can be
+/// stopped cleanly when the caller is done with the subscription.
+///
+/// Without this, dropping the returned receiver does NOT stop those tasks
+/// — they keep running forever, each holding an `Arc<HttpClient>` and the
+/// listenKey mutex. The dashboard supervisor restarts bots on every
+/// crash, so leaking those tasks compounds quickly.
+///
+/// Pass `Some(rx)` to get cancellable behavior; pass `None` (or use the
+/// non-cancellable wrapper) for one-shot tools like `run_perp` that exit
+/// the process on shutdown.
+pub async fn subscribe_user_data_stream_cancellable(
+    http: HttpClient,
+    env: BinanceEnv,
+    api_key: String,
+    key_material: Arc<BinanceKeyMaterial>,
+    kind: MarketKind,
+    symbol_filter: String,
+    shutdown_rx: Option<watch::Receiver<bool>>,
+) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     if env.is_futures() {
-        subscribe_futures_user_data_stream(http, env, api_key, kind, symbol_filter).await
+        subscribe_futures_user_data_stream(http, env, api_key, kind, symbol_filter, shutdown_rx)
+            .await
     } else {
-        subscribe_spot_user_data_stream(env, api_key, key_material, kind, symbol_filter).await
+        subscribe_spot_user_data_stream(
+            env,
+            api_key,
+            key_material,
+            kind,
+            symbol_filter,
+            shutdown_rx,
+        )
+        .await
     }
 }
 
@@ -350,6 +392,7 @@ async fn subscribe_spot_user_data_stream(
     key_material: Arc<BinanceKeyMaterial>,
     kind: MarketKind,
     symbol_filter: String,
+    shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     let stream = open_spot_user_data_ws(env, &api_key, &key_material).await?;
     let (tx, rx) = mpsc::unbounded_channel::<Fill>();
@@ -362,6 +405,7 @@ async fn subscribe_spot_user_data_stream(
         key_material,
         kind,
         symbol_filter,
+        shutdown_rx,
     ));
 
     Ok(rx)
@@ -376,13 +420,34 @@ async fn spot_user_data_pump(
     key_material: Arc<BinanceKeyMaterial>,
     kind: MarketKind,
     symbol_filter: String,
+    mut shutdown_rx: Option<watch::Receiver<bool>>,
 ) {
     let reconnect_min_ms: u64 = 1_000;
     let reconnect_max_ms: u64 = 30_000;
     let mut backoff_ms = reconnect_min_ms;
 
     loop {
-        let frame = stream.next().await;
+        let frame_fut = stream.next();
+        let shut_fut = async {
+            match shutdown_rx.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                    *rx.borrow()
+                }
+                None => std::future::pending::<bool>().await,
+            }
+        };
+        let frame;
+        tokio::select! {
+            f = frame_fut => { frame = f; }
+            signaled = shut_fut => {
+                if signaled {
+                    debug!("spot WS-API: shutdown signaled");
+                    return;
+                }
+                continue;
+            }
+        }
         match frame {
             None => {
                 warn!(
@@ -502,6 +567,7 @@ async fn subscribe_futures_user_data_stream(
     api_key: String,
     kind: MarketKind,
     symbol_filter: String,
+    shutdown_rx: Option<watch::Receiver<bool>>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     let listen_key = mint_listen_key(&http, env, &api_key).await?;
     let ws_url = format!("{}/{}", ws_base_url(env), listen_key);
@@ -513,21 +579,43 @@ async fn subscribe_futures_user_data_stream(
     // Share the current listenKey between the WS task and keepalive task.
     let shared_key: Arc<Mutex<String>> = Arc::new(Mutex::new(listen_key.clone()));
 
-    // Keepalive task: PUT every 20 min.
+    // Keepalive task: PUT every 20 min. When `shutdown_rx` is provided
+    // the loop exits on signal; otherwise it runs forever (matches the
+    // long-standing one-shot `run_perp` behavior).
     let http2 = http.clone();
     let api_key2 = api_key.clone();
     let shared_key2 = shared_key.clone();
+    let mut keepalive_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(KEEPALIVE_INTERVAL_MS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await; // burn first immediate tick
         loop {
-            interval.tick().await;
-            let key = shared_key2.lock().await.clone();
-            if let Err(e) = keepalive_listen_key(&http2, env, &api_key2, &key).await {
-                warn!(error = ?e, "userDataStream: keepalive PUT failed");
-            } else {
-                debug!("userDataStream: keepalive PUT OK");
+            let tick = interval.tick();
+            let shut = async {
+                match keepalive_shutdown.as_mut() {
+                    Some(rx) => {
+                        let _ = rx.changed().await;
+                        *rx.borrow()
+                    }
+                    None => std::future::pending::<bool>().await,
+                }
+            };
+            tokio::select! {
+                _ = tick => {
+                    let key = shared_key2.lock().await.clone();
+                    if let Err(e) = keepalive_listen_key(&http2, env, &api_key2, &key).await {
+                        warn!(error = ?e, "userDataStream: keepalive PUT failed");
+                    } else {
+                        debug!("userDataStream: keepalive PUT OK");
+                    }
+                }
+                signaled = shut => {
+                    if signaled {
+                        debug!("userDataStream: keepalive shutdown");
+                        return;
+                    }
+                }
             }
         }
     });
@@ -542,6 +630,7 @@ async fn subscribe_futures_user_data_stream(
         kind,
         shared_key,
         symbol_filter,
+        shutdown_rx,
     ));
 
     Ok(rx)
@@ -564,13 +653,34 @@ async fn user_data_pump(
     kind: MarketKind,
     shared_key: Arc<Mutex<String>>,
     symbol_filter: String,
+    mut shutdown_rx: Option<watch::Receiver<bool>>,
 ) {
     let reconnect_min_ms: u64 = 1_000;
     let reconnect_max_ms: u64 = 30_000;
     let mut backoff_ms = reconnect_min_ms;
 
     loop {
-        let frame = stream.next().await;
+        let frame_fut = stream.next();
+        let shut_fut = async {
+            match shutdown_rx.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                    *rx.borrow()
+                }
+                None => std::future::pending::<bool>().await,
+            }
+        };
+        let frame;
+        tokio::select! {
+            f = frame_fut => { frame = f; }
+            signaled = shut_fut => {
+                if signaled {
+                    debug!("userDataStream WS: shutdown signaled");
+                    return;
+                }
+                continue;
+            }
+        }
         match frame {
             None => {
                 if !reconnect_user_data(

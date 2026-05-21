@@ -57,11 +57,12 @@ pub fn spawn_supervisor(
 
                 let handle_result = run_once(&ctx).await;
                 match handle_result {
-                    Ok(handle) => {
+                    Ok(spawned) => {
                         attempt = 0; // reset backoff on successful spawn
-                        shared_state.attach_handle(&symbol_str, &handle);
-                        let shutdown_tx = handle.shutdown_tx.clone();
-                        let mut join = handle.join;
+                        shared_state.attach_handle(&symbol_str, &spawned.handle);
+                        let shutdown_tx = spawned.handle.shutdown_tx.clone();
+                        let us_shutdown_tx = spawned.us_shutdown_tx;
+                        let mut join = spawned.handle.join;
                         // Wait for either the bot to finish OR global shutdown.
                         loop {
                             tokio::select! {
@@ -77,6 +78,10 @@ pub fn spawn_supervisor(
                                             shared_state.set_status(&symbol_str, BotStatus::Crashed(format!("join error: {e}")));
                                         }
                                     }
+                                    // Bot is done — tell its dedicated user-stream
+                                    // tasks (keepalive + WS pump) to wind down so
+                                    // they don't outlive this incarnation.
+                                    let _ = us_shutdown_tx.send(true);
                                     break;
                                 }
                                 _ = global_shutdown.changed() => {
@@ -84,6 +89,7 @@ pub fn spawn_supervisor(
                                         info!("global shutdown — stopping bot");
                                         let _ = shutdown_tx.send(true);
                                         let _ = tokio::time::timeout(Duration::from_secs(5), &mut join).await;
+                                        let _ = us_shutdown_tx.send(true);
                                         return;
                                     }
                                 }
@@ -119,8 +125,19 @@ pub fn spawn_supervisor(
     })
 }
 
+/// A bot + the shutdown sender for its dedicated user-stream tasks.
+///
+/// `us_shutdown_tx` is the per-incarnation watch sender that signals the
+/// keepalive + WS pump tasks spawned by `subscribe_user_data_stream` to
+/// exit. The supervisor fires it after the bot's join resolves (success
+/// OR crash) so those tasks don't outlive the bot.
+struct SpawnedBot {
+    handle: BotHandle,
+    us_shutdown_tx: watch::Sender<bool>,
+}
+
 /// One spawn cycle: build venue, subscribe fills, spawn bot.
-async fn run_once(ctx: &SupervisorCtx) -> Result<BotHandle> {
+async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     let symbol = venue::perp_symbol(&ctx.cfg.symbol);
 
     // Reset uses a throwaway client so the run_with_resume venue can be
@@ -135,12 +152,23 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<BotHandle> {
         venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol).await?;
 
     info!("subscribing user data stream");
-    let fill_rx =
-        venue::subscribe_fills(ctx.env, &ctx.api_key, ctx.key_material.clone(), &symbol).await?;
+    let (us_shutdown_tx, us_shutdown_rx) = watch::channel(false);
+    let fill_rx = venue::subscribe_fills(
+        ctx.env,
+        &ctx.api_key,
+        ctx.key_material.clone(),
+        &symbol,
+        us_shutdown_rx,
+    )
+    .await?;
 
     let spec = to_spec(&ctx.cfg, symbol, &venue_for_run, &ctx.base_state_dir)?;
     info!(strategy = %spec.strategy.label(), "spawning bot");
-    Ok(tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx)))
+    let handle = tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx));
+    Ok(SpawnedBot {
+        handle,
+        us_shutdown_tx,
+    })
 }
 
 async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {

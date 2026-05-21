@@ -343,8 +343,12 @@ where
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
                 resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
+            // Non-blocking publish: if a reader (dashboard TUI) is mid-
+            // draw and holds the read lock, skip this tick rather than
+            // blocking the event loop. The next snapshot interval will
+            // refresh — eventual consistency is fine for a dashboard.
             if let Some(ref tap) = config.snapshot_tap
-                && let Ok(mut guard) = tap.write()
+                && let Ok(mut guard) = tap.try_write()
             {
                 *guard = Some(report.clone());
             }
@@ -694,7 +698,12 @@ where
                 }
             } => {
                 let Some(fill) = fill else {
-                    info!("external fill channel closed");
+                    // Channel closed unexpectedly — either planned
+                    // shutdown (cancellable user_stream tasks dropped
+                    // the sender) or the WS pump exited mid-session.
+                    // Drop out so the supervisor can re-spawn with a
+                    // fresh subscription.
+                    warn!("external fill channel closed; runner exiting for respawn");
                     break;
                 };
                 let fill_clone = fill.clone();
@@ -1181,7 +1190,9 @@ fn publish_live(
         last_fill_size: last_fill.as_ref().map(|f| f.size.0).unwrap_or_default(),
         inventory_usdt: pos.size.0 * last_mid.0,
     };
-    if let Ok(mut guard) = tap.write() {
+    // Non-blocking: dashboard reader can be holding the read lock
+    // during a draw; the next fill / snapshot tick will refresh.
+    if let Ok(mut guard) = tap.try_write() {
         *guard = Some(snap);
     }
 }

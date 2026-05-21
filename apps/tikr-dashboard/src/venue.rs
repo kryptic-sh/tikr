@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use reqwest::Client as HttpClient;
-use tikr_binance::user_stream::subscribe_user_data_stream;
+use tikr_binance::user_stream::subscribe_user_data_stream_cancellable;
 use tikr_binance::{
     BinanceClient, BinanceEnv, BinanceKeyMaterial, env_with_product_fallback,
     load_credentials_from_file, load_key_material_from_env, product_var,
 };
 use tikr_core::{Asset, Fill, MarketKind, Symbol, VenueId};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Parse an env string like `"futures-testnet"` / `"futures-mainnet"`.
 pub fn parse_env(s: &str) -> Result<BinanceEnv> {
@@ -105,22 +105,29 @@ pub async fn build_venue(
 }
 
 /// Subscribe to userDataStream for `symbol`, returning the fill receiver.
+///
+/// `shutdown_rx` is propagated to the internal keepalive + WS pump tasks
+/// so they exit cleanly when the bot is being restarted — without this
+/// they would leak with every supervisor respawn (each holding an
+/// `Arc<HttpClient>` + a listenKey mutex slot).
 pub async fn subscribe_fills(
     env: BinanceEnv,
     api_key: &str,
     key_material: Arc<BinanceKeyMaterial>,
     symbol: &Symbol,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>> {
     let http = HttpClient::new();
     let sym_filter =
         format!("{}{}", symbol.base.0.as_ref(), symbol.quote.0.as_ref()).to_uppercase();
-    subscribe_user_data_stream(
+    subscribe_user_data_stream_cancellable(
         http,
         env,
         api_key.to_string(),
         key_material,
         MarketKind::Perp,
         sym_filter,
+        Some(shutdown_rx),
     )
     .await
     .map_err(|e| anyhow::anyhow!("subscribe_user_data_stream: {e}"))
