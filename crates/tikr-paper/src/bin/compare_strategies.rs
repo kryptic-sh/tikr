@@ -98,6 +98,19 @@ struct Args {
     #[arg(long, default_value = "3,5")]
     sg_levels_list: String,
 
+    /// StaticGrid sweep: comma-separated `skew_strength` values
+    /// (decimals, e.g. "0,0.3,0.5,0.8,1.0").
+    #[arg(long, default_value = "0,0.5")]
+    sg_skew_list: String,
+
+    /// StaticGrid sweep: comma-separated `target_inventory_usdt` values.
+    #[arg(long, default_value = "50")]
+    sg_target_inventory_list: String,
+
+    /// StaticGrid sweep: comma-separated `rebuild_pos_ratio_delta` values.
+    #[arg(long, default_value = "0.3")]
+    sg_rebuild_pos_delta_list: String,
+
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
     /// to disable funding accrual entirely.
@@ -110,6 +123,14 @@ fn parse_u32_list(s: &str) -> Result<Vec<u32>, String> {
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .map(|t| t.parse::<u32>().map_err(|e| format!("bad u32 '{t}': {e}")))
+        .collect()
+}
+
+fn parse_decimal_list(s: &str) -> Result<Vec<Decimal>, String> {
+    s.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| Decimal::from_str(t).map_err(|e| format!("bad decimal '{t}': {e}")))
         .collect()
 }
 
@@ -453,25 +474,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sg_inner_sweep = parse_u32_list(&args.sg_inner_bps_list)?;
     let sg_step_sweep = parse_u32_list(&args.sg_step_bps_list)?;
     let sg_levels_sweep = parse_u32_list(&args.sg_levels_list)?;
+    let sg_skew_sweep = parse_decimal_list(&args.sg_skew_list)?;
+    let sg_target_sweep = parse_decimal_list(&args.sg_target_inventory_list)?;
+    let sg_rebuild_sweep = parse_decimal_list(&args.sg_rebuild_pos_delta_list)?;
     for &inner in &sg_inner_sweep {
         for &step in &sg_step_sweep {
             for &levels in &sg_levels_sweep {
-                let label = format!("SG in={inner} st={step} lv={levels}");
-                spawn_preset(
-                    &mut handles,
-                    &shared_data,
-                    &symbol,
-                    &label,
-                    StaticGrid::new(StaticGridConfig {
-                        notional_per_order: Decimal::from(100),
-                        levels_per_side: levels,
-                        inner_bps: inner,
-                        step_bps: step,
-                    }),
-                    fees,
-                    skim_cfg,
-                    funding_cfg,
-                );
+                for &skew in &sg_skew_sweep {
+                    for &target in &sg_target_sweep {
+                        for &rebuild_delta in &sg_rebuild_sweep {
+                            let label = format!(
+                                "SG in={inner} st={step} lv={levels} sk={skew} tgt={target} rb={rebuild_delta}",
+                            );
+                            spawn_preset(
+                                &mut handles,
+                                &shared_data,
+                                &symbol,
+                                &label,
+                                StaticGrid::new(StaticGridConfig {
+                                    notional_per_order: Decimal::from(100),
+                                    levels_per_side: levels,
+                                    inner_bps: inner,
+                                    step_bps: step,
+                                    skew_strength: skew,
+                                    target_inventory_usdt: target,
+                                    rebuild_pos_ratio_delta: rebuild_delta,
+                                }),
+                                fees,
+                                skim_cfg,
+                                funding_cfg,
+                            );
+                        }
+                    }
+                }
             }
         }
     }

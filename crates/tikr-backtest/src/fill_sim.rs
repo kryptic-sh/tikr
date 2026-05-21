@@ -132,6 +132,12 @@ pub struct FillSim {
     pending: Vec<PendingOp>,
     live_quotes: Vec<LiveQuote>,
     book_state: HashMap<Symbol, BookState>,
+    /// Intents rejected during the last `apply_pending` pass (post-only
+    /// crosses the touch). Paper-mode runner drains this after each
+    /// `on_market_event` and routes each entry through
+    /// `strategy.on_quote_rejected` so backtests exercise the same
+    /// recovery path live mode uses.
+    pending_rejections: Vec<(QuoteIntent, String)>,
 }
 
 impl FillSim {
@@ -142,7 +148,15 @@ impl FillSim {
             pending: Vec::new(),
             live_quotes: Vec::new(),
             book_state: HashMap::new(),
+            pending_rejections: Vec::new(),
         }
+    }
+
+    /// Drain post-only rejections accumulated since the last call.
+    /// Returns `(intent, reason)` pairs the paper-mode runner can pass
+    /// straight to `strategy.on_quote_rejected`.
+    pub fn drain_rejections(&mut self) -> Vec<(QuoteIntent, String)> {
+        std::mem::take(&mut self.pending_rejections)
     }
 
     /// Snapshot of currently-resting orders for `symbol` as
@@ -292,6 +306,10 @@ impl FillSim {
         override_id: Option<QuoteId>,
     ) -> Option<Fill> {
         if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
+            self.pending_rejections.push((
+                intent.clone(),
+                "post-only would cross touch (paper)".to_string(),
+            ));
             return None;
         }
         // IOC / FOK: if the intent crosses the live touch, fill immediately

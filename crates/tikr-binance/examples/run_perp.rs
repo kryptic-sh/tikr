@@ -205,6 +205,15 @@ struct Args {
     /// StaticGrid: step between consecutive levels on the same side in bps.
     #[arg(long, default_value_t = 3u32)]
     sg_step_bps: u32,
+    /// StaticGrid: inventory-skew strength. 0.0 = symmetric, 1.0 = ±100%.
+    #[arg(long, default_value = "0.5")]
+    sg_skew_strength: String,
+    /// StaticGrid: position USDT at which skew saturates (clamped to ±1).
+    #[arg(long, default_value = "50")]
+    sg_target_inventory: String,
+    /// StaticGrid: rebuild on inventory drift > this ratio since last placement.
+    #[arg(long, default_value = "0.3")]
+    sg_rebuild_pos_delta: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +580,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 levels_per_side: args.sg_levels,
                 inner_bps: args.sg_inner_bps,
                 step_bps: args.sg_step_bps,
+                skew_strength: Decimal::from_str(&args.sg_skew_strength).map_err(|e| {
+                    format!(
+                        "--sg-skew-strength '{}' invalid: {}",
+                        args.sg_skew_strength, e
+                    )
+                })?,
+                target_inventory_usdt: Decimal::from_str(&args.sg_target_inventory).map_err(
+                    |e| {
+                        format!(
+                            "--sg-target-inventory '{}' invalid: {}",
+                            args.sg_target_inventory, e
+                        )
+                    },
+                )?,
+                rebuild_pos_ratio_delta: Decimal::from_str(&args.sg_rebuild_pos_delta).map_err(
+                    |e| {
+                        format!(
+                            "--sg-rebuild-pos-delta '{}' invalid: {}",
+                            args.sg_rebuild_pos_delta, e
+                        )
+                    },
+                )?,
             });
             run_with_resume(
                 venue,

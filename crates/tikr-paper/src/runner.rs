@@ -548,6 +548,36 @@ where
                     let _ = fill_sim.on_market_event(&event, ts);
                 }
 
+                // Paper-mode post-only rejections: FillSim collected any
+                // PostOnly intent whose price would cross the touch this
+                // tick. Route each through `strategy.on_quote_rejected` so
+                // the strategy's recovery path is exercised in backtests
+                // (mirrors the live-mode recovery loop in
+                // dispatch_post_fill_actions). Resulting actions queue
+                // through fill_sim and apply on the NEXT event.
+                if !live_mode {
+                    let rejections = fill_sim.drain_rejections();
+                    if !rejections.is_empty() {
+                        let rec_pos = tracker.snapshot();
+                        for (rej_intent, rej_reason) in rejections {
+                            let rec_quotes = fill_sim.live_quotes_for(&symbol);
+                            let rec_ctx = StrategyContext {
+                                symbol: &symbol,
+                                now: ts,
+                                position: &rec_pos,
+                                recent_fills: &[],
+                                latest_book: &current_book,
+                                open_quotes: &rec_quotes,
+                            };
+                            let recovery_actions =
+                                strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
+                            for action in recovery_actions {
+                                fill_sim.on_action(action, ts);
+                            }
+                        }
+                    }
+                }
+
                 // Skim-mode: after fills land this tick, check whether net
                 // realized P&L (excluding skimmed dollars) crossed the next
                 // threshold and convert that chunk to base asset at last_mid.
