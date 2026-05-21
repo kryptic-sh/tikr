@@ -86,6 +86,10 @@ struct UiState {
     /// captured so chord actions can compute "page up / page down" in
     /// proportion to what the user actually sees.
     last_log_visible: usize,
+    /// Last drawn log line count for the active tab — captured so the
+    /// scroll handlers can compute a valid anchor when transitioning
+    /// from Follow → Anchored without waiting for a render.
+    last_log_total: usize,
     /// Current modal state.
     mode: ModeState,
     /// Keymap for chord dispatch in Normal mode.
@@ -105,6 +109,7 @@ impl UiState {
             last_log_rect: None,
             last_tab_ranges: Vec::new(),
             last_log_visible: 0,
+            last_log_total: 0,
             mode: ModeState::Normal,
             keymap,
             last_key_ts: None,
@@ -269,7 +274,14 @@ fn to_hjkl_key(k: &crossterm::event::KeyEvent) -> Option<hjkl_keymap::KeyEvent> 
         _ => return None,
     };
     let mut mods = Hm::NONE;
-    if k.modifiers.contains(Cm::SHIFT) {
+    // Vim convention: a capital letter chord (`H`, `G`, `L`, ...) is the
+    // literal character without an explicit SHIFT modifier. Crossterm
+    // delivers Shift+h as `Char('H')` WITH `KeyModifiers::SHIFT`, which
+    // would never match a `Chord::parse("H")` event. Drop the SHIFT bit
+    // when the char is already uppercase so the keymap sees what its
+    // chord trie expects.
+    let is_uppercase_char = matches!(k.code, KeyCode::Char(c) if c.is_ascii_uppercase());
+    if k.modifiers.contains(Cm::SHIFT) && !is_uppercase_char {
         mods |= Hm::SHIFT;
     }
     if k.modifiers.contains(Cm::CONTROL) {
@@ -315,29 +327,24 @@ fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mu
 /// (toward older lines), positive = scroll down (toward newest).
 fn scroll_log(ui: &mut UiState, delta: i64) {
     let visible = ui.last_log_visible.max(1);
-    match ui.log_view {
-        LogView::Follow => {
-            if delta < 0 {
-                // First scroll up: anchor just above the current bottom.
-                // `total` is unknown here, but caller uses log_top relative
-                // to total at render time; choose a high "from top" that
-                // gets clamped down to (total - visible) on render.
-                ui.log_view = LogView::Anchored(usize::MAX);
-                // Now apply the requested upward step.
-                scroll_log(ui, delta);
-            }
-        }
-        LogView::Anchored(top) => {
-            let new_top = if delta < 0 {
-                top.saturating_sub((-delta) as usize)
-            } else {
-                top.saturating_add(delta as usize)
-            };
-            ui.log_view = LogView::Anchored(new_top);
-            // Tail snap-back handled at render time by detecting that the
-            // anchor is at-or-past the live tail position.
-            let _ = visible;
-        }
+    let total = ui.last_log_total;
+    let max_top = total.saturating_sub(visible);
+    let current_top = match ui.log_view {
+        LogView::Follow => max_top,
+        LogView::Anchored(t) => t.min(max_top),
+    };
+    let new_top = if delta < 0 {
+        current_top.saturating_sub((-delta) as usize)
+    } else {
+        current_top.saturating_add(delta as usize)
+    };
+    // If we've caught up to (or moved past) the tail going DOWN, snap
+    // back to Follow so new lines stream in. Otherwise pin to the
+    // anchor so the viewport sticks even as new lines arrive.
+    if delta >= 0 && new_top >= max_top {
+        ui.log_view = LogView::Follow;
+    } else {
+        ui.log_view = LogView::Anchored(new_top);
     }
 }
 
@@ -784,6 +791,7 @@ fn draw_logs(
     let total = log_lines.len();
     let visible = area.height.saturating_sub(2) as usize; // borders eat 2 rows
     ui.last_log_visible = visible;
+    ui.last_log_total = total;
 
     // Resolve viewport. Anchored(top) is sticky — new lines arriving don't
     // shift the displayed range. Snap back to Follow when the anchor has
