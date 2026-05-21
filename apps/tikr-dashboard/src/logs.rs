@@ -17,10 +17,21 @@ use tracing_subscriber::registry::LookupSpan;
 /// Max log lines kept per symbol in the ring buffer.
 pub const LOG_RING_SIZE: usize = 500;
 
+/// One captured log line.
+#[derive(Clone)]
+pub struct LogLine {
+    /// Severity (drives color in the TUI).
+    pub level: tracing::Level,
+    /// Formatted `HH:MM:SS` prefix.
+    pub ts: String,
+    /// Body (message + serialized fields).
+    pub body: String,
+}
+
 /// Shared per-symbol log store. Keyed by `BTCUSDT`-style symbol string.
 #[derive(Clone, Default)]
 pub struct LogStore {
-    inner: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+    inner: Arc<Mutex<HashMap<String, VecDeque<LogLine>>>>,
 }
 
 impl LogStore {
@@ -30,7 +41,7 @@ impl LogStore {
     }
 
     /// Append a log line to `symbol`'s ring; trims to [`LOG_RING_SIZE`].
-    pub fn append(&self, symbol: &str, line: String) {
+    pub fn append(&self, symbol: &str, line: LogLine) {
         if let Ok(mut guard) = self.inner.lock() {
             let buf = guard.entry(symbol.to_string()).or_default();
             buf.push_back(line);
@@ -41,7 +52,7 @@ impl LogStore {
     }
 
     /// Snapshot the lines for `symbol` (oldest first).
-    pub fn snapshot(&self, symbol: &str) -> Vec<String> {
+    pub fn snapshot(&self, symbol: &str) -> Vec<LogLine> {
         match self.inner.lock() {
             Ok(guard) => guard
                 .get(symbol)
@@ -131,15 +142,20 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let line = format!(
-            "[{:02}:{:02}:{:02}] {} {}",
+        let ts = format!(
+            "{:02}:{:02}:{:02}",
             (now / 3600) % 24,
             (now / 60) % 60,
             now % 60,
-            event.metadata().level(),
-            msg.0
         );
-        self.store.append(&symbol, line);
+        self.store.append(
+            &symbol,
+            LogLine {
+                level: *event.metadata().level(),
+                ts,
+                body: msg.0,
+            },
+        );
     }
 
     fn on_new_span(

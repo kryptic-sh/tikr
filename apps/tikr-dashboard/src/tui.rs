@@ -1,25 +1,73 @@
-//! ratatui draw + event loop.
+//! ratatui draw + event loop with mouse support.
 
 use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{ExecutableCommand, event};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use tokio::sync::watch;
+use tracing::Level;
 
-use crate::logs::LogStore;
-use crate::state::{AccountAggregate, BotStatus, SharedBotState};
+use crate::logs::{LogLine, LogStore};
+use crate::state::{AccountAggregate, BotStatus, BotViewSnapshot, SharedBotState};
 
 const DRAW_INTERVAL_MS: u64 = 250;
-const EVENT_POLL_MS: u64 = 50;
+const EVENT_POLL_MS: u64 = 30;
+
+/// UI state owned by the render loop.
+struct UiState {
+    active_tab: usize,
+    /// Offset from the newest log line. 0 = pinned to bottom.
+    log_scroll: usize,
+    /// Last-drawn rects so mouse events can hit-test.
+    last_tab_rect: Option<Rect>,
+    last_log_rect: Option<Rect>,
+    /// Per-tab `(start_x, end_x)` in absolute terminal coords.
+    last_tab_ranges: Vec<(u16, u16)>,
+}
+
+impl UiState {
+    fn new() -> Self {
+        Self {
+            active_tab: 0,
+            log_scroll: 0,
+            last_tab_rect: None,
+            last_log_rect: None,
+            last_tab_ranges: Vec::new(),
+        }
+    }
+
+    fn hit_tab(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = self.last_tab_rect?;
+        if y < rect.y || y >= rect.y + rect.height {
+            return None;
+        }
+        for (idx, (sx, ex)) in self.last_tab_ranges.iter().enumerate() {
+            if x >= *sx && x < *ex {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn in_log_pane(&self, x: u16, y: u16) -> bool {
+        let Some(r) = self.last_log_rect else {
+            return false;
+        };
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+}
 
 /// Run the TUI until the user presses `q` (or Ctrl-C).
 ///
@@ -33,33 +81,26 @@ pub async fn run(
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(crossterm::terminal::EnterAlternateScreen)?;
+    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut active_tab: usize = 0;
+    let mut ui = UiState::new();
     let mut last_draw = Instant::now();
 
     loop {
-        // 1. Pump events.
-        if event::poll(Duration::from_millis(EVENT_POLL_MS))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            let views = state.views();
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('c')
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    break;
+        // 1. Pump events (keys + mouse).
+        if event::poll(Duration::from_millis(EVENT_POLL_MS))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let views = state.views();
+                    if handle_key(key, &views, &mut ui) {
+                        break;
+                    }
                 }
-                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if !views.is_empty() => {
-                    active_tab = (active_tab + 1) % views.len();
-                }
-                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if !views.is_empty() => {
-                    active_tab = (active_tab + views.len().saturating_sub(1)) % views.len();
+                Event::Mouse(mev) => {
+                    let views = state.views();
+                    handle_mouse(mev, &views, &mut ui);
                 }
                 _ => {}
             }
@@ -68,16 +109,16 @@ pub async fn run(
         // 2. Throttled redraw.
         if last_draw.elapsed() >= Duration::from_millis(DRAW_INTERVAL_MS) {
             let views = state.views();
-            if active_tab >= views.len() && !views.is_empty() {
-                active_tab = views.len() - 1;
+            if ui.active_tab >= views.len() && !views.is_empty() {
+                ui.active_tab = views.len() - 1;
             }
-            let active_symbol = views.get(active_tab).map(|v| v.symbol.clone());
+            let active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
             let log_lines = active_symbol
                 .as_deref()
                 .map(|s| logs.snapshot(s))
                 .unwrap_or_default();
             let agg = AccountAggregate::compute(&views);
-            terminal.draw(|f| draw(f, &views, active_tab, &agg, &log_lines))?;
+            terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui))?;
             last_draw = Instant::now();
         }
     }
@@ -85,18 +126,64 @@ pub async fn run(
     // Cleanup.
     let _ = global_shutdown.send(true);
     disable_raw_mode()?;
-    terminal
-        .backend_mut()
-        .execute(crossterm::terminal::LeaveAlternateScreen)?;
+    let backend = terminal.backend_mut();
+    backend.execute(DisableMouseCapture)?;
+    backend.execute(crossterm::terminal::LeaveAlternateScreen)?;
     Ok(())
+}
+
+fn handle_key(
+    key: crossterm::event::KeyEvent,
+    views: &[BotViewSnapshot],
+    ui: &mut UiState,
+) -> bool {
+    use crossterm::event::KeyModifiers;
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if !views.is_empty() => {
+            ui.active_tab = (ui.active_tab + 1) % views.len();
+            ui.log_scroll = 0;
+        }
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if !views.is_empty() => {
+            ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
+            ui.log_scroll = 0;
+        }
+        KeyCode::PageUp => ui.log_scroll = ui.log_scroll.saturating_add(10),
+        KeyCode::PageDown => ui.log_scroll = ui.log_scroll.saturating_sub(10),
+        KeyCode::Home => ui.log_scroll = usize::MAX,
+        KeyCode::End => ui.log_scroll = 0,
+        _ => {}
+    }
+    false
+}
+
+fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
+    match mev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = ui.hit_tab(mev.column, mev.row)
+                && idx < views.len()
+            {
+                ui.active_tab = idx;
+                ui.log_scroll = 0;
+            }
+        }
+        MouseEventKind::ScrollUp if ui.in_log_pane(mev.column, mev.row) => {
+            ui.log_scroll = ui.log_scroll.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown if ui.in_log_pane(mev.column, mev.row) => {
+            ui.log_scroll = ui.log_scroll.saturating_sub(3);
+        }
+        _ => {}
+    }
 }
 
 fn draw(
     f: &mut Frame<'_>,
-    views: &[crate::state::BotViewSnapshot],
-    active: usize,
+    views: &[BotViewSnapshot],
     agg: &AccountAggregate,
-    log_lines: &[String],
+    log_lines: &[LogLine],
+    ui: &mut UiState,
 ) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -107,54 +194,63 @@ fn draw(
         ])
         .split(f.area());
 
-    draw_tabs(f, outer[0], views, active);
-    draw_body(f, outer[1], views, active, agg, log_lines);
+    draw_tabs(f, outer[0], views, ui);
+    draw_body(f, outer[1], views, ui.active_tab, agg, log_lines, ui);
     draw_footer(f, outer[2]);
 }
 
-fn draw_tabs(
-    f: &mut Frame<'_>,
-    area: Rect,
-    views: &[crate::state::BotViewSnapshot],
-    active: usize,
-) {
-    let titles: Vec<Line> = views
-        .iter()
-        .map(|v| {
-            let color = match v.status {
-                BotStatus::Running => Color::Green,
-                BotStatus::Crashed(_) => Color::Red,
-                BotStatus::Restarting(_) => Color::Yellow,
-                BotStatus::Starting => Color::Cyan,
-            };
-            Line::from(vec![
-                Span::styled(format!(" {} ", v.symbol), Style::default().fg(Color::White)),
-                Span::styled(format!("[{}]", v.status.tag()), Style::default().fg(color)),
-            ])
-        })
-        .collect();
-    let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" tikr-dashboard "),
-        )
-        .select(active)
-        .highlight_style(
+fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut UiState) {
+    // Custom render so we control click hit-boxes exactly.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" tikr-dashboard ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    let mut x = inner.x;
+
+    for (i, v) in views.iter().enumerate() {
+        let (color, tag) = match &v.status {
+            BotStatus::Running => (Color::Green, v.status.tag()),
+            BotStatus::Crashed(_) => (Color::Red, v.status.tag()),
+            BotStatus::Restarting(_) => (Color::Yellow, v.status.tag()),
+            BotStatus::Starting => (Color::Cyan, v.status.tag()),
+        };
+        let active = i == ui.active_tab;
+        let label = format!(" {} [{}] ", v.symbol, tag);
+        let w = label.chars().count() as u16;
+        let style = if active {
             Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD)
-                .bg(Color::DarkGray),
-        );
-    f.render_widget(tabs, area);
+        } else {
+            Style::default().fg(color)
+        };
+        spans.push(Span::styled(label, style));
+        ranges.push((x, x + w));
+        x = x.saturating_add(w);
+        spans.push(Span::raw("│"));
+        x = x.saturating_add(1);
+    }
+
+    let para = Paragraph::new(Line::from(spans));
+    f.render_widget(para, inner);
+
+    ui.last_tab_rect = Some(area);
+    ui.last_tab_ranges = ranges;
 }
 
 fn draw_body(
     f: &mut Frame<'_>,
     area: Rect,
-    views: &[crate::state::BotViewSnapshot],
+    views: &[BotViewSnapshot],
     active: usize,
     agg: &AccountAggregate,
-    log_lines: &[String],
+    log_lines: &[LogLine],
+    ui: &mut UiState,
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -166,16 +262,11 @@ fn draw_body(
         .split(area);
 
     draw_account(f, cols[0], views, agg);
-    draw_logs(f, cols[1], views.get(active), log_lines);
+    draw_logs(f, cols[1], views.get(active), log_lines, ui);
     draw_bot_detail(f, cols[2], views.get(active));
 }
 
-fn draw_account(
-    f: &mut Frame<'_>,
-    area: Rect,
-    views: &[crate::state::BotViewSnapshot],
-    agg: &AccountAggregate,
-) {
+fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &AccountAggregate) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("bots ", Style::default().fg(Color::Gray)),
@@ -250,24 +341,70 @@ fn draw_account(
 fn draw_logs(
     f: &mut Frame<'_>,
     area: Rect,
-    active: Option<&crate::state::BotViewSnapshot>,
-    log_lines: &[String],
+    active: Option<&BotViewSnapshot>,
+    log_lines: &[LogLine],
+    ui: &mut UiState,
 ) {
-    let title = active
-        .map(|v| format!(" {} logs ", v.symbol))
-        .unwrap_or_else(|| " logs ".to_string());
-    let items: Vec<ListItem> = log_lines
+    let total = log_lines.len();
+    let visible = area.height.saturating_sub(2) as usize; // borders eat 2 rows
+    // Clamp scroll: 0 = pinned to newest; max = oldest visible at top.
+    let max_scroll = total.saturating_sub(visible);
+    if ui.log_scroll > max_scroll {
+        ui.log_scroll = max_scroll;
+    }
+    let scroll_str = if ui.log_scroll == 0 {
+        " (live) ".to_string()
+    } else {
+        format!(" ↑{} ", ui.log_scroll)
+    };
+    let title = match active {
+        Some(v) => format!(" {} logs{}", v.symbol, scroll_str),
+        None => " logs ".to_string(),
+    };
+
+    let end = total.saturating_sub(ui.log_scroll);
+    let start = end.saturating_sub(visible);
+    let slice = &log_lines[start..end];
+
+    let items: Vec<ListItem> = slice
         .iter()
-        .rev()
-        .take(area.height.saturating_sub(2) as usize)
-        .rev()
-        .map(|s| ListItem::new(s.as_str()))
+        .map(|ln| ListItem::new(format_log_line(ln)))
         .collect();
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(list, area);
+    ui.last_log_rect = Some(area);
 }
 
-fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&crate::state::BotViewSnapshot>) {
+fn format_log_line(ln: &LogLine) -> Line<'static> {
+    let (lvl_tag, lvl_color) = match ln.level {
+        Level::ERROR => ("ERROR", Color::Red),
+        Level::WARN => ("WARN ", Color::Yellow),
+        Level::INFO => ("INFO ", Color::Green),
+        Level::DEBUG => ("DEBUG", Color::Cyan),
+        Level::TRACE => ("TRACE", Color::DarkGray),
+    };
+    let body_style = match ln.level {
+        Level::ERROR => Style::default().fg(Color::Red),
+        Level::WARN => Style::default().fg(Color::Yellow),
+        Level::INFO => Style::default().fg(Color::White),
+        Level::DEBUG => Style::default().fg(Color::Cyan),
+        Level::TRACE => Style::default().fg(Color::DarkGray),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("[{}] ", ln.ts),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            lvl_tag,
+            Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(ln.body.clone(), body_style),
+    ])
+}
+
+fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapshot>) {
     let Some(v) = active else {
         let p =
             Paragraph::new("no bot").block(Block::default().borders(Borders::ALL).title(" bot "));
@@ -360,7 +497,7 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&crate::state::
 
 fn draw_footer(f: &mut Frame<'_>, area: Rect) {
     let p = Paragraph::new(
-        " q quit  ←/→ switch tab  Ctrl-C exit                                                ",
+        " q quit  ←/→ tab  click tab/wheel scroll  PgUp/PgDn jump  Home/End top/bottom        ",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(p, area);

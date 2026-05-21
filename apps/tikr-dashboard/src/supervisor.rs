@@ -182,4 +182,3 @@ async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {
         Err(e) => warn!(error = ?e, "venue.position failed"),
     }
 }
-

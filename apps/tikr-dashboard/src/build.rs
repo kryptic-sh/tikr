@@ -117,4 +117,3 @@ fn autobump_notional(
     }
     Ok(requested)
 }
-
