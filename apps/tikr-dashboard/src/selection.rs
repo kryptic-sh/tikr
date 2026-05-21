@@ -173,25 +173,32 @@ pub fn finalize_copy(sel: &mut MouseSelection, buf: &Buffer) -> Option<String> {
 /// over SSH.
 ///
 /// - **Inside an SSH session** (`$SSH_CONNECTION` / `$SSH_TTY` set):
-///   force the OSC52 path by wrapping a [`NullBackend`] (always returns
-///   `BackendUnavailable`) with [`SshAwareBackend`]. This avoids the
-///   auto-probe picking up an X11 backend over X-forwarding and writing
-///   to the *remote* clipboard. OSC52 travels back through the SSH
-///   stream so the operator's *local* terminal catches it.
+///   skip the auto-probe and go straight to OSC52. Without this guard,
+///   the probe would pick up an X11/Wayland backend over X-forwarding
+///   (or a logged-in desktop session on the remote host) and write to
+///   the *remote* clipboard, leaving the operator's local clipboard
+///   untouched.
 ///
-/// - **Locally**: use [`Clipboard::new`] which probes Wayland → X11 →
-///   OSC52 on Linux, NSPasteboard on macOS, Win32 on Windows. If the
-///   probe somehow fails, fall through to the SSH-aware OSC52-only
-///   handle (still works in any modern terminal).
+/// - **Locally**: [`Clipboard::new`] probes Wayland → X11 → NSPasteboard
+///   / Win32 → OSC52. If the probe somehow fails, fall back to the
+///   OSC52-only handle (works in any modern terminal).
 fn build_clipboard() -> Clipboard {
     let in_ssh =
         std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
     if in_ssh {
-        return Clipboard::with_backend(Box::new(SshAwareBackend::new(Box::new(NullBackend))));
+        return osc52_only_clipboard();
     }
-    Clipboard::new().unwrap_or_else(|_| {
-        Clipboard::with_backend(Box::new(SshAwareBackend::new(Box::new(NullBackend))))
-    })
+    Clipboard::new().unwrap_or_else(|_| osc52_only_clipboard())
+}
+
+/// Build a clipboard handle that ALWAYS routes through OSC52 by
+/// wrapping a [`NullBackend`] (every method returns
+/// `BackendUnavailable`) with [`SshAwareBackend`] — the decorator's
+/// fallback kicks in on every write, emitting the OSC52 escape via
+/// the crate's own implementation (tmux DCS passthrough, base64,
+/// size-cap enforcement).
+fn osc52_only_clipboard() -> Clipboard {
+    Clipboard::with_backend(Box::new(SshAwareBackend::new(Box::new(NullBackend))))
 }
 
 /// A [`Backend`] that fails every operation with
