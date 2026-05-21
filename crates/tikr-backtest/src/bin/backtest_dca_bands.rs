@@ -78,6 +78,7 @@ struct Args {
 
 #[derive(Debug, Clone, Copy)]
 struct Candle {
+    #[allow(dead_code)]
     open: f64,
     high: f64,
     low: f64,

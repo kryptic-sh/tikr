@@ -10,9 +10,9 @@
 //! 2. When **flat**, post post-only limits at both edges:
 //!    - BUY at `lower = center − width/2`
 //!    - SELL at `upper = center + width/2`
-//!    If the next candle's `low ≤ lower` the BUY fills; `high ≥ upper`
-//!    fills the SELL. Both filling = clean round trip (1 cycle, gross =
-//!    `upper − lower` per unit).
+//!      If the next candle's `low ≤ lower` the BUY fills; `high ≥ upper`
+//!      fills the SELL. Both filling = clean round trip (1 cycle, gross =
+//!      `upper − lower` per unit).
 //! 3. When **holding** (only one side filled, position open):
 //!    - Recompute band on the new bar.
 //!    - **Re-band exit** (loss cap): if long and `new_upper < entry`, the
@@ -26,7 +26,7 @@
 //! Fees: limit fills pay maker; re-band exits pay taker. No spread/slippage
 //! modeling beyond the OHLC bar (touches assumed at the edge price).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use polars::prelude::*;
@@ -73,7 +73,7 @@ struct Candle {
     open_ts_ms: u64,
 }
 
-fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
+fn load_candles(path: &Path) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let df = ParquetReader::new(file).finish()?;
     let ts = df.column("open_ts_ms")?.u64()?;
@@ -154,7 +154,6 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
     let mut pos = Position::Flat;
     let mut res = Result_::default();
 
-    let mut cum_pnl = 0.0f64;
     let mut peak = 0.0f64;
 
     // In fixed-spread mode, lookback can be 0 (we don't need history). Start
@@ -174,7 +173,7 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
         let c = candles[i];
 
         // Helper to track drawdown after each PnL change.
-        let mut update_dd = |realized: f64, fees: f64, peak: &mut f64, max_dd: &mut f64| {
+        let update_dd = |realized: f64, fees: f64, peak: &mut f64, max_dd: &mut f64| {
             let cur = realized - fees;
             if cur > *peak {
                 *peak = cur;
@@ -200,7 +199,7 @@ fn simulate(candles: &[Candle], args: &Args) -> Result_ {
                         res.cycles += 1;
                         res.round_trips += 1;
                         res.wins += 1;
-                        cum_pnl = res.realized - res.fees;
+                        let cum_pnl = res.realized - res.fees;
                         if cum_pnl > peak {
                             peak = cum_pnl;
                         }

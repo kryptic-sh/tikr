@@ -13,7 +13,7 @@
 //! of fills so consecutive same-side fills extend deeper while the opposite
 //! side stays close for a TP.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use polars::prelude::*;
@@ -58,13 +58,11 @@ struct Candle {
     low: f64,
     close: f64,
     open: f64,
-    open_ts_ms: u64,
 }
 
-fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
+fn load_candles(path: &Path) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let df = ParquetReader::new(file).finish()?;
-    let ts = df.column("open_ts_ms")?.u64()?;
     let open = df.column("open")?.f64()?;
     let high = df.column("high")?.f64()?;
     let low = df.column("low")?.f64()?;
@@ -77,7 +75,6 @@ fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error
             high: high.get(i).ok_or("null high")?,
             low: low.get(i).ok_or("null low")?,
             close: close.get(i).ok_or("null close")?,
-            open_ts_ms: ts.get(i).ok_or("null ts")?,
         });
     }
     Ok(out)
@@ -196,7 +193,7 @@ fn parse_symbols(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn symbol_to_path(data_dir: &PathBuf, sym: &str, suffix: &str) -> PathBuf {
+fn symbol_to_path(data_dir: &Path, sym: &str, suffix: &str) -> PathBuf {
     let base = sym.trim_end_matches("USDT").to_lowercase();
     data_dir.join(format!("{base}{suffix}"))
 }

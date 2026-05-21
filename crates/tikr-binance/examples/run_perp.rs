@@ -60,7 +60,7 @@ use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    LayeredGridConfig, SimpleGap, SimpleGapConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::signal;
@@ -96,6 +96,9 @@ enum StrategyArg {
     /// StaticGrid — passive grid that rebuilds only when batch is consumed.
     #[value(name = "static-grid", alias = "sg")]
     StaticGrid,
+    /// SimpleGap — fixed-gap pair; adds one pair after each fill.
+    #[value(name = "simple-gap", alias = "sgap")]
+    SimpleGap,
 }
 
 #[derive(Parser, Debug)]
@@ -219,6 +222,17 @@ struct Args {
     /// StaticGrid: upper bound on adaptive scale multiplier (default 4.0).
     #[arg(long, default_value = "4.0")]
     sg_scale_max: String,
+    /// StaticGrid: disable inventory-driven asymmetric skew. By default
+    /// the weak side joins best bid/ask and the strong side widens by
+    /// `(1 + |ratio|)`; this flag forces a symmetric ladder.
+    #[arg(long, default_value_t = false)]
+    sg_no_auto_skew: bool,
+    /// SimpleGap: fiat notional per order. Auto-bumped if below symbol minNotional × 1.2.
+    #[arg(long, default_value = "25")]
+    simple_gap_notional: String,
+    /// SimpleGap: fixed distance from mid in bps.
+    #[arg(long, default_value_t = 4u32)]
+    simple_gap_bps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +442,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maker_bps: 0,
             taker_bps: 0,
         },
+        max_position_notional_usdt: None,
+        silent_cancel_rate_per_min: 0.0,
+        rng_seed: 0,
     });
 
     let runner_config = RunnerConfig {
@@ -602,6 +619,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scale_max: Decimal::from_str(&args.sg_scale_max).map_err(|e| {
                     format!("--sg-scale-max '{}' invalid: {}", args.sg_scale_max, e)
                 })?,
+                auto_skew: !args.sg_no_auto_skew,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::SimpleGap => {
+            let requested = Decimal::from_str(&args.simple_gap_notional).map_err(|e| {
+                format!(
+                    "--simple-gap-notional '{}' invalid: {}",
+                    args.simple_gap_notional, e
+                )
+            })?;
+            let mut notional = requested;
+            if let Some(min_n) = venue.min_notional(&symbol) {
+                let floor = min_n * Decimal::from_str("1.2").unwrap();
+                if notional < floor {
+                    warn!(
+                        requested = %requested, min_notional = %min_n, bumped_to = %floor,
+                        "simple-gap-notional below symbol minNotional × 1.2 — auto-bumping"
+                    );
+                    notional = floor;
+                }
+            }
+            let strategy = SimpleGap::new(SimpleGapConfig {
+                notional_per_order: notional,
+                gap_bps: args.simple_gap_bps,
             });
             run_with_resume(
                 venue,

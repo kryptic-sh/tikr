@@ -46,7 +46,7 @@ pub struct BotConfig {
     /// Binance-style symbol, e.g. `"BTCUSDT"`.
     pub symbol: String,
     /// Strategy id: one of `"static-grid"`, `"layered-grid"`,
-    /// `"avellaneda-stoikov"`, `"glft"`, `"top-of-book"`.
+    /// `"simple-gap"`, `"avellaneda-stoikov"`, `"glft"`, `"top-of-book"`.
     pub strategy: String,
     /// StaticGrid params (only honored when `strategy = "static-grid"`).
     #[serde(default)]
@@ -54,6 +54,9 @@ pub struct BotConfig {
     /// LayeredGrid params.
     #[serde(default)]
     pub lg: Option<LgParams>,
+    /// SimpleGap params.
+    #[serde(default)]
+    pub simple_gap: Option<SimpleGapParams>,
 }
 
 /// StaticGrid configuration.
@@ -84,6 +87,10 @@ pub struct SgParams {
     /// Adaptive scaler upper bound.
     #[serde(default = "sg_default_scale_max")]
     pub scale_max: Decimal,
+    /// Enable inventory-driven asymmetric skew (default `true`).
+    /// `false` = symmetric ladder regardless of position.
+    #[serde(default = "sg_default_auto_skew")]
+    pub auto_skew: bool,
 }
 
 fn sg_default_notional() -> Decimal {
@@ -106,6 +113,9 @@ fn sg_default_scale_min() -> Decimal {
 }
 fn sg_default_scale_max() -> Decimal {
     Decimal::from(4)
+}
+fn sg_default_auto_skew() -> bool {
+    true
 }
 
 /// LayeredGrid configuration.
@@ -131,6 +141,25 @@ fn lg_default_levels() -> u32 {
 }
 fn lg_default_bps() -> u32 {
     6
+}
+
+/// SimpleGap configuration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct SimpleGapParams {
+    /// Notional per order.
+    #[serde(default = "simple_gap_default_notional")]
+    pub notional: Decimal,
+    /// Fixed distance from mid, in bps.
+    #[serde(default = "simple_gap_default_gap_bps")]
+    pub gap_bps: u32,
+}
+
+fn simple_gap_default_notional() -> Decimal {
+    Decimal::from(25)
+}
+fn simple_gap_default_gap_bps() -> u32 {
+    4
 }
 
 /// Parse a TOML config file.
@@ -160,12 +189,18 @@ mod tests {
             symbol = "ETHUSDT"
             strategy = "layered-grid"
             lg = { notional = 25, levels = 1, bps = 6 }
+
+            [[bot]]
+            symbol = "BNBUSDT"
+            strategy = "simple-gap"
+            simple_gap = { notional = 25, gap_bps = 4 }
         "#;
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
-        assert_eq!(cfg.bots.len(), 2);
+        assert_eq!(cfg.bots.len(), 3);
         assert_eq!(cfg.bots[0].symbol, "BTCUSDT");
         assert_eq!(cfg.bots[0].strategy, "static-grid");
         assert_eq!(cfg.bots[1].strategy, "layered-grid");
+        assert_eq!(cfg.bots[2].strategy, "simple-gap");
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(sg.levels, 2);
     }

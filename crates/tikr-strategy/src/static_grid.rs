@@ -68,6 +68,13 @@ pub struct StaticGridConfig {
     /// Upper bound on the adaptive scale multiplier. Default `4.0` =
     /// up to 4× widening under heavy fill pressure.
     pub scale_max: Decimal,
+    /// Enable inventory-driven asymmetric skew. When `true`:
+    /// the side accumulating inventory (weak side) joins the book at
+    /// best bid/ask, while the opposite side widens by `(1 + |ratio|)`.
+    /// When `false`: symmetric ladder at `inner_bps + k·step_bps` from
+    /// mid regardless of position — useful for testing baseline grid
+    /// behaviour or when an external risk layer manages inventory.
+    pub auto_skew: bool,
 }
 
 /// Static grid state.
@@ -116,6 +123,21 @@ pub struct StaticGrid {
 /// arrives (the position changed → rebuild_decision now computes
 /// against a different state, so the cooldown becomes irrelevant).
 const REFILL_COOLDOWN_NS: u64 = 2_000_000_000; // 2 seconds
+
+/// Sort an action batch by `|price - mid|` ascending so the venue sees
+/// inner orders first. Non-quote actions (CancelAll, Cancel(id)) keep
+/// distance `0` and stay at the front. Stable so same-distance entries
+/// preserve insertion order — important when a bid and ask are
+/// equidistant under symmetric skew (both fire same tick).
+fn sort_inside_out(actions: &mut [Action], mid: Price) {
+    actions.sort_by_key(|a| match a {
+        Action::Quote(q) => {
+            let d = q.price.0 - mid.0;
+            if d < Decimal::ZERO { -d } else { d }
+        }
+        _ => Decimal::ZERO,
+    });
+}
 
 impl StaticGrid {
     fn make_quote(&self, symbol: &Symbol, side: Side, price: Price) -> Action {
@@ -257,6 +279,15 @@ impl StaticGrid {
             actions.push(self.make_level(symbol, mid, best_bid, best_ask, pos_ratio, Side::Bid, k));
             actions.push(self.make_level(symbol, mid, best_bid, best_ask, pos_ratio, Side::Ask, k));
         }
+        // Submit innermost-first regardless of side. The naive
+        // `for k { bid, ask }` loop emits k=1 bid BEFORE k=0 ask when
+        // auto-skew puts the ask weak-side at the touch and pushes bids
+        // out by `(1 + |ratio|)`. On a one-sided market move that
+        // means the bot fires a stack of distant bids before its
+        // closest ask is even on the book — exactly the asymmetry we
+        // want to avoid. Sorting by |price - mid| ascending sends the
+        // nearest-to-mid quote first whatever its side.
+        sort_inside_out(&mut actions, mid);
         actions
     }
 
@@ -294,19 +325,26 @@ impl StaticGrid {
         let adaptive = self.adaptive_scale();
         let base_bps = Decimal::from(self.config.inner_bps + self.config.step_bps * k) * adaptive;
 
-        // Identify weak side from inventory direction.
-        let weak_side = if pos_ratio > Decimal::ZERO {
-            Some(Side::Ask) // long → closing side is Ask
-        } else if pos_ratio < Decimal::ZERO {
-            Some(Side::Bid) // short → closing side is Bid
+        // Identify weak side from inventory direction. When auto_skew
+        // is off both legs fall through to the symmetric branches —
+        // `is_weak = false` and `abs_ratio = 0` collapse the math back
+        // to plain `inner_bps + k·step_bps` from mid.
+        let (is_weak, abs_ratio) = if self.config.auto_skew {
+            let weak_side = if pos_ratio > Decimal::ZERO {
+                Some(Side::Ask) // long → closing side is Ask
+            } else if pos_ratio < Decimal::ZERO {
+                Some(Side::Bid) // short → closing side is Bid
+            } else {
+                None // flat → no asymmetry
+            };
+            let abs = if pos_ratio < Decimal::ZERO {
+                -pos_ratio
+            } else {
+                pos_ratio
+            };
+            (weak_side == Some(side), abs)
         } else {
-            None // flat → no asymmetry
-        };
-        let is_weak = weak_side == Some(side);
-        let abs_ratio = if pos_ratio < Decimal::ZERO {
-            -pos_ratio
-        } else {
-            pos_ratio
+            (false, Decimal::ZERO)
         };
 
         let price = match side {
@@ -583,6 +621,7 @@ mod tests {
             fillrate_window_secs: window_secs,
             scale_min: Decimal::from_str(sc_min).unwrap(),
             scale_max: Decimal::from_str(sc_max).unwrap(),
+            auto_skew: true,
         }
     }
 
@@ -671,5 +710,40 @@ mod tests {
     #[should_panic(expected = "scale_min")]
     fn invalid_scale_bounds_panic_on_new() {
         StaticGrid::new(cfg("5", 60, "5", "2"));
+    }
+
+    #[test]
+    fn build_batch_emits_inside_out() {
+        let mut c = cfg("0", 60, "1", "4");
+        c.levels_per_side = 3;
+        c.inner_bps = 5;
+        c.step_bps = 5;
+        c.auto_skew = false;
+        let g = StaticGrid::new(c);
+        let sym = Symbol {
+            base: tikr_core::Asset::new("BTC"),
+            quote: tikr_core::Asset::new("USDT"),
+            venue: tikr_core::VenueId::new("test"),
+            kind: tikr_core::MarketKind::Perp,
+        };
+        let mid = Price(Decimal::from(100_000));
+        let actions = g.build_batch(&sym, mid, mid, mid, Decimal::ZERO);
+        // Extract |price - mid| sequence; must be non-decreasing.
+        let dists: Vec<Decimal> = actions
+            .iter()
+            .map(|a| match a {
+                Action::Quote(q) => {
+                    let d = q.price.0 - mid.0;
+                    if d < Decimal::ZERO { -d } else { d }
+                }
+                _ => panic!("non-quote action in batch"),
+            })
+            .collect();
+        for w in dists.windows(2) {
+            assert!(w[0] <= w[1], "batch not sorted inside-out: {dists:?}");
+        }
+        // Innermost pair = inner_bps = 5bp distance on a 100_000 mid = 50.
+        assert_eq!(dists[0], Decimal::from(50));
+        assert_eq!(dists[1], Decimal::from(50));
     }
 }

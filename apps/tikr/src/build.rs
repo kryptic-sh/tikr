@@ -9,7 +9,7 @@ use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
-use tikr_strategy::{LayeredGridConfig, StaticGridConfig};
+use tikr_strategy::{LayeredGridConfig, SimpleGapConfig, StaticGridConfig};
 
 use crate::config::{BotConfig, LgParams};
 
@@ -26,9 +26,10 @@ pub fn to_spec(
     let strategy = match cfg.strategy.as_str() {
         "static-grid" | "sg" => build_sg(cfg, &symbol, venue)?,
         "layered-grid" | "lg" => build_lg(cfg, &symbol, venue)?,
+        "simple-gap" | "sgap" => build_simple_gap(cfg, &symbol, venue)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, simple-gap)"
             ));
         }
     };
@@ -52,6 +53,9 @@ pub fn to_spec(
             maker_bps: 0,
             taker_bps: 0,
         },
+        max_position_notional_usdt: None,
+        silent_cancel_rate_per_min: 0.0,
+        rng_seed: 0,
     });
 
     Ok(BotSpec {
@@ -84,6 +88,7 @@ fn build_sg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<S
         fillrate_window_secs: sg.fillrate_window_secs,
         scale_min: sg.scale_min,
         scale_max: sg.scale_max,
+        auto_skew: sg.auto_skew,
     }))
 }
 
@@ -99,6 +104,24 @@ fn build_lg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<S
         notional_per_order: notional,
         levels_per_side: lg.levels,
         inner_bps: lg.bps,
+    }))
+}
+
+fn build_simple_gap(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+) -> Result<StrategyChoice> {
+    let simple_gap = cfg.simple_gap.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=simple-gap but [bot.simple_gap] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(simple_gap.notional, symbol, venue)?;
+    Ok(StrategyChoice::SimpleGap(SimpleGapConfig {
+        notional_per_order: notional,
+        gap_bps: simple_gap.gap_bps,
     }))
 }
 

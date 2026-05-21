@@ -11,7 +11,7 @@ use tikr_core::{
     Timestamp,
 };
 use tikr_strategy::Action;
-use tikr_venue::{QuoteId, QuoteIntent};
+use tikr_venue::{OpenOrder, QuoteId, QuoteIntent};
 
 /// Per-venue fee schedule. Negative maker = rebate.
 #[derive(Debug, Clone, Copy)]
@@ -26,11 +26,28 @@ pub struct VenueFees {
 #[derive(Debug, Clone)]
 pub struct FillSimConfig {
     /// Latency between action submission and venue ack, in milliseconds.
+    /// Realistic Binance: ~50ms one-way (NA → AWS-Tokyo). Set non-zero
+    /// to exercise post-only rejects on fast-moving markets: the book
+    /// can move through our intended price between decision and apply.
     pub submit_latency_ms: u64,
     /// Latency between cancel submission and venue ack, in milliseconds.
     pub cancel_latency_ms: u64,
     /// Per-venue fee schedule.
     pub fees: VenueFees,
+    /// Hard cap on signed position USDT notional. `None` = unlimited.
+    /// When set, Place ops are rejected with a synthetic "margin
+    /// insufficient" reason if applying the quote would push
+    /// |position| past this cap. Simulates Binance `-2019`.
+    pub max_position_notional_usdt: Option<Decimal>,
+    /// Per-minute probability that any individual live quote gets
+    /// silently dropped, simulating venue-side cancel/expire that the
+    /// user_stream WS misses (the live reconciliation loop normally
+    /// catches these via `Venue::open_orders`). `0.0` = disabled.
+    /// Typical realistic value: `0.005` (0.5% per quote per minute).
+    pub silent_cancel_rate_per_min: f64,
+    /// Deterministic RNG seed for silent cancellations. Same seed =
+    /// same dropped quotes for reproducible backtests.
+    pub rng_seed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,17 +155,35 @@ pub struct FillSim {
     /// `strategy.on_quote_rejected` so backtests exercise the same
     /// recovery path live mode uses.
     pending_rejections: Vec<(QuoteIntent, String)>,
+    /// Signed position notional in USDT per symbol. Positive = long.
+    /// Maintained by maker fills (`match_trade`) and taker fills
+    /// (`place_or_reject` IOC arm). Used for synthetic margin rejects.
+    position_notional: HashMap<Symbol, Decimal>,
+    /// xorshift64 state for silent-cancellation rolls.
+    rng_state: u64,
+    /// Last `on_market_event` timestamp, in nanoseconds. Used to compute
+    /// the elapsed window for `silent_cancel_rate_per_min`.
+    last_event_ts_ns: Option<u64>,
 }
 
 impl FillSim {
     /// Construct a new fill simulator from `cfg`.
     pub fn new(cfg: FillSimConfig) -> Self {
+        // xorshift64 cannot start at 0 — degenerate fixed point.
+        let rng_state = if cfg.rng_seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            cfg.rng_seed
+        };
         Self {
             cfg,
             pending: Vec::new(),
             live_quotes: Vec::new(),
             book_state: HashMap::new(),
             pending_rejections: Vec::new(),
+            position_notional: HashMap::new(),
+            rng_state,
+            last_event_ts_ns: None,
         }
     }
 
@@ -169,7 +204,8 @@ impl FillSim {
     /// `size_remaining` carries the live remaining size, NOT the original
     /// intent size — important for strategies that look up partial state.
     pub fn live_quotes_for(&self, symbol: &Symbol) -> Vec<(QuoteId, QuoteIntent)> {
-        self.live_quotes
+        let mut out: Vec<(QuoteId, QuoteIntent)> = self
+            .live_quotes
             .iter()
             .filter(|q| &q.symbol == symbol)
             .map(|q| {
@@ -189,7 +225,26 @@ impl FillSim {
                     },
                 )
             })
-            .collect()
+            .collect();
+        // Live mode: include in-flight Place ops that already carry a
+        // venue-issued id. They're physically resting on the exchange
+        // book even though `apply_pending` hasn't promoted them into
+        // `live_quotes` yet. Excluding them makes the strategy think
+        // the side is empty between back-to-back fills and trigger a
+        // spurious RefillSide — open-order count then balloons past
+        // `levels_per_side`. Pure-paper Place ops (override_id=None)
+        // stay excluded since the venue doesn't know about them.
+        for p in &self.pending {
+            if let Op::Place {
+                intent,
+                override_id: Some(qid),
+            } = &p.op
+                && &intent.symbol == symbol
+            {
+                out.push((*qid, intent.clone()));
+            }
+        }
+        out
     }
 
     /// Schedule a strategy action for venue submission at `now + appropriate_latency_ms`.
@@ -245,6 +300,7 @@ impl FillSim {
     /// taken out by the trade-through model. Also emits taker fills for any
     /// pending IOC/FOK ops that became eligible this tick.
     pub fn on_market_event(&mut self, ev: &MarketEvent, now: Timestamp) -> Vec<Fill> {
+        self.silent_cancel_tick(now);
         let mut fills = self.apply_pending(now);
         match ev {
             MarketEvent::BookUpdate { snapshot } => {
@@ -267,6 +323,38 @@ impl FillSim {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Drop random subset of `live_quotes` to simulate venue-side silent
+    /// cancels (cancel/expire events the user-stream WS misses; live mode
+    /// catches these via the `Venue::open_orders` reconciliation tick).
+    /// The strategy is NOT notified — runner reconciliation eventually
+    /// purges the stale ids from its view, mirroring live behaviour.
+    fn silent_cancel_tick(&mut self, now: Timestamp) {
+        let rate = self.cfg.silent_cancel_rate_per_min;
+        if rate <= 0.0 {
+            self.last_event_ts_ns = Some(now.0);
+            return;
+        }
+        let elapsed_ns = match self.last_event_ts_ns {
+            Some(prev) => now.0.saturating_sub(prev),
+            None => 0,
+        };
+        self.last_event_ts_ns = Some(now.0);
+        if elapsed_ns == 0 || self.live_quotes.is_empty() {
+            return;
+        }
+        let elapsed_min = elapsed_ns as f64 / 60_000_000_000.0;
+        let p = (rate * elapsed_min).clamp(0.0, 1.0);
+        if p <= 0.0 {
+            return;
+        }
+        let mut state = self.rng_state;
+        self.live_quotes.retain(|_| {
+            let r = next_unit_f64(&mut state);
+            r >= p
+        });
+        self.rng_state = state;
+    }
 
     fn apply_pending(&mut self, now: Timestamp) -> Vec<Fill> {
         let pivot = self.pending.partition_point(|p| p.scheduled_ts_ns <= now.0);
@@ -312,6 +400,29 @@ impl FillSim {
             ));
             return None;
         }
+        // Synthetic Binance `-2019` (margin insufficient). At place-time,
+        // if applying this intent *as a fill* would push |position| past
+        // the configured cap, reject. Cheap approximation of the live
+        // pre-trade margin check.
+        if let Some(cap) = self.cfg.max_position_notional_usdt {
+            let pos = self
+                .position_notional
+                .get(&intent.symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let delta = intent.price.0 * intent.size.0;
+            let projected = match intent.side {
+                Side::Bid => pos + delta,
+                Side::Ask => pos - delta,
+            };
+            if projected.abs() > cap {
+                self.pending_rejections.push((
+                    intent.clone(),
+                    "margin insufficient (paper -2019)".to_string(),
+                ));
+                return None;
+            }
+        }
         // IOC / FOK: if the intent crosses the live touch, fill immediately
         // at the touch price as a taker. If it doesn't cross, drop silently
         // (IOC = unfilled remainder gets cancelled; we treat 0 fill as full
@@ -341,6 +452,15 @@ impl FillSim {
                 Side::Ask => Side::Bid,
             };
             st.decrement_level(touched_side, touch_price, fill_size);
+            let delta = touch_price.0 * fill_size;
+            let entry = self
+                .position_notional
+                .entry(intent.symbol.clone())
+                .or_insert(Decimal::ZERO);
+            match intent.side {
+                Side::Bid => *entry += delta,
+                Side::Ask => *entry -= delta,
+            }
             return Some(Fill {
                 quote_id: QuoteId::new(),
                 price: touch_price,
@@ -388,11 +508,26 @@ impl FillSim {
 
     fn cancel_id(&mut self, id: QuoteId) {
         self.live_quotes.retain(|q| q.id != id);
+        // Also drop any not-yet-applied Place / Replace whose venue id
+        // matches — otherwise a pending entry would get promoted into
+        // `live_quotes` by the next `apply_pending`, even though the
+        // strategy already cancelled (or the venue already filled) the
+        // underlying order.
+        self.pending.retain(|p| match &p.op {
+            Op::Place {
+                override_id: Some(oid),
+                ..
+            } => *oid != id,
+            Op::Replace { id: rid, .. } => *rid != id,
+            _ => true,
+        });
     }
 
     /// Live mode: an external venue fill consumed one of our resting orders.
     /// Drop the corresponding `LiveQuote` so `live_quotes_for` and queue
-    /// state stay in sync with the real exchange.
+    /// state stay in sync with the real exchange. Also evicts any
+    /// in-flight Place/Replace op with the same venue id so a fill
+    /// arriving BEFORE `apply_pending` doesn't leave a ghost behind.
     pub fn drop_quote(&mut self, id: QuoteId) {
         self.cancel_id(id);
     }
@@ -414,6 +549,62 @@ impl FillSim {
         self.live_quotes
             .retain(|q| &q.symbol != symbol || valid_ids.contains(&q.id));
         before - self.live_quotes.len()
+    }
+
+    /// Reconcile in-memory live quote state to the venue's authoritative open
+    /// order list. Unlike [`Self::retain_quotes_for`], this is bidirectional:
+    /// it drops local ghosts AND imports venue-resting orders missing from the
+    /// local mirror.
+    ///
+    /// Returns `(removed_ghosts, added_missing)`.
+    pub fn reconcile_quotes_for(
+        &mut self,
+        symbol: &Symbol,
+        orders: &[OpenOrder],
+    ) -> (usize, usize) {
+        let valid_ids: std::collections::HashSet<QuoteId> = orders.iter().map(|o| o.id).collect();
+        let removed = self.retain_quotes_for(symbol, &valid_ids);
+
+        let mut known_ids: std::collections::HashSet<QuoteId> = self
+            .live_quotes
+            .iter()
+            .filter(|q| &q.symbol == symbol)
+            .map(|q| q.id)
+            .collect();
+        for p in &self.pending {
+            if let Op::Place {
+                intent,
+                override_id: Some(qid),
+            } = &p.op
+                && &intent.symbol == symbol
+            {
+                known_ids.insert(*qid);
+            }
+        }
+
+        let mut added = 0;
+        for order in orders {
+            if &order.symbol != symbol || known_ids.contains(&order.id) {
+                continue;
+            }
+            self.live_quotes.push(LiveQuote {
+                id: order.id,
+                symbol: order.symbol.clone(),
+                side: order.side,
+                price: order.price,
+                size_remaining: order.size,
+                // We do not know queue position for imported live orders.
+                // `0` is conservative for local open-count accuracy; these
+                // imports are only used in live-mode bookkeeping/UI and cancel
+                // targeting, not paper-mode fill simulation.
+                queue_ahead: Decimal::ZERO,
+                ts_submitted: Timestamp(0),
+            });
+            known_ids.insert(order.id);
+            added += 1;
+        }
+
+        (removed, added)
     }
 
     fn update_book_state(&mut self, snapshot: &Snapshot) {
@@ -551,6 +742,15 @@ impl FillSim {
                 ts: trade_ts,
                 is_full,
             });
+            let delta = fill_price.0 * fill_amount;
+            let entry = self
+                .position_notional
+                .entry(symbol.clone())
+                .or_insert(Decimal::ZERO);
+            match q.side {
+                Side::Bid => *entry += delta,
+                Side::Ask => *entry -= delta,
+            }
             q.size_remaining = Size(q.size_remaining.0 - fill_amount);
             trade_remaining -= fill_amount;
             if q.size_remaining.0 == Decimal::ZERO {
@@ -562,6 +762,23 @@ impl FillSim {
 
         out
     }
+}
+
+/// xorshift64 step. Deterministic given the seed.
+fn next_u64(s: &mut u64) -> u64 {
+    let mut x = *s;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *s = x;
+    x
+}
+
+/// Uniform `[0.0, 1.0)` from xorshift64. Uses 53 top bits of the draw,
+/// matching standard double-precision conversion.
+fn next_unit_f64(s: &mut u64) -> f64 {
+    let x = next_u64(s);
+    (x >> 11) as f64 / ((1u64 << 53) as f64)
 }
 
 /// Whether a resting quote on `quote_side` at `quote_price` would be taken by
@@ -657,6 +874,9 @@ mod tests {
                 maker_bps: 0,
                 taker_bps: 0,
             },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 0,
         }
     }
 
@@ -964,6 +1184,9 @@ mod tests {
                 maker_bps: -10,
                 taker_bps: 0,
             },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 0,
         };
         let mut sim = FillSim::new(cfg);
 
@@ -1002,6 +1225,9 @@ mod tests {
                 maker_bps: 0,
                 taker_bps: 5,
             },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 0,
         };
         let mut sim = FillSim::new(cfg);
         // Seed the book via a snapshot: best_bid=99, best_ask=101.

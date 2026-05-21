@@ -213,6 +213,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maker_bps: 0,
             taker_bps: 0,
         },
+        max_position_notional_usdt: None,
+        silent_cancel_rate_per_min: 0.0,
+        rng_seed: 0,
     });
 
     let runner_config = RunnerConfig {

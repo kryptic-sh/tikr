@@ -301,6 +301,12 @@ where
     let mut last_mid = Price(Decimal::ZERO);
     let mut last_fill: Option<Fill> = None;
     let started = Instant::now();
+    // Decouple in-memory `snapshot_tap` updates from event-count disk
+    // writes so the dashboard sidebar refreshes every ~250ms regardless
+    // of how chatty the symbol's book is. Disk persistence still rides
+    // on `snapshot_every_n_events`.
+    let mut last_tap_publish = started;
+    const TAP_MIN_INTERVAL: Duration = Duration::from_millis(250);
     // Track sim-time span from event timestamps so backtest reports show
     // data-time duration, not wall-clock replay speed.
     let mut first_event_ts: Option<Timestamp> = None;
@@ -433,8 +439,14 @@ where
                 };
 
                 let actions = strategy.on_event(&ctx, &event);
+
+                // Risk-gate filter — same `risk_ctx` for every action in this
+                // batch (tracker state can't change mid-loop since fills
+                // arrive via a separate select arm), so doing it up-front
+                // lets the dispatch loop below batch quotes without
+                // re-entering the gate per action.
+                let mut filtered: Vec<tikr_strategy::Action> = Vec::with_capacity(actions.len());
                 for action in actions {
-                    // Risk-gate check happens BEFORE the action is dispatched.
                     if let Some(gate) = risk_gate.as_mut() {
                         let pnl_now = tracker.report(last_mid);
                         let risk_ctx = RiskContext {
@@ -471,33 +483,63 @@ where
                             }
                         }
                     }
+                    filtered.push(action);
+                }
 
-                    // Live mode: dispatch the action to the real venue.
-                    // Fills come back via the external_fills channel.
-                    // Paper mode: skip the venue call (fill_sim simulates).
-                    //
-                    // Quote handling is special — we feed the venue's returned
-                    // QuoteId into FillSim so subsequent strategy `Cancel(id)`
-                    // actions reference ids the venue recognizes.
-                    if live_mode {
-                        match &action {
-                            tikr_strategy::Action::Quote(intent) => {
-                                match venue.quote(intent.clone()).await {
+                // Live mode: dispatch the action to the real venue.
+                // Fills come back via the external_fills channel.
+                // Paper mode: skip the venue call (fill_sim simulates).
+                //
+                // Quote handling is special — we feed the venue's returned
+                // QuoteId into FillSim so subsequent strategy `Cancel(id)`
+                // actions reference ids the venue recognizes.
+                //
+                // Consecutive `Quote` actions in `filtered` are dispatched
+                // concurrently via `join_all` so the venue sees them as
+                // close together in time as possible. The strategy already
+                // emits them inner-out (`sort_inside_out` in StaticGrid),
+                // but with concurrent dispatch they all leave the host at
+                // roughly the same instant — a fast market move can't fill
+                // the early orders on a single side before later orders
+                // even leave the box. Non-Quote actions still execute
+                // sequentially (Cancel/Requote/CancelAll have ordering
+                // semantics relative to neighbouring quotes).
+                if live_mode {
+                    let mut i = 0;
+                    while i < filtered.len() {
+                        if matches!(filtered[i], tikr_strategy::Action::Quote(_)) {
+                            let mut run_intents: Vec<QuoteIntent> = Vec::new();
+                            while i < filtered.len() {
+                                if let tikr_strategy::Action::Quote(intent) = &filtered[i] {
+                                    run_intents.push(intent.clone());
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let results = futures::future::join_all(
+                                run_intents
+                                    .iter()
+                                    .map(|intent| venue.quote(intent.clone())),
+                            )
+                            .await;
+                            for (intent, r) in run_intents.into_iter().zip(results.into_iter()) {
+                                match r {
                                     Ok(qid) => {
                                         info!(
                                             side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
                                             quote_id = ?qid, "live: order placed"
                                         );
-                                        fill_sim.enqueue_place_with_id(
-                                            intent.clone(),
-                                            ts,
-                                            qid,
-                                        );
+                                        fill_sim.enqueue_place_with_id(intent, ts, qid);
                                     }
-                                    Err(e) => warn!(error = ?e, "live: venue.quote failed"),
+                                    Err(e) => {
+                                        warn!(error = ?e, "live: venue.quote failed");
+                                    }
                                 }
-                                continue;
                             }
+                            continue;
+                        }
+                        match &filtered[i] {
                             tikr_strategy::Action::Requote { id, intent } => {
                                 match venue.requote(*id, intent.clone()).await {
                                     Ok(()) => info!(
@@ -518,9 +560,18 @@ where
                                 }
                             }
                             tikr_strategy::Action::NoOp => {}
+                            tikr_strategy::Action::Quote(_) => unreachable!(),
                         }
+                        // Mirror non-Quote actions into FillSim too so its
+                        // book of live quotes tracks cancels/requotes.
+                        fill_sim.on_action(filtered[i].clone(), ts);
+                        i += 1;
                     }
-                    fill_sim.on_action(action, ts);
+                } else {
+                    // Paper mode: all actions feed FillSim; no venue calls.
+                    for action in filtered {
+                        fill_sim.on_action(action, ts);
+                    }
                 }
 
                 // In paper mode: synthesize fills from FillSim.
@@ -679,7 +730,9 @@ where
                 let first_paper_snapshot = events_processed == 1;
                 let interval_due = config.snapshot_every_n_events > 0
                     && events_processed.is_multiple_of(config.snapshot_every_n_events as u64);
-                if first_paper_snapshot || interval_due {
+                let tap_due = config.snapshot_tap.is_some()
+                    && last_tap_publish.elapsed() >= TAP_MIN_INTERVAL;
+                if first_paper_snapshot || interval_due || tap_due {
                     let mut report = finalize(
                         &tracker,
                         last_mid,
@@ -701,8 +754,11 @@ where
                     // Skip the disk write on the first-event publish —
                     // there's no meaningful state to persist before any
                     // events have accumulated, and we don't want every
-                    // bot to spam the filesystem on startup.
+                    // bot to spam the filesystem on startup. ALSO skip
+                    // disk writes on time-only `tap_due` ticks; only the
+                    // event-count cadence (interval_due) earns persistence.
                     if !first_paper_snapshot
+                        && interval_due
                         && let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id)
                     {
                         warn!("snapshot write failed: {}", e);
@@ -711,6 +767,7 @@ where
                         && let Ok(mut guard) = tap.try_write()
                     {
                         *guard = Some(report.clone());
+                        last_tap_publish = Instant::now();
                     }
                 }
             }
@@ -746,21 +803,21 @@ where
                 )
                 .await;
                 last_fill = Some(fill_clone.clone());
-                publish_live(
-                    &config.live_tap,
-                    &tracker,
-                    &fill_sim,
-                    &symbol,
-                    last_mid,
-                    &current_book,
-                    buy_fills,
-                    sell_fills,
-                    &last_fill,
-                );
                 // Partial fill: order is still resting on the book, do not
                 // drop from FillSim and do not notify the strategy — the
                 // strategy should keep waiting for the remaining size.
                 if !fill_is_full {
+                    publish_live(
+                        &config.live_tap,
+                        &tracker,
+                        &fill_sim,
+                        &symbol,
+                        last_mid,
+                        &current_book,
+                        buy_fills,
+                        sell_fills,
+                        &last_fill,
+                    );
                     continue;
                 }
                 // Sync FillSim: drop the consumed quote so `live_quotes_for`
@@ -796,6 +853,20 @@ where
                     true,
                 )
                 .await;
+                // Publish AFTER local mirror has dropped the filled order and
+                // recorded the newly-created pair. Publishing earlier showed
+                // transient/stale open b/s counts under fill bursts.
+                publish_live(
+                    &config.live_tap,
+                    &tracker,
+                    &fill_sim,
+                    &symbol,
+                    last_mid,
+                    &current_book,
+                    buy_fills,
+                    sell_fills,
+                    &last_fill,
+                );
             }
             _ = status_tick.tick() => {
                 let pos = tracker.snapshot();
@@ -854,14 +925,25 @@ where
                 // to event rate.
                 match venue.open_orders(&symbol).await {
                     Ok(orders) => {
-                        let valid: std::collections::HashSet<tikr_venue::QuoteId> =
-                            orders.iter().map(|o| o.id).collect();
-                        let removed = fill_sim.retain_quotes_for(&symbol, &valid);
-                        if removed > 0 {
+                        let venue_open = orders.len();
+                        let (removed, added) = fill_sim.reconcile_quotes_for(&symbol, &orders);
+                        if removed > 0 || added > 0 {
                             warn!(
                                 ghosts = removed,
-                                venue_open = valid.len(),
-                                "order reconciliation: dropped FillSim ghosts not present on venue"
+                                missing = added,
+                                venue_open,
+                                "order reconciliation: synced FillSim mirror to venue"
+                            );
+                            publish_live(
+                                &config.live_tap,
+                                &tracker,
+                                &fill_sim,
+                                &symbol,
+                                last_mid,
+                                &current_book,
+                                buy_fills,
+                                sell_fills,
+                                &last_fill,
                             );
                         }
                     }
@@ -1087,6 +1169,7 @@ async fn dispatch_post_fill_actions<V, S>(
 /// Shared by paper mode (FillSim-synthesized fills) and live mode (external
 /// venue fills). Keeping this as a standalone async fn avoids code duplication
 /// in the two `select!` arms.
+#[allow(clippy::too_many_arguments)]
 async fn apply_fill(
     fill: Fill,
     tracker: &mut PositionTracker,
@@ -1395,6 +1478,9 @@ mod tests {
                 maker_bps: 0,
                 taker_bps: 0,
             },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 0,
         })
     }
 
@@ -1729,6 +1815,9 @@ mod tests {
                 maker_bps: 0,
                 taker_bps: 0,
             },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 0,
         });
 
         let temp = TempDir::new().unwrap();
@@ -1806,6 +1895,9 @@ mod tests {
                 maker_bps: 0,
                 taker_bps: 0,
             },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 0,
         });
 
         let temp = TempDir::new().unwrap();

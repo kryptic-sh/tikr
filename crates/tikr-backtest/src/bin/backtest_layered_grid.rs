@@ -28,7 +28,7 @@
 //! then unwind from any level back up. Inventory drift on fixed-fiat
 //! sizing means we accumulate base asset over time even on flat markets.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use polars::prelude::*;
@@ -342,7 +342,7 @@ fn parse_symbols(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn symbol_to_path(data_dir: &PathBuf, sym: &str, suffix: &str) -> PathBuf {
+fn symbol_to_path(data_dir: &Path, sym: &str, suffix: &str) -> PathBuf {
     let base = sym.trim_end_matches("USDT").to_lowercase();
     data_dir.join(format!("{base}{suffix}"))
 }

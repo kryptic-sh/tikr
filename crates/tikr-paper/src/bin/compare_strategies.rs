@@ -20,8 +20,8 @@ use tikr_core::{
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, MicroPrice, MicroPriceConfig, StaticGrid, StaticGridConfig, Strategy,
-    TopOfBook, TopOfBookConfig,
+    LayeredGridConfig, MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig, StaticGrid,
+    StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -116,11 +116,44 @@ struct Args {
     #[arg(long, default_value = "4.0")]
     sg_scale_max_list: String,
 
+    /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
+    #[arg(long, default_value = "4")]
+    simple_gap_bps_list: String,
+
+    /// SimpleGap notional per order.
+    #[arg(long, default_value = "100")]
+    simple_gap_notional: String,
+
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
     /// to disable funding accrual entirely.
     #[arg(long, default_value_t = 1i32)]
     funding_bps_per_8h: i32,
+
+    /// FillSim: submit-ack latency in ms. Bumping this from 0 exposes
+    /// post-only crosses on fast moves (book ticks through our intended
+    /// price between decision and ack). Realistic NA → AWS-Tokyo ~50ms.
+    #[arg(long, default_value_t = 50u64)]
+    sim_submit_latency_ms: u64,
+
+    /// FillSim: cancel-ack latency in ms.
+    #[arg(long, default_value_t = 10u64)]
+    sim_cancel_latency_ms: u64,
+
+    /// FillSim: synthetic `-2019` margin cap in USDT notional (signed
+    /// position abs). `0` = unlimited.
+    #[arg(long, default_value_t = 0.0_f64)]
+    sim_max_position_notional: f64,
+
+    /// FillSim: silent-cancel rate per minute per live quote (simulates
+    /// venue cancel/expire events the WS misses; runner reconciliation
+    /// eventually purges them). `0.0` = disabled.
+    #[arg(long, default_value_t = 0.0_f64)]
+    sim_silent_cancel_rate_per_min: f64,
+
+    /// FillSim: deterministic RNG seed for silent-cancel rolls.
+    #[arg(long, default_value_t = 0u64)]
+    sim_rng_seed: u64,
 }
 
 fn parse_u32_list(s: &str) -> Result<Vec<u32>, String> {
@@ -188,6 +221,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let sim_cfg_template = FillSimConfig {
+        submit_latency_ms: args.sim_submit_latency_ms,
+        cancel_latency_ms: args.sim_cancel_latency_ms,
+        fees,
+        max_position_notional_usdt: if args.sim_max_position_notional > 0.0 {
+            Some(Decimal::try_from(args.sim_max_position_notional)?)
+        } else {
+            None
+        },
+        silent_cancel_rate_per_min: args.sim_silent_cancel_rate_per_min,
+        rng_seed: args.sim_rng_seed,
+    };
+    let simple_gap_notional = Decimal::from_str(&args.simple_gap_notional)?;
+
     // Load + sort + validate parquet once; share across all presets via Arc.
     let load_start = std::time::Instant::now();
     let shared_data = LoadedReplayData::load(ReplayConfig {
@@ -226,6 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -244,6 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -263,6 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -282,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -301,6 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -320,6 +372,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     for max_imb in [3u32, 5, 7, 10, 20] {
@@ -341,6 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fees,
             skim_cfg,
             funding_cfg,
+            sim_cfg_template.clone(),
         );
     }
 
@@ -361,6 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -380,6 +435,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bnb_fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     spawn_preset(
@@ -399,6 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bnb_fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     // Micro-price sweep: half-spread 1/2/3/5 ticks. Direct comparable against
@@ -422,6 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fees,
             skim_cfg,
             funding_cfg,
+            sim_cfg_template.clone(),
         );
     }
 
@@ -442,6 +500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fees,
         skim_cfg,
         funding_cfg,
+        sim_cfg_template.clone(),
     );
 
     // Layered grid sweep — re-entry-scalping ladder, fill-driven. Re-entry
@@ -469,8 +528,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fees,
                 skim_cfg,
                 funding_cfg,
+                sim_cfg_template.clone(),
             );
         }
+    }
+
+    // SimpleGap — one fixed-distance bid/ask pair, then another pair after
+    // every fill. No cancels, skew, requotes, or inventory logic.
+    let simple_gap_sweep = parse_u32_list(&args.simple_gap_bps_list)?;
+    for &gap in &simple_gap_sweep {
+        let label = format!("SimpleGap gap={gap}bps");
+        spawn_preset(
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &label,
+            SimpleGap::new(SimpleGapConfig {
+                notional_per_order: simple_gap_notional,
+                gap_bps: gap,
+            }),
+            fees,
+            skim_cfg,
+            funding_cfg,
+            sim_cfg_template.clone(),
+        );
     }
 
     // StaticGrid sweep — place-once-then-sit grid. Triggers a fresh batch
@@ -510,10 +591,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         fillrate_window_secs: fpm_window,
                                         scale_min: sc_min,
                                         scale_max: sc_max,
+                                        auto_skew: true,
                                     }),
                                     fees,
                                     skim_cfg,
                                     funding_cfg,
+                                    sim_cfg_template.clone(),
                                 );
                             }
                         }
@@ -541,6 +624,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one<S: Strategy>(
     shared_data: Arc<LoadedReplayData>,
     symbol: Symbol,
@@ -549,14 +633,11 @@ async fn run_one<S: Strategy>(
     fees: VenueFees,
     skim: Option<SkimConfig>,
     funding: Option<FundingConfig>,
+    sim_cfg: FillSimConfig,
 ) -> PaperReport {
     let replay = ParquetReplay::from_shared(shared_data);
     let venue = BacktestVenue::new(replay);
-    let fill_sim = FillSim::new(FillSimConfig {
-        submit_latency_ms: 0,
-        cancel_latency_ms: 0,
-        fees,
-    });
+    let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
     let runner_config = RunnerConfig {
         state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
         snapshot_every_n_events: 0,
@@ -600,6 +681,7 @@ fn spawn_preset<S: Strategy + Send + 'static>(
     fees: VenueFees,
     skim: Option<SkimConfig>,
     funding: Option<FundingConfig>,
+    sim_cfg: FillSimConfig,
 ) {
     let sd = Arc::clone(shared_data);
     let sym = symbol.clone();
@@ -609,7 +691,7 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
     handles.push(tokio::spawn(async move {
-        let r = run_one(sd, sym, state_id, strategy, fees, skim, funding).await;
+        let r = run_one(sd, sym, state_id, strategy, fees, skim, funding, sim_cfg).await;
         (display, r)
     }));
 }

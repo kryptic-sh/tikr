@@ -1,0 +1,58 @@
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+# "futures-testnet" | "futures-mainnet"
+env = "futures-testnet"
+
+state_dir = "./state"
+
+
+[[bot]]
+symbol = "BTCUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+[[bot]]
+symbol = "ETHUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+[[bot]]
+symbol = "BNBUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+[[bot]]
+symbol = "SOLUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+[[bot]]
+symbol = "HYPERUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+[[bot]]
+symbol = "PROMPTUSDT"
+strategy = "simple-gap"
+[bot.simple_gap]
+
+
+# ─── SimpleGap template (uncomment to use) ─────────────────────────────────
+#
+# [[bot]]
+# symbol   = "BTCUSDT"
+#
+# [bot.simple_gap]
+# # notional = 25   # fiat $ per order
+# # gap_bps  = 4    # fixed distance from mid; adds one pair after every fill

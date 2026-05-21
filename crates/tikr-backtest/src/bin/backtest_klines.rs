@@ -10,7 +10,7 @@
 //! Real OHLC doesn't carry tick order; the pessimistic call is the honest
 //! assumption.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use polars::prelude::*;
@@ -47,18 +47,16 @@ struct Candle {
     open: f64,
     high: f64,
     low: f64,
-    close: f64,
     open_ts_ms: u64,
 }
 
-fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
+fn load_candles(path: &Path) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
     let file = std::fs::File::open(path)?;
     let df = ParquetReader::new(file).finish()?;
     let ts = df.column("open_ts_ms")?.u64()?;
     let open = df.column("open")?.f64()?;
     let high = df.column("high")?.f64()?;
     let low = df.column("low")?.f64()?;
-    let close = df.column("close")?.f64()?;
     let n = df.height();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -66,7 +64,6 @@ fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error
             open: open.get(i).ok_or("null open")?,
             high: high.get(i).ok_or("null high")?,
             low: low.get(i).ok_or("null low")?,
-            close: close.get(i).ok_or("null close")?,
             open_ts_ms: ts.get(i).ok_or("null ts")?,
         });
     }
@@ -112,7 +109,6 @@ fn simulate(candles: &[Candle], args: &Args, seed: u64) -> SimResult {
     };
 
     // Cumulative PnL tracking for drawdown.
-    let mut cum_pnl = 0.0f64;
     let mut peak = 0.0f64;
 
     // Position state. side: +1 long, -1 short, 0 flat. entry: fill price.
@@ -150,9 +146,7 @@ fn simulate(candles: &[Candle], args: &Args, seed: u64) -> SimResult {
 
         if hit_tp || hit_sl {
             // Conservative tie-break: SL first.
-            let (exit_price, is_win) = if hit_sl && hit_tp {
-                (sl_price, false)
-            } else if hit_sl {
+            let (exit_price, is_win) = if hit_sl {
                 (sl_price, false)
             } else {
                 (tp_price, true)
@@ -166,7 +160,7 @@ fn simulate(candles: &[Candle], args: &Args, seed: u64) -> SimResult {
             res.realized += realized;
             res.fees += exit_price * size * fee_rate; // exit taker fee
 
-            cum_pnl = res.realized - res.fees;
+            let cum_pnl = res.realized - res.fees;
             if cum_pnl > peak {
                 peak = cum_pnl;
             }

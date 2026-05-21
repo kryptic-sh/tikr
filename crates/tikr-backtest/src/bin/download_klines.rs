@@ -75,7 +75,7 @@ struct RawKline(
     String,                     // close
     String,                     // volume (base asset)
     u64,                        // close time (ms)
-    String,                     // quote volume
+    #[allow(dead_code)] String, // quote volume
     u64,                        // number of trades
     #[allow(dead_code)] String, // taker buy base
     #[allow(dead_code)] String, // taker buy quote
