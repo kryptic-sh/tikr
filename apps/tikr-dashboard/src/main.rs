@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
             strategy: b.strategy.clone(),
             status: BotStatus::Starting,
             snapshot: Arc::new(std::sync::RwLock::new(None)),
+            live: Arc::new(std::sync::RwLock::new(None)),
             shutdown_tx: None,
         };
         shared_state.insert(&b.symbol, view);

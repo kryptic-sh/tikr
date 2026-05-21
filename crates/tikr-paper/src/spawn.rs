@@ -19,6 +19,7 @@ use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::live::LiveSnapshot;
 use crate::report::PaperReport;
 use crate::runner::{RunnerConfig, run_with_resume};
 
@@ -85,6 +86,9 @@ pub struct BotHandle {
     /// ([`RunnerConfig::snapshot_every_n_events`]). `None` until the
     /// first snapshot lands.
     pub state: Arc<RwLock<Option<PaperReport>>>,
+    /// Live, fill-granular snapshot of position + open orders + last
+    /// fill. Updated on every fill AND every regular snapshot tick.
+    pub live: Arc<RwLock<Option<LiveSnapshot>>>,
     /// Shutdown signal. Send `true` to ask the bot to wind down.
     pub shutdown_tx: watch::Sender<bool>,
     /// Join handle for the underlying task. Resolves to the final
@@ -114,8 +118,10 @@ where
 {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state: Arc<RwLock<Option<PaperReport>>> = Arc::new(RwLock::new(None));
+    let live: Arc<RwLock<Option<LiveSnapshot>>> = Arc::new(RwLock::new(None));
     let mut config = spec.runner_config;
     config.snapshot_tap = Some(state.clone());
+    config.live_tap = Some(live.clone());
 
     let strategy_label = spec.strategy.label();
     let symbol = spec.symbol.clone();
@@ -213,6 +219,7 @@ where
         symbol: spec.symbol,
         strategy_label,
         state,
+        live,
         shutdown_tx,
         join,
     }
@@ -227,5 +234,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         skim: None,
         funding: None,
         snapshot_tap: None,
+        live_tap: None,
     }
 }

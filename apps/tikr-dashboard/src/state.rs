@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use rust_decimal::Decimal;
-use tikr_paper::{BotHandle, PaperReport};
+use tikr_paper::{BotHandle, LiveSnapshot, PaperReport};
 use tokio::sync::watch;
 
 /// Bot lifecycle status as the supervisor sees it.
@@ -45,6 +45,8 @@ pub struct BotView {
     pub status: BotStatus,
     /// Snapshot tap shared with the bot task. `None` initially.
     pub snapshot: Arc<RwLock<Option<PaperReport>>>,
+    /// Fill-granular live tap shared with the bot task.
+    pub live: Arc<RwLock<Option<LiveSnapshot>>>,
     /// Shutdown sender for the current incarnation (None between restarts).
     pub shutdown_tx: Option<watch::Sender<bool>>,
 }
@@ -109,6 +111,7 @@ impl SharedBotState {
             && let Some(v) = g.get_mut(symbol)
         {
             v.snapshot = handle.state.clone();
+            v.live = handle.live.clone();
             v.shutdown_tx = Some(handle.shutdown_tx.clone());
             v.status = BotStatus::Running;
         }
@@ -142,6 +145,7 @@ impl SharedBotState {
                     strategy: v.strategy.clone(),
                     status: v.status.clone(),
                     snapshot: v.snapshot.read().ok().and_then(|g| g.clone()),
+                    live: v.live.read().ok().and_then(|g| g.clone()),
                 })
             })
             .collect()
@@ -160,8 +164,10 @@ pub struct BotViewSnapshot {
     pub strategy: String,
     /// Current lifecycle status.
     pub status: BotStatus,
-    /// Latest live snapshot, if any.
+    /// Latest PaperReport snapshot, if any.
     pub snapshot: Option<PaperReport>,
+    /// Latest fill-granular live snapshot, if any.
+    pub live: Option<LiveSnapshot>,
 }
 
 /// Account-wide aggregate computed from all bot views.
@@ -179,6 +185,18 @@ pub struct AccountAggregate {
     pub events: u64,
     /// Σ fills emitted.
     pub fills: u64,
+    /// Σ buy-side fills.
+    pub buy_fills: u64,
+    /// Σ sell-side fills.
+    pub sell_fills: u64,
+    /// Σ resting buy quotes.
+    pub open_buys: u64,
+    /// Σ resting sell quotes.
+    pub open_sells: u64,
+    /// Σ |position × mid| in USDT (gross inventory exposure).
+    pub gross_inventory: Decimal,
+    /// Signed Σ position × mid in USDT (net directional bias).
+    pub net_inventory: Decimal,
     /// Count of bots currently in `Running` state.
     pub running_count: usize,
     /// Count of bots in `Crashed` state.
@@ -205,6 +223,14 @@ impl AccountAggregate {
                 a.net += r.net.0;
                 a.events = a.events.saturating_add(r.events_processed);
                 a.fills = a.fills.saturating_add(r.fills_emitted);
+            }
+            if let Some(ref lv) = v.live {
+                a.buy_fills = a.buy_fills.saturating_add(lv.buy_fills);
+                a.sell_fills = a.sell_fills.saturating_add(lv.sell_fills);
+                a.open_buys = a.open_buys.saturating_add(lv.open_buys as u64);
+                a.open_sells = a.open_sells.saturating_add(lv.open_sells as u64);
+                a.net_inventory += lv.inventory_usdt;
+                a.gross_inventory += lv.inventory_usdt.abs();
             }
         }
         a

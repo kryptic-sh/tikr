@@ -12,6 +12,7 @@
 //! exchange fills drive the tracker instead.
 
 use crate::alerts::{Alert, AlertSink};
+use crate::live::LiveSnapshot;
 use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
@@ -52,6 +53,14 @@ pub struct RunnerConfig {
     /// or supervisor read live PnL/position state without polling
     /// `state_dir`. `None` (default) disables — runner behaves as before.
     pub snapshot_tap: Option<std::sync::Arc<std::sync::RwLock<Option<crate::PaperReport>>>>,
+    /// Optional fine-grained live state publication target. When `Some`,
+    /// the runner writes a fresh [`crate::LiveSnapshot`] on every fill
+    /// AND every regular snapshot tick — much higher update frequency
+    /// than [`Self::snapshot_tap`], which fires only at
+    /// `snapshot_every_n_events`. Holds position size, open-order
+    /// counts, buy/sell split, last fill, and the best bid/ask/mid for
+    /// dashboards that need to refresh on every fill.
+    pub live_tap: Option<std::sync::Arc<std::sync::RwLock<Option<crate::LiveSnapshot>>>>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -89,6 +98,7 @@ impl Default for RunnerConfig {
             skim: None,
             funding: None,
             snapshot_tap: None,
+            live_tap: None,
         }
     }
 }
@@ -289,6 +299,7 @@ where
 
     let mut current_book = empty_snapshot(&symbol);
     let mut last_mid = Price(Decimal::ZERO);
+    let mut last_fill: Option<Fill> = None;
     let started = Instant::now();
     // Track sim-time span from event timestamps so backtest reports show
     // data-time duration, not wall-clock replay speed.
@@ -519,6 +530,18 @@ where
                             &symbol,
                         )
                         .await;
+                        last_fill = Some(fill_clone.clone());
+                        publish_live(
+                            &config.live_tap,
+                            &tracker,
+                            &fill_sim,
+                            &symbol,
+                            last_mid,
+                            &current_book,
+                            buy_fills,
+                            sell_fills,
+                            &last_fill,
+                        );
                         // Partial: the LiveQuote is still on the book (FillSim
                         // keeps it around with reduced size_remaining). Don't
                         // notify the strategy so it won't move/cancel a still-
@@ -648,6 +671,17 @@ where
                     {
                         *guard = Some(report.clone());
                     }
+                    publish_live(
+                        &config.live_tap,
+                        &tracker,
+                        &fill_sim,
+                        &symbol,
+                        last_mid,
+                        &current_book,
+                        buy_fills,
+                        sell_fills,
+                        &last_fill,
+                    );
                 }
             }
             // Live mode: process real exchange fills.
@@ -676,6 +710,18 @@ where
                     &symbol,
                 )
                 .await;
+                last_fill = Some(fill_clone.clone());
+                publish_live(
+                    &config.live_tap,
+                    &tracker,
+                    &fill_sim,
+                    &symbol,
+                    last_mid,
+                    &current_book,
+                    buy_fills,
+                    sell_fills,
+                    &last_fill,
+                );
                 // Partial fill: order is still resting on the book, do not
                 // drop from FillSim and do not notify the strategy — the
                 // strategy should keep waiting for the remaining size.
@@ -1079,6 +1125,67 @@ fn empty_snapshot(symbol: &Symbol) -> Snapshot {
     }
 }
 
+/// Publish a fresh [`LiveSnapshot`] into `tap` if present.
+///
+/// Called on every fill and at every regular snapshot tick so dashboards
+/// see position + open-order + last-fill state with sub-second latency.
+#[allow(clippy::too_many_arguments)]
+fn publish_live(
+    tap: &Option<std::sync::Arc<std::sync::RwLock<Option<LiveSnapshot>>>>,
+    tracker: &PositionTracker,
+    fill_sim: &FillSim,
+    symbol: &Symbol,
+    last_mid: Price,
+    last_book: &Snapshot,
+    buy_fills: u64,
+    sell_fills: u64,
+    last_fill: &Option<Fill>,
+) {
+    let Some(tap) = tap.as_ref() else {
+        return;
+    };
+    let pos = tracker.snapshot();
+    let quotes = fill_sim.live_quotes_for(symbol);
+    let mut open_buys: u32 = 0;
+    let mut open_sells: u32 = 0;
+    for (_, q) in &quotes {
+        match q.side {
+            tikr_core::Side::Bid => open_buys = open_buys.saturating_add(1),
+            tikr_core::Side::Ask => open_sells = open_sells.saturating_add(1),
+        }
+    }
+    let last_bid = last_book
+        .bids
+        .first()
+        .map(|l| l.price.0)
+        .unwrap_or_default();
+    let last_ask = last_book
+        .asks
+        .first()
+        .map(|l| l.price.0)
+        .unwrap_or_default();
+    let snap = LiveSnapshot {
+        position_size: pos.size.0,
+        avg_entry: pos.avg_entry.0,
+        last_mid: last_mid.0,
+        last_bid,
+        last_ask,
+        buy_fills,
+        sell_fills,
+        open_quotes: open_buys.saturating_add(open_sells),
+        open_buys,
+        open_sells,
+        last_fill_ts: last_fill.as_ref().map(|f| f.ts.0),
+        last_fill_side: last_fill.as_ref().map(|f| f.side),
+        last_fill_price: last_fill.as_ref().map(|f| f.price.0).unwrap_or_default(),
+        last_fill_size: last_fill.as_ref().map(|f| f.size.0).unwrap_or_default(),
+        inventory_usdt: pos.size.0 * last_mid.0,
+    };
+    if let Ok(mut guard) = tap.write() {
+        *guard = Some(snap);
+    }
+}
+
 fn event_ts(event: &MarketEvent) -> Timestamp {
     match event {
         MarketEvent::BookUpdate { snapshot } => snapshot.ts,
@@ -1238,6 +1345,7 @@ mod tests {
             skim: None,
             funding: None,
             snapshot_tap: None,
+            live_tap: None,
         }
     }
 
@@ -1570,6 +1678,7 @@ mod tests {
             skim: None,
             funding: None,
             snapshot_tap: None,
+            live_tap: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -1646,6 +1755,7 @@ mod tests {
             skim: None,
             funding: None,
             snapshot_tap: None,
+            live_tap: None,
         };
         let (_tx, rx) = watch::channel(false);
 

@@ -41,6 +41,7 @@ pub fn to_spec(
         skim: None,
         funding: None,
         snapshot_tap: None, // spawn_bot installs its own
+        live_tap: None,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

@@ -35,6 +35,7 @@
 #![deny(missing_docs)]
 
 pub mod alerts;
+pub mod live;
 pub mod metrics;
 pub mod multi;
 pub mod report;
@@ -45,6 +46,7 @@ pub mod state;
 pub use alerts::{
     Alert, AlertError, AlertSink, MultiSink, Severity, StdoutSink, WebhookFormat, WebhookSink,
 };
+pub use live::LiveSnapshot;
 pub use metrics::MetricRegistry;
 pub use multi::{MultiPaperReport, MultiSymbolRun, run_multi};
 pub use report::{PaperReport, SCHEMA_VERSION};

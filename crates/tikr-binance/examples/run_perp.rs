@@ -446,6 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         skim: None,
         funding: None,
         snapshot_tap: None,
+        live_tap: None,
     };
 
     info!(strategy = ?args.strategy, "strategy selected");

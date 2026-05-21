@@ -526,15 +526,15 @@ fn draw_body(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(28), // left: account
+            Constraint::Length(34), // left: bot detail
             Constraint::Min(40),    // middle: logs
-            Constraint::Length(34), // right: bot detail
+            Constraint::Length(28), // right: account
         ])
         .split(area);
 
-    draw_account(f, cols[0], views, agg);
+    draw_bot_detail(f, cols[0], views.get(active));
     draw_logs(f, cols[1], views.get(active), log_lines, ui);
-    draw_bot_detail(f, cols[2], views.get(active));
+    draw_account(f, cols[2], views, agg);
 }
 
 fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &AccountAggregate) {
@@ -587,7 +587,38 @@ fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &
     ]));
     lines.push(Line::from(vec![
         Span::styled("fills    ", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{}", agg.fills)),
+        Span::styled(
+            format!("{:>4}", agg.buy_fills),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" / "),
+        Span::styled(
+            format!("{:<4}", agg.sell_fills),
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("open b/s ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{:>4}", agg.open_buys),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" / "),
+        Span::styled(
+            format!("{:<4}", agg.open_sells),
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("gross inv", Style::default().fg(Color::Gray)),
+        Span::raw(format!("{:>10.2}", dec_to_f64(agg.gross_inventory))),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("net   inv", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{:>+10.2}", dec_to_f64(agg.net_inventory)),
+            pnl_style(agg.net_inventory),
+        ),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::styled(
@@ -760,6 +791,119 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
         ));
     }
 
+    if let Some(ref lv) = v.live {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "── position ──",
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("size     ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>+12.4}", dec_to_f64(lv.position_size)),
+                pnl_style(lv.position_size),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("avg entry", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{:>13.4}", dec_to_f64(lv.avg_entry))),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("inventory", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>+12.2}", dec_to_f64(lv.inventory_usdt)),
+                pnl_style(lv.inventory_usdt),
+            ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "── book ──",
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("bid      ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>13.4}", dec_to_f64(lv.last_bid)),
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("ask      ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>13.4}", dec_to_f64(lv.last_ask)),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("mid      ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{:>13.4}", dec_to_f64(lv.last_mid))),
+        ]));
+        if lv.last_ask > rust_decimal::Decimal::ZERO {
+            let spread = lv.last_ask - lv.last_bid;
+            let bps = if lv.last_mid > rust_decimal::Decimal::ZERO {
+                dec_to_f64(spread) / dec_to_f64(lv.last_mid) * 10_000.0
+            } else {
+                0.0
+            };
+            lines.push(Line::from(vec![
+                Span::styled("spread   ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{bps:>13.2} bps")),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "── orders ──",
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("open b/s ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>3}", lv.open_buys),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" / "),
+            Span::styled(
+                format!("{:>3}", lv.open_sells),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("filled   ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>5}", lv.buy_fills),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" / "),
+            Span::styled(
+                format!("{:>5}", lv.sell_fills),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+        if let Some(side) = lv.last_fill_side {
+            let (tag, col) = match side {
+                tikr_core::Side::Bid => ("BUY ", Color::Green),
+                tikr_core::Side::Ask => ("SELL", Color::Red),
+            };
+            lines.push(Line::from(vec![
+                Span::styled("last fill", Style::default().fg(Color::Gray)),
+                Span::raw(" "),
+                Span::styled(tag, Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                Span::raw(format!(
+                    " {:.4} × {:.4}",
+                    dec_to_f64(lv.last_fill_price),
+                    dec_to_f64(lv.last_fill_size)
+                )),
+            ]));
+            if let Some(ts) = lv.last_fill_ts {
+                let ago = secs_ago(ts);
+                lines.push(Line::from(vec![
+                    Span::styled("  ago    ", Style::default().fg(Color::Gray)),
+                    Span::raw(format_ago(ago)),
+                ]));
+            }
+        }
+    }
+
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" bot "))
         .wrap(Wrap { trim: false });
@@ -803,4 +947,22 @@ fn format_secs(s: u64) -> String {
     let m = (s % 3600) / 60;
     let sec = s % 60;
     format!("{h:02}:{m:02}:{sec:02}")
+}
+
+fn secs_ago(ts_ns: u64) -> u64 {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    now_ns.saturating_sub(ts_ns) / 1_000_000_000
+}
+
+fn format_ago(s: u64) -> String {
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
 }
