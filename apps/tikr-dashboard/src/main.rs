@@ -60,8 +60,21 @@ async fn main() -> anyhow::Result<()> {
     // Set up the per-bot log capture BEFORE any tracing macros fire.
     let log_store = LogStore::new();
     let log_layer = crate::logs::LogLayer::new(log_store.clone());
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tikr_dashboard=info,tikr_paper=info"));
+    // Default: capture INFO+ from every tikr-* crate so the bot's log
+    // pane shows the same stream a manual `run_perp` invocation would.
+    // Operators can override via `RUST_LOG=...` for noisier debugging.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "info,\
+             tikr_dashboard=info,\
+             tikr_paper=info,\
+             tikr_binance=info,\
+             tikr_strategy=info,\
+             tikr_backtest=info,\
+             tikr_venue=info,\
+             tikr_risk=info",
+        )
+    });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(log_layer)

@@ -153,8 +153,8 @@ pub fn run(
                 let active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
                 let log_lines = active_symbol
                     .as_deref()
-                    .map(|s| logs.snapshot(s))
-                    .unwrap_or_default();
+                    .map(|s| logs.snapshot_merged(s))
+                    .unwrap_or_else(|| logs.snapshot(crate::logs::SYSTEM_KEY));
                 let agg = AccountAggregate::compute(&views);
                 terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui))?;
                 last_draw = Instant::now();
@@ -685,16 +685,25 @@ fn format_log_line(ln: &LogLine) -> Line<'static> {
         Level::DEBUG => ("DEBUG", Color::Cyan),
         Level::TRACE => ("TRACE", Color::DarkGray),
     };
-    let body_style = match ln.level {
-        Level::ERROR => Style::default().fg(Color::Red),
-        Level::WARN => Style::default().fg(Color::Yellow),
-        Level::INFO => Style::default().fg(Color::White),
-        Level::DEBUG => Style::default().fg(Color::Cyan),
-        Level::TRACE => Style::default().fg(Color::DarkGray),
+    let body_style = if ln.from_system {
+        // System events (no symbol span) get a dimmed body so they
+        // don't visually drown out the active bot's own log stream.
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    } else {
+        match ln.level {
+            Level::ERROR => Style::default().fg(Color::Red),
+            Level::WARN => Style::default().fg(Color::Yellow),
+            Level::INFO => Style::default().fg(Color::White),
+            Level::DEBUG => Style::default().fg(Color::Cyan),
+            Level::TRACE => Style::default().fg(Color::DarkGray),
+        }
     };
+    let prefix = if ln.from_system { "·" } else { " " };
     Line::from(vec![
         Span::styled(
-            format!("[{}] ", ln.ts),
+            format!("{prefix}[{}] ", ln.ts),
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
