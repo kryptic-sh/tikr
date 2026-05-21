@@ -4,111 +4,117 @@
 #   1. ./config.toml         (this file — wins if cwd has one)
 #   2. $XDG_CONFIG_HOME/tikr/config.toml   (default: ~/.config/tikr/config.toml)
 #
-# Every knob is shown explicitly. Drop a line to fall back to its default.
+# Convention: commented-out lines equal the in-code defaults. Drop the
+# `#` to keep them explicit, edit the value to override.
 
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 # "futures-testnet" | "futures-mainnet"
 env = "futures-testnet"
 
-# Per-bot snapshot subdirs live under this path:
-#   <state_dir>/<symbol>/<run_id>.json
+# Per-bot snapshot subdirs live under <state_dir>/<symbol>/...
 state_dir = "./state"
 
-# Optional: HMAC key file (single line "key:secret"). Env vars
+# Optional HMAC key file (single line "key:secret"). Env vars
 # TIKR_BINANCE_API_KEY / TIKR_BINANCE_API_SECRET take precedence.
 # key_file = "./keys/binance-testnet.txt"
 
 
-# ─── Per-bot specs ─────────────────────────────────────────────────────────
-# Each [[bot]] entry spawns one in-process bot with its own venue +
-# user_stream subscription. Order matters — the dashboard's tab strip
-# is rendered in declaration order.
-
-# --- StaticGrid (default strategy for the kryptic.sh setup) ----------------
-# Places 2 × levels orders once; rebuilds only when most are consumed OR
-# inventory drift exceeds rebuild_pos_ratio_delta.
+# ─── BTCUSDT — every StaticGrid knob shown explicitly (reference) ──────────
 
 [[bot]]
-symbol     = "BTCUSDT"
-strategy   = "static-grid"
+symbol   = "BTCUSDT"
+strategy = "static-grid"
 
-# Every StaticGrid knob shown explicitly on this bot. The others below
-# only override what they care about and fall back to defaults.
 [bot.sg]
-notional                = 25
-levels                  = 2
-inner_bps               = 3
-step_bps                = 2
-skew_strength           = "0"
-target_inventory_usdt   = 50
-rebuild_pos_ratio_delta = "0.3"
-target_fills_per_min    = "0"
-fillrate_window_secs    = 60
-scale_min               = "1.0"
-scale_max               = "4.0"
+# notional                = 25      # fiat $ per order; auto-bumps to min_notional × 1.2
+levels                    = 2       # default 3 — orders per side (2 × levels at cold start)
+# inner_bps               = 3       # nearest-level spread from mid in bps
+step_bps                  = 2       # default 3 — bps between consecutive same-side levels
+# skew_strength           = "0"     # 0 = symmetric; 0.5–1.5 tightens the dominant side
+# target_inventory_usdt   = 50      # position USDT at which skew saturates
+# rebuild_pos_ratio_delta = "0.3"   # force rebuild when |Δpos_ratio| exceeds this
+# target_fills_per_min    = "0"     # 0 = adaptive scaler off
+# fillrate_window_secs    = 60      # rolling window for the fpm measurement
+# scale_min               = "1.0"   # adaptive multiplier floor (1.0 = never tighten)
+# scale_max               = "4.0"   # adaptive multiplier ceiling (4× widening max)
+
+
+# ─── ETHUSDT ───────────────────────────────────────────────────────────────
 
 [[bot]]
-symbol     = "ETHUSDT"
-strategy   = "static-grid"
-sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }
+symbol   = "ETHUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+levels   = 2
+step_bps = 2
+
+
+# ─── BNBUSDT (small skew — wins NET per 24h sweep) ─────────────────────────
 
 [[bot]]
-symbol     = "BNBUSDT"
-strategy   = "static-grid"
-# Small skew — 24h sweep showed sk=0.5 wins NET on BNB.
-sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2, skew_strength = "0.5" }
+symbol   = "BNBUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+levels        = 2
+step_bps      = 2
+skew_strength = "0.5"
+
+
+# ─── SOLUSDT ───────────────────────────────────────────────────────────────
 
 [[bot]]
-symbol     = "SOLUSDT"
-strategy   = "static-grid"
-sg = { notional = 25, levels = 3, inner_bps = 3, step_bps = 2 }
+symbol   = "SOLUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+# levels   = 3   # default
+step_bps   = 2
+
+
+# ─── DOGEUSDT ──────────────────────────────────────────────────────────────
 
 [[bot]]
-symbol     = "DOGEUSDT"
-strategy   = "static-grid"
-sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }
+symbol   = "DOGEUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+levels   = 2
+step_bps = 2
+
+
+# ─── HYPERUSDT (small skew) ────────────────────────────────────────────────
 
 [[bot]]
-symbol     = "HYPERUSDT"
-strategy   = "static-grid"
-sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2, skew_strength = "0.5" }
+symbol   = "HYPERUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+levels        = 2
+step_bps      = 2
+skew_strength = "0.5"
+
+
+# ─── PROMPTUSDT ────────────────────────────────────────────────────────────
 
 [[bot]]
-symbol     = "PROMPTUSDT"
-strategy   = "static-grid"
-sg = { notional = 25, levels = 2, inner_bps = 3, step_bps = 2 }
+symbol   = "PROMPTUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+levels   = 2
+step_bps = 2
 
 
-# ─── StaticGrid field reference ────────────────────────────────────────────
-#
-# notional                  Fiat ($) per order. Auto-bumped to
-#                           min_notional × 1.2 if below the symbol filter.
-# levels                    Orders per side. Total open at start = 2 × levels.
-# inner_bps                 Inner spread from mid (nearest level) in bps.
-# step_bps                  bps between consecutive same-side levels.
-# skew_strength             0.0 = symmetric. 0.5 = each-side gap scales by
-#                           ±50% at full inventory. 1.0 saturates a side
-#                           toward 0 bp (floored at 1 bp). sk=0 wins on
-#                           clean mean-reverters; sk=0.5+ wins on
-#                           inventory-bleed-prone symbols.
-# target_inventory_usdt     Position-USDT at which skew saturates.
-# rebuild_pos_ratio_delta   Force a rebuild when |Δpos_ratio| > this
-#                           since the last batch placement.
-# target_fills_per_min      Adaptive scaler target (fpm). 0 = scaler off.
-# fillrate_window_secs      Rolling window for fpm measurement.
-# scale_min, scale_max      Lower/upper bounds on the adaptive multiplier.
-#                           Defaults (1.0, 4.0) only widen — never tighten.
-#
-# ─── LayeredGrid (LG) — alternative ────────────────────────────────────────
-# Uncomment to switch a bot to the rolling re-anchored ladder.
+# ─── LayeredGrid template (uncomment to use) ───────────────────────────────
 #
 # [[bot]]
 # symbol   = "BTCUSDT"
 # strategy = "layered-grid"
-# lg = { notional = 25, levels = 1, bps = 6 }
 #
-# LayeredGrid field reference:
-#   notional    Fiat ($) per order.
-#   levels      Orders per side.
-#   bps         Spacing in bps (also TP distance and same-side extension step).
+# [bot.lg]
+# # notional = 25   # fiat $ per order
+# # levels   = 1    # orders per side
+# # bps      = 6    # spacing in bps (also TP distance + same-side extension step)
