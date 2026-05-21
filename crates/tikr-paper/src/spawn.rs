@@ -19,6 +19,8 @@ use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use tracing::Instrument;
+
 use crate::live::LiveSnapshot;
 use crate::report::PaperReport;
 use crate::runner::{RunnerConfig, run_with_resume};
@@ -129,90 +131,103 @@ where
     let fill_sim = spec.fill_sim;
     let choice = spec.strategy;
 
-    let join = tokio::spawn(async move {
-        match choice {
-            StrategyChoice::StaticGrid(cfg) => {
-                let strategy = StaticGrid::new(cfg);
-                run_with_resume(
-                    venue,
-                    strategy,
-                    fill_sim,
-                    symbol,
-                    shutdown_rx,
-                    config,
-                    None,
-                    None,
-                    None,
-                    external_fills,
-                )
-                .await
-            }
-            StrategyChoice::LayeredGrid(cfg) => {
-                let strategy = LayeredGrid::new(cfg);
-                run_with_resume(
-                    venue,
-                    strategy,
-                    fill_sim,
-                    symbol,
-                    shutdown_rx,
-                    config,
-                    None,
-                    None,
-                    None,
-                    external_fills,
-                )
-                .await
-            }
-            StrategyChoice::AvellanedaStoikov(cfg) => {
-                let strategy = AvellanedaStoikov::new(cfg);
-                run_with_resume(
-                    venue,
-                    strategy,
-                    fill_sim,
-                    symbol,
-                    shutdown_rx,
-                    config,
-                    None,
-                    None,
-                    None,
-                    external_fills,
-                )
-                .await
-            }
-            StrategyChoice::Glft(cfg) => {
-                let strategy = Glft::new(cfg);
-                run_with_resume(
-                    venue,
-                    strategy,
-                    fill_sim,
-                    symbol,
-                    shutdown_rx,
-                    config,
-                    None,
-                    None,
-                    None,
-                    external_fills,
-                )
-                .await
-            }
-            StrategyChoice::TopOfBook(cfg) => {
-                let strategy = TopOfBook::new(cfg);
-                run_with_resume(
-                    venue,
-                    strategy,
-                    fill_sim,
-                    symbol,
-                    shutdown_rx,
-                    config,
-                    None,
-                    None,
-                    None,
-                    external_fills,
-                )
-                .await
+    // Tracing span: every log line emitted from inside the spawned
+    // bot task carries `symbol = "BTCUSDT"` so a span-aware log
+    // subscriber (e.g. the dashboard's per-tab capture) can route it
+    // to the right bucket. Without this, `tokio::spawn` would detach
+    // the task from any parent span and all bot logs would dump into
+    // a shared "system" bucket — visible on every dashboard tab.
+    let symbol_str =
+        format!("{}{}", symbol.base.0.as_ref(), symbol.quote.0.as_ref()).to_uppercase();
+    let bot_span = tracing::info_span!("bot", symbol = %symbol_str);
+
+    let join = tokio::spawn(
+        async move {
+            match choice {
+                StrategyChoice::StaticGrid(cfg) => {
+                    let strategy = StaticGrid::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::LayeredGrid(cfg) => {
+                    let strategy = LayeredGrid::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::AvellanedaStoikov(cfg) => {
+                    let strategy = AvellanedaStoikov::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::Glft(cfg) => {
+                    let strategy = Glft::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::TopOfBook(cfg) => {
+                    let strategy = TopOfBook::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
             }
         }
-    });
+        .instrument(bot_span),
+    );
 
     BotHandle {
         label,

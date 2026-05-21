@@ -52,7 +52,7 @@ use tikr_venue::VenueError;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
 use crate::BinanceEnv;
@@ -397,16 +397,19 @@ async fn subscribe_spot_user_data_stream(
     let stream = open_spot_user_data_ws(env, &api_key, &key_material).await?;
     let (tx, rx) = mpsc::unbounded_channel::<Fill>();
 
-    tokio::spawn(spot_user_data_pump(
-        stream,
-        tx,
-        env,
-        api_key,
-        key_material,
-        kind,
-        symbol_filter,
-        shutdown_rx,
-    ));
+    tokio::spawn(
+        spot_user_data_pump(
+            stream,
+            tx,
+            env,
+            api_key,
+            key_material,
+            kind,
+            symbol_filter,
+            shutdown_rx,
+        )
+        .in_current_span(),
+    );
 
     Ok(rx)
 }
@@ -586,52 +589,58 @@ async fn subscribe_futures_user_data_stream(
     let api_key2 = api_key.clone();
     let shared_key2 = shared_key.clone();
     let mut keepalive_shutdown = shutdown_rx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(KEEPALIVE_INTERVAL_MS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await; // burn first immediate tick
-        loop {
-            let tick = interval.tick();
-            let shut = async {
-                match keepalive_shutdown.as_mut() {
-                    Some(rx) => {
-                        let _ = rx.changed().await;
-                        *rx.borrow()
+    tokio::spawn(
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(KEEPALIVE_INTERVAL_MS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // burn first immediate tick
+            loop {
+                let tick = interval.tick();
+                let shut = async {
+                    match keepalive_shutdown.as_mut() {
+                        Some(rx) => {
+                            let _ = rx.changed().await;
+                            *rx.borrow()
+                        }
+                        None => std::future::pending::<bool>().await,
                     }
-                    None => std::future::pending::<bool>().await,
-                }
-            };
-            tokio::select! {
-                _ = tick => {
-                    let key = shared_key2.lock().await.clone();
-                    if let Err(e) = keepalive_listen_key(&http2, env, &api_key2, &key).await {
-                        warn!(error = ?e, "userDataStream: keepalive PUT failed");
-                    } else {
-                        debug!("userDataStream: keepalive PUT OK");
+                };
+                tokio::select! {
+                    _ = tick => {
+                        let key = shared_key2.lock().await.clone();
+                        if let Err(e) = keepalive_listen_key(&http2, env, &api_key2, &key).await {
+                            warn!(error = ?e, "userDataStream: keepalive PUT failed");
+                        } else {
+                            debug!("userDataStream: keepalive PUT OK");
+                        }
                     }
-                }
-                signaled = shut => {
-                    if signaled {
-                        debug!("userDataStream: keepalive shutdown");
-                        return;
+                    signaled = shut => {
+                        if signaled {
+                            debug!("userDataStream: keepalive shutdown");
+                            return;
+                        }
                     }
                 }
             }
         }
-    });
+        .in_current_span(),
+    );
 
     // WS pump task.
-    tokio::spawn(user_data_pump(
-        stream,
-        tx,
-        http,
-        env,
-        api_key,
-        kind,
-        shared_key,
-        symbol_filter,
-        shutdown_rx,
-    ));
+    tokio::spawn(
+        user_data_pump(
+            stream,
+            tx,
+            http,
+            env,
+            api_key,
+            kind,
+            shared_key,
+            symbol_filter,
+            shutdown_rx,
+        )
+        .in_current_span(),
+    );
 
     Ok(rx)
 }
