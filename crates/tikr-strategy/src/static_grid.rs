@@ -272,29 +272,38 @@ impl StaticGrid {
             .count();
         let sells = open_quotes.len() - buys;
 
-        // Inventory drift past the configured threshold: re-anchor the
-        // whole grid at the new skew.
-        let drift = (cur_pos_ratio - self.last_pos_ratio).abs();
-        if drift > self.config.rebuild_pos_ratio_delta {
-            return RebuildDecision::FullRebuild;
-        }
-
         // Both sides empty (or wiped by external cancel): full rebuild.
+        // Checked first so it short-circuits before the side-empty arm
+        // — neither side here is "surviving" so there's nothing to
+        // preserve.
         if buys == 0 && sells == 0 {
             return RebuildDecision::FullRebuild;
         }
 
         // One side empty: refill only that side. CRITICAL: do NOT
         // cancel the surviving side — those are the closing orders for
-        // the inventory we accumulated. The pre-fix design did a
-        // CancelAll on side-empty which cancelled the very orders that
-        // would have flattened the position, causing runaway one-sided
-        // fills (PROMPT 165 buys / 5 sells, DOGE realized = 0).
+        // the inventory we accumulated. We deliberately check this
+        // BEFORE the drift trigger because a single fill that
+        // saturates pos_ratio (notional × 1 ≥ target_inventory_usdt)
+        // would otherwise jump to FullRebuild and wipe the surviving
+        // closing side, defeating the whole purpose. The drift check
+        // only fires once both sides are still healthy — i.e. a
+        // partial fill or external state change moved inventory
+        // without emptying a side.
         if buys == 0 {
             return RebuildDecision::RefillSide(Side::Bid);
         }
         if sells == 0 {
             return RebuildDecision::RefillSide(Side::Ask);
+        }
+
+        // Both sides healthy. Drift past the configured threshold
+        // means the position changed significantly via partials or
+        // outside the strategy (e.g. an externally-forced close), and
+        // it's worth re-anchoring the whole grid at the new skew.
+        let drift = (cur_pos_ratio - self.last_pos_ratio).abs();
+        if drift > self.config.rebuild_pos_ratio_delta {
+            return RebuildDecision::FullRebuild;
         }
 
         RebuildDecision::None
