@@ -540,18 +540,17 @@ impl Strategy for StaticGrid {
         intent: &QuoteIntent,
         _reason: &str,
     ) -> Vec<Action> {
-        // Recovery path: a single Quote we emitted was post-only rejected
-        // (the market moved through our intended price between emit and
-        // arrival). Re-anchor on the FRESHEST top-of-book and re-place
-        // ONLY the side that got rejected.
+        // Recovery path: a single Quote we emitted was rejected. Emit
+        // ONE replacement at the innermost level (k=0) of the same
+        // side, anchored on the freshest book. Do NOT call
+        // build_one_side here — that would emit `levels_per_side`
+        // orders, and recovery rounds compound: 5 rounds × lv=2 = 10
+        // extra orders stacked on the side, ballooning the open count
+        // (live trace showed open b/s = 3/16 from this).
         //
-        // Critical: do NOT CancelAll here. Pre-fix this method did exactly
-        // that, which wiped the surviving opposite-side orders — the very
-        // ones that would close any inventory accumulated since the last
-        // rebuild. In the DOGE 24h backtest that pattern produced 421k
-        // fills with realized = 0 because every reject (frequent on a
-        // moving market) flattened the closing side before it could fire.
-        // Symmetric to the Fill-arm side-empty preservation logic.
+        // The deeper levels on this side already exist from the prior
+        // batch placement; this hook only patches the specific failed
+        // intent.
         let bid = ctx.latest_book.bids.first().map(|l| l.price.0);
         let ask = ctx.latest_book.asks.first().map(|l| l.price.0);
         let (Some(b), Some(a)) = (bid, ask) else {
@@ -565,7 +564,7 @@ impl Strategy for StaticGrid {
         self.last_ask = Some(best_ask);
         let pos_usdt = ctx.position.size.0 * mid.0;
         let ratio = self.pos_ratio(pos_usdt);
-        self.build_one_side(ctx.symbol, mid, best_bid, best_ask, ratio, intent.side)
+        vec![self.make_level(ctx.symbol, mid, best_bid, best_ask, ratio, intent.side, 0)]
     }
 }
 
