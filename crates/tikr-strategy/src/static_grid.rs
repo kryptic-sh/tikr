@@ -99,7 +99,23 @@ pub struct StaticGrid {
     /// when computing effective window length (since the scaler is
     /// called from `build_batch` which doesn't take ts directly).
     last_event_ts: Option<u64>,
+    /// Per-side timestamp (ns) of the last refill we EMITTED. Used to
+    /// rate-limit BookUpdate-driven self-heal so a venue rejection
+    /// (insufficient margin, lot-size violation, etc.) doesn't kick
+    /// off a hot loop of place→reject→next-tick→place→reject at the
+    /// BookUpdate cadence (~10/sec).
+    ///
+    /// `[Bid, Ask]` indexed by `side as usize` doesn't work cleanly
+    /// since `Side` isn't a known repr — store as two Options.
+    last_refill_bid_ts: Option<u64>,
+    last_refill_ask_ts: Option<u64>,
 }
+
+/// How long to wait before re-attempting a side refill after the
+/// strategy already emitted one. Resets implicitly when a real fill
+/// arrives (the position changed → rebuild_decision now computes
+/// against a different state, so the cooldown becomes irrelevant).
+const REFILL_COOLDOWN_NS: u64 = 2_000_000_000; // 2 seconds
 
 impl StaticGrid {
     fn make_quote(&self, symbol: &Symbol, side: Side, price: Price) -> Action {
@@ -159,6 +175,36 @@ impl StaticGrid {
         let actual_fpm = Decimal::from(count as u64) / effective_min;
         let raw = actual_fpm / self.config.target_fills_per_min;
         raw.clamp(self.config.scale_min, self.config.scale_max)
+    }
+
+    /// True when the BookUpdate-driven self-heal recently emitted a
+    /// refill for `side` and the cooldown hasn't expired yet. Prevents
+    /// the place→reject→retry hot loop on terminal venue rejections
+    /// (margin insufficient, etc.) that the strategy can't recover
+    /// from until inventory shifts.
+    fn side_in_cooldown(&self, side: Side, now_ns: u64) -> bool {
+        let last = match side {
+            Side::Bid => self.last_refill_bid_ts,
+            Side::Ask => self.last_refill_ask_ts,
+        };
+        let Some(last) = last else { return false };
+        now_ns.saturating_sub(last) < REFILL_COOLDOWN_NS
+    }
+
+    /// Record a refill emission timestamp for the given side.
+    fn mark_refill(&mut self, side: Side, now_ns: u64) {
+        match side {
+            Side::Bid => self.last_refill_bid_ts = Some(now_ns),
+            Side::Ask => self.last_refill_ask_ts = Some(now_ns),
+        }
+    }
+
+    /// Clear both side cooldowns. Called after an actual Fill so that
+    /// any subsequent refill decision starts fresh — a fill changed
+    /// the position and the prior cooldown's reasoning is stale.
+    fn clear_refill_cooldowns(&mut self) {
+        self.last_refill_bid_ts = None;
+        self.last_refill_ask_ts = None;
     }
 
     /// Compute position ratio in `[-1, 1]`, **balance-agnostic**: measures
@@ -361,6 +407,8 @@ impl Strategy for StaticGrid {
             fill_ts: VecDeque::new(),
             session_start_ts: None,
             last_event_ts: None,
+            last_refill_bid_ts: None,
+            last_refill_ask_ts: None,
         }
     }
 
@@ -413,9 +461,20 @@ impl Strategy for StaticGrid {
                 // one book tick (~100ms on a busy symbol).
                 let pos_usdt = ctx.position.size.0 * mid.0;
                 let cur_ratio = self.pos_ratio(pos_usdt);
+                let now_ns = self.last_event_ts.unwrap_or(0);
                 match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
                     RebuildDecision::None => vec![Action::NoOp],
                     RebuildDecision::FullRebuild => {
+                        // Both sides need re-placement; rate-limit on
+                        // EITHER side being in cooldown to avoid the
+                        // hot loop on venue errors.
+                        if self.side_in_cooldown(Side::Bid, now_ns)
+                            || self.side_in_cooldown(Side::Ask, now_ns)
+                        {
+                            return vec![Action::NoOp];
+                        }
+                        self.mark_refill(Side::Bid, now_ns);
+                        self.mark_refill(Side::Ask, now_ns);
                         let mut actions =
                             Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
                         actions.push(Action::CancelAll);
@@ -425,6 +484,10 @@ impl Strategy for StaticGrid {
                         actions
                     }
                     RebuildDecision::RefillSide(side) => {
+                        if self.side_in_cooldown(side, now_ns) {
+                            return vec![Action::NoOp];
+                        }
+                        self.mark_refill(side, now_ns);
                         self.build_one_side(ctx.symbol, mid, best_bid, best_ask, cur_ratio, side)
                     }
                 }
@@ -435,6 +498,10 @@ impl Strategy for StaticGrid {
                 // trigger the rebuild check below.
                 self.fill_ts.push_back(f.ts.0);
                 self.prune_fills(f.ts.0);
+                // A real fill means inventory just changed — the prior
+                // refill cooldown reasoning is stale, allow fresh
+                // refill decisions immediately.
+                self.clear_refill_cooldowns();
                 if !f.is_full {
                     return Vec::new();
                 }
