@@ -98,14 +98,6 @@ struct Args {
     #[arg(long, default_value = "3,5")]
     sg_levels_list: String,
 
-    /// StaticGrid sweep: comma-separated `target_inventory_usdt` values.
-    #[arg(long, default_value = "50")]
-    sg_target_inventory_list: String,
-
-    /// StaticGrid sweep: comma-separated `rebuild_pos_ratio_delta` values.
-    #[arg(long, default_value = "0.3")]
-    sg_rebuild_pos_delta_list: String,
-
     /// StaticGrid sweep: comma-separated `target_fills_per_min` values
     /// (decimals). `0` disables the adaptive scaler. Default `0` keeps
     /// the scaler off so baseline sweeps are comparable.
@@ -487,8 +479,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sg_inner_sweep = parse_u32_list(&args.sg_inner_bps_list)?;
     let sg_step_sweep = parse_u32_list(&args.sg_step_bps_list)?;
     let sg_levels_sweep = parse_u32_list(&args.sg_levels_list)?;
-    let sg_target_sweep = parse_decimal_list(&args.sg_target_inventory_list)?;
-    let sg_rebuild_sweep = parse_decimal_list(&args.sg_rebuild_pos_delta_list)?;
     let sg_fpm_sweep = parse_decimal_list(&args.sg_target_fpm_list)?;
     let sg_fpm_window_sweep = parse_u32_list(&args.sg_fpm_window_list)?;
     let sg_scale_min_sweep = parse_decimal_list(&args.sg_scale_min_list)?;
@@ -496,41 +486,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for &inner in &sg_inner_sweep {
         for &step in &sg_step_sweep {
             for &levels in &sg_levels_sweep {
-                for &target in &sg_target_sweep {
-                    for &rebuild_delta in &sg_rebuild_sweep {
-                        for &fpm_target in &sg_fpm_sweep {
-                            for &fpm_window in &sg_fpm_window_sweep {
-                                for &sc_min in &sg_scale_min_sweep {
-                                    for &sc_max in &sg_scale_max_sweep {
-                                        if sc_min > sc_max {
-                                            continue;
-                                        }
-                                        let label = format!(
-                                            "SG in={inner} st={step} lv={levels} tgt={target} rb={rebuild_delta} fpm={fpm_target} w={fpm_window} sm={sc_min} sM={sc_max}",
-                                        );
-                                        spawn_preset(
-                                            &mut handles,
-                                            &shared_data,
-                                            &symbol,
-                                            &label,
-                                            StaticGrid::new(StaticGridConfig {
-                                                notional_per_order: Decimal::from(100),
-                                                levels_per_side: levels,
-                                                inner_bps: inner,
-                                                step_bps: step,
-                                                target_inventory_usdt: target,
-                                                rebuild_pos_ratio_delta: rebuild_delta,
-                                                target_fills_per_min: fpm_target,
-                                                fillrate_window_secs: fpm_window,
-                                                scale_min: sc_min,
-                                                scale_max: sc_max,
-                                            }),
-                                            fees,
-                                            skim_cfg,
-                                            funding_cfg,
-                                        );
-                                    }
+                for &fpm_target in &sg_fpm_sweep {
+                    for &fpm_window in &sg_fpm_window_sweep {
+                        for &sc_min in &sg_scale_min_sweep {
+                            for &sc_max in &sg_scale_max_sweep {
+                                if sc_min > sc_max {
+                                    continue;
                                 }
+                                let label = format!(
+                                    "SG in={inner} st={step} lv={levels} fpm={fpm_target} w={fpm_window} sm={sc_min} sM={sc_max}",
+                                );
+                                spawn_preset(
+                                    &mut handles,
+                                    &shared_data,
+                                    &symbol,
+                                    &label,
+                                    StaticGrid::new(StaticGridConfig {
+                                        notional_per_order: Decimal::from(100),
+                                        levels_per_side: levels,
+                                        inner_bps: inner,
+                                        step_bps: step,
+                                        target_fills_per_min: fpm_target,
+                                        fillrate_window_secs: fpm_window,
+                                        scale_min: sc_min,
+                                        scale_max: sc_max,
+                                    }),
+                                    fees,
+                                    skim_cfg,
+                                    funding_cfg,
+                                );
                             }
                         }
                     }

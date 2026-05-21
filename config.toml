@@ -27,16 +27,17 @@ symbol   = "BTCUSDT"
 strategy = "static-grid"
 
 [bot.sg]
-# notional                = 25      # fiat $ per order; auto-bumps to min_notional × 1.2
-levels                    = 2       # default 3 — orders per side (2 × levels at cold start)
-# inner_bps               = 3       # nearest-level spread from mid in bps
-step_bps                  = 2       # default 3 — bps between consecutive same-side levels
-# target_inventory_usdt   = 50      # position USDT at which the inventory skew saturates
-# rebuild_pos_ratio_delta = "0.3"   # force rebuild when |Δpos_ratio| exceeds this
-# target_fills_per_min    = "0"     # 0 = adaptive scaler off
-# fillrate_window_secs    = 60      # rolling window for the fpm measurement
-# scale_min               = "1.0"   # adaptive multiplier floor (1.0 = never tighten)
-# scale_max               = "4.0"   # adaptive multiplier ceiling (4× widening max)
+# notional             = 25      # fiat $ per order; auto-bumps to min_notional × 1.2
+levels                 = 2       # default 3 — orders per side (2 × levels at cold start)
+# inner_bps            = 3       # nearest-level spread from mid in bps
+step_bps               = 2       # default 3 — bps between consecutive same-side levels
+# target_fills_per_min = "0"     # 0 = adaptive scaler off
+# fillrate_window_secs = 60      # rolling window for the fpm measurement
+# scale_min            = "1.0"   # adaptive multiplier floor (1.0 = never tighten)
+# scale_max            = "4.0"   # adaptive multiplier ceiling (4× widening max)
+#
+# Inventory skew is automatic — `pos_ratio = (position / notional) / levels`,
+# saturates when one side has filled every level. No external target.
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────

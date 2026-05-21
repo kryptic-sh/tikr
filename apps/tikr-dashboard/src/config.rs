@@ -72,12 +72,6 @@ pub struct SgParams {
     /// Step between consecutive levels on the same side, in bps.
     #[serde(default = "sg_default_step")]
     pub step_bps: u32,
-    /// Position USDT magnitude at which skew saturates.
-    #[serde(default = "sg_default_target_inventory")]
-    pub target_inventory_usdt: Decimal,
-    /// Rebuild when position ratio drifts by more than this.
-    #[serde(default = "sg_default_rebuild_delta")]
-    pub rebuild_pos_ratio_delta: Decimal,
     /// Adaptive scaler target fills/min. `0` disables.
     #[serde(default)]
     pub target_fills_per_min: Decimal,
@@ -103,12 +97,6 @@ fn sg_default_inner() -> u32 {
 }
 fn sg_default_step() -> u32 {
     3
-}
-fn sg_default_target_inventory() -> Decimal {
-    Decimal::from(50)
-}
-fn sg_default_rebuild_delta() -> Decimal {
-    Decimal::new(3, 1) // 0.3
 }
 fn sg_default_fpm_window() -> u32 {
     60

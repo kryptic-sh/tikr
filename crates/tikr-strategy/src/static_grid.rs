@@ -53,15 +53,6 @@ pub struct StaticGridConfig {
     pub inner_bps: u32,
     /// Step between consecutive levels on the same side in bps.
     pub step_bps: u32,
-    /// Position USDT magnitude at which skew saturates (clamped to ±1).
-    /// Smaller value = grid responds to small inventory; larger = needs
-    /// big position to skew. Pick close to your acceptable inventory cap.
-    pub target_inventory_usdt: Decimal,
-    /// Rebuild threshold for inventory-ratio drift. When the position
-    /// ratio changes by more than this since the last rebuild, force a
-    /// fresh batch placement at the newly-skewed prices.
-    /// Default 0.3 (i.e. 30% saturation move). Set high to disable.
-    pub rebuild_pos_ratio_delta: Decimal,
     /// Adaptive fill-rate scaler. Widens `inner_bps`/`step_bps` when
     /// realised fills/min exceed `target_fills_per_min`. `0` disables
     /// (no scaling applied). Default `5.0` fills/min target — tune to
@@ -88,10 +79,6 @@ pub struct StaticGrid {
     /// rebuild trigger fires (since rebuild fires inside `on_event(Fill)` which
     /// doesn't carry a fresh book snapshot of its own).
     last_mid: Option<Price>,
-    /// Position ratio captured at the last batch placement. Clamped to
-    /// `[-1.0, 1.0]`. Used by `rebuild_needed` to fire a fresh batch when
-    /// inventory has drifted by more than `rebuild_pos_ratio_delta`.
-    last_pos_ratio: Decimal,
     /// Rolling window of fill timestamps (ns since epoch). Pruned to
     /// `fillrate_window_secs` on every fill; used to compute the
     /// adaptive bps scale.
@@ -168,13 +155,22 @@ impl StaticGrid {
         raw.clamp(self.config.scale_min, self.config.scale_max)
     }
 
-    /// Compute position ratio in `[-1, 1]`. Positive = long, negative = short.
-    /// `target_inventory_usdt = 0` disables skew (returns 0).
+    /// Compute position ratio in `[-1, 1]`, **balance-agnostic**: measures
+    /// imbalance as "filled orders relative to the grid's own size", not
+    /// against an external dollar target.
+    ///
+    /// Net fills in this side = `position_usdt / notional_per_order`.
+    /// Ratio = `net_fills / levels_per_side`. Saturates at ±1 when the
+    /// bot has filled every level on one side (max grid imbalance).
+    ///
+    /// Positive = long, negative = short. Zero notional or zero
+    /// levels short-circuits to flat (defensive guard).
     fn pos_ratio(&self, pos_usdt: Decimal) -> Decimal {
-        if self.config.target_inventory_usdt <= Decimal::ZERO {
+        if self.config.notional_per_order <= Decimal::ZERO || self.config.levels_per_side == 0 {
             return Decimal::ZERO;
         }
-        let raw = pos_usdt / self.config.target_inventory_usdt;
+        let net_fills = pos_usdt / self.config.notional_per_order;
+        let raw = net_fills / Decimal::from(self.config.levels_per_side);
         raw.clamp(-Decimal::ONE, Decimal::ONE)
     }
 
@@ -282,14 +278,7 @@ impl StaticGrid {
 
         // One side empty: refill only that side. CRITICAL: do NOT
         // cancel the surviving side — those are the closing orders for
-        // the inventory we accumulated. We deliberately check this
-        // BEFORE the drift trigger because a single fill that
-        // saturates pos_ratio (notional × 1 ≥ target_inventory_usdt)
-        // would otherwise jump to FullRebuild and wipe the surviving
-        // closing side, defeating the whole purpose. The drift check
-        // only fires once both sides are still healthy — i.e. a
-        // partial fill or external state change moved inventory
-        // without emptying a side.
+        // the inventory we accumulated.
         if buys == 0 {
             return RebuildDecision::RefillSide(Side::Bid);
         }
@@ -297,15 +286,14 @@ impl StaticGrid {
             return RebuildDecision::RefillSide(Side::Ask);
         }
 
-        // Both sides healthy. Drift past the configured threshold
-        // means the position changed significantly via partials or
-        // outside the strategy (e.g. an externally-forced close), and
-        // it's worth re-anchoring the whole grid at the new skew.
-        let drift = (cur_pos_ratio - self.last_pos_ratio).abs();
-        if drift > self.config.rebuild_pos_ratio_delta {
-            return RebuildDecision::FullRebuild;
-        }
-
+        // Both sides healthy. Nothing to do — the next fill will empty
+        // a side and route through RefillSide, which preserves the
+        // closing side and re-prices the accumulating side with the
+        // current inventory skew. No drift trigger needed: it was a
+        // mis-fit with the balance-agnostic ratio (which now scales
+        // 0→1 over levels_per_side fills, so any single fill exceeded
+        // any reasonable drift threshold).
+        let _ = cur_pos_ratio;
         RebuildDecision::None
     }
 }
@@ -335,7 +323,6 @@ impl Strategy for StaticGrid {
             config,
             placed: false,
             last_mid: None,
-            last_pos_ratio: Decimal::ZERO,
             fill_ts: VecDeque::new(),
             session_start_ts: None,
             last_event_ts: None,
@@ -374,7 +361,6 @@ impl Strategy for StaticGrid {
                 if !self.placed {
                     let pos_usdt = ctx.position.size.0 * mid.0;
                     let ratio = self.pos_ratio(pos_usdt);
-                    self.last_pos_ratio = ratio;
                     self.placed = true;
                     return self.build_batch(ctx.symbol, mid, ratio);
                 }
@@ -397,7 +383,6 @@ impl Strategy for StaticGrid {
                 match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
                     RebuildDecision::None => Vec::new(),
                     RebuildDecision::FullRebuild => {
-                        self.last_pos_ratio = cur_ratio;
                         let mut actions =
                             Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
                         actions.push(Action::CancelAll);
@@ -405,8 +390,6 @@ impl Strategy for StaticGrid {
                         actions
                     }
                     RebuildDecision::RefillSide(side) => {
-                        // Don't touch last_pos_ratio — only the drift /
-                        // full-rebuild paths anchor the skew snapshot.
                         // Don't CancelAll — the surviving side's orders
                         // are the ones that will close the inventory.
                         self.build_one_side(ctx.symbol, mid, cur_ratio, side)
@@ -439,7 +422,6 @@ impl Strategy for StaticGrid {
         self.last_mid = Some(mid);
         let pos_usdt = ctx.position.size.0 * mid.0;
         let ratio = self.pos_ratio(pos_usdt);
-        self.last_pos_ratio = ratio;
 
         let mut actions = Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
         actions.push(Action::CancelAll);
@@ -459,8 +441,6 @@ mod tests {
             levels_per_side: 2,
             inner_bps: 3,
             step_bps: 2,
-            target_inventory_usdt: Decimal::from(50),
-            rebuild_pos_ratio_delta: Decimal::from_str("0.3").unwrap(),
             target_fills_per_min: Decimal::from_str(target_fpm).unwrap(),
             fillrate_window_secs: window_secs,
             scale_min: Decimal::from_str(sc_min).unwrap(),
