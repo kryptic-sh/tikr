@@ -22,6 +22,7 @@ use tokio::sync::watch;
 use tracing::Level;
 
 use crate::logs::{LogLine, LogStore};
+use crate::selection::{self, MouseSelection};
 use crate::state::{AccountAggregate, BotStatus, BotViewSnapshot, SharedBotState};
 
 /// Frame budget. ~60 FPS — the render thread is its own OS thread (off
@@ -97,6 +98,11 @@ struct UiState {
     /// Timestamp of the last keymap-relevant key so we can call
     /// `timeout_resolve` after the ambiguity window expires.
     last_key_ts: Option<Instant>,
+    /// Mouse drag-to-select + clipboard copy state. Lives outside any
+    /// per-panel logic — the selection is applied to the rendered
+    /// ratatui buffer, so it works uniformly across all three panes
+    /// + the tab row + footer. See `selection.rs`.
+    selection: MouseSelection,
 }
 
 impl UiState {
@@ -113,6 +119,7 @@ impl UiState {
             mode: ModeState::Normal,
             keymap,
             last_key_ts: None,
+            selection: MouseSelection::default(),
         }
     }
 
@@ -212,6 +219,11 @@ pub fn run(
                     .unwrap_or_else(|| logs.snapshot(crate::logs::SYSTEM_KEY));
                 let agg = AccountAggregate::compute(&views);
                 terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui, &config_path))?;
+                // Mouse drag-up may have set pending_copy. Read text
+                // from the just-rendered buffer and ship to the
+                // clipboard before the next loop tick.
+                let buf = terminal.current_buffer_mut();
+                let _ = selection::finalize_copy(&mut ui.selection, buf);
                 last_draw = Instant::now();
                 dirty = false;
             }
@@ -481,6 +493,11 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
     if !matches!(ui.mode, ModeState::Normal) {
         return;
     }
+    // Drag-to-select consumes drag + drag-up events. A non-dragging
+    // click falls through so tab-click + wheel still fire.
+    if selection::on_mouse_event(&mut ui.selection, &mev) {
+        return;
+    }
     match mev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(idx) = ui.hit_tab(mev.column, mev.row)
@@ -525,6 +542,10 @@ fn draw(
     if matches!(&ui.mode, ModeState::Picker { .. }) {
         draw_picker_overlay(f, views, ui);
     }
+
+    // Mouse-drag selection highlight — paint LAST so it covers any
+    // panel under the drag rect.
+    selection::apply_highlight(&ui.selection, f.buffer_mut());
 }
 
 fn draw_picker_overlay(f: &mut Frame<'_>, views: &[BotViewSnapshot], ui: &UiState) {

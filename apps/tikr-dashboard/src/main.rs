@@ -13,6 +13,7 @@
 mod build;
 mod config;
 mod logs;
+mod selection;
 mod state;
 mod supervisor;
 mod tui;
