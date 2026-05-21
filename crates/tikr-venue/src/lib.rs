@@ -55,6 +55,27 @@ pub struct QuoteIntent {
 }
 
 // ---------------------------------------------------------------------------
+// OpenOrder
+// ---------------------------------------------------------------------------
+
+/// A venue's view of a single resting order. Returned by
+/// [`Venue::open_orders`] for periodic reconciliation against in-memory
+/// fill-sim state.
+#[derive(Debug, Clone)]
+pub struct OpenOrder {
+    /// Venue-assigned id.
+    pub id: QuoteId,
+    /// Symbol the order rests on.
+    pub symbol: Symbol,
+    /// Side (bid or ask).
+    pub side: Side,
+    /// Resting price.
+    pub price: Price,
+    /// Remaining size (origQty − executedQty for partials).
+    pub size: Size,
+}
+
+// ---------------------------------------------------------------------------
 // VenueError
 // ---------------------------------------------------------------------------
 
@@ -141,6 +162,20 @@ pub trait Venue: Send + Sync {
     /// Return all fills timestamped at or after `since_ts` (nanoseconds since UNIX epoch).
     /// Pull/reconciliation path; not intended for the hot path.
     async fn fills_since(&self, since_ts: u64) -> Result<Vec<Fill>, VenueError>;
+
+    /// Return the venue's current view of resting orders for `symbol`.
+    ///
+    /// Used by the runner for periodic reconciliation: any
+    /// `FillSim::live_quotes` entry whose `QuoteId` is NOT in the venue's
+    /// returned set is a **ghost** (silently cancelled, expired, or lost
+    /// across a `listenKey` reconnect) and gets dropped.
+    ///
+    /// Default returns an empty vec — venues that don't support
+    /// reconciliation (paper backtest, hyperliquid v0) opt out without
+    /// breaking the trait.
+    async fn open_orders(&self, _symbol: &Symbol) -> Result<Vec<OpenOrder>, VenueError> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------------------

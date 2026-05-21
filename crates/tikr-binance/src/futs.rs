@@ -248,6 +248,84 @@ pub async fn get_exchange_info(
 /// negative = short, zero = flat. In one-way mode the API returns a single
 /// row per symbol; hedge mode returns two — we sum them which collapses to
 /// the net position either way.
+/// Fetch open orders for `symbol` on Futures.
+///
+/// Endpoint: `GET /fapi/v1/openOrders?symbol=...`
+///
+/// Returns `(order_id, side, price, remaining_qty)` tuples. The runner
+/// uses this for periodic reconciliation against `FillSim`'s in-memory
+/// `live_quotes` — Binance can silently cancel/expire post-only orders
+/// (e.g. across `listenKey` reconnects) and the WS pump only emits
+/// FILLED / PARTIALLY_FILLED events, so without periodic reconcile a
+/// ghost would stay tracked forever.
+pub async fn get_open_orders(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+) -> Result<Vec<(u64, tikr_core::Side, tikr_core::Decimal, tikr_core::Decimal)>, VenueError> {
+    let params = format!("symbol={symbol}");
+    let signed = append_auth_dispatch(&params, key_material);
+    let url = format!("{base_url}/fapi/v1/openOrders?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "openOrders: expected array",
+        )))
+    })?;
+
+    let mut out = Vec::with_capacity(arr.len());
+    for ord in arr {
+        let Some(id) = ord.get("orderId").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(side_str) = ord.get("side").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(price_str) = ord.get("price").and_then(Value::as_str) else {
+            continue;
+        };
+        let orig_str = ord.get("origQty").and_then(Value::as_str).unwrap_or("0");
+        let exec_str = ord
+            .get("executedQty")
+            .and_then(Value::as_str)
+            .unwrap_or("0");
+        let Ok(price) = tikr_core::Decimal::from_str_exact(price_str) else {
+            continue;
+        };
+        let orig = tikr_core::Decimal::from_str_exact(orig_str).unwrap_or_default();
+        let exec = tikr_core::Decimal::from_str_exact(exec_str).unwrap_or_default();
+        let remaining = orig - exec;
+        let side = if side_str == "BUY" {
+            tikr_core::Side::Bid
+        } else {
+            tikr_core::Side::Ask
+        };
+        out.push((id, side, price, remaining));
+    }
+    Ok(out)
+}
+
+/// Fetch the net position size for `symbol` on Futures. Positive = long.
 pub async fn get_position_amount(
     http: &HttpClient,
     base_url: &str,

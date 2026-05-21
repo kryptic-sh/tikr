@@ -397,6 +397,25 @@ impl FillSim {
         self.cancel_id(id);
     }
 
+    /// Reconcile in-memory `live_quotes` against the venue's authoritative
+    /// view for `symbol`. Any tracked quote whose id is NOT in `valid_ids`
+    /// is a ghost (silently cancelled / expired / lost across a WS
+    /// reconnect) and gets dropped. Returns the number of ghosts removed.
+    ///
+    /// Only affects quotes for `symbol`; other symbols' state is left
+    /// untouched so this is safe to call per-bot in a multi-symbol
+    /// process.
+    pub fn retain_quotes_for(
+        &mut self,
+        symbol: &Symbol,
+        valid_ids: &std::collections::HashSet<QuoteId>,
+    ) -> usize {
+        let before = self.live_quotes.len();
+        self.live_quotes
+            .retain(|q| &q.symbol != symbol || valid_ids.contains(&q.id));
+        before - self.live_quotes.len()
+    }
+
     fn update_book_state(&mut self, snapshot: &Snapshot) {
         // Cancel attribution: any LiveQuote at a level whose aggregate
         // SHRANK between the previous BookState snapshot and this one had

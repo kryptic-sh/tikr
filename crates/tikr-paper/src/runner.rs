@@ -369,6 +369,14 @@ where
     status_tick.tick().await;
     let mut last_status_fingerprint: Option<(u64, u32, u32, Decimal)> = None;
 
+    // 30 s order-reconciliation tick (live mode only). Polls
+    // `venue.open_orders` and drops any FillSim ghosts — orders that
+    // were silently cancelled / expired by the venue, or lost across a
+    // listenKey reconnect. Skip in paper mode (FillSim is authoritative).
+    let mut recon_tick = tokio::time::interval(Duration::from_secs(30));
+    recon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    recon_tick.tick().await;
+
     loop {
         // Poll the external fill receiver when in live mode. We use an async
         // block that resolves to `Option<Fill>` so the select! can be unified.
@@ -820,6 +828,29 @@ where
                     base_stk = %base_stacked.round_dp(6),
                     "status"
                 );
+            }
+            _ = recon_tick.tick(), if live_mode => {
+                // Order reconciliation: ground-truth via venue.open_orders.
+                // Drop any FillSim ghosts (silent cancel / expiry / lost WS
+                // events). One REST call every 30 s per bot — cheap relative
+                // to event rate.
+                match venue.open_orders(&symbol).await {
+                    Ok(orders) => {
+                        let valid: std::collections::HashSet<tikr_venue::QuoteId> =
+                            orders.iter().map(|o| o.id).collect();
+                        let removed = fill_sim.retain_quotes_for(&symbol, &valid);
+                        if removed > 0 {
+                            warn!(
+                                ghosts = removed,
+                                venue_open = valid.len(),
+                                "order reconciliation: dropped FillSim ghosts not present on venue"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "order reconciliation: venue.open_orders failed");
+                    }
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {

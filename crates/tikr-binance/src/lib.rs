@@ -539,6 +539,40 @@ impl Venue for BinanceClient {
         result
     }
 
+    async fn open_orders(&self, symbol: &Symbol) -> Result<Vec<tikr_venue::OpenOrder>, VenueError> {
+        let sym_str = binance_symbol(symbol);
+        let base_url = self.env.rest_base_url();
+        if !self.env.is_futures() {
+            // Spot path not implemented yet — fall through to empty so
+            // the runner's reconciliation simply does nothing on spot.
+            return Ok(Vec::new());
+        }
+        let rows = crate::futs::get_open_orders(
+            &self.http,
+            base_url,
+            &self.api_key,
+            &self.key_material,
+            &sym_str,
+        )
+        .await?;
+        // Map each Binance row to a venue-agnostic OpenOrder. The QuoteId
+        // is derived the same way as in the user_stream parser
+        // (`QuoteId::from_uuid(Uuid::from_u128(order_id as u128))`) so
+        // FillSim can compare set membership against IDs it already
+        // tracks from `enqueue_place_with_id`.
+        let out = rows
+            .into_iter()
+            .map(|(id, side, price, qty)| tikr_venue::OpenOrder {
+                id: tikr_venue::QuoteId::from_uuid(uuid::Uuid::from_u128(id as u128)),
+                symbol: symbol.clone(),
+                side,
+                price: tikr_core::Price(price),
+                size: tikr_core::Size(qty),
+            })
+            .collect();
+        Ok(out)
+    }
+
     /// Cancel all open orders for a symbol.
     async fn cancel_all(&self, symbol: &Symbol) -> Result<(), VenueError> {
         self.check_mainnet_gate()?;
