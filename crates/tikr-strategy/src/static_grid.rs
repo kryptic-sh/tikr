@@ -53,13 +53,6 @@ pub struct StaticGridConfig {
     pub inner_bps: u32,
     /// Step between consecutive levels on the same side in bps.
     pub step_bps: u32,
-    /// Inventory-skew strength. `0.0` = symmetric grid (no skew). `0.5` =
-    /// each-side gap scales by ±50% at saturation. `1.0` = ±100% (closer
-    /// side approaches 0 bps — floored at 1 bp for maker safety).
-    ///
-    /// When `position_usdt > 0` (long), buy gaps widen and sell gaps
-    /// tighten — encouraging sells to fill and reduce inventory.
-    pub skew_strength: Decimal,
     /// Position USDT magnitude at which skew saturates (clamped to ±1).
     /// Smaller value = grid responds to small inventory; larger = needs
     /// big position to skew. Pick close to your acceptable inventory cap.
@@ -187,11 +180,11 @@ impl StaticGrid {
 
     /// Emit `2N` orders around `mid` skewed by current inventory.
     ///
-    /// When `pos_ratio > 0` (long), buy gaps widen and sell gaps tighten;
-    /// when negative, the reverse. Closer-side gaps floor at 1 bp to keep
-    /// the order maker-safe — without this clamp a fully-saturated grid
-    /// with `skew_strength = 1.0` would try to post at the current mid and
-    /// get post-only rejected.
+    /// Asymmetric: only the side that's filling faster (the one driving
+    /// the position away from flat) gets pushed wider. The opposite
+    /// side keeps its configured `inner_bps + k·step_bps` so it can
+    /// close the imbalance at the normal edge. Floor at 1 bp on the
+    /// widened side keeps post-only safety regardless of saturation.
     fn build_batch(&self, symbol: &Symbol, mid: Price, pos_ratio: Decimal) -> Vec<Action> {
         let mut actions = Vec::with_capacity(self.config.levels_per_side as usize * 2);
         for k in 0..self.config.levels_per_side {
@@ -227,10 +220,31 @@ impl StaticGrid {
         k: u32,
     ) -> Action {
         let bp_unit = Decimal::from(10_000);
-        let buy_scale = Decimal::ONE + pos_ratio * self.config.skew_strength;
-        let sell_scale = Decimal::ONE - pos_ratio * self.config.skew_strength;
         let adaptive = self.adaptive_scale();
         let base_bps = Decimal::from(self.config.inner_bps + self.config.step_bps * k) * adaptive;
+        // Asymmetric inventory skew: only push the side that's
+        // ACCUMULATING away from mid. The other side keeps its
+        // configured distance so it can close the imbalance at the
+        // normal edge.
+        //
+        // Position long (pos_ratio > 0)  ⇒ buys are filling faster
+        //   buy_scale  = 1 + pos_ratio  (widen — slow further accumulation)
+        //   sell_scale = 1              (keep — let sells close at normal edge)
+        //
+        // Position short (pos_ratio < 0) ⇒ sells are filling faster
+        //   buy_scale  = 1              (keep)
+        //   sell_scale = 1 + |pos_ratio| (widen)
+        //
+        // No `skew_strength` multiplier — the magnitude IS |pos_ratio|.
+        // `target_inventory_usdt` still controls how fast pos_ratio
+        // saturates (smaller target → reacts to small positions).
+        let (buy_scale, sell_scale) = if pos_ratio > Decimal::ZERO {
+            (Decimal::ONE + pos_ratio, Decimal::ONE)
+        } else if pos_ratio < Decimal::ZERO {
+            (Decimal::ONE, Decimal::ONE - pos_ratio)
+        } else {
+            (Decimal::ONE, Decimal::ONE)
+        };
         match side {
             Side::Bid => {
                 let bps = (base_bps * buy_scale).max(Decimal::ONE);
@@ -436,7 +450,6 @@ mod tests {
             levels_per_side: 2,
             inner_bps: 3,
             step_bps: 2,
-            skew_strength: Decimal::ZERO,
             target_inventory_usdt: Decimal::from(50),
             rebuild_pos_ratio_delta: Decimal::from_str("0.3").unwrap(),
             target_fills_per_min: Decimal::from_str(target_fpm).unwrap(),

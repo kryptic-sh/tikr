@@ -80,7 +80,6 @@ fn build_sg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<S
         levels_per_side: sg.levels,
         inner_bps: sg.inner_bps,
         step_bps: sg.step_bps,
-        skew_strength: sg.skew_strength,
         target_inventory_usdt: sg.target_inventory_usdt,
         rebuild_pos_ratio_delta: sg.rebuild_pos_ratio_delta,
         target_fills_per_min: sg.target_fills_per_min,

@@ -205,10 +205,6 @@ struct Args {
     /// StaticGrid: step between consecutive levels on the same side in bps.
     #[arg(long, default_value_t = 3u32)]
     sg_step_bps: u32,
-    /// StaticGrid: inventory-skew strength. 0.0 = symmetric (default — best
-    /// on majors). Bump to 0.8–1.5 for high-vol meme alts (DOGE etc).
-    #[arg(long, default_value = "0")]
-    sg_skew_strength: String,
     /// StaticGrid: position USDT at which skew saturates (clamped to ±1).
     #[arg(long, default_value = "50")]
     sg_target_inventory: String,
@@ -598,12 +594,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     levels_per_side: args.sg_levels,
                     inner_bps: args.sg_inner_bps,
                     step_bps: args.sg_step_bps,
-                    skew_strength: Decimal::from_str(&args.sg_skew_strength).map_err(|e| {
-                        format!(
-                            "--sg-skew-strength '{}' invalid: {}",
-                            args.sg_skew_strength, e
-                        )
-                    })?,
                     target_inventory_usdt: Decimal::from_str(&args.sg_target_inventory).map_err(
                         |e| {
                             format!(

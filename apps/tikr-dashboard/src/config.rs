@@ -72,9 +72,6 @@ pub struct SgParams {
     /// Step between consecutive levels on the same side, in bps.
     #[serde(default = "sg_default_step")]
     pub step_bps: u32,
-    /// Inventory-skew strength (`0` = symmetric).
-    #[serde(default)]
-    pub skew_strength: Decimal,
     /// Position USDT magnitude at which skew saturates.
     #[serde(default = "sg_default_target_inventory")]
     pub target_inventory_usdt: Decimal,
@@ -183,7 +180,6 @@ mod tests {
         assert_eq!(cfg.bots[1].strategy, "layered-grid");
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(sg.levels, 2);
-        assert_eq!(sg.skew_strength, Decimal::ZERO); // defaulted
     }
 
     #[test]
