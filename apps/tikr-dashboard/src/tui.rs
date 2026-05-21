@@ -151,6 +151,7 @@ pub fn run(
     state: SharedBotState,
     logs: LogStore,
     global_shutdown: watch::Sender<bool>,
+    config_path: std::path::PathBuf,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -210,7 +211,7 @@ pub fn run(
                     .map(|s| logs.snapshot_merged(s))
                     .unwrap_or_else(|| logs.snapshot(crate::logs::SYSTEM_KEY));
                 let agg = AccountAggregate::compute(&views);
-                terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui))?;
+                terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui, &config_path))?;
                 last_draw = Instant::now();
                 dirty = false;
             }
@@ -505,6 +506,7 @@ fn draw(
     agg: &AccountAggregate,
     log_lines: &[LogLine],
     ui: &mut UiState,
+    config_path: &std::path::Path,
 ) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -517,7 +519,7 @@ fn draw(
 
     draw_tabs(f, outer[0], views, ui);
     draw_body(f, outer[1], views, ui.active_tab, agg, log_lines, ui);
-    draw_footer(f, outer[2], &ui.mode);
+    draw_footer(f, outer[2], &ui.mode, config_path);
 
     // Modal overlays.
     if matches!(&ui.mode, ModeState::Picker { .. }) {
@@ -1073,21 +1075,41 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &ModeState) {
-    let text = match mode {
-        ModeState::Normal => {
-            " :q  H/L tab  <Spc><Spc> picker  gg/G top/bot  PgUp/PgDn  click/wheel".to_string()
-        }
-        ModeState::Ex { buffer } => format!(":{buffer}_"),
-        ModeState::Picker { .. } => " Esc cancel  Enter open  ↑/↓ or Ctrl-P/N".to_string(),
+fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &ModeState, config_path: &std::path::Path) {
+    let (left_text, left_style) = match mode {
+        ModeState::Normal => (
+            " :q  H/L tab  <Spc><Spc> picker  gg/G top/bot  PgUp/PgDn  click/wheel".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        ModeState::Ex { buffer } => (format!(":{buffer}_"), Style::default().fg(Color::Yellow)),
+        ModeState::Picker { .. } => (
+            " Esc cancel  Enter open  ↑/↓ or Ctrl-P/N".to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
     };
-    let style = match mode {
-        ModeState::Normal => Style::default().fg(Color::Gray),
-        ModeState::Ex { .. } => Style::default().fg(Color::Yellow),
-        ModeState::Picker { .. } => Style::default().fg(Color::Cyan),
+
+    // Right-side config-path indicator. Shown only in Normal mode so
+    // the Ex prompt / picker hint owns the whole row when active.
+    let right_text = if matches!(mode, ModeState::Normal) {
+        format!("cfg {} ", config_path.display())
+    } else {
+        String::new()
     };
-    let p = Paragraph::new(text).style(style);
-    f.render_widget(p, area);
+    let right_width = right_text.chars().count() as u16;
+
+    // Split horizontally — left grows, right is sized to the path.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(0), Constraint::Length(right_width)])
+        .split(area);
+
+    f.render_widget(Paragraph::new(left_text).style(left_style), cols[0]);
+    if right_width > 0 {
+        f.render_widget(
+            Paragraph::new(right_text).style(Style::default().fg(Color::DarkGray)),
+            cols[1],
+        );
+    }
 }
 
 fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {

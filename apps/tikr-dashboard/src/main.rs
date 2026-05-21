@@ -1,9 +1,14 @@
 //! tikr-dashboard — multi-bot live trading TUI.
 //!
 //! ```bash
-//! tikr-dashboard --config ./tikr.toml          # launch dashboard
-//! tikr-dashboard --config ./tikr.toml --check  # validate config only
+//! tikr-dashboard                  # auto-discover config
+//! tikr-dashboard --config <path>  # explicit override
+//! tikr-dashboard --check          # validate + exit
 //! ```
+//!
+//! Config discovery (when `--config` is not passed):
+//!   1. `./config.toml`                       — cwd, wins if present
+//!   2. `$XDG_CONFIG_HOME/tikr/config.toml`   — defaults to `~/.config/tikr/config.toml`
 
 mod build;
 mod config;
@@ -32,13 +37,51 @@ use crate::supervisor::{SupervisorCtx, spawn_supervisor};
     about = "Multi-bot live trading dashboard for tikr"
 )]
 struct Args {
-    /// Path to the dashboard config TOML.
-    #[arg(long, default_value = "tikr.toml")]
-    config: PathBuf,
+    /// Path to the dashboard config TOML. If omitted, the loader looks
+    /// at `./config.toml` first, then `$XDG_CONFIG_HOME/tikr/config.toml`.
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Validate the config and exit without spawning bots.
     #[arg(long)]
     check: bool,
+}
+
+/// Resolve the config path using cwd-first → XDG fallback discovery.
+///
+/// Returns the resolved path (display-able) AND the path that was
+/// actually opened, so the TUI can surface the source.
+fn resolve_config_path(cli: Option<&std::path::Path>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = cli {
+        if !p.exists() {
+            anyhow::bail!("--config '{}' does not exist", p.display());
+        }
+        return Ok(p.to_path_buf());
+    }
+    let cwd = std::path::Path::new("./config.toml");
+    if cwd.exists() {
+        return Ok(cwd.to_path_buf());
+    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                let mut p = PathBuf::from(h);
+                p.push(".config");
+                p
+            })
+        });
+    if let Some(mut base) = xdg {
+        base.push("tikr");
+        base.push("config.toml");
+        if base.exists() {
+            return Ok(base);
+        }
+    }
+    anyhow::bail!(
+        "no config found. searched: ./config.toml, $XDG_CONFIG_HOME/tikr/config.toml \
+         (default ~/.config/tikr/config.toml). Pass --config <path> to override."
+    )
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -47,10 +90,15 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let args = Args::parse();
-    let cfg = config::load(&args.config)?;
+    let config_path = resolve_config_path(args.config.as_deref())?;
+    let cfg = config::load(&config_path)?;
 
     if args.check {
-        println!("config OK: {} bots configured", cfg.bots.len());
+        println!(
+            "config OK ({}): {} bots configured",
+            config_path.display(),
+            cfg.bots.len()
+        );
         for b in &cfg.bots {
             println!("  - {} ({})", b.symbol, b.strategy);
         }
@@ -127,9 +175,10 @@ async fn main() -> anyhow::Result<()> {
     let tui_state = shared_state.clone();
     let tui_logs = log_store.clone();
     let tui_shutdown = global_shutdown_tx.clone();
+    let tui_config_path = config_path.clone();
     let tui_thread = std::thread::Builder::new()
         .name("tikr-dashboard-tui".into())
-        .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown))?;
+        .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown, tui_config_path))?;
 
     // Wait for the TUI thread to exit. Joining off a blocking task so
     // the tokio runtime stays free for the supervisors.
