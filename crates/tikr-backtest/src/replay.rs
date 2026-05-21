@@ -358,6 +358,12 @@ fn load_trades_parquet(
             .ok_or_else(|| ReplayError::Schema("null ts_ns".into()))?;
         let price = price_col[i];
         let size = size_col[i];
+        // Heal corrupt rows: pre-2026-05-21 recordings can contain
+        // zero-price / zero-size trades (Binance feed glitch). Drop
+        // silently so FillSim doesn't cross every resting buy.
+        if price <= Decimal::ZERO || size <= Decimal::ZERO {
+            continue;
+        }
         let taker_side = taker_col[i];
         out.push(LoadedEvent {
             ts_ns,

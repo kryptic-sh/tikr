@@ -155,6 +155,13 @@ pub fn parse_agg_trade_frame(txt: &str, symbol: &Symbol) -> Option<MarketEvent> 
     let frame: AggTradeFrame = serde_json::from_str(txt).ok()?;
     let price = Decimal::from_str(&frame.price).ok()?;
     let size = Decimal::from_str(&frame.qty).ok()?;
+    // Sanity: drop zero-price or zero-size trades — Binance occasionally
+    // emits these (cause unknown; observed 0.29% of DOGE feed). If kept
+    // they cross every resting buy in FillSim, inflating fills + biasing
+    // position one-side. See [[feedback_zero_price_trade_filter]].
+    if price <= Decimal::ZERO || size <= Decimal::ZERO {
+        return None;
+    }
     // is_buyer_maker = true → taker is the SELLER → taker_side = Ask.
     let taker_side = if frame.is_buyer_maker {
         Side::Ask

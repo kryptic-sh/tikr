@@ -469,6 +469,12 @@ impl FillSim {
         taker_side: Side,
         trade_ts: Timestamp,
     ) -> Vec<Fill> {
+        // Defence: a zero-price or zero-size trade would cross every
+        // resting buy (since any positive buy price > 0). Bad upstream
+        // data — drop here as last line of defence.
+        if trade_price.0 <= Decimal::ZERO || trade_size.0 <= Decimal::ZERO {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut trade_remaining = trade_size.0;
 
