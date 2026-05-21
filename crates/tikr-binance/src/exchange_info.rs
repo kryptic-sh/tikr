@@ -22,7 +22,7 @@ use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tikr_core::{Price, Size};
+use tikr_core::{Price, Side, Size};
 use tikr_venue::VenueError;
 
 // ---------------------------------------------------------------------------
@@ -178,6 +178,9 @@ pub fn parse_exchange_info(resp: &ExchangeInfoResponse) -> ExchangeInfoCache {
 /// Round `price` down to the nearest `tick_size` for `symbol`.
 ///
 /// Returns `VenueError::Rejected` if the symbol is not in the cache.
+///
+/// **Side-unaware** — see [`round_price_for_side`] for the post-only-
+/// safe variant the runner uses.
 pub fn round_price(
     cache: &ExchangeInfoCache,
     symbol: &str,
@@ -185,6 +188,32 @@ pub fn round_price(
 ) -> Result<Price, VenueError> {
     let filters = get_filters(cache, symbol)?;
     Ok(Price(floor_to(price.0, filters.tick_size)))
+}
+
+/// Round `price` to the nearest `tick_size`, biased AWAY from the
+/// spread so post-only orders don't accidentally land on the
+/// opposite side of book and get rejected as `-5022`.
+///
+/// - `Side::Bid` (buy quote): floor — a tick lower is still post-only.
+/// - `Side::Ask` (sell quote): ceil — a tick higher is still post-only.
+///
+/// Naïve floor rounding on both sides was the source of an infinite
+/// reject loop seen on HYPERUSDT: bid 0.1157, ask 0.1158, mid 0.11575.
+/// Strategy emits sell @ 0.11580 + ε; floor → 0.1157 which equals the
+/// bid → Binance rejects as crossing maker. Ceiling pushes us to
+/// 0.1158 which stays strictly inside the ask.
+pub fn round_price_for_side(
+    cache: &ExchangeInfoCache,
+    symbol: &str,
+    price: Price,
+    side: Side,
+) -> Result<Price, VenueError> {
+    let filters = get_filters(cache, symbol)?;
+    let rounded = match side {
+        Side::Bid => floor_to(price.0, filters.tick_size),
+        Side::Ask => ceil_to(price.0, filters.tick_size),
+    };
+    Ok(Price(rounded))
 }
 
 /// Round `size` down to the nearest `step_size` for `symbol`.
@@ -244,6 +273,17 @@ pub fn floor_to(value: Decimal, tick: Decimal) -> Decimal {
     }
     // floor(value / tick) * tick
     let quotient = (value / tick).floor();
+    quotient * tick
+}
+
+/// Ceil `value` to the nearest multiple of `tick`.
+///
+/// If `tick` is zero or negative, returns `value` unchanged (no-op guard).
+pub fn ceil_to(value: Decimal, tick: Decimal) -> Decimal {
+    if tick <= Decimal::ZERO {
+        return value;
+    }
+    let quotient = (value / tick).ceil();
     quotient * tick
 }
 

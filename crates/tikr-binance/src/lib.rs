@@ -58,7 +58,7 @@ pub use sign::BinanceKeyMaterial;
 use async_trait::async_trait;
 use depth_stream::binance_symbol;
 use exchange_info::{
-    ExchangeInfoCache, parse_exchange_info, round_price, round_size, validate_qty,
+    ExchangeInfoCache, parse_exchange_info, round_price_for_side, round_size, validate_qty,
 };
 use futures::stream::BoxStream;
 use reqwest::Client as HttpClient;
@@ -396,7 +396,12 @@ impl Venue for BinanceClient {
         self.check_mainnet_gate()?;
 
         let sym_str = binance_symbol(&intent.symbol);
-        let price = round_price(&self.exchange_info_cache, &sym_str, intent.price)?;
+        let price = round_price_for_side(
+            &self.exchange_info_cache,
+            &sym_str,
+            intent.price,
+            intent.side,
+        )?;
         let size = round_size(&self.exchange_info_cache, &sym_str, intent.size)?;
         validate_qty(&self.exchange_info_cache, &sym_str, size, price)?;
 
