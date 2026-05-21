@@ -7,7 +7,11 @@
 //! draw / run loops.
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use hjkl_clipboard::{Clipboard, MimeType, Selection as ClipSelection};
+use hjkl_clipboard::backend::ssh_aware::SshAwareBackend;
+use hjkl_clipboard::{
+    Backend, BackendKind, Capabilities, Clipboard, ClipboardError, MimeType,
+    Selection as ClipSelection,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -149,63 +153,77 @@ pub fn finalize_copy(sel: &mut MouseSelection, buf: &Buffer) -> Option<String> {
         return None;
     }
 
-    // Two-pronged copy:
-    //   1. OSC52 escape via stdout — passes through SSH to the LOCAL
-    //      terminal's clipboard. This is what enables paste on the
-    //      operator's local machine when the dashboard runs over SSH.
-    //   2. hjkl-clipboard native backend — sets the host's clipboard
-    //      (Wayland / X11 / NSPasteboard / Win32). Useful when the
-    //      operator is running the dashboard locally.
-    //
-    // Both fire because OSC52 alone may not work in terminals that
-    // don't honor the escape (Apple Terminal default), and the native
-    // backend alone is useless over SSH (sets the remote clipboard).
-    let osc52_ok = emit_osc52(&text).is_ok();
-    let native_ok = match Clipboard::new() {
-        Ok(cb) => cb
-            .set(ClipSelection::Clipboard, MimeType::Text, text.as_bytes())
-            .is_ok(),
-        Err(_) => false,
-    };
-    tracing::info!(
-        chars = text.chars().count(),
-        osc52 = osc52_ok,
-        native = native_ok,
-        "copied selection to clipboard"
-    );
-    if osc52_ok || native_ok {
-        Some(text)
-    } else {
-        tracing::warn!("clipboard copy failed via both OSC52 and native backend");
-        None
+    let cb = build_clipboard();
+    match cb.set(ClipSelection::Clipboard, MimeType::Text, text.as_bytes()) {
+        Ok(()) => {
+            tracing::info!(
+                chars = text.chars().count(),
+                "copied selection to clipboard"
+            );
+            Some(text)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "clipboard set failed");
+            None
+        }
     }
 }
 
-/// Emit an OSC 52 escape to stdout so the user's terminal emulator
-/// (local OR upstream of an SSH session) captures the text into its
-/// native clipboard.
+/// Build a clipboard handle that does the right thing both locally and
+/// over SSH.
 ///
-/// Format:
-/// - Plain terminal: `\x1b]52;c;<base64>\x07`
-/// - Inside tmux:    `\x1bPtmux;\x1b\x1b]52;c;<base64>\x07\x1b\\`
-///   (DCS passthrough — tmux strips one ESC layer)
+/// - **Inside an SSH session** (`$SSH_CONNECTION` / `$SSH_TTY` set):
+///   force the OSC52 path by wrapping a [`NullBackend`] (always returns
+///   `BackendUnavailable`) with [`SshAwareBackend`]. This avoids the
+///   auto-probe picking up an X11 backend over X-forwarding and writing
+///   to the *remote* clipboard. OSC52 travels back through the SSH
+///   stream so the operator's *local* terminal catches it.
 ///
-/// The terminal must support OSC52. Modern emulators do: kitty, wezterm,
-/// alacritty, iTerm2 (with permission), foot, xterm (with `allowWindowOps`).
-/// Apple Terminal default config does NOT support OSC52.
-fn emit_osc52(text: &str) -> std::io::Result<()> {
-    use base64::Engine;
-    use std::io::Write;
+/// - **Locally**: use [`Clipboard::new`] which probes Wayland → X11 →
+///   OSC52 on Linux, NSPasteboard on macOS, Win32 on Windows. If the
+///   probe somehow fails, fall through to the SSH-aware OSC52-only
+///   handle (still works in any modern terminal).
+fn build_clipboard() -> Clipboard {
+    let in_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if in_ssh {
+        return Clipboard::with_backend(Box::new(SshAwareBackend::new(Box::new(NullBackend))));
+    }
+    Clipboard::new().unwrap_or_else(|_| {
+        Clipboard::with_backend(Box::new(SshAwareBackend::new(Box::new(NullBackend))))
+    })
+}
 
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let in_tmux = std::env::var_os("TMUX").is_some();
-    let payload = if in_tmux {
-        format!("\x1bPtmux;\x1b\x1b]52;c;{encoded}\x07\x1b\\")
-    } else {
-        format!("\x1b]52;c;{encoded}\x07")
-    };
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    out.write_all(payload.as_bytes())?;
-    out.flush()
+/// A [`Backend`] that fails every operation with
+/// [`ClipboardError::BackendUnavailable`]. Used only as the inner of
+/// [`SshAwareBackend`]: the decorator falls back to its OSC52 path on
+/// any unavailable error, which is exactly the behavior we want over
+/// SSH (terminal-mediated clipboard, not the remote host's native one).
+struct NullBackend;
+
+#[async_trait::async_trait]
+impl Backend for NullBackend {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Mock
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::empty()
+    }
+    fn set(
+        &self,
+        _sel: ClipSelection,
+        _mime: MimeType,
+        _bytes: &[u8],
+    ) -> Result<(), ClipboardError> {
+        Err(ClipboardError::BackendUnavailable)
+    }
+    fn get(&self, _sel: ClipSelection, _mime: MimeType) -> Result<Vec<u8>, ClipboardError> {
+        Err(ClipboardError::BackendUnavailable)
+    }
+    fn clear(&self, _sel: ClipSelection) -> Result<(), ClipboardError> {
+        Err(ClipboardError::BackendUnavailable)
+    }
+    fn available(&self, _sel: ClipSelection) -> Result<Vec<MimeType>, ClipboardError> {
+        Err(ClipboardError::BackendUnavailable)
+    }
 }
