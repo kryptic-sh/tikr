@@ -403,16 +403,21 @@ impl Strategy for StaticGrid {
     fn on_quote_rejected(
         &mut self,
         ctx: &StrategyContext<'_>,
-        _intent: &QuoteIntent,
+        intent: &QuoteIntent,
         _reason: &str,
     ) -> Vec<Action> {
-        // Recovery path: a Quote we just emitted (typically from a rebuild
-        // after a fill) was post-only rejected because the market moved
-        // through our intended price. Read the FRESHEST book the runner
-        // can give us, refresh `last_mid`, and emit a new symmetric batch
-        // anchored on the current top-of-book mid. The runner retries
-        // recovery up to MAX_RECOVERY_ROUNDS until both sides land or the
-        // cap fires.
+        // Recovery path: a single Quote we emitted was post-only rejected
+        // (the market moved through our intended price between emit and
+        // arrival). Re-anchor on the FRESHEST top-of-book and re-place
+        // ONLY the side that got rejected.
+        //
+        // Critical: do NOT CancelAll here. Pre-fix this method did exactly
+        // that, which wiped the surviving opposite-side orders — the very
+        // ones that would close any inventory accumulated since the last
+        // rebuild. In the DOGE 24h backtest that pattern produced 421k
+        // fills with realized = 0 because every reject (frequent on a
+        // moving market) flattened the closing side before it could fire.
+        // Symmetric to the Fill-arm side-empty preservation logic.
         let bid = ctx.latest_book.bids.first().map(|l| l.price.0);
         let ask = ctx.latest_book.asks.first().map(|l| l.price.0);
         let (Some(b), Some(a)) = (bid, ask) else {
@@ -422,11 +427,7 @@ impl Strategy for StaticGrid {
         self.last_mid = Some(mid);
         let pos_usdt = ctx.position.size.0 * mid.0;
         let ratio = self.pos_ratio(pos_usdt);
-
-        let mut actions = Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
-        actions.push(Action::CancelAll);
-        actions.extend(self.build_batch(ctx.symbol, mid, ratio));
-        actions
+        self.build_one_side(ctx.symbol, mid, ratio, intent.side)
     }
 }
 
