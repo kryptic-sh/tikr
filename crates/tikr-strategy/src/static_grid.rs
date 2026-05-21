@@ -194,48 +194,108 @@ impl StaticGrid {
     /// get post-only rejected.
     fn build_batch(&self, symbol: &Symbol, mid: Price, pos_ratio: Decimal) -> Vec<Action> {
         let mut actions = Vec::with_capacity(self.config.levels_per_side as usize * 2);
-        let bp_unit = Decimal::from(10_000);
-        let buy_scale = Decimal::ONE + pos_ratio * self.config.skew_strength;
-        let sell_scale = Decimal::ONE - pos_ratio * self.config.skew_strength;
-        let adaptive = self.adaptive_scale();
         for k in 0..self.config.levels_per_side {
-            let base_bps =
-                Decimal::from(self.config.inner_bps + self.config.step_bps * k) * adaptive;
-            let buy_bps = (base_bps * buy_scale).max(Decimal::ONE);
-            let sell_bps = (base_bps * sell_scale).max(Decimal::ONE);
-            let buy = Price(mid.0 * (Decimal::ONE - buy_bps / bp_unit));
-            let sell = Price(mid.0 * (Decimal::ONE + sell_bps / bp_unit));
-            actions.push(self.make_quote(symbol, Side::Bid, buy));
-            actions.push(self.make_quote(symbol, Side::Ask, sell));
+            actions.push(self.make_level(symbol, mid, pos_ratio, Side::Bid, k));
+            actions.push(self.make_level(symbol, mid, pos_ratio, Side::Ask, k));
         }
         actions
     }
 
-    fn rebuild_needed(
+    /// Build only the `side` half of the ladder. Used by the
+    /// "refill only the empty side" path so we don't cancel the
+    /// surviving closing orders.
+    fn build_one_side(
+        &self,
+        symbol: &Symbol,
+        mid: Price,
+        pos_ratio: Decimal,
+        side: Side,
+    ) -> Vec<Action> {
+        let mut actions = Vec::with_capacity(self.config.levels_per_side as usize);
+        for k in 0..self.config.levels_per_side {
+            actions.push(self.make_level(symbol, mid, pos_ratio, side, k));
+        }
+        actions
+    }
+
+    fn make_level(
+        &self,
+        symbol: &Symbol,
+        mid: Price,
+        pos_ratio: Decimal,
+        side: Side,
+        k: u32,
+    ) -> Action {
+        let bp_unit = Decimal::from(10_000);
+        let buy_scale = Decimal::ONE + pos_ratio * self.config.skew_strength;
+        let sell_scale = Decimal::ONE - pos_ratio * self.config.skew_strength;
+        let adaptive = self.adaptive_scale();
+        let base_bps = Decimal::from(self.config.inner_bps + self.config.step_bps * k) * adaptive;
+        match side {
+            Side::Bid => {
+                let bps = (base_bps * buy_scale).max(Decimal::ONE);
+                let price = Price(mid.0 * (Decimal::ONE - bps / bp_unit));
+                self.make_quote(symbol, Side::Bid, price)
+            }
+            Side::Ask => {
+                let bps = (base_bps * sell_scale).max(Decimal::ONE);
+                let price = Price(mid.0 * (Decimal::ONE + bps / bp_unit));
+                self.make_quote(symbol, Side::Ask, price)
+            }
+        }
+    }
+
+    /// What the bot should do on a full fill — refill only the empty
+    /// side, or rebuild the whole batch?
+    fn rebuild_decision(
         &self,
         open_quotes: &[(QuoteId, QuoteIntent)],
         cur_pos_ratio: Decimal,
-    ) -> bool {
-        let total = open_quotes.len();
-        if total <= 2 {
-            return true;
-        }
+    ) -> RebuildDecision {
         let buys = open_quotes
             .iter()
             .filter(|(_, q)| q.side == Side::Bid)
             .count();
-        let sells = total - buys;
-        if buys == 0 || sells == 0 {
-            return true;
+        let sells = open_quotes.len() - buys;
+
+        // Inventory drift past the configured threshold: re-anchor the
+        // whole grid at the new skew.
+        let drift = (cur_pos_ratio - self.last_pos_ratio).abs();
+        if drift > self.config.rebuild_pos_ratio_delta {
+            return RebuildDecision::FullRebuild;
         }
-        // Inventory drifted past the rebuild threshold since the last
-        // batch placement — re-anchor at the newly-skewed prices.
-        let delta = (cur_pos_ratio - self.last_pos_ratio).abs();
-        if delta > self.config.rebuild_pos_ratio_delta {
-            return true;
+
+        // Both sides empty (or wiped by external cancel): full rebuild.
+        if buys == 0 && sells == 0 {
+            return RebuildDecision::FullRebuild;
         }
-        false
+
+        // One side empty: refill only that side. CRITICAL: do NOT
+        // cancel the surviving side — those are the closing orders for
+        // the inventory we accumulated. The pre-fix design did a
+        // CancelAll on side-empty which cancelled the very orders that
+        // would have flattened the position, causing runaway one-sided
+        // fills (PROMPT 165 buys / 5 sells, DOGE realized = 0).
+        if buys == 0 {
+            return RebuildDecision::RefillSide(Side::Bid);
+        }
+        if sells == 0 {
+            return RebuildDecision::RefillSide(Side::Ask);
+        }
+
+        RebuildDecision::None
     }
+}
+
+/// Outcome of `rebuild_decision`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildDecision {
+    None,
+    /// Wipe and re-place both sides around current mid.
+    FullRebuild,
+    /// Place only this side's `levels_per_side` orders, leaving the
+    /// opposite side untouched.
+    RefillSide(Side),
 }
 
 impl Strategy for StaticGrid {
@@ -311,16 +371,24 @@ impl Strategy for StaticGrid {
                 };
                 let pos_usdt = ctx.position.size.0 * mid.0;
                 let cur_ratio = self.pos_ratio(pos_usdt);
-                if !self.rebuild_needed(ctx.open_quotes, cur_ratio) {
-                    return Vec::new();
+                match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
+                    RebuildDecision::None => Vec::new(),
+                    RebuildDecision::FullRebuild => {
+                        self.last_pos_ratio = cur_ratio;
+                        let mut actions =
+                            Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
+                        actions.push(Action::CancelAll);
+                        actions.extend(self.build_batch(ctx.symbol, mid, cur_ratio));
+                        actions
+                    }
+                    RebuildDecision::RefillSide(side) => {
+                        // Don't touch last_pos_ratio — only the drift /
+                        // full-rebuild paths anchor the skew snapshot.
+                        // Don't CancelAll — the surviving side's orders
+                        // are the ones that will close the inventory.
+                        self.build_one_side(ctx.symbol, mid, cur_ratio, side)
+                    }
                 }
-                self.last_pos_ratio = cur_ratio;
-                // CancelAll wipes the few remaining stragglers; fresh batch
-                // re-anchors on current mid with inventory-aware skew.
-                let mut actions = Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
-                actions.push(Action::CancelAll);
-                actions.extend(self.build_batch(ctx.symbol, mid, cur_ratio));
-                actions
             }
             _ => Vec::new(),
         }
