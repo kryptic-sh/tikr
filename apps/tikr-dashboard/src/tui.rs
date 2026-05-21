@@ -1,5 +1,7 @@
 //! ratatui draw + event loop with mouse support.
 
+#![allow(clippy::collapsible_match)]
+
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,16 @@ use crate::state::{AccountAggregate, BotStatus, BotViewSnapshot, SharedBotState}
 const DRAW_INTERVAL_MS: u64 = 250;
 const EVENT_POLL_MS: u64 = 30;
 
+/// UI input mode (vim-style).
+enum Mode {
+    /// Default mode: tab navigation, log scroll, leader keys.
+    Normal,
+    /// `:`-prefixed Ex command — buffer is what the user has typed so far.
+    Ex { buffer: String },
+    /// `<Space><Space>` fuzzy bot picker.
+    Picker { query: String, selected: usize },
+}
+
 /// UI state owned by the render loop.
 struct UiState {
     active_tab: usize,
@@ -35,6 +47,11 @@ struct UiState {
     last_log_rect: Option<Rect>,
     /// Per-tab `(start_x, end_x)` in absolute terminal coords.
     last_tab_ranges: Vec<(u16, u16)>,
+    /// Current input mode.
+    mode: Mode,
+    /// Timestamp of the last `<Space>` press — for the `<Space><Space>`
+    /// leader sequence. Cleared after 800ms.
+    leader_pending: Option<Instant>,
 }
 
 impl UiState {
@@ -45,6 +62,8 @@ impl UiState {
             last_tab_rect: None,
             last_log_rect: None,
             last_tab_ranges: Vec::new(),
+            mode: Mode::Normal,
+            leader_pending: None,
         }
     }
 
@@ -132,20 +151,128 @@ pub async fn run(
     Ok(())
 }
 
+/// Leader-key window: a second `<Space>` within this many ms triggers
+/// the picker. Mirrors vim's `:set timeoutlen=800`.
+const LEADER_WINDOW_MS: u128 = 800;
+
 fn handle_key(
     key: crossterm::event::KeyEvent,
     views: &[BotViewSnapshot],
     ui: &mut UiState,
 ) -> bool {
     use crossterm::event::KeyModifiers;
+
+    // Ctrl-C always quits, regardless of mode.
+    if let KeyCode::Char('c') = key.code
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return true;
+    }
+
+    match &mut ui.mode {
+        Mode::Ex { buffer } => {
+            match key.code {
+                KeyCode::Esc => ui.mode = Mode::Normal,
+                KeyCode::Enter => {
+                    let cmd = buffer.trim().to_string();
+                    ui.mode = Mode::Normal;
+                    if cmd == "q" || cmd == "quit" {
+                        return true;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if buffer.pop().is_none() {
+                        ui.mode = Mode::Normal;
+                    }
+                }
+                KeyCode::Char(c) => buffer.push(c),
+                _ => {}
+            }
+            return false;
+        }
+        Mode::Picker { query, selected } => {
+            let filtered = filter_views(views, query);
+            match key.code {
+                KeyCode::Esc => ui.mode = Mode::Normal,
+                KeyCode::Enter => {
+                    if let Some((idx, _, _)) = filtered.get(*selected) {
+                        ui.active_tab = *idx;
+                        ui.log_scroll = 0;
+                    }
+                    ui.mode = Mode::Normal;
+                }
+                KeyCode::Up => {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if *selected + 1 < filtered.len() {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Char(c) if c == 'p' && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    }
+                }
+                KeyCode::Char(c) if c == 'n' && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if *selected + 1 < filtered.len() {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    *selected = 0;
+                }
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    *selected = 0;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        Mode::Normal => {}
+    }
+
+    // Normal mode.
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
-        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') if !views.is_empty() => {
+        KeyCode::Char(':') => {
+            ui.mode = Mode::Ex {
+                buffer: String::new(),
+            }
+        }
+        // Shift+H / Shift+L → tab nav (capital letters arrive directly).
+        KeyCode::Char('H') if !views.is_empty() => {
+            ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
+            ui.log_scroll = 0;
+        }
+        KeyCode::Char('L') if !views.is_empty() => {
             ui.active_tab = (ui.active_tab + 1) % views.len();
             ui.log_scroll = 0;
         }
-        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') if !views.is_empty() => {
+        KeyCode::Char(' ') => {
+            let now = Instant::now();
+            let leader_active = ui
+                .leader_pending
+                .map(|t| now.duration_since(t).as_millis() < LEADER_WINDOW_MS)
+                .unwrap_or(false);
+            if leader_active {
+                ui.leader_pending = None;
+                ui.mode = Mode::Picker {
+                    query: String::new(),
+                    selected: 0,
+                };
+            } else {
+                ui.leader_pending = Some(now);
+            }
+        }
+        KeyCode::Tab | KeyCode::Right if !views.is_empty() => {
+            ui.active_tab = (ui.active_tab + 1) % views.len();
+            ui.log_scroll = 0;
+        }
+        KeyCode::BackTab | KeyCode::Left if !views.is_empty() => {
             ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
             ui.log_scroll = 0;
         }
@@ -158,7 +285,28 @@ fn handle_key(
     false
 }
 
+/// Filter + score bot views by `query` (fuzzy, via `hjkl_picker::score`).
+/// Returns `(original_index, score, match_positions)` sorted descending
+/// by score. Empty query returns all views with score 0.
+fn filter_views(views: &[BotViewSnapshot], query: &str) -> Vec<(usize, i64, Vec<usize>)> {
+    let mut out: Vec<(usize, i64, Vec<usize>)> = views
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, v)| {
+            let (score, positions) = hjkl_picker::score(&v.symbol, query)?;
+            Some((idx, score, positions))
+        })
+        .collect();
+    out.sort_by_key(|t| std::cmp::Reverse(t.1));
+    out
+}
+
 fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
+    // Modal modes swallow mouse events so they don't manipulate the
+    // underlying tabs/log pane.
+    if !matches!(ui.mode, Mode::Normal) {
+        return;
+    }
     match mev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(idx) = ui.hit_tab(mev.column, mev.row)
@@ -196,7 +344,102 @@ fn draw(
 
     draw_tabs(f, outer[0], views, ui);
     draw_body(f, outer[1], views, ui.active_tab, agg, log_lines, ui);
-    draw_footer(f, outer[2]);
+    draw_footer(f, outer[2], &ui.mode);
+
+    // Modal overlays.
+    if let Mode::Picker {
+        query: _,
+        selected: _,
+    } = &ui.mode
+    {
+        draw_picker_overlay(f, views, ui);
+    }
+}
+
+fn draw_picker_overlay(f: &mut Frame<'_>, views: &[BotViewSnapshot], ui: &UiState) {
+    let area = centered_rect(60, 70, f.area());
+    // Clear the underlying area so the overlay isn't see-through.
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let (query, selected) = match &ui.mode {
+        Mode::Picker { query, selected } => (query.clone(), *selected),
+        _ => return,
+    };
+    let filtered = filter_views(views, &query);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    // Query input.
+    let input = Paragraph::new(format!("  {}_", query)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" pick bot (Esc cancel, Enter open) ")
+            .style(Style::default().fg(Color::White)),
+    );
+    f.render_widget(input, chunks[0]);
+
+    // Results list.
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(row, (orig_idx, score, positions))| {
+            let v = &views[*orig_idx];
+            let style_base = if row == selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(
+                if row == selected { "› " } else { "  " },
+                style_base,
+            ));
+            // Highlight matched char positions.
+            for (i, ch) in v.symbol.chars().enumerate() {
+                let s = if positions.contains(&i) {
+                    style_base.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    style_base
+                };
+                spans.push(Span::styled(ch.to_string(), s));
+            }
+            spans.push(Span::styled(format!("  · {} ", v.strategy), style_base));
+            let _ = score;
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
+        " {} match{} ",
+        filtered.len(),
+        if filtered.len() == 1 { "" } else { "es" }
+    )));
+    f.render_widget(list, chunks[1]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vert[1])[1]
 }
 
 fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut UiState) {
@@ -495,11 +738,20 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
     f.render_widget(p, area);
 }
 
-fn draw_footer(f: &mut Frame<'_>, area: Rect) {
-    let p = Paragraph::new(
-        " q quit  ←/→ tab  click tab/wheel scroll  PgUp/PgDn jump  Home/End top/bottom        ",
-    )
-    .style(Style::default().fg(Color::DarkGray));
+fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &Mode) {
+    let text = match mode {
+        Mode::Normal => {
+            " :q quit  H/L tab  <Space><Space> picker  PgUp/PgDn scroll  click/wheel".to_string()
+        }
+        Mode::Ex { buffer } => format!(":{buffer}_"),
+        Mode::Picker { .. } => " Esc cancel  Enter open  ↑/↓ or Ctrl-P/N".to_string(),
+    };
+    let style = match mode {
+        Mode::Normal => Style::default().fg(Color::DarkGray),
+        Mode::Ex { .. } => Style::default().fg(Color::Yellow),
+        Mode::Picker { .. } => Style::default().fg(Color::Cyan),
+    };
+    let p = Paragraph::new(text).style(style);
     f.render_widget(p, area);
 }
 
