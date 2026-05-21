@@ -205,8 +205,9 @@ struct Args {
     /// StaticGrid: step between consecutive levels on the same side in bps.
     #[arg(long, default_value_t = 3u32)]
     sg_step_bps: u32,
-    /// StaticGrid: inventory-skew strength. 0.0 = symmetric, 1.0 = ±100%.
-    #[arg(long, default_value = "0.5")]
+    /// StaticGrid: inventory-skew strength. 0.0 = symmetric (default — best
+    /// on majors). Bump to 0.8–1.5 for high-vol meme alts (DOGE etc).
+    #[arg(long, default_value = "0")]
     sg_skew_strength: String,
     /// StaticGrid: position USDT at which skew saturates (clamped to ±1).
     #[arg(long, default_value = "50")]

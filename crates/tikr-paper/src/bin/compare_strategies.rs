@@ -99,8 +99,9 @@ struct Args {
     sg_levels_list: String,
 
     /// StaticGrid sweep: comma-separated `skew_strength` values
-    /// (decimals, e.g. "0,0.3,0.5,0.8,1.0").
-    #[arg(long, default_value = "0,0.5")]
+    /// (decimals, e.g. "0,0.3,0.5,0.8,1.0"). Default exercises 0 (off)
+    /// and 1.0 (heavy) — 0 wins majors, ≥1 wins high-vol alts.
+    #[arg(long, default_value = "0,1.0")]
     sg_skew_list: String,
 
     /// StaticGrid sweep: comma-separated `target_inventory_usdt` values.
