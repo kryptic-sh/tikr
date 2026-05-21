@@ -7,45 +7,24 @@ state_dir = "./state"
 
 
 [[bot]]
-symbol = "BTCUSDT"
-strategy = "simple-gap"
-[bot.simple_gap]
-
-
-[[bot]]
-symbol = "ETHUSDT"
-strategy = "simple-gap"
-[bot.simple_gap]
-
-
-[[bot]]
-symbol = "BNBUSDT"
-strategy = "simple-gap"
-[bot.simple_gap]
-
-
-[[bot]]
-symbol = "SOLUSDT"
-strategy = "simple-gap"
-[bot.simple_gap]
-
-
-[[bot]]
 symbol = "DOGEUSDT"
 strategy = "simple-gap"
 [bot.simple_gap]
+gap_bps = 5
 
 
 [[bot]]
 symbol = "HYPERUSDT"
 strategy = "simple-gap"
 [bot.simple_gap]
+gap_bps = 5
 
 
 [[bot]]
 symbol = "PROMPTUSDT"
 strategy = "simple-gap"
 [bot.simple_gap]
+gap_bps = 5
 
 
 # ─── SimpleGap template (uncomment to use) ─────────────────────────────────
