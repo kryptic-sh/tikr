@@ -104,11 +104,25 @@ async fn main() -> anyhow::Result<()> {
         supervisors.push(h);
     }
 
-    // Run the TUI on the current task. Blocks until quit.
-    tui::run(shared_state, log_store, global_shutdown_tx.clone()).await?;
+    // Run the TUI on a dedicated OS thread, OFF the tokio runtime.
+    // crossterm event-poll and ratatui draws are sync I/O — running
+    // them inside a tokio task would block a worker that should be
+    // servicing bot futures. The dedicated thread also gets its own
+    // OS-level scheduling so render frames aren't gated on tokio
+    // wakeups.
+    let tui_state = shared_state.clone();
+    let tui_logs = log_store.clone();
+    let tui_shutdown = global_shutdown_tx.clone();
+    let tui_thread = std::thread::Builder::new()
+        .name("tikr-dashboard-tui".into())
+        .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown))?;
 
-    // Tell supervisors to wind down (already done in tui::run on exit,
-    // but redundant signaling is harmless).
+    // Wait for the TUI thread to exit. Joining off a blocking task so
+    // the tokio runtime stays free for the supervisors.
+    let _ = tokio::task::spawn_blocking(move || tui_thread.join()).await;
+
+    // Tell supervisors to wind down (the TUI thread already did this
+    // on exit, but redundant signaling is harmless).
     let _ = global_shutdown_tx.send(true);
 
     // Give supervisors up to 6s to finish.

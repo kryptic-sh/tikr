@@ -24,8 +24,9 @@ use tracing::Level;
 use crate::logs::{LogLine, LogStore};
 use crate::state::{AccountAggregate, BotStatus, BotViewSnapshot, SharedBotState};
 
-const DRAW_INTERVAL_MS: u64 = 250;
-const EVENT_POLL_MS: u64 = 30;
+/// Frame budget. ~60 FPS — the render thread is its own OS thread (off
+/// the tokio runtime), so we're not stealing time from bot tasks.
+const FRAME_BUDGET_MS: u64 = 16;
 
 /// UI input mode (vim-style).
 enum Mode {
@@ -88,11 +89,17 @@ impl UiState {
     }
 }
 
-/// Run the TUI until the user presses `q` (or Ctrl-C).
+/// Run the TUI on the current (blocking) thread until the user issues
+/// `:q` or Ctrl-C.
+///
+/// This is intentionally a **synchronous** entry point. crossterm event
+/// polling and ratatui rendering are both sync I/O; mixing them into a
+/// tokio task would block a worker that should otherwise be servicing
+/// bot futures. The dashboard runs this on a dedicated OS thread.
 ///
 /// Sends `true` on `global_shutdown` when exiting so supervisors can
 /// wind down their bots.
-pub async fn run(
+pub fn run(
     state: SharedBotState,
     logs: LogStore,
     global_shutdown: watch::Sender<bool>,
@@ -105,50 +112,65 @@ pub async fn run(
     let mut terminal = Terminal::new(backend)?;
 
     let mut ui = UiState::new();
+    let mut dirty = true;
     let mut last_draw = Instant::now();
+    let frame = Duration::from_millis(FRAME_BUDGET_MS);
 
-    loop {
-        // 1. Pump events (keys + mouse).
-        if event::poll(Duration::from_millis(EVENT_POLL_MS))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let views = state.views();
-                    if handle_key(key, &views, &mut ui) {
-                        break;
+    let res: Result<()> = (|| {
+        loop {
+            // Compute remaining budget before the next forced redraw.
+            let elapsed = last_draw.elapsed();
+            let wait = frame.saturating_sub(elapsed);
+
+            // Block up to `wait` for an event. If wait==0 we still call
+            // poll(0) to drain any pending events synchronously.
+            if event::poll(wait)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        let views = state.views();
+                        if handle_key(key, &views, &mut ui) {
+                            break;
+                        }
+                        dirty = true;
                     }
+                    Event::Mouse(mev) => {
+                        let views = state.views();
+                        handle_mouse(mev, &views, &mut ui);
+                        dirty = true;
+                    }
+                    Event::Resize(_, _) => dirty = true,
+                    _ => {}
                 }
-                Event::Mouse(mev) => {
-                    let views = state.views();
-                    handle_mouse(mev, &views, &mut ui);
+            }
+
+            // Frame budget exhausted → redraw (forced) even if the UI
+            // wasn't marked dirty, so live PnL / log lines flow.
+            if dirty || last_draw.elapsed() >= frame {
+                let views = state.views();
+                if ui.active_tab >= views.len() && !views.is_empty() {
+                    ui.active_tab = views.len() - 1;
                 }
-                _ => {}
+                let active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
+                let log_lines = active_symbol
+                    .as_deref()
+                    .map(|s| logs.snapshot(s))
+                    .unwrap_or_default();
+                let agg = AccountAggregate::compute(&views);
+                terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui))?;
+                last_draw = Instant::now();
+                dirty = false;
             }
         }
+        Ok(())
+    })();
 
-        // 2. Throttled redraw.
-        if last_draw.elapsed() >= Duration::from_millis(DRAW_INTERVAL_MS) {
-            let views = state.views();
-            if ui.active_tab >= views.len() && !views.is_empty() {
-                ui.active_tab = views.len() - 1;
-            }
-            let active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
-            let log_lines = active_symbol
-                .as_deref()
-                .map(|s| logs.snapshot(s))
-                .unwrap_or_default();
-            let agg = AccountAggregate::compute(&views);
-            terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui))?;
-            last_draw = Instant::now();
-        }
-    }
-
-    // Cleanup.
+    // Cleanup — always run even on error.
     let _ = global_shutdown.send(true);
-    disable_raw_mode()?;
+    let _ = disable_raw_mode();
     let backend = terminal.backend_mut();
-    backend.execute(DisableMouseCapture)?;
-    backend.execute(crossterm::terminal::LeaveAlternateScreen)?;
-    Ok(())
+    let _ = backend.execute(DisableMouseCapture);
+    let _ = backend.execute(crossterm::terminal::LeaveAlternateScreen);
+    res
 }
 
 /// Leader-key window: a second `<Space>` within this many ms triggers
