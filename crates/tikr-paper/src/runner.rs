@@ -653,10 +653,33 @@ where
                 }
                 events_processed += 1;
 
-                if events_processed > 0
-                    && config.snapshot_every_n_events > 0
-                    && events_processed.is_multiple_of(config.snapshot_every_n_events as u64)
-                {
+                // Live tap is published EVERY event — cheap try_write on
+                // an Arc<RwLock> with one small clone — so dashboards
+                // see open-order counts / position / last fill within a
+                // frame of the runner observing it. The PaperReport
+                // snapshot (with finalize() cost + disk write) stays
+                // at the configured cadence below.
+                publish_live(
+                    &config.live_tap,
+                    &tracker,
+                    &fill_sim,
+                    &symbol,
+                    last_mid,
+                    &current_book,
+                    buy_fills,
+                    sell_fills,
+                    &last_fill,
+                );
+
+                // PaperReport snapshot: fire on the very FIRST event so
+                // the dashboard's bot-detail panel populates instantly
+                // (otherwise quiet symbols can take 30-60s to hit the
+                // first multiple of snapshot_every_n_events). After
+                // that, regular interval cadence applies.
+                let first_paper_snapshot = events_processed == 1;
+                let interval_due = config.snapshot_every_n_events > 0
+                    && events_processed.is_multiple_of(config.snapshot_every_n_events as u64);
+                if first_paper_snapshot || interval_due {
                     let mut report = finalize(
                         &tracker,
                         last_mid,
@@ -675,25 +698,20 @@ where
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
                         resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
-                    if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
+                    // Skip the disk write on the first-event publish —
+                    // there's no meaningful state to persist before any
+                    // events have accumulated, and we don't want every
+                    // bot to spam the filesystem on startup.
+                    if !first_paper_snapshot
+                        && let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id)
+                    {
                         warn!("snapshot write failed: {}", e);
                     }
                     if let Some(ref tap) = config.snapshot_tap
-                        && let Ok(mut guard) = tap.write()
+                        && let Ok(mut guard) = tap.try_write()
                     {
                         *guard = Some(report.clone());
                     }
-                    publish_live(
-                        &config.live_tap,
-                        &tracker,
-                        &fill_sim,
-                        &symbol,
-                        last_mid,
-                        &current_book,
-                        buy_fills,
-                        sell_fills,
-                        &last_fill,
-                    );
                 }
             }
             // Live mode: process real exchange fills.
@@ -900,7 +918,7 @@ where
         warn!("final snapshot write failed: {}", e);
     }
     if let Some(ref tap) = config.snapshot_tap
-        && let Ok(mut guard) = tap.write()
+        && let Ok(mut guard) = tap.try_write()
     {
         *guard = Some(report.clone());
     }
