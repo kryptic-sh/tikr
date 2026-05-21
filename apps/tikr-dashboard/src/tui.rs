@@ -236,7 +236,13 @@ fn handle_key(
         Mode::Normal => {}
     }
 
-    // Normal mode.
+    // Normal mode. Leader-key (`<Space>`) state is cleared by any
+    // non-`<Space>` keystroke so a stale leader from earlier doesn't
+    // wrongly trigger the picker on the next `<Space>`.
+    let was_space = matches!(key.code, KeyCode::Char(' '));
+    if !was_space {
+        ui.leader_pending = None;
+    }
     match key.code {
         KeyCode::Char(':') => {
             ui.mode = Mode::Ex {
