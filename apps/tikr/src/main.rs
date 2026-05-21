@@ -1,9 +1,10 @@
-//! tikr-dashboard — multi-bot live trading TUI.
+//! tikr — multi-bot live trading orchestrator.
 //!
 //! ```bash
-//! tikr-dashboard                  # auto-discover config
-//! tikr-dashboard --config <path>  # explicit override
-//! tikr-dashboard --check          # validate + exit
+//! tikr                  # auto-discover config, launch TUI
+//! tikr --headless       # same but no TUI (for SSH / CI / smoke tests)
+//! tikr --config <path>  # explicit override
+//! tikr --check          # validate + exit
 //! ```
 //!
 //! Config discovery (when `--config` is not passed):
@@ -33,10 +34,7 @@ use crate::state::{BotStatus, BotView, SharedBotState};
 use crate::supervisor::{SupervisorCtx, spawn_supervisor};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "tikr-dashboard",
-    about = "Multi-bot live trading dashboard for tikr"
-)]
+#[command(name = "tikr", about = "Multi-bot live trading orchestrator")]
 struct Args {
     /// Path to the dashboard config TOML. If omitted, the loader looks
     /// at `./config.toml` first, then `$XDG_CONFIG_HOME/tikr/config.toml`.
@@ -46,6 +44,17 @@ struct Args {
     /// Validate the config and exit without spawning bots.
     #[arg(long)]
     check: bool,
+
+    /// Run without a TUI — spawn bots, log to stdout, exit on Ctrl-C.
+    /// Useful for SSH sessions, CI/smoke tests, or any place where the
+    /// interactive TUI is in the way.
+    #[arg(long)]
+    headless: bool,
+
+    /// Headless-only: stop after `--minutes` (0 = run until Ctrl-C).
+    /// Ignored in TUI mode.
+    #[arg(long, default_value_t = 0u32)]
+    minutes: u32,
 }
 
 /// Resolve the config path using cwd-first → XDG fallback discovery.
@@ -106,16 +115,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Set up the per-bot log capture BEFORE any tracing macros fire.
-    let log_store = LogStore::new();
-    let log_layer = crate::logs::LogLayer::new(log_store.clone());
-    // Default: capture INFO+ from every tikr-* crate so the bot's log
-    // pane shows the same stream a manual `run_perp` invocation would.
-    // Operators can override via `RUST_LOG=...` for noisier debugging.
+    // Tracing setup differs by mode:
+    // - TUI mode: per-bot LogStore + custom Layer routes events to the
+    //   active tab's log pane (no stdout writes, the TUI owns the screen).
+    // - Headless mode: standard fmt::layer to stdout for SSH / CI runs.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
             "info,\
-             tikr_dashboard=info,\
+             tikr=info,\
              tikr_paper=info,\
              tikr_binance=info,\
              tikr_strategy=info,\
@@ -124,10 +131,19 @@ async fn main() -> anyhow::Result<()> {
              tikr_risk=info",
         )
     });
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(log_layer)
-        .init();
+    let log_store = LogStore::new();
+    if args.headless {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    } else {
+        let log_layer = crate::logs::LogLayer::new(log_store.clone());
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(log_layer)
+            .init();
+    }
 
     // Account-wide credentials.
     let env = venue::parse_env(&cfg.account.env)?;
@@ -167,23 +183,44 @@ async fn main() -> anyhow::Result<()> {
         supervisors.push(h);
     }
 
-    // Run the TUI on a dedicated OS thread, OFF the tokio runtime.
-    // crossterm event-poll and ratatui draws are sync I/O — running
-    // them inside a tokio task would block a worker that should be
-    // servicing bot futures. The dedicated thread also gets its own
-    // OS-level scheduling so render frames aren't gated on tokio
-    // wakeups.
-    let tui_state = shared_state.clone();
-    let tui_logs = log_store.clone();
-    let tui_shutdown = global_shutdown_tx.clone();
-    let tui_config_path = config_path.clone();
-    let tui_thread = std::thread::Builder::new()
-        .name("tikr-dashboard-tui".into())
-        .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown, tui_config_path))?;
-
-    // Wait for the TUI thread to exit. Joining off a blocking task so
-    // the tokio runtime stays free for the supervisors.
-    let _ = tokio::task::spawn_blocking(move || tui_thread.join()).await;
+    if args.headless {
+        // No TUI — wait for Ctrl-C (or --minutes timer if set).
+        let ctrl_c = tokio::signal::ctrl_c();
+        if args.minutes > 0 {
+            let dur = std::time::Duration::from_secs(args.minutes as u64 * 60);
+            tracing::info!(
+                bots = cfg.bots.len(),
+                minutes = args.minutes,
+                "headless mode — running until time cap or Ctrl-C"
+            );
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("Ctrl-C received"),
+                _ = tokio::time::sleep(dur) => tracing::info!("time cap reached"),
+            }
+        } else {
+            tracing::info!(
+                bots = cfg.bots.len(),
+                "headless mode — running until Ctrl-C"
+            );
+            let _ = ctrl_c.await;
+            tracing::info!("Ctrl-C received");
+        }
+    } else {
+        // Run the TUI on a dedicated OS thread, OFF the tokio runtime.
+        // crossterm event-poll and ratatui draws are sync I/O — running
+        // them inside a tokio task would block a worker that should be
+        // servicing bot futures. The dedicated thread also gets its own
+        // OS-level scheduling so render frames aren't gated on tokio
+        // wakeups.
+        let tui_state = shared_state.clone();
+        let tui_logs = log_store.clone();
+        let tui_shutdown = global_shutdown_tx.clone();
+        let tui_config_path = config_path.clone();
+        let tui_thread = std::thread::Builder::new()
+            .name("tikr-tui".into())
+            .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown, tui_config_path))?;
+        let _ = tokio::task::spawn_blocking(move || tui_thread.join()).await;
+    }
 
     // Tell supervisors to wind down (the TUI thread already did this
     // on exit, but redundant signaling is harmless).

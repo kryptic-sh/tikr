@@ -636,9 +636,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut UiState) {
     // Custom render so we control click hit-boxes exactly.
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" tikr-dashboard ");
+    let block = Block::default().borders(Borders::ALL).title(" tikr ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 

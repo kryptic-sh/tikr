@@ -5443,6 +5443,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "crossterm",
+ "dotenvy",
+ "futures",
+ "hjkl-clipboard",
+ "hjkl-keymap",
+ "hjkl-picker",
+ "ratatui",
+ "reqwest 0.12.28",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "rustls",
+ "serde",
+ "tikr-backtest",
+ "tikr-binance",
+ "tikr-core",
+ "tikr-paper",
+ "tikr-strategy",
+ "tikr-venue",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tikr-backtest"
 version = "0.1.0"
 dependencies = [
@@ -5510,37 +5541,6 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
-]
-
-[[package]]
-name = "tikr-dashboard"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "crossterm",
- "dotenvy",
- "futures",
- "hjkl-clipboard",
- "hjkl-keymap",
- "hjkl-picker",
- "ratatui",
- "reqwest 0.12.28",
- "rust_decimal",
- "rust_decimal_macros",
- "rustls",
- "serde",
- "tikr-backtest",
- "tikr-binance",
- "tikr-core",
- "tikr-paper",
- "tikr-strategy",
- "tikr-venue",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
