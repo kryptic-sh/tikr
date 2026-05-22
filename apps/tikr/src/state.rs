@@ -145,6 +145,16 @@ impl SharedBotState {
         }
     }
 
+    /// Remove a symbol from the dashboard state.
+    pub fn remove(&self, symbol: &str) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.remove(symbol);
+        }
+        if let Ok(mut o) = self.order.lock() {
+            o.retain(|s| s != symbol);
+        }
+    }
+
     /// Update status for a symbol.
     pub fn set_status(&self, symbol: &str, status: BotStatus) {
         if let Ok(mut g) = self.inner.lock()
@@ -199,6 +209,11 @@ impl SharedBotState {
                 })
             })
             .collect()
+    }
+
+    /// Symbols currently known to the dashboard state.
+    pub fn symbols(&self) -> Vec<String> {
+        self.order.lock().map(|o| o.clone()).unwrap_or_default()
     }
 }
 

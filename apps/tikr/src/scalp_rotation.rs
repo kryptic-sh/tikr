@@ -142,6 +142,9 @@ async fn update_active_set(
         }
     }
     if !removed.is_empty() {
+        for symbol in removed.keys() {
+            shared_state.remove(symbol);
+        }
         stop_bots(removed, account).await;
     }
     for symbol in symbols.iter().take(slots) {
