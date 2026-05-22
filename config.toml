@@ -18,7 +18,7 @@ state_dir = "./state"
 # Account margin-balance percent allocated to computed per-order size.
 # Split evenly across bots: 10 with 2 bots => 5% balance per bot/order.
 # Per-bot strategy `notional = ...` overrides this computed value.
-order_balance_pct = "10"
+order_balance_pct = "1"
 
 # Multiplier applied to wallet balance before sizing, usually account leverage.
 # Effective pool = wallet_balance * margin_multiplier * order_balance_pct.
@@ -96,9 +96,9 @@ symbol = "DOGEUSDT"
 strategy = "static-grid"
 
 [bot.sg]
-target_fills_per_min = 10
 levels = 3
-step_bps = 1
+step_bps = 3
+inner_bps = 4
 
 
 # ─── HYPERUSDT ─────────────────────────────────────────────────────────────
@@ -108,9 +108,9 @@ symbol = "HYPERUSDT"
 strategy = "static-grid"
 
 [bot.sg]
-target_fills_per_min = 10
 levels = 3
-step_bps = 1
+step_bps = 3
+inner_bps = 4
 
 
 # ─── PROMPTUSDT ────────────────────────────────────────────────────────────
@@ -120,9 +120,9 @@ symbol = "PROMPTUSDT"
 strategy = "static-grid"
 
 [bot.sg]
-target_fills_per_min = 10
 levels = 3
-step_bps = 1
+step_bps = 3
+inner_bps = 4
 
 
 # ─── LayeredGrid template (uncomment to use) ───────────────────────────────

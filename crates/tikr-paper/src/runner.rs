@@ -1224,14 +1224,11 @@ async fn apply_fill(
     if let Some(gate) = risk_gate.as_mut() {
         gate.record_fill(fill.ts);
     }
-    // Display/report fill counters track completed orders, not every partial
-    // execution. PnL/position/risk still apply every partial above.
-    if fill.is_full {
-        *fills_emitted += 1;
-        match fill.side {
-            tikr_core::Side::Bid => *buy_fills += 1,
-            tikr_core::Side::Ask => *sell_fills += 1,
-        }
+    // Display/report fill counters track every execution, including partials.
+    *fills_emitted += 1;
+    match fill.side {
+        tikr_core::Side::Bid => *buy_fills += 1,
+        tikr_core::Side::Ask => *sell_fills += 1,
     }
     if let Some(sink) = alert_sink {
         let _ = sink
