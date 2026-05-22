@@ -252,9 +252,13 @@ fn build_spread_scalp(
             cfg.symbol
         );
     }
+    let step_size = venue.step_size(symbol).unwrap_or(tick_size);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
     Ok(StrategyChoice::SpreadScalp(SpreadScalpConfig {
         notional_per_order: notional,
         tick_size,
+        step_size,
+        min_notional,
         improve_ticks: spread_scalp.improve_ticks,
         min_requote_interval_ms: spread_scalp.min_requote_interval_ms,
         requote_tick_threshold: spread_scalp.requote_tick_threshold,

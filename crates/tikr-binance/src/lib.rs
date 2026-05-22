@@ -268,6 +268,18 @@ impl BinanceClient {
             .map(|f| f.min_notional)
     }
 
+    /// Look up the price tick size cached from `exchangeInfo`.
+    pub fn tick_size(&self, symbol: &Symbol) -> Option<tikr_core::Decimal> {
+        let sym_str = binance_symbol(symbol);
+        self.exchange_info_cache.get(&sym_str).map(|f| f.tick_size)
+    }
+
+    /// Look up the lot step size cached from `exchangeInfo`.
+    pub fn step_size(&self, symbol: &Symbol) -> Option<tikr_core::Decimal> {
+        let sym_str = binance_symbol(symbol);
+        self.exchange_info_cache.get(&sym_str).map(|f| f.step_size)
+    }
+
     /// Fetch USD-M futures balance for a margin asset (usually `USDT`).
     pub async fn futures_balance(
         &self,

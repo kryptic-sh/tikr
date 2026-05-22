@@ -18,6 +18,10 @@ pub struct SpreadScalpConfig {
     pub notional_per_order: Decimal,
     /// Venue tick size (price increment).
     pub tick_size: Decimal,
+    /// Venue lot step size (quantity rounding).
+    pub step_size: Decimal,
+    /// Minimum order notional (price × size) required by the venue.
+    pub min_notional: Decimal,
     /// Ticks inside best bid/ask to quote. `0` joins best bid/ask.
     pub improve_ticks: u32,
     /// Minimum time between normal cancel/replace cycles (ms).
@@ -93,20 +97,30 @@ impl SpreadScalp {
         }
 
         let flatten = self.config.flatten_threshold_notional;
-        let mut bid = if flatten > Decimal::ZERO && pos_notional >= flatten {
+        let long_flatten = flatten > Decimal::ZERO && pos_notional >= flatten;
+        let short_flatten = flatten > Decimal::ZERO && pos_notional <= -flatten;
+        let mut bid = if long_flatten {
             None
+        } else if short_flatten {
+            Some(best_bid)
         } else {
             Some(bid)
         };
-        let mut ask = if flatten > Decimal::ZERO && pos_notional <= -flatten {
+        let mut ask = if short_flatten {
             None
+        } else if long_flatten {
+            Some(best_ask)
         } else {
             Some(ask)
         };
 
-        self.drop_loss_making_reducer(ctx, &mut bid, &mut ask);
+        if !long_flatten && !short_flatten {
+            self.drop_loss_making_reducer(ctx, &mut bid, &mut ask);
+        }
 
         if let (Some(bid), Some(ask)) = (bid, ask)
+            && !long_flatten
+            && !short_flatten
             && self.quote_edge_bps(bid, ask, mid) < self.config.min_quote_edge_bps
         {
             return None;
@@ -164,11 +178,29 @@ impl SpreadScalp {
     }
 
     fn make_quote(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> Action {
+        let raw_size = self.config.notional_per_order / price.0;
+        let step = self.config.step_size;
+        let size = if step > Decimal::ZERO {
+            (raw_size / step).floor() * step
+        } else {
+            raw_size
+        };
+        let size = if self.config.min_notional > Decimal::ZERO
+            && size * price.0 < self.config.min_notional
+        {
+            if step > Decimal::ZERO {
+                size + step
+            } else {
+                size
+            }
+        } else {
+            size
+        };
         Action::Quote(QuoteIntent {
             symbol: ctx.symbol.clone(),
             side,
             price,
-            size: Size(self.config.notional_per_order / price.0),
+            size: Size(size),
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
@@ -487,6 +519,8 @@ mod tests {
         SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -561,6 +595,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -587,6 +623,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -619,6 +657,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -649,6 +689,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -675,6 +717,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -730,6 +774,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 1000,
             requote_tick_threshold: 1,
@@ -816,6 +862,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 5000,
             requote_tick_threshold: 3,
@@ -850,6 +898,8 @@ mod tests {
         let mut strategy = SpreadScalp::new(SpreadScalpConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             improve_ticks: 1,
             min_requote_interval_ms: 5000,
             requote_tick_threshold: 3,
