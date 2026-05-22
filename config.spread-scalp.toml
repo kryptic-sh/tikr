@@ -34,7 +34,7 @@ min_requote_interval_ms = 5000
 requote_tick_threshold = 3
 force_requote_interval_ms = 60000
 min_quote_edge_bps = 4
-flatten_threshold_notional = 20
+flatten_threshold_notional = 0
 skew_unit_notional = 10
 max_skew_ticks = 2
 
@@ -47,6 +47,6 @@ max_skew_ticks = 2
 # requote_tick_threshold = 3     # price must drift this many ticks before requote
 # force_requote_interval_ms = 60000 # safety refresh; 0 disables
 # min_quote_edge_bps = 4         # minimum gross edge between our bid/ask before fees/slippage
-# flatten_threshold_notional = 20 # one-sided flatten mode starts here; 0 disables
+# flatten_threshold_notional = 0  # disabled; was one-sided flatten mode
 # skew_unit_notional = 10        # notional where max_skew_ticks is fully applied; 0 disables
 # max_skew_ticks = 2             # long shifts quotes down; short shifts quotes up
