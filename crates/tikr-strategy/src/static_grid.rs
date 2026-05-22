@@ -1,4 +1,4 @@
-//! Static grid — place once, never move, only rebuild when batch is mostly consumed.
+//! Static grid — place once, then rebuild the full grid when one side is consumed.
 //!
 //! Differs from [`LayeredGrid`] in that there is NO rolling, NO TP, NO mid-tracking
 //! after cold start. Each order is a passive limit that sits until filled or
@@ -26,10 +26,8 @@
 //! # Rebuild rule
 //!
 //! After cold start, on each fully-filled fill the strategy counts the
-//! remaining open quotes. Rebuilds when EITHER:
-//!
-//! - Total open quotes `<= 2`
-//! - One side is empty (i.e. all remaining orders on the same side)
+//! remaining open quotes. Rebuilds when one side is empty (i.e. all
+//! remaining orders are on the same side, or both sides were externally wiped).
 //!
 //! Rebuild = `CancelAll` + fresh `2N` orders around the latest book mid.
 //! Anchored on the current book mid each time — the grid "follows" big
@@ -291,25 +289,6 @@ impl StaticGrid {
         actions
     }
 
-    /// Build only the `side` half of the ladder. Used by the
-    /// "refill only the empty side" path so we don't cancel the
-    /// surviving closing orders.
-    fn build_one_side(
-        &self,
-        symbol: &Symbol,
-        mid: Price,
-        best_bid: Price,
-        best_ask: Price,
-        pos_ratio: Decimal,
-        side: Side,
-    ) -> Vec<Action> {
-        let mut actions = Vec::with_capacity(self.config.levels_per_side as usize);
-        for k in 0..self.config.levels_per_side {
-            actions.push(self.make_level(symbol, mid, best_bid, best_ask, pos_ratio, side, k));
-        }
-        actions
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn make_level(
         &self,
@@ -372,8 +351,7 @@ impl StaticGrid {
         self.make_quote(symbol, side, price)
     }
 
-    /// What the bot should do on a full fill — refill only the empty
-    /// side, or rebuild the whole batch?
+    /// What the bot should do on a full fill.
     fn rebuild_decision(
         &self,
         open_quotes: &[(QuoteId, QuoteIntent)],
@@ -386,30 +364,19 @@ impl StaticGrid {
         let sells = open_quotes.len() - buys;
 
         // Both sides empty (or wiped by external cancel): full rebuild.
-        // Checked first so it short-circuits before the side-empty arm
-        // — neither side here is "surviving" so there's nothing to
-        // preserve.
         if buys == 0 && sells == 0 {
             return RebuildDecision::FullRebuild;
         }
 
-        // One side empty: refill only that side. CRITICAL: do NOT
-        // cancel the surviving side — those are the closing orders for
-        // the inventory we accumulated.
-        if buys == 0 {
-            return RebuildDecision::RefillSide(Side::Bid);
-        }
-        if sells == 0 {
-            return RebuildDecision::RefillSide(Side::Ask);
+        // One side empty: rebuild the whole grid so the surviving side
+        // follows the current price instead of lagging in fast trends.
+        if buys == 0 || sells == 0 {
+            return RebuildDecision::FullRebuild;
         }
 
-        // Both sides healthy. Nothing to do — the next fill will empty
-        // a side and route through RefillSide, which preserves the
-        // closing side and re-prices the accumulating side with the
-        // current inventory skew. No drift trigger needed: it was a
-        // mis-fit with the balance-agnostic ratio (which now scales
-        // 0→1 over levels_per_side fills, so any single fill exceeded
-        // any reasonable drift threshold).
+        // Both sides healthy. Nothing to do — the next fill may empty
+        // a side and route through FullRebuild, which re-prices both
+        // sides with the current inventory skew.
         let _ = cur_pos_ratio;
         RebuildDecision::None
     }
@@ -421,9 +388,6 @@ enum RebuildDecision {
     None,
     /// Wipe and re-place both sides around current mid.
     FullRebuild,
-    /// Place only this side's `levels_per_side` orders, leaving the
-    /// opposite side untouched.
-    RefillSide(Side),
 }
 
 impl Strategy for StaticGrid {
@@ -521,13 +485,6 @@ impl Strategy for StaticGrid {
                         );
                         actions
                     }
-                    RebuildDecision::RefillSide(side) => {
-                        if self.side_in_cooldown(side, now_ns) {
-                            return vec![Action::NoOp];
-                        }
-                        self.mark_refill(side, now_ns);
-                        self.build_one_side(ctx.symbol, mid, best_bid, best_ask, cur_ratio, side)
-                    }
                 }
             }
             MarketEvent::Fill(f) => {
@@ -561,11 +518,6 @@ impl Strategy for StaticGrid {
                         );
                         actions
                     }
-                    RebuildDecision::RefillSide(side) => {
-                        // Don't CancelAll — the surviving side's orders
-                        // are the ones that will close the inventory.
-                        self.build_one_side(ctx.symbol, mid, best_bid, best_ask, cur_ratio, side)
-                    }
                 }
             }
             _ => Vec::new(),
@@ -580,11 +532,8 @@ impl Strategy for StaticGrid {
     ) -> Vec<Action> {
         // Recovery path: a single Quote we emitted was rejected. Emit
         // ONE replacement at the innermost level (k=0) of the same
-        // side, anchored on the freshest book. Do NOT call
-        // build_one_side here — that would emit `levels_per_side`
-        // orders, and recovery rounds compound: 5 rounds × lv=2 = 10
-        // extra orders stacked on the side, ballooning the open count
-        // (live trace showed open b/s = 3/16 from this).
+        // side, anchored on the freshest book. Do NOT rebuild here —
+        // recovery rounds compound and can balloon open counts.
         //
         // The deeper levels on this side already exist from the prior
         // batch placement; this hook only patches the specific failed
@@ -638,6 +587,48 @@ mod tests {
             scale_max: Decimal::from_str(sc_max).unwrap(),
             auto_skew: true,
         }
+    }
+
+    fn quote(side: Side) -> (QuoteId, QuoteIntent) {
+        let symbol = Symbol {
+            base: tikr_core::Asset::new("BTC"),
+            quote: tikr_core::Asset::new("USDT"),
+            venue: tikr_core::VenueId::new("test"),
+            kind: tikr_core::MarketKind::Perp,
+        };
+        (
+            QuoteId::new(),
+            QuoteIntent {
+                symbol,
+                side,
+                price: Price(Decimal::from(100)),
+                size: Size(Decimal::ONE),
+                tif: TimeInForce::PostOnly,
+                kind: QuoteKind::Point,
+            },
+        )
+    }
+
+    #[test]
+    fn side_empty_triggers_full_rebuild() {
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert_eq!(
+            g.rebuild_decision(&[quote(Side::Ask), quote(Side::Ask)], Decimal::ZERO),
+            RebuildDecision::FullRebuild
+        );
+        assert_eq!(
+            g.rebuild_decision(&[quote(Side::Bid), quote(Side::Bid)], Decimal::ZERO),
+            RebuildDecision::FullRebuild
+        );
+    }
+
+    #[test]
+    fn both_sides_present_does_not_rebuild() {
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert_eq!(
+            g.rebuild_decision(&[quote(Side::Bid), quote(Side::Ask)], Decimal::ZERO),
+            RebuildDecision::None
+        );
     }
 
     #[test]
