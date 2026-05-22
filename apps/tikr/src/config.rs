@@ -33,10 +33,18 @@ pub struct AccountConfig {
     /// snapshots under a subdir keyed by symbol.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
+    /// Percent of account margin balance allocated to orders across all bots.
+    /// Split evenly by bot count when a bot's strategy does not set `notional`.
+    #[serde(default = "default_order_balance_pct")]
+    pub order_balance_pct: Decimal,
 }
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from("./state")
+}
+
+fn default_order_balance_pct() -> Decimal {
+    Decimal::new(2, 1)
 }
 
 /// Per-bot configuration.
@@ -67,9 +75,9 @@ pub struct BotConfig {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SgParams {
-    /// Fiat notional per order. Auto-bumped to `min_notional × 1.2` if below.
-    #[serde(default = "sg_default_notional")]
-    pub notional: Decimal,
+    /// Fiat notional per order. Defaults to account-level balance percent split.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
     /// Levels per side (total orders = `2 × levels`).
     #[serde(default = "sg_default_levels")]
     pub levels: u32,
@@ -97,9 +105,6 @@ pub struct SgParams {
     pub auto_skew: bool,
 }
 
-fn sg_default_notional() -> Decimal {
-    Decimal::from(25)
-}
 fn sg_default_levels() -> u32 {
     3
 }
@@ -127,8 +132,8 @@ fn sg_default_auto_skew() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LgParams {
     /// Notional per order.
-    #[serde(default = "lg_default_notional")]
-    pub notional: Decimal,
+    #[serde(default)]
+    pub notional: Option<Decimal>,
     /// Orders per side.
     #[serde(default = "lg_default_levels")]
     pub levels: u32,
@@ -137,9 +142,6 @@ pub struct LgParams {
     pub bps: u32,
 }
 
-fn lg_default_notional() -> Decimal {
-    Decimal::from(25)
-}
 fn lg_default_levels() -> u32 {
     1
 }
@@ -152,8 +154,8 @@ fn lg_default_bps() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct LadderReentryParams {
     /// Notional per order.
-    #[serde(default = "ladder_reentry_default_notional")]
-    pub notional: Decimal,
+    #[serde(default)]
+    pub notional: Option<Decimal>,
     /// Initial orders per side.
     #[serde(default = "ladder_reentry_default_levels")]
     pub levels: u32,
@@ -171,9 +173,6 @@ pub struct LadderReentryParams {
     pub continuation_bps: u32,
 }
 
-fn ladder_reentry_default_notional() -> Decimal {
-    Decimal::from(25)
-}
 fn ladder_reentry_default_levels() -> u32 {
     10
 }
@@ -195,16 +194,13 @@ fn ladder_reentry_default_continuation_bps() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SimpleGapParams {
     /// Notional per order.
-    #[serde(default = "simple_gap_default_notional")]
-    pub notional: Decimal,
+    #[serde(default)]
+    pub notional: Option<Decimal>,
     /// Fixed distance from mid, in bps.
     #[serde(default = "simple_gap_default_gap_bps")]
     pub gap_bps: u32,
 }
 
-fn simple_gap_default_notional() -> Decimal {
-    Decimal::from(25)
-}
 fn simple_gap_default_gap_bps() -> u32 {
     4
 }
@@ -271,7 +267,8 @@ mod tests {
         "#;
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
         let sg = cfg.bots[0].sg.as_ref().unwrap();
-        assert_eq!(sg.notional, Decimal::from(25));
+        assert_eq!(cfg.account.order_balance_pct, Decimal::new(2, 1));
+        assert_eq!(sg.notional, None);
         assert_eq!(sg.levels, 3);
         assert_eq!(sg.inner_bps, 3);
         assert_eq!(sg.scale_max, Decimal::from(4));

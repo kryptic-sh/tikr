@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use rust_decimal::Decimal;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -55,6 +56,11 @@ struct Args {
     /// Ignored in TUI mode.
     #[arg(long, default_value_t = 0u32)]
     minutes: u32,
+
+    /// Override [account].order_balance_pct for computed per-order notional.
+    /// Split evenly across configured bots. Example: 10 with 2 bots = 5% each.
+    #[arg(long)]
+    order_balance_pct: Option<Decimal>,
 }
 
 /// Resolve the config path using cwd-first → XDG fallback discovery.
@@ -206,7 +212,13 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let config_path = resolve_config_path(args.config.as_deref())?;
-    let cfg = config::load(&config_path)?;
+    let mut cfg = config::load(&config_path)?;
+    if let Some(pct) = args.order_balance_pct {
+        cfg.account.order_balance_pct = pct;
+    }
+    if cfg.account.order_balance_pct <= Decimal::ZERO {
+        anyhow::bail!("order_balance_pct must be positive");
+    }
 
     if args.check {
         println!(
@@ -293,6 +305,8 @@ async fn main() -> anyhow::Result<()> {
             api_key: api_key.clone(),
             key_material: key_material.clone(),
             base_state_dir: cfg.account.state_dir.clone(),
+            order_balance_pct: cfg.account.order_balance_pct,
+            bot_count: cfg.bots.len(),
         };
         let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());
         supervisors.push(h);

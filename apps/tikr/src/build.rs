@@ -22,12 +22,13 @@ pub fn to_spec(
     symbol: Symbol,
     venue: &BinanceClient,
     base_state_dir: &std::path::Path,
+    default_notional: Decimal,
 ) -> Result<BotSpec> {
     let strategy = match cfg.strategy.as_str() {
-        "static-grid" | "sg" => build_sg(cfg, &symbol, venue)?,
-        "layered-grid" | "lg" => build_lg(cfg, &symbol, venue)?,
-        "ladder-reentry" | "lr" => build_ladder_reentry(cfg, &symbol, venue)?,
-        "simple-gap" | "sgap" => build_simple_gap(cfg, &symbol, venue)?,
+        "static-grid" | "sg" => build_sg(cfg, &symbol, venue, default_notional)?,
+        "layered-grid" | "lg" => build_lg(cfg, &symbol, venue, default_notional)?,
+        "ladder-reentry" | "lr" => build_ladder_reentry(cfg, &symbol, venue, default_notional)?,
+        "simple-gap" | "sgap" => build_simple_gap(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
                 "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap)"
@@ -72,14 +73,19 @@ fn per_bot_state_dir(base: &std::path::Path, symbol: &str) -> PathBuf {
     base.join(symbol.to_lowercase())
 }
 
-fn build_sg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<StrategyChoice> {
+fn build_sg(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
     let sg = cfg.sg.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "bot {} strategy=static-grid but [bot.sg] missing",
             cfg.symbol
         )
     })?;
-    let notional = autobump_notional(sg.notional, symbol, venue)?;
+    let notional = autobump_notional(sg.notional.unwrap_or(default_notional), symbol, venue)?;
     Ok(StrategyChoice::StaticGrid(StaticGridConfig {
         notional_per_order: notional,
         levels_per_side: sg.levels,
@@ -93,14 +99,19 @@ fn build_sg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<S
     }))
 }
 
-fn build_lg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<StrategyChoice> {
+fn build_lg(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
     let lg: &LgParams = cfg.lg.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "bot {} strategy=layered-grid but [bot.lg] missing",
             cfg.symbol
         )
     })?;
-    let notional = autobump_notional(lg.notional, symbol, venue)?;
+    let notional = autobump_notional(lg.notional.unwrap_or(default_notional), symbol, venue)?;
     Ok(StrategyChoice::LayeredGrid(LayeredGridConfig {
         notional_per_order: notional,
         levels_per_side: lg.levels,
@@ -112,6 +123,7 @@ fn build_ladder_reentry(
     cfg: &BotConfig,
     symbol: &Symbol,
     venue: &BinanceClient,
+    default_notional: Decimal,
 ) -> Result<StrategyChoice> {
     let lr = cfg.ladder_reentry.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -119,7 +131,7 @@ fn build_ladder_reentry(
             cfg.symbol
         )
     })?;
-    let notional = autobump_notional(lr.notional, symbol, venue)?;
+    let notional = autobump_notional(lr.notional.unwrap_or(default_notional), symbol, venue)?;
     Ok(StrategyChoice::LadderReentry(LadderReentryConfig {
         notional_per_order: notional,
         levels_per_side: lr.levels,
@@ -134,6 +146,7 @@ fn build_simple_gap(
     cfg: &BotConfig,
     symbol: &Symbol,
     venue: &BinanceClient,
+    default_notional: Decimal,
 ) -> Result<StrategyChoice> {
     let simple_gap = cfg.simple_gap.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -141,7 +154,11 @@ fn build_simple_gap(
             cfg.symbol
         )
     })?;
-    let notional = autobump_notional(simple_gap.notional, symbol, venue)?;
+    let notional = autobump_notional(
+        simple_gap.notional.unwrap_or(default_notional),
+        symbol,
+        venue,
+    )?;
     Ok(StrategyChoice::SimpleGap(SimpleGapConfig {
         notional_per_order: notional,
         gap_bps: simple_gap.gap_bps,

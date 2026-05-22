@@ -15,6 +15,11 @@ env = "futures-testnet"
 # Per-bot snapshot subdirs live under <state_dir>/<symbol>/...
 state_dir = "./state"
 
+# Account margin-balance percent allocated to computed per-order size.
+# Split evenly across bots: 10 with 2 bots => 5% balance per bot/order.
+# Per-bot strategy `notional = ...` overrides this computed value.
+order_balance_pct = "0.2"
+
 # Optional HMAC key file (single line "key:secret"). Env vars
 # TIKR_BINANCE_API_KEY / TIKR_BINANCE_API_SECRET take precedence.
 # key_file = "./keys/binance-testnet.txt"
@@ -44,40 +49,40 @@ state_dir = "./state"
 # # `inner_bps + k·step_bps` from mid no matter the inventory.
 
 
-# ─── ETHUSDT ───────────────────────────────────────────────────────────────
-
-[[bot]]
-symbol = "ETHUSDT"
-strategy = "static-grid"
-
-[bot.sg]
-auto_skew = false
-levels = 3
-step_bps = 3
-
-
-# ─── BNBUSDT ───────────────────────────────────────────────────────────────
-
-[[bot]]
-symbol = "BNBUSDT"
-strategy = "static-grid"
-
-[bot.sg]
-auto_skew = false
-levels = 3
-step_bps = 3
+# # ─── ETHUSDT ───────────────────────────────────────────────────────────────
+#
+# [[bot]]
+# symbol = "ETHUSDT"
+# strategy = "static-grid"
+#
+# [bot.sg]
+# auto_skew = false
+# levels = 3
+# step_bps = 3
 
 
-# ─── SOLUSDT ───────────────────────────────────────────────────────────────
+# # ─── BNBUSDT ───────────────────────────────────────────────────────────────
+#
+# [[bot]]
+# symbol = "BNBUSDT"
+# strategy = "static-grid"
+#
+# [bot.sg]
+# auto_skew = false
+# levels = 3
+# step_bps = 3
 
-[[bot]]
-symbol = "SOLUSDT"
-strategy = "static-grid"
 
-[bot.sg]
-auto_skew = false
-levels = 3        # default
-step_bps = 3
+# # ─── SOLUSDT ───────────────────────────────────────────────────────────────
+#
+# [[bot]]
+# symbol = "SOLUSDT"
+# strategy = "static-grid"
+#
+# [bot.sg]
+# auto_skew = false
+# levels = 3        # default
+# step_bps = 3
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
