@@ -24,6 +24,32 @@ use crate::errors::{is_cancel_idempotent, parse_binance_error_code};
 use crate::exchange_info::ExchangeInfoResponse;
 use crate::sign::{BinanceKeyMaterial, append_auth_dispatch};
 
+/// USD-M futures account balance values for one margin asset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FuturesBalance {
+    /// Wallet balance for the asset.
+    pub wallet_balance: tikr_core::Decimal,
+    /// Balance available for new orders / withdrawals.
+    pub available_balance: tikr_core::Decimal,
+    /// Cross-position unrealized PnL included by Binance for this asset.
+    pub cross_unrealized_pnl: tikr_core::Decimal,
+}
+
+/// USD-M futures position-risk values for one symbol.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FuturesPositionRisk {
+    /// Signed position amount. Positive = long, negative = short.
+    pub position_amount: tikr_core::Decimal,
+    /// Binance entry price.
+    pub entry_price: tikr_core::Decimal,
+    /// Binance break-even price, including fee/funding adjustments when exposed.
+    pub break_even_price: tikr_core::Decimal,
+    /// Binance mark price used for unrealized PnL.
+    pub mark_price: tikr_core::Decimal,
+    /// Binance unrealized profit for this symbol.
+    pub unrealized_profit: tikr_core::Decimal,
+}
+
 // ---------------------------------------------------------------------------
 // Futures endpoints
 // ---------------------------------------------------------------------------
@@ -375,6 +401,122 @@ pub async fn get_position_amount(
         net += amt;
     }
     Ok(net)
+}
+
+/// Fetch position-risk fields for `symbol` on Futures.
+pub async fn get_position_risk(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+) -> Result<FuturesPositionRisk, VenueError> {
+    let params = format!("symbol={symbol}");
+    let signed = append_auth_dispatch(&params, key_material);
+    let url = format!("{base_url}/fapi/v2/positionRisk?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "positionRisk: expected array",
+        )))
+    })?;
+
+    let mut out = FuturesPositionRisk::default();
+    for row in arr {
+        let parse = |field: &str| -> Result<tikr_core::Decimal, VenueError> {
+            let s = row.get(field).and_then(Value::as_str).unwrap_or("0");
+            <tikr_core::Decimal as std::str::FromStr>::from_str(s).map_err(|e| {
+                VenueError::Internal(Box::new(std::io::Error::other(format!(
+                    "positionRisk parse {field}='{s}': {e}"
+                ))))
+            })
+        };
+        out.position_amount += parse("positionAmt")?;
+        out.unrealized_profit += parse("unRealizedProfit")?;
+        if out.position_amount != tikr_core::Decimal::ZERO {
+            out.entry_price = parse("entryPrice")?;
+            out.break_even_price = parse("breakEvenPrice")?;
+            out.mark_price = parse("markPrice")?;
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch USD-M futures account balance for `asset` (usually `USDT`).
+///
+/// Endpoint: `GET /fapi/v3/balance`
+pub async fn get_balance(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    asset: &str,
+) -> Result<FuturesBalance, VenueError> {
+    let signed = append_auth_dispatch("", key_material);
+    let url = format!("{base_url}/fapi/v3/balance?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other("balance: expected array")))
+    })?;
+    let row = arr
+        .iter()
+        .find(|row| row.get("asset").and_then(Value::as_str) == Some(asset))
+        .ok_or_else(|| {
+            VenueError::Internal(Box::new(std::io::Error::other(format!(
+                "balance: asset {asset} not found"
+            ))))
+        })?;
+
+    let parse = |field: &str| -> Result<tikr_core::Decimal, VenueError> {
+        let s = row.get(field).and_then(Value::as_str).unwrap_or("0");
+        <tikr_core::Decimal as std::str::FromStr>::from_str(s).map_err(|e| {
+            VenueError::Internal(Box::new(std::io::Error::other(format!(
+                "balance parse {field}='{s}': {e}"
+            ))))
+        })
+    };
+
+    Ok(FuturesBalance {
+        wallet_balance: parse("balance")?,
+        available_balance: parse("availableBalance")?,
+        cross_unrealized_pnl: parse("crossUnPnl")?,
+    })
 }
 
 // ---------------------------------------------------------------------------

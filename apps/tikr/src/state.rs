@@ -8,6 +8,38 @@ use rust_decimal::Decimal;
 use tikr_paper::{BotHandle, LiveSnapshot, PaperReport};
 use tokio::sync::watch;
 
+/// Account balance read directly from Binance REST.
+#[derive(Debug, Clone, Default)]
+pub struct ApiAccountSnapshot {
+    /// Margin asset, usually `USDT`.
+    pub asset: String,
+    /// Futures wallet balance reported by Binance.
+    pub wallet_balance: Decimal,
+    /// Balance available for new orders / withdrawals.
+    pub available_balance: Decimal,
+    /// Binance cross-position unrealized PnL for this asset.
+    pub cross_unrealized_pnl: Decimal,
+    /// Local unix timestamp in ms when this value was fetched.
+    pub fetched_at_ms: u64,
+}
+
+/// Per-symbol position values read directly from Binance REST.
+#[derive(Debug, Clone, Default)]
+pub struct ApiPositionSnapshot {
+    /// Signed position amount. Positive = long, negative = short.
+    pub position_amount: Decimal,
+    /// Binance entry price.
+    pub entry_price: Decimal,
+    /// Binance break-even price.
+    pub break_even_price: Decimal,
+    /// Binance mark price used for unrealized PnL.
+    pub mark_price: Decimal,
+    /// Binance unrealized PnL for this symbol.
+    pub unrealized_profit: Decimal,
+    /// Local unix timestamp in ms when this value was fetched.
+    pub fetched_at_ms: u64,
+}
+
 /// Bot lifecycle status as the supervisor sees it.
 #[derive(Debug, Clone)]
 pub enum BotStatus {
@@ -50,6 +82,8 @@ pub struct BotView {
     pub live: Arc<RwLock<Option<LiveSnapshot>>>,
     /// Shutdown sender for the current incarnation (None between restarts).
     pub shutdown_tx: Option<watch::Sender<bool>>,
+    /// Last Binance REST positionRisk snapshot for this symbol.
+    pub api_position: Arc<RwLock<Option<ApiPositionSnapshot>>>,
 }
 
 impl BotView {
@@ -67,6 +101,7 @@ pub struct SharedBotState {
     /// Ordered list of symbols — the TUI's tab order. Kept in sync with
     /// the order bots were inserted.
     order: Arc<Mutex<Vec<String>>>,
+    api_account: Arc<RwLock<Option<ApiAccountSnapshot>>>,
 }
 
 impl Default for SharedBotState {
@@ -81,7 +116,20 @@ impl SharedBotState {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             order: Arc::new(Mutex::new(Vec::new())),
+            api_account: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Update account-wide API balance snapshot.
+    pub fn set_api_account(&self, snapshot: ApiAccountSnapshot) {
+        if let Ok(mut g) = self.api_account.write() {
+            *g = Some(snapshot);
+        }
+    }
+
+    /// Read latest account-wide API balance snapshot.
+    pub fn api_account(&self) -> Option<ApiAccountSnapshot> {
+        self.api_account.read().ok().and_then(|g| g.clone())
     }
 
     /// Insert a fresh bot view (called once per bot before its
@@ -147,9 +195,22 @@ impl SharedBotState {
                     status: v.status.clone(),
                     snapshot: v.snapshot.read().ok().and_then(|g| g.clone()),
                     live: v.live.read().ok().and_then(|g| g.clone()),
+                    api_position: v.api_position.read().ok().and_then(|g| g.clone()),
                 })
             })
             .collect()
+    }
+}
+
+impl SharedBotState {
+    /// Update per-symbol API position snapshot.
+    pub fn set_api_position(&self, symbol: &str, snapshot: ApiPositionSnapshot) {
+        if let Ok(g) = self.inner.lock()
+            && let Some(v) = g.get(symbol)
+            && let Ok(mut pos) = v.api_position.write()
+        {
+            *pos = Some(snapshot);
+        }
     }
 }
 
@@ -169,6 +230,8 @@ pub struct BotViewSnapshot {
     pub snapshot: Option<PaperReport>,
     /// Latest fill-granular live snapshot, if any.
     pub live: Option<LiveSnapshot>,
+    /// Latest Binance REST positionRisk snapshot, if any.
+    pub api_position: Option<ApiPositionSnapshot>,
 }
 
 /// Account-wide aggregate computed from all bot views.
@@ -198,6 +261,10 @@ pub struct AccountAggregate {
     pub gross_inventory: Decimal,
     /// Signed Σ position × mid in USDT (net directional bias).
     pub net_inventory: Decimal,
+    /// Σ Binance per-symbol unrealized PnL from positionRisk.
+    pub api_unrealized: Decimal,
+    /// Σ local unrealized PnL re-marked with Binance mark prices.
+    pub mark_unrealized: Decimal,
     /// Count of bots currently in `Running` state.
     pub running_count: usize,
     /// Count of bots in `Crashed` state.
@@ -233,7 +300,21 @@ impl AccountAggregate {
                 a.net_inventory += lv.inventory_usdt;
                 a.gross_inventory += lv.inventory_usdt.abs();
             }
+            if let Some(ref api) = v.api_position {
+                a.api_unrealized += api.unrealized_profit;
+                if let (Some(r), Some(lv)) = (&v.snapshot, &v.live) {
+                    a.mark_unrealized += mark_unrealized(r.unrealized.0, lv, api.mark_price);
+                }
+            }
         }
         a
     }
+}
+
+pub fn mark_unrealized(
+    mid_unrealized: Decimal,
+    live: &tikr_paper::live::LiveSnapshot,
+    mark_price: Decimal,
+) -> Decimal {
+    mid_unrealized + live.position_size * (mark_price - live.last_mid)
 }

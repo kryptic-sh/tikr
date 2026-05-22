@@ -23,7 +23,10 @@ use tracing::Level;
 
 use crate::logs::{LogLine, LogStore};
 use crate::selection::{self, MouseSelection};
-use crate::state::{AccountAggregate, BotStatus, BotViewSnapshot, SharedBotState};
+use crate::state::{
+    AccountAggregate, ApiAccountSnapshot, BotStatus, BotViewSnapshot, SharedBotState,
+    mark_unrealized,
+};
 
 /// Frame budget. ~60 FPS — the render thread is its own OS thread (off
 /// the tokio runtime), so we're not stealing time from bot tasks.
@@ -220,7 +223,18 @@ pub fn run(
                     .map(|s| logs.snapshot_merged(s))
                     .unwrap_or_else(|| logs.snapshot(crate::logs::SYSTEM_KEY));
                 let agg = AccountAggregate::compute(&views);
-                terminal.draw(|f| draw(f, &views, &agg, &log_lines, &mut ui, &config_path))?;
+                let api_account = state.api_account();
+                terminal.draw(|f| {
+                    draw(
+                        f,
+                        &views,
+                        &agg,
+                        api_account.as_ref(),
+                        &log_lines,
+                        &mut ui,
+                        &config_path,
+                    )
+                })?;
                 // Mouse drag-up may have set pending_copy. Read text
                 // from the just-rendered buffer and ship to the
                 // clipboard before the next loop tick.
@@ -523,6 +537,7 @@ fn draw(
     f: &mut Frame<'_>,
     views: &[BotViewSnapshot],
     agg: &AccountAggregate,
+    api_account: Option<&ApiAccountSnapshot>,
     log_lines: &[LogLine],
     ui: &mut UiState,
     config_path: &std::path::Path,
@@ -537,7 +552,16 @@ fn draw(
         .split(f.area());
 
     draw_tabs(f, outer[0], views, ui);
-    draw_body(f, outer[1], views, ui.active_tab, agg, log_lines, ui);
+    draw_body(
+        f,
+        outer[1],
+        views,
+        ui.active_tab,
+        agg,
+        api_account,
+        log_lines,
+        ui,
+    );
     draw_footer(f, outer[2], &ui.mode, config_path);
 
     // Modal overlays.
@@ -731,12 +755,14 @@ fn tabs_fit_active(
     width <= available_width
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_body(
     f: &mut Frame<'_>,
     area: Rect,
     views: &[BotViewSnapshot],
     active: usize,
     agg: &AccountAggregate,
+    api_account: Option<&ApiAccountSnapshot>,
     log_lines: &[LogLine],
     ui: &mut UiState,
 ) {
@@ -751,10 +777,16 @@ fn draw_body(
 
     draw_bot_detail(f, cols[0], views.get(active));
     draw_logs(f, cols[1], views.get(active), log_lines, ui);
-    draw_account(f, cols[2], views, agg);
+    draw_account(f, cols[2], views, agg, api_account);
 }
 
-fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &AccountAggregate) {
+fn draw_account(
+    f: &mut Frame<'_>,
+    area: Rect,
+    views: &[BotViewSnapshot],
+    agg: &AccountAggregate,
+    api_account: Option<&ApiAccountSnapshot>,
+) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("bots     ", Style::default().fg(Color::Gray)),
@@ -797,6 +829,59 @@ fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &
             pnl_style(agg.net),
         ),
     ]));
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "api account",
+        Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+    ));
+    if let Some(api) = api_account {
+        lines.push(Line::from(vec![
+            Span::styled("wallet   ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{:>10.2}", dec_to_f64(api.wallet_balance))),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("avail    ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{:>10.2}", dec_to_f64(api.available_balance))),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("api unrl ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>+10.2}", dec_to_f64(api.cross_unrealized_pnl)),
+                pnl_style(api.cross_unrealized_pnl),
+            ),
+        ]));
+        let local_vs_api_unreal = agg.mark_unrealized - agg.api_unrealized;
+        lines.push(Line::from(vec![
+            Span::styled("mark Δ   ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>+10.2}", dec_to_f64(local_vs_api_unreal)),
+                pnl_style(local_vs_api_unreal),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("sym unrl ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:>+10.2}", dec_to_f64(agg.api_unrealized)),
+                pnl_style(agg.api_unrealized),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("asset    ", Style::default().fg(Color::Gray)),
+            Span::raw(format!("{:>10}", api.asset)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("age      ", Style::default().fg(Color::Gray)),
+            Span::raw(format!(
+                "{:>10}",
+                format_ago(millis_ago(api.fetched_at_ms) / 1000)
+            )),
+        ]));
+    } else {
+        lines.push(Line::styled(
+            "waiting...",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::styled("events   ", Style::default().fg(Color::Gray)),
@@ -898,12 +983,11 @@ fn draw_logs(
     };
     let slice = &log_lines[start..end];
 
-    let items: Vec<ListItem> = slice
-        .iter()
-        .map(|ln| ListItem::new(format_log_line(ln)))
-        .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(list, area);
+    let lines: Vec<Line> = slice.iter().map(format_log_line).collect();
+    let logs = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    f.render_widget(logs, area);
     ui.last_log_rect = Some(area);
 }
 
@@ -1089,6 +1173,61 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
                 Span::raw(format!("{bps:>13.2} bps")),
             ]));
         }
+        if let Some(ref api) = v.api_position {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "── api mark ──",
+                Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+            ));
+            lines.push(Line::from(vec![
+                Span::styled("api size ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:>+13.4}", dec_to_f64(api.position_amount)),
+                    pnl_style(api.position_amount),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("api entry", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{:>13.6}", dec_to_f64(api.entry_price))),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("api be   ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{:>13.6}", dec_to_f64(api.break_even_price))),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("api mark ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{:>13.6}", dec_to_f64(api.mark_price))),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("api unrl ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:>+13.4}", dec_to_f64(api.unrealized_profit)),
+                    pnl_style(api.unrealized_profit),
+                ),
+            ]));
+            if let (Some(r), Some(lv)) = (&v.snapshot, &v.live) {
+                let local_mark_unrealized = mark_unrealized(r.unrealized.0, lv, api.mark_price);
+                let delta = local_mark_unrealized - api.unrealized_profit;
+                lines.push(Line::from(vec![
+                    Span::styled("local mrk", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{:>+13.4}", dec_to_f64(local_mark_unrealized)),
+                        pnl_style(local_mark_unrealized),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("mark Δ  ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{:>+13.4}", dec_to_f64(delta)), pnl_style(delta)),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("age      ", Style::default().fg(Color::Gray)),
+                Span::raw(format!(
+                    "{:>13}",
+                    format_ago(millis_ago(api.fetched_at_ms) / 1000)
+                )),
+            ]));
+        }
         lines.push(Line::from(""));
         lines.push(Line::styled(
             "── orders ──",
@@ -1214,6 +1353,14 @@ fn secs_ago(ts_ns: u64) -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     now_ns.saturating_sub(ts_ns) / 1_000_000_000
+}
+
+fn millis_ago(ts_ms: u64) -> u64 {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now_ms.saturating_sub(ts_ms)
 }
 
 fn format_ago(s: u64) -> String {

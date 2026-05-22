@@ -30,7 +30,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::logs::LogStore;
-use crate::state::{BotStatus, BotView, SharedBotState};
+use crate::state::{ApiAccountSnapshot, ApiPositionSnapshot, BotStatus, BotView, SharedBotState};
 use crate::supervisor::{SupervisorCtx, spawn_supervisor};
 
 #[derive(Parser, Debug)]
@@ -92,6 +92,111 @@ fn resolve_config_path(cli: Option<&std::path::Path>) -> anyhow::Result<PathBuf>
         "no config found. searched: ./config.toml, $XDG_CONFIG_HOME/tikr/config.toml \
          (default ~/.config/tikr/config.toml). Pass --config <path> to override."
     )
+}
+
+fn spawn_account_balance_poller(
+    shared_state: SharedBotState,
+    env: tikr_binance::BinanceEnv,
+    api_key: String,
+    key_material: Arc<tikr_binance::BinanceKeyMaterial>,
+    symbols: Vec<String>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let http = reqwest::Client::new();
+        let key_material = match key_material.as_ref() {
+            tikr_binance::BinanceKeyMaterial::Hmac { secret } => {
+                tikr_binance::BinanceKeyMaterial::Hmac {
+                    secret: secret.clone(),
+                }
+            }
+            tikr_binance::BinanceKeyMaterial::Ed25519 { signing_key } => {
+                tikr_binance::BinanceKeyMaterial::Ed25519 {
+                    signing_key: signing_key.clone(),
+                }
+            }
+        };
+        loop {
+            match tikr_binance::futs::get_balance(
+                &http,
+                env.rest_base_url(),
+                &api_key,
+                &key_material,
+                "USDT",
+            )
+            .await
+            {
+                Ok(balance) => {
+                    tracing::info!(
+                        wallet = %balance.wallet_balance,
+                        available = %balance.available_balance,
+                        api_unrealized = %balance.cross_unrealized_pnl,
+                        "account balance poll"
+                    );
+                    shared_state.set_api_account(ApiAccountSnapshot {
+                        asset: "USDT".to_string(),
+                        wallet_balance: balance.wallet_balance,
+                        available_balance: balance.available_balance,
+                        cross_unrealized_pnl: balance.cross_unrealized_pnl,
+                        fetched_at_ms: current_time_ms(),
+                    });
+                }
+                Err(e) => tracing::warn!(error = ?e, "account balance poll failed"),
+            }
+
+            for symbol in &symbols {
+                match tikr_binance::futs::get_position_risk(
+                    &http,
+                    env.rest_base_url(),
+                    &api_key,
+                    &key_material,
+                    symbol,
+                )
+                .await
+                {
+                    Ok(pos) => {
+                        tracing::info!(
+                            symbol,
+                            amount = %pos.position_amount,
+                            entry = %pos.entry_price,
+                            breakeven = %pos.break_even_price,
+                            mark = %pos.mark_price,
+                            api_unrealized = %pos.unrealized_profit,
+                            "position risk poll"
+                        );
+                        shared_state.set_api_position(
+                            symbol,
+                            ApiPositionSnapshot {
+                                position_amount: pos.position_amount,
+                                entry_price: pos.entry_price,
+                                break_even_price: pos.break_even_price,
+                                mark_price: pos.mark_price,
+                                unrealized_profit: pos.unrealized_profit,
+                                fetched_at_ms: current_time_ms(),
+                            },
+                        );
+                    }
+                    Err(e) => tracing::warn!(symbol, error = ?e, "position risk poll failed"),
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -162,12 +267,22 @@ async fn main() -> anyhow::Result<()> {
             snapshot: Arc::new(std::sync::RwLock::new(None)),
             live: Arc::new(std::sync::RwLock::new(None)),
             shutdown_tx: None,
+            api_position: Arc::new(std::sync::RwLock::new(None)),
         };
         shared_state.insert(&b.symbol, view);
     }
 
     // Global shutdown channel — TUI flips it on `q`; supervisors observe.
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
+
+    spawn_account_balance_poller(
+        shared_state.clone(),
+        env,
+        api_key.clone(),
+        key_material.clone(),
+        cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
+        global_shutdown_rx.clone(),
+    );
 
     // Spawn one supervisor per bot.
     let mut supervisors = Vec::with_capacity(cfg.bots.len());

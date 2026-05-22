@@ -69,7 +69,15 @@ pub fn spawn_supervisor(
                                 res = &mut join => {
                                     match res {
                                         Ok(report) => {
-                                            info!(net = %report.net.0, "bot ended cleanly");
+                                            info!(
+                                                realized = %report.realized.0,
+                                                unrealized = %report.unrealized.0,
+                                                fees = %report.fees.0,
+                                                funding = %report.funding.0,
+                                                net = %report.net.0,
+                                                fills = report.fills_emitted,
+                                                "bot ended cleanly"
+                                            );
                                             shared_state.set_final(&symbol_str, report.clone());
                                             shared_state.set_status(&symbol_str, BotStatus::Crashed("clean exit".into()));
                                         }

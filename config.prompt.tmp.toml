@@ -1,0 +1,12 @@
+[account]
+env = "futures-testnet"
+state_dir = "./state"
+
+[[bot]]
+symbol = "PROMPTUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+auto_skew = false
+levels = 3
+step_bps = 3

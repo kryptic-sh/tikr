@@ -268,6 +268,26 @@ impl BinanceClient {
             .map(|f| f.min_notional)
     }
 
+    /// Fetch USD-M futures balance for a margin asset (usually `USDT`).
+    pub async fn futures_balance(
+        &self,
+        asset: &str,
+    ) -> Result<crate::futs::FuturesBalance, VenueError> {
+        if !self.env.is_futures() {
+            return Err(VenueError::Rejected {
+                reason: "futures balance requested for non-futures env".to_string(),
+            });
+        }
+        crate::futs::get_balance(
+            &self.http,
+            self.env.rest_base_url(),
+            &self.api_key,
+            &self.key_material,
+            asset,
+        )
+        .await
+    }
+
     /// Enforce mainnet gate before any write action.
     fn check_mainnet_gate(&self) -> Result<(), VenueError> {
         if self.env.is_mainnet() && !self.mainnet_writes_enabled {

@@ -20,28 +20,28 @@ state_dir = "./state"
 # key_file = "./keys/binance-testnet.txt"
 
 
-# ─── BTCUSDT — every StaticGrid knob shown explicitly (reference) ──────────
-
-[[bot]]
-symbol = "BTCUSDT"
-strategy = "static-grid"
-
-[bot.sg]
-auto_skew = false
-# notional             = 25      # fiat $ per order; auto-bumps to min_notional × 1.2
-levels = 3 # default 3 — orders per side (2 × levels at cold start)
-# inner_bps            = 3       # nearest-level spread from mid in bps
-step_bps = 3 # default 3 — bps between consecutive same-side levels
-# target_fills_per_min = "0"     # 0 = adaptive scaler off
-# fillrate_window_secs = 60      # rolling window for the fpm measurement
-# scale_min            = "1.0"   # adaptive multiplier floor (1.0 = never tighten)
-# scale_max            = "4.0"   # adaptive multiplier ceiling (4× widening max)
-# auto_skew            = true    # false = symmetric ladder regardless of position
+# # ─── BTCUSDT — every StaticGrid knob shown explicitly (reference) ──────────
 #
-# Inventory skew is automatic — `pos_ratio = (position / notional) / levels`,
-# saturates when one side has filled every level. No external target.
-# Set `auto_skew = false` to disable: ladder stays symmetric at
-# `inner_bps + k·step_bps` from mid no matter the inventory.
+# [[bot]]
+# symbol = "BTCUSDT"
+# strategy = "static-grid"
+#
+# [bot.sg]
+# auto_skew = false
+# # notional             = 25      # fiat $ per order; auto-bumps to min_notional × 1.2
+# levels = 3 # default 3 — orders per side (2 × levels at cold start)
+# # inner_bps            = 3       # nearest-level spread from mid in bps
+# step_bps = 3 # default 3 — bps between consecutive same-side levels
+# # target_fills_per_min = "0"     # 0 = adaptive scaler off
+# # fillrate_window_secs = 60      # rolling window for the fpm measurement
+# # scale_min            = "1.0"   # adaptive multiplier floor (1.0 = never tighten)
+# # scale_max            = "4.0"   # adaptive multiplier ceiling (4× widening max)
+# # auto_skew            = true    # false = symmetric ladder regardless of position
+# #
+# # Inventory skew is automatic — `pos_ratio = (position / notional) / levels`,
+# # saturates when one side has filled every level. No external target.
+# # Set `auto_skew = false` to disable: ladder stays symmetric at
+# # `inner_bps + k·step_bps` from mid no matter the inventory.
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────
