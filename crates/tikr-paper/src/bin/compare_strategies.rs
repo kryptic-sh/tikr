@@ -150,13 +150,9 @@ struct Args {
     #[arg(long, default_value = "100")]
     spread_scalp_notional: String,
 
-    /// SpreadScalp sweep: comma-separated min quote edge in bps.
-    #[arg(long, default_value = "3,4,5")]
-    spread_scalp_min_quote_edge_bps_list: String,
-
-    /// SpreadScalp sweep: comma-separated improve ticks.
-    #[arg(long, default_value = "0,1")]
-    spread_scalp_improve_ticks_list: String,
+    /// SpreadScalp sweep: comma-separated min spread in bps.
+    #[arg(long, default_value = "5,7,10")]
+    spread_scalp_min_spread_bps_list: String,
 
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
@@ -638,34 +634,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let spread_scalp_edge_sweep = parse_decimal_list(&args.spread_scalp_min_quote_edge_bps_list)?;
-    let spread_scalp_improve_sweep = parse_u32_list(&args.spread_scalp_improve_ticks_list)?;
-    for &edge_bps in &spread_scalp_edge_sweep {
-        for &improve in &spread_scalp_improve_sweep {
-            let label = format!("SpreadScalp edge={edge_bps}bps imp={improve}t");
-            spawn_preset(
-                &mut handles,
-                &shared_data,
-                &symbol,
-                &label,
-                SpreadScalp::new(SpreadScalpConfig {
-                    notional_per_order: spread_scalp_notional,
-                    tick_size: tick,
-                    improve_ticks: improve,
-                    min_requote_interval_ms: 1000,
-                    requote_tick_threshold: 3,
-                    force_requote_interval_ms: 60_000,
-                    min_quote_edge_bps: edge_bps,
-                    flatten_threshold_notional: Decimal::ZERO,
-                    skew_unit_notional: Decimal::ZERO,
-                    max_skew_ticks: 0,
-                }),
-                fees,
-                skim_cfg,
-                funding_cfg,
-                sim_cfg_template.clone(),
-            );
-        }
+    let spread_scalp_spread_sweep = parse_decimal_list(&args.spread_scalp_min_spread_bps_list)?;
+    for &min_spread_bps in &spread_scalp_spread_sweep {
+        let label = format!("SpreadScalp spread>={min_spread_bps}bps");
+        spawn_preset(
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &label,
+            SpreadScalp::new(SpreadScalpConfig {
+                notional_per_order: spread_scalp_notional,
+                tick_size: tick,
+                step_size: tick,
+                min_notional: Decimal::ZERO,
+                min_spread_bps,
+                requote_interval_ms: 1000,
+            }),
+            fees,
+            skim_cfg,
+            funding_cfg,
+            sim_cfg_template.clone(),
+        );
     }
 
     // StaticGrid sweep — place-once-then-sit grid. Triggers a fresh batch

@@ -13,7 +13,7 @@ state_dir = "./state"
 [scalp_rotation]
 enabled = true
 slots = 4
-refresh_secs = 300
+refresh_secs = 3000
 quote_asset = "USDT"
 min_quote_volume = 50000000
 
@@ -29,24 +29,12 @@ symbol = "DOGEUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 5
-improve_ticks = 1
-min_requote_interval_ms = 5000
-requote_tick_threshold = 3
-force_requote_interval_ms = 60000
-min_quote_edge_bps = 4
-flatten_threshold_notional = 0
-skew_unit_notional = 10
-max_skew_ticks = 2
+min_spread_bps = 5
+requote_interval_ms = 1000
 
 
 # Defaults:
 # notional = 25                 # fiat $ per order; auto-bumps to min_notional × 1.2
 # tick_size = "0.0001"          # optional; auto-detected from Binance exchangeInfo
-# improve_ticks = 1             # ticks inside best bid/ask; 0 joins best bid/ask
-# min_requote_interval_ms = 5000 # hard throttle for normal cancel/replace cycles
-# requote_tick_threshold = 3     # price must drift this many ticks before requote
-# force_requote_interval_ms = 60000 # safety refresh; 0 disables
-# min_quote_edge_bps = 4         # minimum gross edge between our bid/ask before fees/slippage
-# flatten_threshold_notional = 0  # disabled; was one-sided flatten mode
-# skew_unit_notional = 10        # notional where max_skew_ticks is fully applied; 0 disables
-# max_skew_ticks = 2             # long shifts quotes down; short shifts quotes up
+# min_spread_bps = 5            # minimum market spread in bps required to quote
+# requote_interval_ms = 1000    # fixed requote interval in ms

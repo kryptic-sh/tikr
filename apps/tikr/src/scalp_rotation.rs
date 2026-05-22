@@ -258,10 +258,9 @@ async fn top_symbols(
         .map(|s| s.to_uppercase())
         .collect::<HashSet<_>>();
     let spread_cfg = template.spread_scalp.as_ref();
-    let improve_ticks = spread_cfg.map(|s| s.improve_ticks).unwrap_or(1);
-    let min_quote_edge_bps = spread_cfg
-        .map(|s| s.min_quote_edge_bps)
-        .unwrap_or_else(|| Decimal::from(4));
+    let min_spread_bps = spread_cfg
+        .map(|s| s.min_spread_bps)
+        .unwrap_or_else(|| Decimal::from(5));
     let exchange_info = tikr_binance::futs::get_exchange_info(&http, env.rest_base_url()).await?;
     let tradable = exchange_info
         .symbols
@@ -302,15 +301,13 @@ async fn top_symbols(
         {
             continue;
         }
-        let quote_bid = book.bid_price + Decimal::from(improve_ticks) * filter.tick_size;
-        let quote_ask = book.ask_price - Decimal::from(improve_ticks) * filter.tick_size;
         let mid = (book.bid_price + book.ask_price) / Decimal::from(2);
-        let quote_edge_bps = if quote_ask > quote_bid && mid > Decimal::ZERO {
-            (quote_ask - quote_bid) / mid * Decimal::from(10_000)
+        let spread_bps = if mid > Decimal::ZERO {
+            (book.ask_price - book.bid_price) / mid * Decimal::from(10_000)
         } else {
             Decimal::ZERO
         };
-        if quote_edge_bps < min_quote_edge_bps {
+        if spread_bps < min_spread_bps {
             continue;
         }
         let rv =
@@ -324,7 +321,7 @@ async fn top_symbols(
             continue;
         }
         let volume_score = (ticker.quote_volume / Decimal::from(1_000_000u64)).max(Decimal::ONE);
-        let score = rv * volume_score * quote_edge_bps;
+        let score = rv * volume_score * spread_bps;
         scored.push(ScoredSymbol {
             symbol: ticker.symbol,
             score,

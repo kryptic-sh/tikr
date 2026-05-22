@@ -259,14 +259,8 @@ fn build_spread_scalp(
         tick_size,
         step_size,
         min_notional,
-        improve_ticks: spread_scalp.improve_ticks,
-        min_requote_interval_ms: spread_scalp.min_requote_interval_ms,
-        requote_tick_threshold: spread_scalp.requote_tick_threshold,
-        force_requote_interval_ms: spread_scalp.force_requote_interval_ms,
-        min_quote_edge_bps: spread_scalp.min_quote_edge_bps,
-        flatten_threshold_notional: spread_scalp.flatten_threshold_notional,
-        skew_unit_notional: spread_scalp.skew_unit_notional,
-        max_skew_ticks: spread_scalp.max_skew_ticks,
+        min_spread_bps: spread_scalp.min_spread_bps,
+        requote_interval_ms: spread_scalp.requote_interval_ms,
     }))
 }
 

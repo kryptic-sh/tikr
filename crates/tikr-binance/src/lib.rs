@@ -65,7 +65,9 @@ use reqwest::Client as HttpClient;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use tikr_core::{Fill, MarketEvent, Position, Price, SignedSize, Snapshot, Symbol, Timestamp};
+use tikr_core::{
+    Fill, MarketEvent, Position, Price, Side, SignedSize, Size, Snapshot, Symbol, Timestamp,
+};
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -484,6 +486,31 @@ impl Venue for BinanceClient {
         }
 
         Ok(venue_qid)
+    }
+
+    async fn market_close(&self, symbol: &Symbol, side: Side, qty: Size) -> Result<(), VenueError> {
+        self.check_mainnet_gate()?;
+        let sym_str = binance_symbol(symbol);
+        let size = round_size(&self.exchange_info_cache, &sym_str, qty)?;
+        let size_str = Self::format_decimal(size.0);
+        let base_url = self.env.rest_base_url();
+        if self.env.is_futures() {
+            crate::futs::place_market_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.key_material,
+                &sym_str,
+                side,
+                &size_str,
+            )
+            .await?;
+        } else {
+            return Err(VenueError::Rejected {
+                reason: "market_close not supported for spot".to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Cancel the old quote then place a new one.

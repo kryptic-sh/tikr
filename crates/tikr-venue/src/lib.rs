@@ -176,6 +176,21 @@ pub trait Venue: Send + Sync {
     async fn open_orders(&self, _symbol: &Symbol) -> Result<Vec<OpenOrder>, VenueError> {
         Ok(Vec::new())
     }
+
+    /// Close the current position on `symbol` with a market order.
+    /// Default uses an IOC limit at the worst price (0 or max) as a fallback.
+    async fn market_close(&self, symbol: &Symbol, side: Side, qty: Size) -> Result<(), VenueError> {
+        let intent = QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price: Price(tikr_core::Decimal::ZERO),
+            size: qty,
+            tif: TimeInForce::IOC,
+            kind: QuoteKind::Point,
+        };
+        let _ = self.quote(intent).await?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

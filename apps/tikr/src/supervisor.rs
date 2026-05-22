@@ -206,10 +206,9 @@ async fn default_order_notional(venue: &BinanceClient, ctx: &SupervisorCtx) -> R
     )
 }
 
-async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {
+pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {
     use rust_decimal::Decimal;
-    use tikr_core::{QuoteKind, Side, Size, TimeInForce};
-    use tikr_venue::QuoteIntent;
+    use tikr_core::{Side, Size};
     use tracing::info;
 
     if let Err(e) = venue.cancel_all(symbol).await {
@@ -223,45 +222,22 @@ async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {
             } else {
                 Side::Bid
             };
-            let snap = venue.snapshot(symbol).await.ok();
-            let close_price = snap.as_ref().and_then(|s| match close_side {
-                Side::Bid => s.asks.first().map(|l| l.price),
-                Side::Ask => s.bids.first().map(|l| l.price),
-            });
-            let Some(price) = close_price else {
-                return;
-            };
-            // Dust guard: positions whose notional is below the
-            // symbol's minNotional cannot be flattened by a single
-            // IOC order — Binance rejects with "notional < minNotional"
-            // (-4164). Topping the qty up to meet minNotional would
-            // FLIP the position the wrong way, so we just leave the
-            // dust on the books and start trading on top of it. The
-            // strategy can absorb a tiny existing position; on the
-            // next fill it'll be reflected in the live tracker.
-            let notional = qty * price.0;
+            let notional_approx = qty * pos.avg_entry.0;
             if let Some(min_n) = venue.min_notional(symbol)
-                && notional < min_n
+                && notional_approx < min_n
             {
                 info!(
                     qty = %qty,
-                    price = %price.0,
-                    notional = %notional,
+                    entry = %pos.avg_entry.0,
+                    notional = %notional_approx,
                     min_notional = %min_n,
                     "skipping flatten: dust position below minNotional — bot will trade on top"
                 );
                 return;
             }
-            let intent = QuoteIntent {
-                symbol: symbol.clone(),
-                side: close_side,
-                price,
-                size: Size(qty),
-                tif: TimeInForce::IOC,
-                kind: QuoteKind::Point,
-            };
-            if let Err(e) = venue.quote(intent).await {
-                warn!(error = ?e, "flatten failed");
+            info!(symbol = %tikr_venue::Venue::id(venue), side = ?close_side, qty = %qty, "flattening position with market order");
+            if let Err(e) = venue.market_close(symbol, close_side, Size(qty)).await {
+                warn!(error = ?e, "market_close failed");
             }
         }
         Ok(_) => {}

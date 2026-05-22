@@ -150,6 +150,70 @@ pub async fn place_order(
     Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
 }
 
+/// Place a market order on USD-M Futures.
+///
+/// Endpoint: `POST /fapi/v1/order`
+/// Auth: API-key header + signed query.
+///
+/// Returns `QuoteId` derived from the venue-assigned `orderId`.
+pub async fn place_market_order(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    side: Side,
+    quantity: &str,
+) -> Result<QuoteId, VenueError> {
+    let side_str = match side {
+        Side::Bid => "BUY",
+        Side::Ask => "SELL",
+    };
+    let client_order_id = format!("mkclose_{}", Uuid::new_v4().as_simple());
+    let params = format!(
+        "symbol={symbol}&side={side_str}&type=MARKET\
+         &quantity={quantity}\
+         &newClientOrderId={client_order_id}"
+    );
+    let signed = append_auth_dispatch(&params, key_material);
+
+    info!(
+        symbol,
+        side = side_str,
+        quantity,
+        "futures: placing market order"
+    );
+
+    let url = format!("{base_url}/fapi/v1/order?{signed}");
+    let resp = http
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(e) = try_parse_error(&body) {
+        return Err(e);
+    }
+
+    let order_id = body.get("orderId").and_then(Value::as_u64).ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures place_market_order: missing orderId in response: {body}"
+        ))))
+    })?;
+
+    info!(order_id, symbol, "futures: market order placed");
+    Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
+}
+
 /// Cancel an order by `origClientOrderId` on Futures.
 ///
 /// Endpoint: `DELETE /fapi/v1/order`

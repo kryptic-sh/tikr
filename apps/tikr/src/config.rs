@@ -299,46 +299,19 @@ pub struct SpreadScalpParams {
     /// Venue tick size. Optional when exchangeInfo has symbol filters.
     #[serde(default)]
     pub tick_size: Decimal,
-    /// Ticks inside best bid/ask to quote. `0` joins best bid/ask.
-    #[serde(default = "spread_scalp_default_improve_ticks")]
-    pub improve_ticks: u32,
-    /// Minimum time between forced requotes in ms.
-    #[serde(default = "spread_scalp_default_min_requote_interval_ms")]
-    pub min_requote_interval_ms: u64,
-    /// Target price drift, in ticks, required before a non-risk requote.
-    #[serde(default = "spread_scalp_default_requote_tick_threshold")]
-    pub requote_tick_threshold: u32,
-    /// Force a refresh after this many ms. `0` disables forced refresh.
-    #[serde(default = "spread_scalp_default_force_requote_interval_ms")]
-    pub force_requote_interval_ms: u64,
-    /// Minimum gross quote-to-quote edge in bps before fees/slippage.
-    #[serde(default = "spread_scalp_default_min_quote_edge_bps")]
-    pub min_quote_edge_bps: Decimal,
-    /// Position notional where one-sided flatten mode starts. `0` disables.
-    #[serde(default)]
-    pub flatten_threshold_notional: Decimal,
-    /// Position notional where `max_skew_ticks` is fully applied. `0` disables skew.
-    #[serde(default)]
-    pub skew_unit_notional: Decimal,
-    /// Maximum inventory-skew shift in ticks.
-    #[serde(default)]
-    pub max_skew_ticks: u32,
+    /// Minimum spread in bps required to quote.
+    #[serde(default = "spread_scalp_default_min_spread_bps")]
+    pub min_spread_bps: Decimal,
+    /// Requote interval in ms.
+    #[serde(default = "spread_scalp_default_requote_interval_ms")]
+    pub requote_interval_ms: u64,
 }
 
-fn spread_scalp_default_improve_ticks() -> u32 {
-    1
+fn spread_scalp_default_min_spread_bps() -> Decimal {
+    Decimal::from(5)
 }
-fn spread_scalp_default_min_requote_interval_ms() -> u64 {
-    5000
-}
-fn spread_scalp_default_requote_tick_threshold() -> u32 {
-    3
-}
-fn spread_scalp_default_force_requote_interval_ms() -> u64 {
-    60_000
-}
-fn spread_scalp_default_min_quote_edge_bps() -> Decimal {
-    Decimal::from(4)
+fn spread_scalp_default_requote_interval_ms() -> u64 {
+    1000
 }
 
 /// Parse a TOML config file.
@@ -387,7 +360,7 @@ mod tests {
             [[bot]]
             symbol = "XRPUSDT"
             strategy = "spread-scalp"
-            spread_scalp = { notional = 25, improve_ticks = 1, min_requote_interval_ms = 5000, requote_tick_threshold = 3, force_requote_interval_ms = 60000, min_quote_edge_bps = 4, flatten_threshold_notional = 20, skew_unit_notional = 10, max_skew_ticks = 2 }
+            spread_scalp = { notional = 25, min_spread_bps = 5, requote_interval_ms = 1000 }
         "#;
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
         assert_eq!(cfg.bots.len(), 6);
