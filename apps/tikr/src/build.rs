@@ -279,6 +279,7 @@ fn build_spread_scalp(
             max_position_usdt_default
         },
         take_profit_usdt: spread_scalp.take_profit_usdt,
+        reject_cooldown_ms: spread_scalp.reject_cooldown_ms,
     }))
 }
 

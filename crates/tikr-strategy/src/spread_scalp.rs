@@ -31,9 +31,13 @@ pub struct SpreadScalpConfig {
     /// 0 = disabled.
     pub max_position_usdt: Decimal,
     /// Unrealized PnL threshold in quote currency to activate take-profit.
-    /// When exceeded, quotes only the reducing side at mid price to close
-    /// the position aggressively. 0 = disabled.
+    /// When exceeded, fires an IOC on the reducing side at the opposing
+    /// touch to close immediately as taker. 0 = disabled.
     pub take_profit_usdt: Decimal,
+    /// Cooldown after a venue rejection (per side) before another rebuild
+    /// is allowed. Prevents -5022 / -2019 hot loops on fast markets.
+    /// 0 disables the gate (legacy behaviour).
+    pub reject_cooldown_ms: u64,
 }
 
 /// Spread scalping strategy state.
@@ -43,6 +47,11 @@ pub struct SpreadScalp {
     last_ask: Option<Price>,
     last_requote_ts: Option<Timestamp>,
     quotes_live: bool,
+    /// Per-side timestamp (ns) of the last venue rejection. Used by
+    /// `should_emit_side` to gate the next rebuild attempt by
+    /// `reject_cooldown_ms`, matching the SG pattern.
+    last_reject_bid_ts: Option<Timestamp>,
+    last_reject_ask_ts: Option<Timestamp>,
 }
 
 impl SpreadScalp {
@@ -89,13 +98,7 @@ impl SpreadScalp {
         price: Price,
         size_multiplier: Decimal,
     ) -> Action {
-        let mut size = self.quote_size(price, size_multiplier);
-        if self.config.min_notional > Decimal::ZERO
-            && size * price.0 < self.config.min_notional
-            && self.config.step_size > Decimal::ZERO
-        {
-            size += self.config.step_size;
-        }
+        let size = self.size_at_least_min_notional(price, size_multiplier);
         Action::Quote(QuoteIntent {
             symbol: ctx.symbol.clone(),
             side,
@@ -104,6 +107,71 @@ impl SpreadScalp {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
+    }
+
+    /// Round-up size so `size × price >= min_notional`. A single step
+    /// bump can still leave the order under min_notional when the gap
+    /// is larger than `step_size × price`, which then re-triggers the
+    /// venue rejection → recovery hot loop. Compute the exact ceil.
+    fn size_at_least_min_notional(&self, price: Price, size_multiplier: Decimal) -> Decimal {
+        let raw = self.quote_size(price, size_multiplier);
+        let min = self.config.min_notional;
+        let step = self.config.step_size;
+        if min <= Decimal::ZERO || price.0 <= Decimal::ZERO {
+            return raw;
+        }
+        let current = raw * price.0;
+        if current >= min {
+            return raw;
+        }
+        if step <= Decimal::ZERO {
+            // No lot step: bump straight to min_notional / price.
+            return min / price.0;
+        }
+        let gap = min - current;
+        // ceil(gap / (price × step)) steps to clear min_notional.
+        let step_value = price.0 * step;
+        if step_value <= Decimal::ZERO {
+            return raw;
+        }
+        let mut needed_steps = (gap / step_value).floor();
+        if needed_steps * step_value < gap {
+            needed_steps += Decimal::ONE;
+        }
+        raw + needed_steps * step
+    }
+
+    /// Whether the strategy is allowed to (re-)place orders on `side`
+    /// right now given the per-side reject cooldown.
+    fn side_in_cooldown(&self, side: Side, now: Timestamp) -> bool {
+        let cooldown_ms = self.config.reject_cooldown_ms;
+        if cooldown_ms == 0 {
+            return false;
+        }
+        let last = match side {
+            Side::Bid => self.last_reject_bid_ts,
+            Side::Ask => self.last_reject_ask_ts,
+        };
+        let Some(last) = last else {
+            return false;
+        };
+        let elapsed_ns = now.0.saturating_sub(last.0);
+        let cooldown_ns = cooldown_ms.saturating_mul(1_000_000);
+        elapsed_ns < cooldown_ns
+    }
+
+    fn mark_reject(&mut self, side: Side, ts: Timestamp) {
+        match side {
+            Side::Bid => self.last_reject_bid_ts = Some(ts),
+            Side::Ask => self.last_reject_ask_ts = Some(ts),
+        }
+    }
+
+    fn clear_reject(&mut self, side: Side) {
+        match side {
+            Side::Bid => self.last_reject_bid_ts = None,
+            Side::Ask => self.last_reject_ask_ts = None,
+        }
     }
 
     fn should_requote(&self, bid: Price, ask: Price, ts: Timestamp) -> bool {
@@ -139,17 +207,19 @@ impl SpreadScalp {
         let cap = self.config.max_position_usdt;
         let capped = cap > Decimal::ZERO && position_value >= cap;
 
-        // Take-profit: if unrealized PnL >= threshold, quote reducing side at
-        // mid and skip the increasing side to close aggressively.
+        // Take-profit: when unrealized PnL >= threshold, fire an IOC
+        // taker on the reducing side at the opposing touch. PostOnly at
+        // mid (the old behaviour) was passive — it sat in the queue
+        // waiting for someone to cross, which contradicts the
+        // "aggressively close" intent. IOC at the opposing best
+        // crosses immediately as taker for the full position size.
         let tp_threshold = self.config.take_profit_usdt;
         let tp_triggered = tp_threshold > Decimal::ZERO
             && ctx.position.avg_entry.0 > Decimal::ZERO
             && ctx.position.size.0 != Decimal::ZERO;
         if tp_triggered {
-            let (long, pos_abs) = (
-                ctx.position.size.0 > Decimal::ZERO,
-                ctx.position.size.0.abs(),
-            );
+            let long = ctx.position.size.0 > Decimal::ZERO;
+            let pos_abs = ctx.position.size.0.abs();
             let profit = if long {
                 mid - ctx.position.avg_entry.0
             } else {
@@ -157,16 +227,32 @@ impl SpreadScalp {
             };
             let unrealized = profit * pos_abs;
             if unrealized >= tp_threshold {
-                let tp_side = if long { Side::Ask } else { Side::Bid };
-                actions.push(self.make_quote(ctx, tp_side, Price(mid), Decimal::ONE));
+                // Reducing side + opposing touch = guaranteed taker.
+                let (tp_side, tp_price) = if long {
+                    (Side::Ask, bid)
+                } else {
+                    (Side::Bid, ask)
+                };
+                actions.push(Action::Quote(QuoteIntent {
+                    symbol: ctx.symbol.clone(),
+                    side: tp_side,
+                    price: tp_price,
+                    size: Size(pos_abs),
+                    tif: TimeInForce::IOC,
+                    kind: QuoteKind::Point,
+                }));
                 return actions;
             }
         }
 
-        if !capped || ctx.position.size.0 <= Decimal::ZERO {
+        let want_bid = (!capped || ctx.position.size.0 <= Decimal::ZERO)
+            && !self.side_in_cooldown(Side::Bid, ts);
+        let want_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
+            && !self.side_in_cooldown(Side::Ask, ts);
+        if want_bid {
             actions.push(self.make_quote(ctx, Side::Bid, bid, size_mult.0));
         }
-        if !capped || ctx.position.size.0 >= Decimal::ZERO {
+        if want_ask {
             actions.push(self.make_quote(ctx, Side::Ask, ask, size_mult.1));
         }
         actions
@@ -183,10 +269,15 @@ impl SpreadScalp {
         }
     }
 
-    fn cancel_if_live(&mut self, ts: Timestamp) -> Vec<Action> {
+    fn cancel_if_live(&mut self, _ts: Timestamp) -> Vec<Action> {
+        // Resetting `last_requote_ts = None` (instead of advancing it to
+        // `ts`) lets us re-enter immediately when targets become valid
+        // again. Stamping it would have parked the next requote behind
+        // `requote_interval_ms` even though we just cancelled — a quiet
+        // stall on spread re-widening.
         self.last_bid = None;
         self.last_ask = None;
-        self.last_requote_ts = Some(ts);
+        self.last_requote_ts = None;
         if self.quotes_live {
             self.quotes_live = false;
             vec![Action::CancelAll]
@@ -206,6 +297,8 @@ impl Strategy for SpreadScalp {
             last_ask: None,
             last_requote_ts: None,
             quotes_live: false,
+            last_reject_bid_ts: None,
+            last_reject_ask_ts: None,
         }
     }
 
@@ -220,6 +313,9 @@ impl Strategy for SpreadScalp {
             MarketEvent::Trade { .. } => return Vec::new(),
             MarketEvent::Fill(fill) => {
                 let ts = ctx.now;
+                // Fill = inventory just moved; whatever rejection state
+                // was tracked for the filled side is stale.
+                self.clear_reject(fill.side);
                 let Some((bid, ask)) = self.compute_targets(ctx.latest_book) else {
                     return self.cancel_if_live(ts);
                 };
@@ -234,49 +330,78 @@ impl Strategy for SpreadScalp {
                 self.last_ask = Some(ask);
                 self.last_requote_ts = Some(ts);
                 self.quotes_live = true;
-                // Filled side is dead — replace it with updated sizing.
-                // Opposite side is still live — keep it, add extra size if
-                // the inventory multiplier increased.
-                let mut actions = vec![self.make_quote(
-                    ctx,
-                    fill_side,
-                    if fill_side == Side::Bid { bid } else { ask },
-                    if fill_side == Side::Bid {
+
+                // Position-cap gate — `emit_requote` honoured it, the
+                // fill path did not. A Bid fill drives us long; if we
+                // already passed the cap, suppress the replacement Bid
+                // (and any opp-side top-up that would lean further in
+                // the same direction). Same logic mirrored for Ask /
+                // short. `<= 0` / `>= 0` keeps the inclusive flat case.
+                let mid = (bid.0 + ask.0) / Decimal::from(2);
+                let position_value = ctx.position.size.0.abs() * mid;
+                let cap = self.config.max_position_usdt;
+                let capped = cap > Decimal::ZERO && position_value >= cap;
+                let allow_bid = (!capped || ctx.position.size.0 <= Decimal::ZERO)
+                    && !self.side_in_cooldown(Side::Bid, ts);
+                let allow_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
+                    && !self.side_in_cooldown(Side::Ask, ts);
+
+                // Filled side replacement.
+                let mut actions = Vec::new();
+                let allow_filled_side = match fill_side {
+                    Side::Bid => allow_bid,
+                    Side::Ask => allow_ask,
+                };
+                if allow_filled_side {
+                    actions.push(self.make_quote(
+                        ctx,
+                        fill_side,
+                        if fill_side == Side::Bid { bid } else { ask },
+                        if fill_side == Side::Bid {
+                            size_mult.0
+                        } else {
+                            size_mult.1
+                        },
+                    ));
+                }
+
+                // Opp-side top-up — only if cap allows growing that side.
+                let allow_opp_side = match opp_side {
+                    Side::Bid => allow_bid,
+                    Side::Ask => allow_ask,
+                };
+                if allow_opp_side {
+                    let opp_mult = if opp_side == Side::Bid {
                         size_mult.0
                     } else {
                         size_mult.1
-                    },
-                )];
-                let opp_mult = if opp_side == Side::Bid {
-                    size_mult.0
-                } else {
-                    size_mult.1
-                };
-                let opp_price = if opp_side == Side::Bid { bid } else { ask };
-                let existing_opp: Decimal = ctx
-                    .open_quotes
-                    .iter()
-                    .filter(|q| q.1.side == opp_side)
-                    .map(|q| q.1.size.0)
-                    .sum();
-                let desired_total = self.quote_size(opp_price, opp_mult);
-                if desired_total > existing_opp {
-                    let extra = desired_total - existing_opp;
-                    let step = self.config.step_size;
-                    let extra = if step > Decimal::ZERO {
-                        (extra / step).floor() * step
-                    } else {
-                        extra
                     };
-                    if extra > Decimal::ZERO {
-                        actions.push(Action::Quote(QuoteIntent {
-                            symbol: ctx.symbol.clone(),
-                            side: opp_side,
-                            price: opp_price,
-                            size: Size(extra),
-                            tif: TimeInForce::PostOnly,
-                            kind: QuoteKind::Point,
-                        }));
+                    let opp_price = if opp_side == Side::Bid { bid } else { ask };
+                    let existing_opp: Decimal = ctx
+                        .open_quotes
+                        .iter()
+                        .filter(|q| q.1.side == opp_side)
+                        .map(|q| q.1.size.0)
+                        .sum();
+                    let desired_total = self.quote_size(opp_price, opp_mult);
+                    if desired_total > existing_opp {
+                        let extra = desired_total - existing_opp;
+                        let step = self.config.step_size;
+                        let extra = if step > Decimal::ZERO {
+                            (extra / step).floor() * step
+                        } else {
+                            extra
+                        };
+                        if extra > Decimal::ZERO {
+                            actions.push(Action::Quote(QuoteIntent {
+                                symbol: ctx.symbol.clone(),
+                                side: opp_side,
+                                price: opp_price,
+                                size: Size(extra),
+                                tif: TimeInForce::PostOnly,
+                                kind: QuoteKind::Point,
+                            }));
+                        }
                     }
                 }
                 return actions;
@@ -294,13 +419,20 @@ impl Strategy for SpreadScalp {
     fn on_quote_rejected(
         &mut self,
         ctx: &StrategyContext<'_>,
-        _intent: &tikr_venue::QuoteIntent,
+        intent: &tikr_venue::QuoteIntent,
         _reason: &str,
     ) -> Vec<Action> {
+        // Stamp the cooldown on the side that just bounced so the next
+        // rebuild attempt within `reject_cooldown_ms` skips this side
+        // (see SG `last_refill_*_ts` for the parent pattern). Without
+        // this, fast moves can produce a -5022 → rebuild → -5022 hot
+        // loop because every rejection nukes the price cache and
+        // re-emits both sides.
+        let ts = ctx.now;
+        self.mark_reject(intent.side, ts);
         self.last_bid = None;
         self.last_ask = None;
         self.last_requote_ts = None;
-        let ts = ctx.now;
         let Some((bid, ask)) = self.compute_targets(ctx.latest_book) else {
             return self.cancel_if_live(ts);
         };
@@ -391,6 +523,7 @@ mod tests {
             requote_interval_ms: 1000,
             max_position_usdt: Decimal::ZERO,
             take_profit_usdt: Decimal::ZERO,
+            reject_cooldown_ms: 0,
         })
     }
 

@@ -320,10 +320,14 @@ pub struct SpreadScalpParams {
     #[serde(default)]
     pub max_position_usdt: Decimal,
     /// Unrealized PnL threshold to trigger take-profit. When exceeded, the
-    /// reducing-side quote moves to mid price and the increasing side is
-    /// skipped. 0 = disabled.
+    /// strategy fires an IOC on the reducing side at the opposing touch
+    /// to close as taker. 0 = disabled.
     #[serde(default)]
     pub take_profit_usdt: Decimal,
+    /// Per-side cooldown (ms) after a venue rejection before another
+    /// rebuild is allowed. Default 2000 mirrors SG. 0 disables.
+    #[serde(default = "spread_scalp_default_reject_cooldown_ms")]
+    pub reject_cooldown_ms: u64,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
@@ -331,6 +335,9 @@ fn spread_scalp_default_min_spread_bps() -> Decimal {
 }
 fn spread_scalp_default_requote_interval_ms() -> u64 {
     1000
+}
+fn spread_scalp_default_reject_cooldown_ms() -> u64 {
+    2000
 }
 
 /// Parse a TOML config file.
