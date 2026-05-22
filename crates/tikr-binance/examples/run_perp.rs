@@ -59,8 +59,9 @@ use tikr_binance::{
 use tikr_core::{Asset, Decimal, MarketKind, Size, Symbol, VenueId};
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, SimpleGap, SimpleGapConfig, Strategy, TopOfBook, TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LadderReentry,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, SimpleGap, SimpleGapConfig, Strategy,
+    TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::signal;
@@ -93,6 +94,9 @@ enum StrategyArg {
     /// LayeredGrid — fixed-fiat rolling ladder with re-entry scalping.
     #[value(name = "layered-grid", alias = "lg")]
     LayeredGrid,
+    /// LadderReentry — seeded ladder, then opposite-side reentry on fills.
+    #[value(name = "ladder-reentry", alias = "lr")]
+    LadderReentry,
     /// StaticGrid — passive grid that rebuilds only when batch is consumed.
     #[value(name = "static-grid", alias = "sg")]
     StaticGrid,
@@ -196,6 +200,24 @@ struct Args {
     /// TP distance on fill, and same-side extension step (all the same).
     #[arg(long, default_value_t = 6u32)]
     lg_bps: u32,
+    /// LadderReentry: fiat notional per order. Auto-bumped if below symbol minNotional × 1.2.
+    #[arg(long, default_value = "25")]
+    lr_notional: String,
+    /// LadderReentry: initial orders per side.
+    #[arg(long, default_value_t = 10u32)]
+    lr_levels: u32,
+    /// LadderReentry: initial inner spread from mid in bps.
+    #[arg(long, default_value_t = 5u32)]
+    lr_inner_bps: u32,
+    /// LadderReentry: initial step between same-side levels in bps.
+    #[arg(long, default_value_t = 1u32)]
+    lr_step_bps: u32,
+    /// LadderReentry: opposite-side reentry distance from filled price in bps.
+    #[arg(long, default_value_t = 5u32)]
+    lr_reentry_bps: u32,
+    /// LadderReentry: same-side continuation distance from filled price in bps.
+    #[arg(long, default_value_t = 11u32)]
+    lr_continuation_bps: u32,
     /// StaticGrid: fiat notional per order. Auto-bumped if below symbol minNotional × 1.2.
     #[arg(long, default_value = "25")]
     sg_notional: String,
@@ -569,6 +591,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 notional_per_order: notional,
                 levels_per_side: args.lg_levels,
                 inner_bps: args.lg_bps,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                Some(fill_rx),
+            )
+            .await
+        }
+        StrategyArg::LadderReentry => {
+            let requested = Decimal::from_str(&args.lr_notional)
+                .map_err(|e| format!("--lr-notional '{}' invalid: {}", args.lr_notional, e))?;
+            let mut notional = requested;
+            if let Some(min_n) = venue.min_notional(&symbol) {
+                let floor = min_n * Decimal::from_str("1.2").unwrap();
+                if notional < floor {
+                    warn!(
+                        requested = %requested, min_notional = %min_n, bumped_to = %floor,
+                        "lr-notional below symbol minNotional × 1.2 — auto-bumping"
+                    );
+                    notional = floor;
+                }
+            }
+            let strategy = LadderReentry::new(LadderReentryConfig {
+                notional_per_order: notional,
+                levels_per_side: args.lr_levels,
+                inner_bps: args.lr_inner_bps,
+                step_bps: args.lr_step_bps,
+                reentry_bps: args.lr_reentry_bps,
+                continuation_bps: args.lr_continuation_bps,
             });
             run_with_resume(
                 venue,

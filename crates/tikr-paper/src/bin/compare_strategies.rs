@@ -19,9 +19,9 @@ use tikr_core::{
 };
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LayeredGrid,
-    LayeredGridConfig, MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig, StaticGrid,
-    StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LadderReentry,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, MicroPrice, MicroPriceConfig, SimpleGap,
+    SimpleGapConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -123,6 +123,10 @@ struct Args {
     /// SimpleGap notional per order.
     #[arg(long, default_value = "100")]
     simple_gap_notional: String,
+
+    /// LadderReentry notional per order.
+    #[arg(long, default_value = "100")]
+    ladder_reentry_notional: String,
 
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
@@ -234,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rng_seed: args.sim_rng_seed,
     };
     let simple_gap_notional = Decimal::from_str(&args.simple_gap_notional)?;
+    let ladder_reentry_notional = Decimal::from_str(&args.ladder_reentry_notional)?;
 
     // Load + sort + validate parquet once; share across all presets via Arc.
     let load_start = std::time::Instant::now();
@@ -532,6 +537,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+
+    spawn_preset(
+        &mut handles,
+        &shared_data,
+        &symbol,
+        "LadderReentry in=5 st=1 lv=10 re=5 cont=11",
+        LadderReentry::new(LadderReentryConfig {
+            notional_per_order: ladder_reentry_notional,
+            levels_per_side: 10,
+            inner_bps: 5,
+            step_bps: 1,
+            reentry_bps: 5,
+            continuation_bps: 11,
+        }),
+        fees,
+        skim_cfg,
+        funding_cfg,
+        sim_cfg_template.clone(),
+    );
 
     // SimpleGap — one fixed-distance bid/ask pair, then another pair after
     // every fill. No cancels, skew, requotes, or inventory logic.

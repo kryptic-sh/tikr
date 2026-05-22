@@ -9,7 +9,7 @@ use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
-use tikr_strategy::{LayeredGridConfig, SimpleGapConfig, StaticGridConfig};
+use tikr_strategy::{LadderReentryConfig, LayeredGridConfig, SimpleGapConfig, StaticGridConfig};
 
 use crate::config::{BotConfig, LgParams};
 
@@ -26,10 +26,11 @@ pub fn to_spec(
     let strategy = match cfg.strategy.as_str() {
         "static-grid" | "sg" => build_sg(cfg, &symbol, venue)?,
         "layered-grid" | "lg" => build_lg(cfg, &symbol, venue)?,
+        "ladder-reentry" | "lr" => build_ladder_reentry(cfg, &symbol, venue)?,
         "simple-gap" | "sgap" => build_simple_gap(cfg, &symbol, venue)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, simple-gap)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap)"
             ));
         }
     };
@@ -104,6 +105,28 @@ fn build_lg(cfg: &BotConfig, symbol: &Symbol, venue: &BinanceClient) -> Result<S
         notional_per_order: notional,
         levels_per_side: lg.levels,
         inner_bps: lg.bps,
+    }))
+}
+
+fn build_ladder_reentry(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+) -> Result<StrategyChoice> {
+    let lr = cfg.ladder_reentry.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=ladder-reentry but [bot.ladder_reentry] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(lr.notional, symbol, venue)?;
+    Ok(StrategyChoice::LadderReentry(LadderReentryConfig {
+        notional_per_order: notional,
+        levels_per_side: lr.levels,
+        inner_bps: lr.inner_bps,
+        step_bps: lr.step_bps,
+        reentry_bps: lr.reentry_bps,
+        continuation_bps: lr.continuation_bps,
     }))
 }
 

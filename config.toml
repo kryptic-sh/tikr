@@ -29,9 +29,9 @@ strategy = "static-grid"
 [bot.sg]
 auto_skew = false
 # notional             = 25      # fiat $ per order; auto-bumps to min_notional × 1.2
-levels = 2 # default 3 — orders per side (2 × levels at cold start)
+levels = 3 # default 3 — orders per side (2 × levels at cold start)
 # inner_bps            = 3       # nearest-level spread from mid in bps
-step_bps = 2 # default 3 — bps between consecutive same-side levels
+step_bps = 3 # default 3 — bps between consecutive same-side levels
 # target_fills_per_min = "0"     # 0 = adaptive scaler off
 # fillrate_window_secs = 60      # rolling window for the fpm measurement
 # scale_min            = "1.0"   # adaptive multiplier floor (1.0 = never tighten)
@@ -52,8 +52,8 @@ strategy = "static-grid"
 
 [bot.sg]
 auto_skew = false
-levels = 2
-step_bps = 2
+levels = 3
+step_bps = 3
 
 
 # ─── BNBUSDT ───────────────────────────────────────────────────────────────
@@ -64,8 +64,8 @@ strategy = "static-grid"
 
 [bot.sg]
 auto_skew = false
-levels = 2
-step_bps = 2
+levels = 3
+step_bps = 3
 
 
 # ─── SOLUSDT ───────────────────────────────────────────────────────────────
@@ -76,8 +76,8 @@ strategy = "static-grid"
 
 [bot.sg]
 auto_skew = false
-# levels   = 3   # default
-step_bps = 2
+levels = 3        # default
+step_bps = 3
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
@@ -88,8 +88,8 @@ strategy = "static-grid"
 
 [bot.sg]
 auto_skew = false
-levels = 2
-step_bps = 2
+levels = 3
+step_bps = 3
 
 
 # ─── HYPERUSDT ─────────────────────────────────────────────────────────────
@@ -100,8 +100,8 @@ strategy = "static-grid"
 
 [bot.sg]
 auto_skew = false
-levels = 2
-step_bps = 2
+levels = 3
+step_bps = 3
 
 
 # ─── PROMPTUSDT ────────────────────────────────────────────────────────────
@@ -112,8 +112,8 @@ strategy = "static-grid"
 
 [bot.sg]
 auto_skew = false
-levels = 2
-step_bps = 2
+levels = 3
+step_bps = 3
 
 
 # ─── LayeredGrid template (uncomment to use) ───────────────────────────────
@@ -126,6 +126,21 @@ step_bps = 2
 # # notional = 25   # fiat $ per order
 # # levels   = 1    # orders per side
 # # bps      = 6    # spacing in bps (also TP distance + same-side extension step)
+
+
+# ─── LadderReentry template (uncomment to use) ─────────────────────────────
+#
+# [[bot]]
+# symbol   = "BTCUSDT"
+# strategy = "ladder-reentry"
+#
+# [bot.ladder_reentry]
+# # notional    = 25   # fiat $ per order
+# # levels      = 10   # initial orders per side
+# # inner_bps   = 5    # first level distance from midpoint
+# # step_bps    = 1    # distance between initial ladder levels
+# # reentry_bps = 5    # opposite-side replacement distance from filled price
+# # continuation_bps = 11 # same-side continuation distance from filled price
 
 
 # ─── SimpleGap template (uncomment to use) ─────────────────────────────────

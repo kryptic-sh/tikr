@@ -1,0 +1,33 @@
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+# "futures-testnet" | "futures-mainnet"
+env = "futures-testnet"
+
+state_dir = "./state"
+
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "ladder-reentry"
+[bot.ladder_reentry]
+
+
+[[bot]]
+symbol = "HYPERUSDT"
+strategy = "ladder-reentry"
+[bot.ladder_reentry]
+
+
+[[bot]]
+symbol = "PROMPTUSDT"
+strategy = "ladder-reentry"
+[bot.ladder_reentry]
+
+
+# Defaults:
+# notional    = 25   # fiat $ per order; auto-bumps to min_notional × 1.2
+# levels      = 10   # initial orders per side
+# inner_bps   = 5    # first level distance from midpoint
+# step_bps    = 1    # distance between initial ladder levels
+# reentry_bps = 5    # opposite-side replacement distance from filled price
+# continuation_bps = 11 # same-side continuation distance from filled price

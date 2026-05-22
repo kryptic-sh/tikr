@@ -46,7 +46,8 @@ pub struct BotConfig {
     /// Binance-style symbol, e.g. `"BTCUSDT"`.
     pub symbol: String,
     /// Strategy id: one of `"static-grid"`, `"layered-grid"`,
-    /// `"simple-gap"`, `"avellaneda-stoikov"`, `"glft"`, `"top-of-book"`.
+    /// `"ladder-reentry"`, `"simple-gap"`, `"avellaneda-stoikov"`,
+    /// `"glft"`, `"top-of-book"`.
     pub strategy: String,
     /// StaticGrid params (only honored when `strategy = "static-grid"`).
     #[serde(default)]
@@ -54,6 +55,9 @@ pub struct BotConfig {
     /// LayeredGrid params.
     #[serde(default)]
     pub lg: Option<LgParams>,
+    /// LadderReentry params.
+    #[serde(default)]
+    pub ladder_reentry: Option<LadderReentryParams>,
     /// SimpleGap params.
     #[serde(default)]
     pub simple_gap: Option<SimpleGapParams>,
@@ -143,6 +147,49 @@ fn lg_default_bps() -> u32 {
     6
 }
 
+/// LadderReentry configuration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LadderReentryParams {
+    /// Notional per order.
+    #[serde(default = "ladder_reentry_default_notional")]
+    pub notional: Decimal,
+    /// Initial orders per side.
+    #[serde(default = "ladder_reentry_default_levels")]
+    pub levels: u32,
+    /// Initial inner distance from mid, in bps.
+    #[serde(default = "ladder_reentry_default_inner_bps")]
+    pub inner_bps: u32,
+    /// Initial spacing between levels, in bps.
+    #[serde(default = "ladder_reentry_default_step_bps")]
+    pub step_bps: u32,
+    /// Opposite-side reentry distance from filled price, in bps.
+    #[serde(default = "ladder_reentry_default_reentry_bps")]
+    pub reentry_bps: u32,
+    /// Same-side continuation distance from filled price, in bps.
+    #[serde(default = "ladder_reentry_default_continuation_bps")]
+    pub continuation_bps: u32,
+}
+
+fn ladder_reentry_default_notional() -> Decimal {
+    Decimal::from(25)
+}
+fn ladder_reentry_default_levels() -> u32 {
+    10
+}
+fn ladder_reentry_default_inner_bps() -> u32 {
+    5
+}
+fn ladder_reentry_default_step_bps() -> u32 {
+    1
+}
+fn ladder_reentry_default_reentry_bps() -> u32 {
+    5
+}
+fn ladder_reentry_default_continuation_bps() -> u32 {
+    11
+}
+
 /// SimpleGap configuration.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
@@ -194,13 +241,19 @@ mod tests {
             symbol = "BNBUSDT"
             strategy = "simple-gap"
             simple_gap = { notional = 25, gap_bps = 4 }
+
+            [[bot]]
+            symbol = "SOLUSDT"
+            strategy = "ladder-reentry"
+            ladder_reentry = { notional = 25, levels = 10, inner_bps = 5, step_bps = 1, reentry_bps = 5, continuation_bps = 11 }
         "#;
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
-        assert_eq!(cfg.bots.len(), 3);
+        assert_eq!(cfg.bots.len(), 4);
         assert_eq!(cfg.bots[0].symbol, "BTCUSDT");
         assert_eq!(cfg.bots[0].strategy, "static-grid");
         assert_eq!(cfg.bots[1].strategy, "layered-grid");
         assert_eq!(cfg.bots[2].strategy, "simple-gap");
+        assert_eq!(cfg.bots[3].strategy, "ladder-reentry");
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(sg.levels, 2);
     }

@@ -12,8 +12,9 @@ use std::sync::{Arc, RwLock};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, LayeredGrid, LayeredGridConfig,
-    SimpleGap, SimpleGapConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, LadderReentry,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, SimpleGap, SimpleGapConfig, StaticGrid,
+    StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -35,6 +36,8 @@ pub enum StrategyChoice {
     StaticGrid(StaticGridConfig),
     /// [`LayeredGrid`] — rolling re-anchored ladder.
     LayeredGrid(LayeredGridConfig),
+    /// [`LadderReentry`] — seeded ladder with opposite-side reentry.
+    LadderReentry(LadderReentryConfig),
     /// [`AvellanedaStoikov`] — finite-horizon inventory-aware MM.
     AvellanedaStoikov(AvellanedaStoikovConfig),
     /// [`Glft`] — Guéant-Lehalle-Fernandez-Tapia infinite-horizon MM.
@@ -51,6 +54,7 @@ impl StrategyChoice {
         match self {
             Self::StaticGrid(_) => "static-grid",
             Self::LayeredGrid(_) => "layered-grid",
+            Self::LadderReentry(_) => "ladder-reentry",
             Self::AvellanedaStoikov(_) => "avellaneda-stoikov",
             Self::Glft(_) => "glft",
             Self::TopOfBook(_) => "top-of-book",
@@ -165,6 +169,22 @@ where
                 }
                 StrategyChoice::LayeredGrid(cfg) => {
                     let strategy = LayeredGrid::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::LadderReentry(cfg) => {
+                    let strategy = LadderReentry::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,

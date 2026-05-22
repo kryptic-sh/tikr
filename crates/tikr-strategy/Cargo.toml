@@ -15,6 +15,3 @@ readme.workspace = true
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"
-# Used by `random_bracket` for deterministic PRNG; seedable so backtest runs
-# reproduce.
-rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }

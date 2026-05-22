@@ -31,6 +31,7 @@
 
 pub mod avellaneda_stoikov;
 pub mod glft;
+pub mod ladder_reentry;
 pub mod layered_grid;
 pub mod micro_price;
 pub mod simple_gap;
@@ -40,6 +41,7 @@ pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
 pub use glft::{Glft, GlftConfig};
+pub use ladder_reentry::{LadderReentry, LadderReentryConfig};
 pub use layered_grid::{LayeredGrid, LayeredGridConfig};
 pub use micro_price::{MicroPrice, MicroPriceConfig};
 pub use simple_gap::{SimpleGap, SimpleGapConfig};

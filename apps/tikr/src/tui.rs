@@ -76,13 +76,14 @@ enum LogView {
 /// UI state owned by the render loop.
 struct UiState {
     active_tab: usize,
+    tab_scroll: usize,
     /// Log viewport mode + anchor.
     log_view: LogView,
     /// Last-drawn rects so mouse events can hit-test.
     last_tab_rect: Option<Rect>,
     last_log_rect: Option<Rect>,
-    /// Per-tab `(start_x, end_x)` in absolute terminal coords.
-    last_tab_ranges: Vec<(u16, u16)>,
+    /// Per-visible-tab `(global_index, start_x, end_x)` in absolute terminal coords.
+    last_tab_ranges: Vec<(usize, u16, u16)>,
     /// Last drawn log pane height (visible row count incl. borders) —
     /// captured so chord actions can compute "page up / page down" in
     /// proportion to what the user actually sees.
@@ -110,6 +111,7 @@ impl UiState {
         let keymap = build_keymap();
         Self {
             active_tab: 0,
+            tab_scroll: 0,
             log_view: LogView::Follow,
             last_tab_rect: None,
             last_log_rect: None,
@@ -128,9 +130,9 @@ impl UiState {
         if y < rect.y || y >= rect.y + rect.height {
             return None;
         }
-        for (idx, (sx, ex)) in self.last_tab_ranges.iter().enumerate() {
+        for (idx, sx, ex) in &self.last_tab_ranges {
             if x >= *sx && x < *ex {
-                return Some(idx);
+                return Some(*idx);
             }
         }
         None
@@ -641,10 +643,35 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
     f.render_widget(block, area);
 
     let mut spans: Vec<Span> = Vec::new();
-    let mut ranges: Vec<(u16, u16)> = Vec::new();
+    let mut ranges: Vec<(usize, u16, u16)> = Vec::new();
     let mut x = inner.x;
+    let right = inner.x.saturating_add(inner.width);
 
-    for (i, v) in views.iter().enumerate() {
+    if views.is_empty() {
+        ui.last_tab_rect = Some(area);
+        ui.last_tab_ranges.clear();
+        return;
+    }
+
+    ui.active_tab = ui.active_tab.min(views.len() - 1);
+    ui.tab_scroll = ui.tab_scroll.min(ui.active_tab);
+    while ui.tab_scroll < ui.active_tab
+        && !tabs_fit_active(views, ui.tab_scroll, ui.active_tab, inner.width)
+    {
+        ui.tab_scroll += 1;
+    }
+    while ui.tab_scroll > 0 && tabs_fit_active(views, ui.tab_scroll - 1, ui.active_tab, inner.width)
+    {
+        ui.tab_scroll -= 1;
+    }
+
+    if ui.tab_scroll > 0 {
+        spans.push(Span::styled(" ‹ ", Style::default().fg(Color::DarkGray)));
+        x = x.saturating_add(3);
+    }
+
+    let mut truncated = false;
+    for (i, v) in views.iter().enumerate().skip(ui.tab_scroll) {
         let (color, tag) = match &v.status {
             BotStatus::Running => (Color::Green, v.status.tag()),
             BotStatus::Crashed(_) => (Color::Red, v.status.tag()),
@@ -654,6 +681,11 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
         let active = i == ui.active_tab;
         let label = format!(" {} ({}) [{}] ", v.symbol, v.strategy, tag);
         let w = label.chars().count() as u16;
+        let sep_w = 1;
+        if i != ui.active_tab && x.saturating_add(w).saturating_add(sep_w) > right {
+            truncated = true;
+            break;
+        }
         let style = if active {
             Style::default()
                 .fg(Color::White)
@@ -663,10 +695,14 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
             Style::default().fg(color)
         };
         spans.push(Span::styled(label, style));
-        ranges.push((x, x + w));
+        ranges.push((i, x, x.saturating_add(w).min(right)));
         x = x.saturating_add(w);
         spans.push(Span::raw("│"));
         x = x.saturating_add(1);
+    }
+
+    if truncated && x.saturating_add(3) <= right {
+        spans.push(Span::styled(" › ", Style::default().fg(Color::DarkGray)));
     }
 
     let para = Paragraph::new(Line::from(spans));
@@ -674,6 +710,25 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
 
     ui.last_tab_rect = Some(area);
     ui.last_tab_ranges = ranges;
+}
+
+fn tab_width(v: &BotViewSnapshot) -> u16 {
+    format!(" {} ({}) [{}] │", v.symbol, v.strategy, v.status.tag())
+        .chars()
+        .count() as u16
+}
+
+fn tabs_fit_active(
+    views: &[BotViewSnapshot],
+    start: usize,
+    active: usize,
+    available_width: u16,
+) -> bool {
+    let prefix = if start > 0 { 3 } else { 0 };
+    let width = views[start..=active]
+        .iter()
+        .fold(prefix, |acc, v| acc + tab_width(v));
+    width <= available_width
 }
 
 fn draw_body(
@@ -702,18 +757,18 @@ fn draw_body(
 fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &AccountAggregate) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("bots ", Style::default().fg(Color::Gray)),
+        Span::styled("bots     ", Style::default().fg(Color::Gray)),
         Span::styled(
             format!("{}", views.len()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  on   ", Style::default().fg(Color::Green)),
+        Span::styled("  on     ", Style::default().fg(Color::Green)),
         Span::raw(format!("{}", agg.running_count)),
-        Span::styled("   x  ", Style::default().fg(Color::Red)),
+        Span::styled("   x    ", Style::default().fg(Color::Red)),
         Span::raw(format!("{}", agg.crashed_count)),
-        Span::styled("   ↻  ", Style::default().fg(Color::Yellow)),
+        Span::styled("   ↻    ", Style::default().fg(Color::Yellow)),
         Span::raw(format!("{}", agg.restarting_count)),
     ]));
     lines.push(Line::from(""));
@@ -750,24 +805,24 @@ fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &
     lines.push(Line::from(vec![
         Span::styled("fills    ", Style::default().fg(Color::Gray)),
         Span::styled(
-            format!("{:>4}", agg.buy_fills),
+            format!("{:>5}", agg.buy_fills),
             Style::default().fg(Color::Green),
         ),
         Span::raw(" / "),
         Span::styled(
-            format!("{:<4}", agg.sell_fills),
+            format!("{:>5}", agg.sell_fills),
             Style::default().fg(Color::Red),
         ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("open b/s ", Style::default().fg(Color::Gray)),
         Span::styled(
-            format!("{:>4}", agg.open_buys),
+            format!("{:>5}", agg.open_buys),
             Style::default().fg(Color::Green),
         ),
         Span::raw(" / "),
         Span::styled(
-            format!("{:<4}", agg.open_sells),
+            format!("{:>5}", agg.open_sells),
             Style::default().fg(Color::Red),
         ),
     ]));
@@ -794,7 +849,7 @@ fn draw_account(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], agg: &
                 format!("  {:<10}", v.symbol),
                 Style::default().fg(Color::White),
             ),
-            Span::styled(format!("{:>+9.2}", dec_to_f64(net)), pnl_style(net)),
+            Span::styled(format!("{:>+10.2}", dec_to_f64(net)), pnl_style(net)),
         ]));
     }
 
@@ -984,7 +1039,7 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
         lines.push(Line::from(vec![
             Span::styled("size     ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:>+12.4}", dec_to_f64(lv.position_size)),
+                format!("{:>+13.4}", dec_to_f64(lv.position_size)),
                 pnl_style(lv.position_size),
             ),
         ]));
@@ -995,7 +1050,7 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
         lines.push(Line::from(vec![
             Span::styled("inventory", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:>+12.2}", dec_to_f64(lv.inventory_usdt)),
+                format!("{:>+13.4}", dec_to_f64(lv.inventory_usdt)),
                 pnl_style(lv.inventory_usdt),
             ),
         ]));
@@ -1042,12 +1097,12 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
         lines.push(Line::from(vec![
             Span::styled("open b/s ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:>3}", lv.open_buys),
+                format!("{:>5}", lv.open_buys),
                 Style::default().fg(Color::Green),
             ),
             Span::raw(" / "),
             Span::styled(
-                format!("{:>3}", lv.open_sells),
+                format!("{:>5}", lv.open_sells),
                 Style::default().fg(Color::Red),
             ),
         ]));

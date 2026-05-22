@@ -532,6 +532,17 @@ impl FillSim {
         self.cancel_id(id);
     }
 
+    /// Live mode: venue confirmed all symbol orders were cancelled. Drop all
+    /// matching live and in-flight quotes from the local mirror immediately.
+    pub fn drop_quotes_for(&mut self, symbol: &Symbol) {
+        self.live_quotes.retain(|q| &q.symbol != symbol);
+        self.pending.retain(|p| match &p.op {
+            Op::Place { intent, .. } => &intent.symbol != symbol,
+            Op::Replace { intent, .. } => &intent.symbol != symbol,
+            Op::Cancel(_) | Op::CancelAll => true,
+        });
+    }
+
     /// Reconcile in-memory `live_quotes` against the venue's authoritative
     /// view for `symbol`. Any tracked quote whose id is NOT in `valid_ids`
     /// is a ghost (silently cancelled / expired / lost across a WS

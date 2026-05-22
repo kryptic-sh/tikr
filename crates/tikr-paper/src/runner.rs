@@ -550,21 +550,24 @@ where
                                 }
                             }
                             tikr_strategy::Action::Cancel(id) => {
-                                if let Err(e) = venue.cancel(*id).await {
-                                    warn!(error = ?e, "live: venue.cancel failed");
+                                match venue.cancel(*id).await {
+                                    Ok(()) => fill_sim.drop_quote(*id),
+                                    Err(e) => warn!(error = ?e, "live: venue.cancel failed"),
                                 }
                             }
                             tikr_strategy::Action::CancelAll => {
-                                if let Err(e) = venue.cancel_all(&symbol).await {
-                                    warn!(error = ?e, "live: venue.cancel_all failed");
+                                match venue.cancel_all(&symbol).await {
+                                    Ok(()) => fill_sim.drop_quotes_for(&symbol),
+                                    Err(e) => warn!(error = ?e, "live: venue.cancel_all failed"),
                                 }
                             }
                             tikr_strategy::Action::NoOp => {}
                             tikr_strategy::Action::Quote(_) => unreachable!(),
                         }
-                        // Mirror non-Quote actions into FillSim too so its
-                        // book of live quotes tracks cancels/requotes.
-                        fill_sim.on_action(filtered[i].clone(), ts);
+                        if matches!(filtered[i], tikr_strategy::Action::Requote { .. }) {
+                            // Requotes still use FillSim's delayed replace path.
+                            fill_sim.on_action(filtered[i].clone(), ts);
+                        }
                         i += 1;
                     }
                 } else {
@@ -1071,18 +1074,14 @@ async fn dispatch_post_fill_actions<V, S>(
                     warn!(error = ?e, "live: venue.requote failed (post-fill)");
                 }
             }
-            tikr_strategy::Action::Cancel(id) => {
-                if let Err(e) = venue.cancel(*id).await {
-                    warn!(error = ?e, "live: venue.cancel failed (post-fill)");
-                }
-                fill_sim.on_action(action, ts);
-            }
-            tikr_strategy::Action::CancelAll => {
-                if let Err(e) = venue.cancel_all(symbol).await {
-                    warn!(error = ?e, "live: venue.cancel_all failed (post-fill)");
-                }
-                fill_sim.on_action(action, ts);
-            }
+            tikr_strategy::Action::Cancel(id) => match venue.cancel(*id).await {
+                Ok(()) => fill_sim.drop_quote(*id),
+                Err(e) => warn!(error = ?e, "live: venue.cancel failed (post-fill)"),
+            },
+            tikr_strategy::Action::CancelAll => match venue.cancel_all(symbol).await {
+                Ok(()) => fill_sim.drop_quotes_for(symbol),
+                Err(e) => warn!(error = ?e, "live: venue.cancel_all failed (post-fill)"),
+            },
             tikr_strategy::Action::NoOp => {}
         }
     }
@@ -1138,18 +1137,16 @@ async fn dispatch_post_fill_actions<V, S>(
                             }
                         }
                     }
-                    tikr_strategy::Action::Cancel(id) => {
-                        if let Err(e) = venue.cancel(*id).await {
-                            warn!(error = ?e, round, "live: venue.cancel failed (recovery)");
+                    tikr_strategy::Action::Cancel(id) => match venue.cancel(*id).await {
+                        Ok(()) => fill_sim.drop_quote(*id),
+                        Err(e) => warn!(error = ?e, round, "live: venue.cancel failed (recovery)"),
+                    },
+                    tikr_strategy::Action::CancelAll => match venue.cancel_all(symbol).await {
+                        Ok(()) => fill_sim.drop_quotes_for(symbol),
+                        Err(e) => {
+                            warn!(error = ?e, round, "live: venue.cancel_all failed (recovery)")
                         }
-                        fill_sim.on_action(action, ts);
-                    }
-                    tikr_strategy::Action::CancelAll => {
-                        if let Err(e) = venue.cancel_all(symbol).await {
-                            warn!(error = ?e, round, "live: venue.cancel_all failed (recovery)");
-                        }
-                        fill_sim.on_action(action, ts);
-                    }
+                    },
                     tikr_strategy::Action::Requote { .. } | tikr_strategy::Action::NoOp => {}
                 }
             }
@@ -1185,10 +1182,14 @@ async fn apply_fill(
     if let Some(gate) = risk_gate.as_mut() {
         gate.record_fill(fill.ts);
     }
-    *fills_emitted += 1;
-    match fill.side {
-        tikr_core::Side::Bid => *buy_fills += 1,
-        tikr_core::Side::Ask => *sell_fills += 1,
+    // Display/report fill counters track completed orders, not every partial
+    // execution. PnL/position/risk still apply every partial above.
+    if fill.is_full {
+        *fills_emitted += 1;
+        match fill.side {
+            tikr_core::Side::Bid => *buy_fills += 1,
+            tikr_core::Side::Ask => *sell_fills += 1,
+        }
     }
     if let Some(sink) = alert_sink {
         let _ = sink
