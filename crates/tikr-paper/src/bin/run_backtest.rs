@@ -162,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         funding: None,
         snapshot_tap: None,
         live_tap: None,
+        notional_rx: None,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.

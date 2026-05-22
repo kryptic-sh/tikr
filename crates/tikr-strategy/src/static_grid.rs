@@ -604,6 +604,21 @@ impl Strategy for StaticGrid {
         let ratio = self.pos_ratio(pos_usdt);
         vec![self.make_level(ctx.symbol, mid, best_bid, best_ask, ratio, intent.side, 0)]
     }
+
+    fn on_notional_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        notional_per_order: Decimal,
+    ) -> Vec<Action> {
+        if notional_per_order <= Decimal::ZERO
+            || notional_per_order == self.config.notional_per_order
+        {
+            return Vec::new();
+        }
+        self.config.notional_per_order = notional_per_order;
+        self.placed = false;
+        vec![Action::CancelAll]
+    }
 }
 
 #[cfg(test)]

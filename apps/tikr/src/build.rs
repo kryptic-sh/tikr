@@ -10,6 +10,7 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{LadderReentryConfig, LayeredGridConfig, SimpleGapConfig, StaticGridConfig};
+use tokio::sync::watch;
 
 use crate::config::{BotConfig, LgParams};
 
@@ -23,7 +24,9 @@ pub fn to_spec(
     venue: &BinanceClient,
     base_state_dir: &std::path::Path,
     default_notional: Decimal,
+    notional_rx: Option<watch::Receiver<Decimal>>,
 ) -> Result<BotSpec> {
+    let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
         "static-grid" | "sg" => build_sg(cfg, &symbol, venue, default_notional)?,
         "layered-grid" | "lg" => build_lg(cfg, &symbol, venue, default_notional)?,
@@ -45,6 +48,11 @@ pub fn to_spec(
         funding: None,
         snapshot_tap: None, // spawn_bot installs its own
         live_tap: None,
+        notional_rx: if uses_default_notional {
+            notional_rx
+        } else {
+            None
+        },
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.
@@ -67,6 +75,20 @@ pub fn to_spec(
         runner_config,
         fill_sim,
     })
+}
+
+fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
+    match cfg.strategy.as_str() {
+        "static-grid" | "sg" => Ok(cfg.sg.as_ref().map(|p| p.notional).unwrap_or(None)),
+        "layered-grid" | "lg" => Ok(cfg.lg.as_ref().map(|p| p.notional).unwrap_or(None)),
+        "ladder-reentry" | "lr" => Ok(cfg
+            .ladder_reentry
+            .as_ref()
+            .map(|p| p.notional)
+            .unwrap_or(None)),
+        "simple-gap" | "sgap" => Ok(cfg.simple_gap.as_ref().map(|p| p.notional).unwrap_or(None)),
+        other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
+    }
 }
 
 fn per_bot_state_dir(base: &std::path::Path, symbol: &str) -> PathBuf {

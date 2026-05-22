@@ -198,6 +198,21 @@ impl Strategy for LadderReentry {
         };
         vec![self.make_seed_side(ctx.symbol, mid, intent.side, self.config.inner_bps)]
     }
+
+    fn on_notional_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        notional_per_order: Decimal,
+    ) -> Vec<Action> {
+        if notional_per_order <= Decimal::ZERO
+            || notional_per_order == self.config.notional_per_order
+        {
+            return Vec::new();
+        }
+        self.config.notional_per_order = notional_per_order;
+        self.seeded = false;
+        vec![Action::CancelAll]
+    }
 }
 
 #[cfg(test)]

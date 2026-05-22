@@ -61,6 +61,9 @@ pub struct RunnerConfig {
     /// counts, buy/sell split, last fill, and the best bid/ask/mid for
     /// dashboards that need to refresh on every fill.
     pub live_tap: Option<std::sync::Arc<std::sync::RwLock<Option<crate::LiveSnapshot>>>>,
+    /// Optional live per-order notional updates derived from account wallet
+    /// balance. Strategies decide how to refresh resting orders.
+    pub notional_rx: Option<watch::Receiver<Decimal>>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -99,6 +102,7 @@ impl Default for RunnerConfig {
             funding: None,
             snapshot_tap: None,
             live_tap: None,
+            notional_rx: None,
         }
     }
 }
@@ -315,6 +319,7 @@ where
     // On each subsequent event we apply `position × mark × rate × dt/28800s`
     // continuously, then advance.
     let funding_cfg = config.funding;
+    let mut notional_rx = config.notional_rx;
     let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
@@ -387,6 +392,43 @@ where
         // Poll the external fill receiver when in live mode. We use an async
         // block that resolves to `Option<Fill>` so the select! can be unified.
         tokio::select! {
+            changed = async {
+                match notional_rx.as_mut() {
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed
+                    && let Some(rx) = notional_rx.as_ref()
+                {
+                    let next_notional = *rx.borrow();
+                    let pos = tracker.snapshot();
+                    let open_quotes = fill_sim.live_quotes_for(&symbol);
+                    let ctx = StrategyContext {
+                        symbol: &symbol,
+                        now: last_event_ts.unwrap_or(Timestamp(0)),
+                        position: &pos,
+                        recent_fills: &[],
+                        latest_book: &current_book,
+                        open_quotes: &open_quotes,
+                    };
+                    let actions = strategy.on_notional_updated(&ctx, next_notional);
+                    if !actions.is_empty() {
+                        info!(notional_per_order = %next_notional, "order notional updated");
+                        dispatch_post_fill_actions(
+                            actions,
+                            &venue,
+                            &mut fill_sim,
+                            &mut strategy,
+                            &symbol,
+                            last_event_ts.unwrap_or(Timestamp(0)),
+                            &pos,
+                            &current_book,
+                            live_mode,
+                        ).await;
+                    }
+                }
+            }
             ev = stream.next() => {
                 let Some(event) = ev else {
                     info!("event stream ended");
@@ -1493,6 +1535,7 @@ mod tests {
             funding: None,
             snapshot_tap: None,
             live_tap: None,
+            notional_rx: None,
         }
     }
 
@@ -1829,6 +1872,7 @@ mod tests {
             funding: None,
             snapshot_tap: None,
             live_tap: None,
+            notional_rx: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -1909,6 +1953,7 @@ mod tests {
             funding: None,
             snapshot_tap: None,
             live_tap: None,
+            notional_rx: None,
         };
         let (_tx, rx) = watch::channel(false);
 

@@ -369,6 +369,7 @@ async fn risk_resume_alerting_capstone() {
         funding: None,
         snapshot_tap: None,
         live_tap: None,
+        notional_rx: None,
     };
     let (_tx1, rx1) = watch::channel(false);
 

@@ -165,6 +165,17 @@ pub trait Strategy: Send {
     ) -> Vec<Action> {
         Vec::new()
     }
+
+    /// Called when the runner receives a new account-derived order notional.
+    /// Strategies with fiat-sized orders should update future quote sizes and
+    /// may return actions to refresh currently resting orders.
+    fn on_notional_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        _notional_per_order: Decimal,
+    ) -> Vec<Action> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------

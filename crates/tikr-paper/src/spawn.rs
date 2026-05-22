@@ -289,5 +289,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         funding: None,
         snapshot_tap: None,
         live_tap: None,
+        notional_rx: None,
     }
 }

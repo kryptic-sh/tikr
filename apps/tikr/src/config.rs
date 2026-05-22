@@ -37,6 +37,9 @@ pub struct AccountConfig {
     /// Split evenly by bot count when a bot's strategy does not set `notional`.
     #[serde(default = "default_order_balance_pct")]
     pub order_balance_pct: Decimal,
+    /// Multiplier applied to wallet balance before order sizing, typically leverage.
+    #[serde(default = "default_margin_multiplier")]
+    pub margin_multiplier: Decimal,
 }
 
 fn default_state_dir() -> PathBuf {
@@ -45,6 +48,10 @@ fn default_state_dir() -> PathBuf {
 
 fn default_order_balance_pct() -> Decimal {
     Decimal::new(2, 1)
+}
+
+fn default_margin_multiplier() -> Decimal {
+    Decimal::ONE
 }
 
 /// Per-bot configuration.
@@ -268,6 +275,7 @@ mod tests {
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(cfg.account.order_balance_pct, Decimal::new(2, 1));
+        assert_eq!(cfg.account.margin_multiplier, Decimal::ONE);
         assert_eq!(sg.notional, None);
         assert_eq!(sg.levels, 3);
         assert_eq!(sg.inner_bps, 3);

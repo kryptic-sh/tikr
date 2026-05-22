@@ -331,6 +331,22 @@ impl Strategy for LayeredGrid {
         self.placed = true;
         actions
     }
+
+    fn on_notional_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        notional_per_order: Decimal,
+    ) -> Vec<Action> {
+        if notional_per_order <= Decimal::ZERO
+            || notional_per_order == self.config.notional_per_order
+        {
+            return Vec::new();
+        }
+        self.config.notional_per_order = notional_per_order;
+        self.placed = false;
+        self.orders.clear();
+        vec![Action::CancelAll]
+    }
 }
 
 /// Helper: does the [`tikr_core::Fill`] belong to our symbol? FillSim

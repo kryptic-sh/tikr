@@ -225,6 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         funding: None,
         snapshot_tap: None,
         live_tap: None,
+        notional_rx: None,
     };
 
     let report = run_with_resume(

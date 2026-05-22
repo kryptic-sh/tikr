@@ -36,8 +36,12 @@ pub struct SupervisorCtx {
     pub base_state_dir: std::path::PathBuf,
     /// Account margin percent allocated to all bot order sizes.
     pub order_balance_pct: Decimal,
+    /// Multiplier applied to wallet balance before sizing, typically leverage.
+    pub margin_multiplier: Decimal,
     /// Number of configured bots sharing the account allocation.
     pub bot_count: usize,
+    /// Live per-bot notional updates from the account balance poller.
+    pub notional_rx: watch::Receiver<Decimal>,
 }
 
 /// Spawn the supervisor for a single bot. Returns the supervisor's join
@@ -182,6 +186,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         &venue_for_run,
         &ctx.base_state_dir,
         default_notional,
+        Some(ctx.notional_rx.clone()),
     )?;
     info!(strategy = %spec.strategy.label(), default_notional = %default_notional, "spawning bot");
     let handle = tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx));
@@ -194,7 +199,11 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
 async fn default_order_notional(venue: &BinanceClient, ctx: &SupervisorCtx) -> Result<Decimal> {
     let balance = venue.futures_balance("USDT").await?;
     let bot_count = Decimal::from(ctx.bot_count.max(1) as u64);
-    Ok(balance.wallet_balance * ctx.order_balance_pct / Decimal::from(100) / bot_count)
+    Ok(
+        balance.wallet_balance * ctx.margin_multiplier * ctx.order_balance_pct
+            / Decimal::from(100)
+            / bot_count,
+    )
 }
 
 async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {

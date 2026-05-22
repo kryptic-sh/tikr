@@ -61,6 +61,10 @@ struct Args {
     /// Split evenly across configured bots. Example: 10 with 2 bots = 5% each.
     #[arg(long)]
     order_balance_pct: Option<Decimal>,
+
+    /// Override [account].margin_multiplier for computed order notional.
+    #[arg(long)]
+    margin_multiplier: Option<Decimal>,
 }
 
 /// Resolve the config path using cwd-first → XDG fallback discovery.
@@ -100,17 +104,23 @@ fn resolve_config_path(cli: Option<&std::path::Path>) -> anyhow::Result<PathBuf>
     )
 }
 
-fn spawn_account_balance_poller(
+struct AccountPollerConfig {
     shared_state: SharedBotState,
+    notional_tx: watch::Sender<Decimal>,
     env: tikr_binance::BinanceEnv,
     api_key: String,
     key_material: Arc<tikr_binance::BinanceKeyMaterial>,
     symbols: Vec<String>,
-    mut shutdown: watch::Receiver<bool>,
-) {
+    order_balance_pct: Decimal,
+    margin_multiplier: Decimal,
+    shutdown: watch::Receiver<bool>,
+}
+
+fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
-        let key_material = match key_material.as_ref() {
+        let mut shutdown = cfg.shutdown;
+        let key_material = match cfg.key_material.as_ref() {
             tikr_binance::BinanceKeyMaterial::Hmac { secret } => {
                 tikr_binance::BinanceKeyMaterial::Hmac {
                     secret: secret.clone(),
@@ -125,8 +135,8 @@ fn spawn_account_balance_poller(
         loop {
             match tikr_binance::futs::get_balance(
                 &http,
-                env.rest_base_url(),
-                &api_key,
+                cfg.env.rest_base_url(),
+                &cfg.api_key,
                 &key_material,
                 "USDT",
             )
@@ -139,22 +149,30 @@ fn spawn_account_balance_poller(
                         api_unrealized = %balance.cross_unrealized_pnl,
                         "account balance poll"
                     );
-                    shared_state.set_api_account(ApiAccountSnapshot {
+                    cfg.shared_state.set_api_account(ApiAccountSnapshot {
                         asset: "USDT".to_string(),
                         wallet_balance: balance.wallet_balance,
                         available_balance: balance.available_balance,
                         cross_unrealized_pnl: balance.cross_unrealized_pnl,
                         fetched_at_ms: current_time_ms(),
                     });
+                    let bot_count = Decimal::from(cfg.symbols.len().max(1) as u64);
+                    let notional =
+                        balance.wallet_balance * cfg.margin_multiplier * cfg.order_balance_pct
+                            / Decimal::from(100)
+                            / bot_count;
+                    if notional != *cfg.notional_tx.borrow() {
+                        let _ = cfg.notional_tx.send(notional);
+                    }
                 }
                 Err(e) => tracing::warn!(error = ?e, "account balance poll failed"),
             }
 
-            for symbol in &symbols {
+            for symbol in &cfg.symbols {
                 match tikr_binance::futs::get_position_risk(
                     &http,
-                    env.rest_base_url(),
-                    &api_key,
+                    cfg.env.rest_base_url(),
+                    &cfg.api_key,
                     &key_material,
                     symbol,
                 )
@@ -170,7 +188,7 @@ fn spawn_account_balance_poller(
                             api_unrealized = %pos.unrealized_profit,
                             "position risk poll"
                         );
-                        shared_state.set_api_position(
+                        cfg.shared_state.set_api_position(
                             symbol,
                             ApiPositionSnapshot {
                                 position_amount: pos.position_amount,
@@ -216,8 +234,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pct) = args.order_balance_pct {
         cfg.account.order_balance_pct = pct;
     }
+    if let Some(multiplier) = args.margin_multiplier {
+        cfg.account.margin_multiplier = multiplier;
+    }
     if cfg.account.order_balance_pct <= Decimal::ZERO {
         anyhow::bail!("order_balance_pct must be positive");
+    }
+    if cfg.account.margin_multiplier <= Decimal::ZERO {
+        anyhow::bail!("margin_multiplier must be positive");
     }
 
     if args.check {
@@ -286,15 +310,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Global shutdown channel — TUI flips it on `q`; supervisors observe.
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
+    let (notional_tx, notional_rx) = watch::channel(Decimal::ZERO);
 
-    spawn_account_balance_poller(
-        shared_state.clone(),
+    spawn_account_balance_poller(AccountPollerConfig {
+        shared_state: shared_state.clone(),
+        notional_tx,
         env,
-        api_key.clone(),
-        key_material.clone(),
-        cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
-        global_shutdown_rx.clone(),
-    );
+        api_key: api_key.clone(),
+        key_material: key_material.clone(),
+        symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
+        order_balance_pct: cfg.account.order_balance_pct,
+        margin_multiplier: cfg.account.margin_multiplier,
+        shutdown: global_shutdown_rx.clone(),
+    });
 
     // Spawn one supervisor per bot.
     let mut supervisors = Vec::with_capacity(cfg.bots.len());
@@ -306,7 +334,9 @@ async fn main() -> anyhow::Result<()> {
             key_material: key_material.clone(),
             base_state_dir: cfg.account.state_dir.clone(),
             order_balance_pct: cfg.account.order_balance_pct,
+            margin_multiplier: cfg.account.margin_multiplier,
             bot_count: cfg.bots.len(),
+            notional_rx: notional_rx.clone(),
         };
         let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());
         supervisors.push(h);
