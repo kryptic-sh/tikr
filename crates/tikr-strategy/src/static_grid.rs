@@ -340,12 +340,30 @@ impl StaticGrid {
             Side::Bid => {
                 // Strong (or neutral) Bid — widen from mid by (1 + |ratio|).
                 let bps = (base_bps * (Decimal::ONE + abs_ratio)).max(Decimal::ONE);
-                Price(mid.0 * (Decimal::ONE - bps / bp_unit))
+                let mid_price = mid.0 * (Decimal::ONE - bps / bp_unit);
+                // If market spread is wider than our grid spread (2×inner_bps),
+                // our k=0 order would land inside the market spread.
+                // Place 1bp below best_bid instead.
+                let grid_spread_bps = Decimal::from(self.config.inner_bps * 2) * adaptive;
+                let market_spread_bps = (best_ask.0 - best_bid.0) / mid.0 * bp_unit;
+                if k == 0 && market_spread_bps > grid_spread_bps {
+                    Price(best_bid.0 * (Decimal::ONE - Decimal::ONE / bp_unit))
+                } else {
+                    Price(mid_price)
+                }
             }
             Side::Ask => {
                 // Strong (or neutral) Ask — widen from mid by (1 + |ratio|).
                 let bps = (base_bps * (Decimal::ONE + abs_ratio)).max(Decimal::ONE);
-                Price(mid.0 * (Decimal::ONE + bps / bp_unit))
+                let mid_price = mid.0 * (Decimal::ONE + bps / bp_unit);
+                // Same logic as Bid side.
+                let grid_spread_bps = Decimal::from(self.config.inner_bps * 2) * adaptive;
+                let market_spread_bps = (best_ask.0 - best_bid.0) / mid.0 * bp_unit;
+                if k == 0 && market_spread_bps > grid_spread_bps {
+                    Price(best_ask.0 * (Decimal::ONE + Decimal::ONE / bp_unit))
+                } else {
+                    Price(mid_price)
+                }
             }
         };
         self.make_quote(symbol, side, price)
@@ -363,11 +381,6 @@ impl StaticGrid {
             .count();
         let sells = open_quotes.len() - buys;
 
-        // Both sides partial = full rebuild.
-        if buys == 1 && sells == 1 {
-            return RebuildDecision::FullRebuild;
-        }
-
         // One side empty: rebuild the whole grid so the surviving side
         // follows the current price instead of lagging in fast trends.
         if buys == 0 || sells == 0 {
@@ -379,6 +392,18 @@ impl StaticGrid {
         // sides with the current inventory skew.
         let _ = cur_pos_ratio;
         RebuildDecision::None
+    }
+
+    /// Check if the grid is down to its last order on each side.
+    /// Called only from the Fill handler — NOT from BookUpdate self-heal
+    /// to avoid premature rebuilds during normal trading.
+    fn is_last_per_side(&self, open_quotes: &[(QuoteId, QuoteIntent)]) -> bool {
+        let buys = open_quotes
+            .iter()
+            .filter(|(_, q)| q.side == Side::Bid)
+            .count();
+        let sells = open_quotes.len() - buys;
+        buys == 1 && sells == 1
     }
 }
 
@@ -507,6 +532,18 @@ impl Strategy for StaticGrid {
                 };
                 let pos_usdt = ctx.position.size.0 * mid.0;
                 let cur_ratio = self.pos_ratio(pos_usdt);
+                // Rebuild when a side is empty OR when down to the last
+                // order on each side. The "last per side" check is done
+                // here (Fill handler only) and NOT in the BookUpdate
+                // self-heal to avoid premature rebuilds during normal trading.
+                if self.is_last_per_side(ctx.open_quotes) {
+                    let mut actions =
+                        Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
+                    actions.push(Action::CancelAll);
+                    actions
+                        .extend(self.build_batch(ctx.symbol, mid, best_bid, best_ask, cur_ratio));
+                    return actions;
+                }
                 match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
                     RebuildDecision::None => Vec::new(),
                     RebuildDecision::FullRebuild => {
@@ -559,14 +596,10 @@ impl Strategy for StaticGrid {
         _ctx: &StrategyContext<'_>,
         notional_per_order: Decimal,
     ) -> Vec<Action> {
-        if notional_per_order <= Decimal::ZERO
-            || notional_per_order == self.config.notional_per_order
-        {
-            return Vec::new();
+        if notional_per_order > Decimal::ZERO {
+            self.config.notional_per_order = notional_per_order;
         }
-        self.config.notional_per_order = notional_per_order;
-        self.placed = false;
-        vec![Action::CancelAll]
+        Vec::new()
     }
 }
 
@@ -623,12 +656,18 @@ mod tests {
     }
 
     #[test]
-    fn single_per_side_triggers_full_rebuild() {
+    fn single_per_side_does_not_trigger_rebuild_decision() {
         let g = StaticGrid::new(cfg("0", 60, "1", "4"));
         assert_eq!(
             g.rebuild_decision(&[quote(Side::Bid), quote(Side::Ask)], Decimal::ZERO),
-            RebuildDecision::FullRebuild
+            RebuildDecision::None
         );
+    }
+
+    #[test]
+    fn single_per_side_triggers_is_last_per_side() {
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert!(g.is_last_per_side(&[quote(Side::Bid), quote(Side::Ask)]));
     }
 
     #[test]
@@ -646,6 +685,12 @@ mod tests {
             ),
             RebuildDecision::None
         );
+        assert!(!g.is_last_per_side(&[
+            quote(Side::Bid),
+            quote(Side::Bid),
+            quote(Side::Ask),
+            quote(Side::Ask),
+        ]));
     }
 
     #[test]
@@ -777,5 +822,99 @@ mod tests {
         // Innermost pair = inner_bps = 5bp distance on a 100_000 mid = 50.
         assert_eq!(dists[0], Decimal::from(50));
         assert_eq!(dists[1], Decimal::from(50));
+    }
+
+    #[test]
+    fn wide_spread_uses_best_bid_ask_minus_1bp() {
+        let mut c = cfg("0", 60, "1", "4");
+        c.levels_per_side = 3;
+        c.inner_bps = 3;
+        c.step_bps = 3;
+        c.auto_skew = false;
+        let g = StaticGrid::new(c);
+        let sym = Symbol {
+            base: tikr_core::Asset::new("BTC"),
+            quote: tikr_core::Asset::new("USDT"),
+            venue: tikr_core::VenueId::new("test"),
+            kind: tikr_core::MarketKind::Perp,
+        };
+        // Market spread = 200bps (best_bid=99000, best_ask=101000, mid=100000).
+        // inner_bps=3 → mid-based bid = 99700, which is INSIDE the spread.
+        // Should use best_bid - 1bp instead.
+        let mid = Price(Decimal::from(100_000));
+        let best_bid = Price(Decimal::from(99_000));
+        let best_ask = Price(Decimal::from(101_000));
+        let actions = g.build_batch(&sym, mid, best_bid, best_ask, Decimal::ZERO);
+        let bids: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let asks: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // k=0 bid is closest to best_bid (spread-aware places at best_bid - 1bp).
+        let inner_bid = bids
+            .iter()
+            .min_by_key(|p| (**p - best_bid.0).abs())
+            .unwrap();
+        let expected_inner_bid = Decimal::from(99_000) * (Decimal::ONE - Decimal::new(1, 4));
+        assert_eq!(*inner_bid, expected_inner_bid);
+        // k=0 ask is closest to best_ask.
+        let inner_ask = asks
+            .iter()
+            .min_by_key(|p| (**p - best_ask.0).abs())
+            .unwrap();
+        let expected_inner_ask = Decimal::from(101_000) * (Decimal::ONE + Decimal::new(1, 4));
+        assert_eq!(*inner_ask, expected_inner_ask);
+    }
+
+    #[test]
+    fn narrow_spread_uses_inner_bps() {
+        let mut c = cfg("0", 60, "1", "4");
+        c.levels_per_side = 3;
+        c.inner_bps = 5;
+        c.step_bps = 5;
+        c.auto_skew = false;
+        let g = StaticGrid::new(c);
+        let sym = Symbol {
+            base: tikr_core::Asset::new("BTC"),
+            quote: tikr_core::Asset::new("USDT"),
+            venue: tikr_core::VenueId::new("test"),
+            kind: tikr_core::MarketKind::Perp,
+        };
+        // Market spread = 2bps (best_bid=99990, best_ask=100010, mid=100000).
+        // inner_bps=5 → mid-based bid = 99950, which is OUTSIDE the spread (below best_bid).
+        // Should use normal inner_bps.
+        let mid = Price(Decimal::from(100_000));
+        let best_bid = Price(Decimal::from(99_990));
+        let best_ask = Price(Decimal::from(100_010));
+        let actions = g.build_batch(&sym, mid, best_bid, best_ask, Decimal::ZERO);
+        let bids: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let asks: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // Innermost bid = mid * (1 - 5bps) = 100000 * 0.9995 = 99950
+        let expected_inner_bid = Decimal::from(100_000) * (Decimal::ONE - Decimal::new(5, 4));
+        assert_eq!(bids[0], expected_inner_bid);
+        // Innermost ask = mid * (1 + 5bps) = 100000 * 1.0005 = 100050
+        let expected_inner_ask = Decimal::from(100_000) * (Decimal::ONE + Decimal::new(5, 4));
+        assert_eq!(asks[0], expected_inner_ask);
     }
 }

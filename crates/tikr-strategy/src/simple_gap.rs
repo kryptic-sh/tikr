@@ -107,14 +107,10 @@ impl Strategy for SimpleGap {
         _ctx: &StrategyContext<'_>,
         notional_per_order: Decimal,
     ) -> Vec<Action> {
-        if notional_per_order <= Decimal::ZERO
-            || notional_per_order == self.config.notional_per_order
-        {
-            return Vec::new();
+        if notional_per_order > Decimal::ZERO {
+            self.config.notional_per_order = notional_per_order;
         }
-        self.config.notional_per_order = notional_per_order;
-        self.seeded = false;
-        vec![Action::CancelAll]
+        Vec::new()
     }
 }
 

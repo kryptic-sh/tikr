@@ -337,15 +337,10 @@ impl Strategy for LayeredGrid {
         _ctx: &StrategyContext<'_>,
         notional_per_order: Decimal,
     ) -> Vec<Action> {
-        if notional_per_order <= Decimal::ZERO
-            || notional_per_order == self.config.notional_per_order
-        {
-            return Vec::new();
+        if notional_per_order > Decimal::ZERO {
+            self.config.notional_per_order = notional_per_order;
         }
-        self.config.notional_per_order = notional_per_order;
-        self.placed = false;
-        self.orders.clear();
-        vec![Action::CancelAll]
+        Vec::new()
     }
 }
 
