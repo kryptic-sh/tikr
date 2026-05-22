@@ -43,6 +43,12 @@ pub struct ExchangeInfoResponse {
 pub struct SymbolInfo {
     /// Binance symbol name (e.g. `"BTCUSDT"`).
     pub symbol: String,
+    /// Trading status when exposed by Binance, e.g. `"TRADING"`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Futures contract type when exposed, e.g. `"PERPETUAL"`.
+    #[serde(default)]
+    pub contract_type: Option<String>,
     /// Raw filter entries from the API.
     pub filters: Vec<FilterEntry>,
 }

@@ -9,7 +9,10 @@ use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
-use tikr_strategy::{LadderReentryConfig, LayeredGridConfig, SimpleGapConfig, StaticGridConfig};
+use tikr_strategy::{
+    LadderReentryConfig, LayeredGridConfig, MicroMeanReversionConfig, SimpleGapConfig,
+    SpreadScalpConfig, StaticGridConfig,
+};
 use tokio::sync::watch;
 
 use crate::config::{BotConfig, LgParams};
@@ -32,9 +35,13 @@ pub fn to_spec(
         "layered-grid" | "lg" => build_lg(cfg, &symbol, venue, default_notional)?,
         "ladder-reentry" | "lr" => build_ladder_reentry(cfg, &symbol, venue, default_notional)?,
         "simple-gap" | "sgap" => build_simple_gap(cfg, &symbol, venue, default_notional)?,
+        "micro-mean-reversion" | "mmr" => {
+            build_micro_mean_reversion(cfg, &symbol, venue, default_notional)?
+        }
+        "spread-scalp" | "ss" => build_spread_scalp(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp)"
             ));
         }
     };
@@ -87,6 +94,16 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
             .map(|p| p.notional)
             .unwrap_or(None)),
         "simple-gap" | "sgap" => Ok(cfg.simple_gap.as_ref().map(|p| p.notional).unwrap_or(None)),
+        "micro-mean-reversion" | "mmr" => Ok(cfg
+            .micro_mean_reversion
+            .as_ref()
+            .map(|p| p.notional)
+            .unwrap_or(None)),
+        "spread-scalp" | "ss" => Ok(cfg
+            .spread_scalp
+            .as_ref()
+            .map(|p| p.notional)
+            .unwrap_or(None)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -184,6 +201,68 @@ fn build_simple_gap(
     Ok(StrategyChoice::SimpleGap(SimpleGapConfig {
         notional_per_order: notional,
         gap_bps: simple_gap.gap_bps,
+    }))
+}
+
+fn build_micro_mean_reversion(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let mmr = cfg.micro_mean_reversion.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=micro-mean-reversion but [bot.micro_mean_reversion] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(mmr.notional.unwrap_or(default_notional), symbol, venue)?;
+    Ok(StrategyChoice::MicroMeanReversion(
+        MicroMeanReversionConfig {
+            notional_per_order: notional,
+            trigger_bps: mmr.trigger_bps,
+            entry_bps: mmr.entry_bps,
+            exit_bps: mmr.exit_bps,
+            max_open_entries: mmr.max_open_entries,
+        },
+    ))
+}
+
+fn build_spread_scalp(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let spread_scalp = cfg.spread_scalp.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=spread-scalp but [bot.spread_scalp] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(
+        spread_scalp.notional.unwrap_or(default_notional),
+        symbol,
+        venue,
+    )?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(spread_scalp.tick_size);
+    if tick_size <= Decimal::ZERO {
+        anyhow::bail!(
+            "bot {} strategy=spread-scalp needs tick_size because exchangeInfo has no symbol filters",
+            cfg.symbol
+        );
+    }
+    Ok(StrategyChoice::SpreadScalp(SpreadScalpConfig {
+        notional_per_order: notional,
+        tick_size,
+        improve_ticks: spread_scalp.improve_ticks,
+        min_requote_interval_ms: spread_scalp.min_requote_interval_ms,
+        requote_tick_threshold: spread_scalp.requote_tick_threshold,
+        force_requote_interval_ms: spread_scalp.force_requote_interval_ms,
+        min_quote_edge_bps: spread_scalp.min_quote_edge_bps,
+        flatten_threshold_notional: spread_scalp.flatten_threshold_notional,
+        skew_unit_notional: spread_scalp.skew_unit_notional,
+        max_skew_ticks: spread_scalp.max_skew_ticks,
     }))
 }
 

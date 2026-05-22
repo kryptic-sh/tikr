@@ -17,6 +17,43 @@ pub struct DashboardConfig {
     /// `[[bot]]` array-of-tables syntax.
     #[serde(rename = "bot", default)]
     pub bots: Vec<BotConfig>,
+    /// Optional rotating SpreadScalp manager.
+    #[serde(default)]
+    pub scalp_rotation: Option<ScalpRotationConfig>,
+}
+
+/// Rotating SpreadScalp manager configuration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScalpRotationConfig {
+    /// Enable rotating scalp mode.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Number of active bots to keep running.
+    #[serde(default = "scalp_rotation_default_slots")]
+    pub slots: usize,
+    /// How often to rescan volatility and rotate symbols.
+    #[serde(default = "scalp_rotation_default_refresh_secs")]
+    pub refresh_secs: u64,
+    /// Quote asset suffix to include.
+    #[serde(default = "scalp_rotation_default_quote_asset")]
+    pub quote_asset: String,
+    /// Minimum quote volume filter.
+    #[serde(default)]
+    pub min_quote_volume: Decimal,
+    /// Optional allow-list. Empty means all matching quote assets.
+    #[serde(default)]
+    pub candidates: Vec<String>,
+}
+
+fn scalp_rotation_default_slots() -> usize {
+    4
+}
+fn scalp_rotation_default_refresh_secs() -> u64 {
+    300
+}
+fn scalp_rotation_default_quote_asset() -> String {
+    "USDT".to_string()
 }
 
 /// Account-wide settings.
@@ -61,8 +98,8 @@ pub struct BotConfig {
     /// Binance-style symbol, e.g. `"BTCUSDT"`.
     pub symbol: String,
     /// Strategy id: one of `"static-grid"`, `"layered-grid"`,
-    /// `"ladder-reentry"`, `"simple-gap"`, `"avellaneda-stoikov"`,
-    /// `"glft"`, `"top-of-book"`.
+    /// `"ladder-reentry"`, `"simple-gap"`, `"micro-mean-reversion"`,
+    /// `"spread-scalp"`, `"avellaneda-stoikov"`, `"glft"`, `"top-of-book"`.
     pub strategy: String,
     /// StaticGrid params (only honored when `strategy = "static-grid"`).
     #[serde(default)]
@@ -76,6 +113,12 @@ pub struct BotConfig {
     /// SimpleGap params.
     #[serde(default)]
     pub simple_gap: Option<SimpleGapParams>,
+    /// MicroMeanReversion params.
+    #[serde(default)]
+    pub micro_mean_reversion: Option<MicroMeanReversionParams>,
+    /// SpreadScalp params.
+    #[serde(default)]
+    pub spread_scalp: Option<SpreadScalpParams>,
 }
 
 /// StaticGrid configuration.
@@ -212,6 +255,92 @@ fn simple_gap_default_gap_bps() -> u32 {
     4
 }
 
+/// MicroMeanReversion configuration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct MicroMeanReversionParams {
+    /// Notional per order.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Trade distance from mid required before entering, in bps.
+    #[serde(default = "mmr_default_trigger_bps")]
+    pub trigger_bps: u32,
+    /// Passive entry distance from mid, in bps.
+    #[serde(default = "mmr_default_entry_bps")]
+    pub entry_bps: u32,
+    /// Exit distance from fill price, in bps.
+    #[serde(default = "mmr_default_exit_bps")]
+    pub exit_bps: u32,
+    /// Maximum same-side entry quotes to keep open.
+    #[serde(default = "mmr_default_max_open_entries")]
+    pub max_open_entries: u32,
+}
+
+fn mmr_default_trigger_bps() -> u32 {
+    10
+}
+fn mmr_default_entry_bps() -> u32 {
+    2
+}
+fn mmr_default_exit_bps() -> u32 {
+    6
+}
+fn mmr_default_max_open_entries() -> u32 {
+    1
+}
+
+/// SpreadScalp configuration.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpreadScalpParams {
+    /// Notional per order.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Venue tick size. Optional when exchangeInfo has symbol filters.
+    #[serde(default)]
+    pub tick_size: Decimal,
+    /// Ticks inside best bid/ask to quote. `0` joins best bid/ask.
+    #[serde(default = "spread_scalp_default_improve_ticks")]
+    pub improve_ticks: u32,
+    /// Minimum time between forced requotes in ms.
+    #[serde(default = "spread_scalp_default_min_requote_interval_ms")]
+    pub min_requote_interval_ms: u64,
+    /// Target price drift, in ticks, required before a non-risk requote.
+    #[serde(default = "spread_scalp_default_requote_tick_threshold")]
+    pub requote_tick_threshold: u32,
+    /// Force a refresh after this many ms. `0` disables forced refresh.
+    #[serde(default = "spread_scalp_default_force_requote_interval_ms")]
+    pub force_requote_interval_ms: u64,
+    /// Minimum gross quote-to-quote edge in bps before fees/slippage.
+    #[serde(default = "spread_scalp_default_min_quote_edge_bps")]
+    pub min_quote_edge_bps: Decimal,
+    /// Position notional where one-sided flatten mode starts. `0` disables.
+    #[serde(default)]
+    pub flatten_threshold_notional: Decimal,
+    /// Position notional where `max_skew_ticks` is fully applied. `0` disables skew.
+    #[serde(default)]
+    pub skew_unit_notional: Decimal,
+    /// Maximum inventory-skew shift in ticks.
+    #[serde(default)]
+    pub max_skew_ticks: u32,
+}
+
+fn spread_scalp_default_improve_ticks() -> u32 {
+    1
+}
+fn spread_scalp_default_min_requote_interval_ms() -> u64 {
+    5000
+}
+fn spread_scalp_default_requote_tick_threshold() -> u32 {
+    3
+}
+fn spread_scalp_default_force_requote_interval_ms() -> u64 {
+    60_000
+}
+fn spread_scalp_default_min_quote_edge_bps() -> Decimal {
+    Decimal::from(4)
+}
+
 /// Parse a TOML config file.
 pub fn load(path: &Path) -> anyhow::Result<DashboardConfig> {
     let s = std::fs::read_to_string(path)
@@ -249,14 +378,26 @@ mod tests {
             symbol = "SOLUSDT"
             strategy = "ladder-reentry"
             ladder_reentry = { notional = 25, levels = 10, inner_bps = 5, step_bps = 1, reentry_bps = 5, continuation_bps = 11 }
+
+            [[bot]]
+            symbol = "DOGEUSDT"
+            strategy = "micro-mean-reversion"
+            micro_mean_reversion = { notional = 25, trigger_bps = 10, entry_bps = 2, exit_bps = 6, max_open_entries = 1 }
+
+            [[bot]]
+            symbol = "XRPUSDT"
+            strategy = "spread-scalp"
+            spread_scalp = { notional = 25, improve_ticks = 1, min_requote_interval_ms = 5000, requote_tick_threshold = 3, force_requote_interval_ms = 60000, min_quote_edge_bps = 4, flatten_threshold_notional = 20, skew_unit_notional = 10, max_skew_ticks = 2 }
         "#;
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
-        assert_eq!(cfg.bots.len(), 4);
+        assert_eq!(cfg.bots.len(), 6);
         assert_eq!(cfg.bots[0].symbol, "BTCUSDT");
         assert_eq!(cfg.bots[0].strategy, "static-grid");
         assert_eq!(cfg.bots[1].strategy, "layered-grid");
         assert_eq!(cfg.bots[2].strategy, "simple-gap");
         assert_eq!(cfg.bots[3].strategy, "ladder-reentry");
+        assert_eq!(cfg.bots[4].strategy, "micro-mean-reversion");
+        assert_eq!(cfg.bots[5].strategy, "spread-scalp");
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(sg.levels, 2);
     }

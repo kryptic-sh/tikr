@@ -20,8 +20,10 @@ use tikr_core::{
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LadderReentry,
-    LadderReentryConfig, LayeredGrid, LayeredGridConfig, MicroPrice, MicroPriceConfig, SimpleGap,
-    SimpleGapConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, MicroMeanReversion,
+    MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig,
+    SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook,
+    TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -127,6 +129,34 @@ struct Args {
     /// LadderReentry notional per order.
     #[arg(long, default_value = "100")]
     ladder_reentry_notional: String,
+
+    /// MicroMeanReversion notional per order.
+    #[arg(long, default_value = "100")]
+    micro_mean_reversion_notional: String,
+
+    /// MicroMeanReversion sweep: comma-separated trigger distances in bps.
+    #[arg(long, default_value = "8,10,12")]
+    mmr_trigger_bps_list: String,
+
+    /// MicroMeanReversion sweep: comma-separated passive entry distances in bps.
+    #[arg(long, default_value = "1,2,3")]
+    mmr_entry_bps_list: String,
+
+    /// MicroMeanReversion sweep: comma-separated exit distances from fill in bps.
+    #[arg(long, default_value = "4,6,8")]
+    mmr_exit_bps_list: String,
+
+    /// SpreadScalp notional per order.
+    #[arg(long, default_value = "100")]
+    spread_scalp_notional: String,
+
+    /// SpreadScalp sweep: comma-separated min quote edge in bps.
+    #[arg(long, default_value = "3,4,5")]
+    spread_scalp_min_quote_edge_bps_list: String,
+
+    /// SpreadScalp sweep: comma-separated improve ticks.
+    #[arg(long, default_value = "0,1")]
+    spread_scalp_improve_ticks_list: String,
 
     /// Perp funding rate per 8h in bps (signed). Default 1 (~0.01%/8h,
     /// typical Binance mid-cap). Positive = longs pay shorts. Set to 0
@@ -239,6 +269,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let simple_gap_notional = Decimal::from_str(&args.simple_gap_notional)?;
     let ladder_reentry_notional = Decimal::from_str(&args.ladder_reentry_notional)?;
+    let micro_mean_reversion_notional = Decimal::from_str(&args.micro_mean_reversion_notional)?;
+    let spread_scalp_notional = Decimal::from_str(&args.spread_scalp_notional)?;
 
     // Load + sort + validate parquet once; share across all presets via Arc.
     let load_start = std::time::Instant::now();
@@ -576,6 +608,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             funding_cfg,
             sim_cfg_template.clone(),
         );
+    }
+
+    let mmr_trigger_sweep = parse_u32_list(&args.mmr_trigger_bps_list)?;
+    let mmr_entry_sweep = parse_u32_list(&args.mmr_entry_bps_list)?;
+    let mmr_exit_sweep = parse_u32_list(&args.mmr_exit_bps_list)?;
+    for &trigger in &mmr_trigger_sweep {
+        for &entry in &mmr_entry_sweep {
+            for &exit in &mmr_exit_sweep {
+                let label = format!("MMR trig={trigger} entry={entry} exit={exit}");
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    MicroMeanReversion::new(MicroMeanReversionConfig {
+                        notional_per_order: micro_mean_reversion_notional,
+                        trigger_bps: trigger,
+                        entry_bps: entry,
+                        exit_bps: exit,
+                        max_open_entries: 1,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                );
+            }
+        }
+    }
+
+    let spread_scalp_edge_sweep = parse_decimal_list(&args.spread_scalp_min_quote_edge_bps_list)?;
+    let spread_scalp_improve_sweep = parse_u32_list(&args.spread_scalp_improve_ticks_list)?;
+    for &edge_bps in &spread_scalp_edge_sweep {
+        for &improve in &spread_scalp_improve_sweep {
+            let label = format!("SpreadScalp edge={edge_bps}bps imp={improve}t");
+            spawn_preset(
+                &mut handles,
+                &shared_data,
+                &symbol,
+                &label,
+                SpreadScalp::new(SpreadScalpConfig {
+                    notional_per_order: spread_scalp_notional,
+                    tick_size: tick,
+                    improve_ticks: improve,
+                    min_requote_interval_ms: 1000,
+                    requote_tick_threshold: 3,
+                    force_requote_interval_ms: 60_000,
+                    min_quote_edge_bps: edge_bps,
+                    flatten_threshold_notional: Decimal::ZERO,
+                    skew_unit_notional: Decimal::ZERO,
+                    max_skew_ticks: 0,
+                }),
+                fees,
+                skim_cfg,
+                funding_cfg,
+                sim_cfg_template.clone(),
+            );
+        }
     }
 
     // StaticGrid sweep — place-once-then-sit grid. Triggers a fresh batch

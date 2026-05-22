@@ -50,6 +50,26 @@ pub struct FuturesPositionRisk {
     pub unrealized_profit: tikr_core::Decimal,
 }
 
+/// USD-M futures 24h ticker stats for one symbol.
+#[derive(Debug, Clone)]
+pub struct FuturesTicker24h {
+    /// Binance symbol, e.g. `DOGEUSDT`.
+    pub symbol: String,
+    /// 24h absolute price-change percent.
+    pub price_change_percent_abs: tikr_core::Decimal,
+    /// 24h quote volume.
+    pub quote_volume: tikr_core::Decimal,
+}
+
+/// USD-M futures best bid/ask for one symbol.
+#[derive(Debug, Clone, Copy)]
+pub struct FuturesBookTicker {
+    /// Best bid price.
+    pub bid_price: tikr_core::Decimal,
+    /// Best ask price.
+    pub ask_price: tikr_core::Decimal,
+}
+
 // ---------------------------------------------------------------------------
 // Futures endpoints
 // ---------------------------------------------------------------------------
@@ -264,6 +284,127 @@ pub async fn get_exchange_info(
     let resp = http.get(&url).send().await.map_err(network_err)?;
     let info: ExchangeInfoResponse = resp.json().await.map_err(internal_err)?;
     Ok(info)
+}
+
+/// Fetch all USD-M futures 24h ticker stats.
+pub async fn get_24hr_tickers(
+    http: &HttpClient,
+    base_url: &str,
+) -> Result<Vec<FuturesTicker24h>, VenueError> {
+    let url = format!("{base_url}/fapi/v1/ticker/24hr");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "ticker/24hr: expected array",
+        )))
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        let Some(symbol) = row.get("symbol").and_then(Value::as_str) else {
+            continue;
+        };
+        let pct = row
+            .get("priceChangePercent")
+            .and_then(Value::as_str)
+            .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+            .unwrap_or_default()
+            .abs();
+        let quote_volume = row
+            .get("quoteVolume")
+            .and_then(Value::as_str)
+            .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+            .unwrap_or_default();
+        out.push(FuturesTicker24h {
+            symbol: symbol.to_string(),
+            price_change_percent_abs: pct,
+            quote_volume,
+        });
+    }
+    Ok(out)
+}
+
+/// Fetch current best bid/ask for one USD-M futures symbol.
+pub async fn get_book_ticker(
+    http: &HttpClient,
+    base_url: &str,
+    symbol: &str,
+) -> Result<FuturesBookTicker, VenueError> {
+    let url = format!("{base_url}/fapi/v1/ticker/bookTicker?symbol={symbol}");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let bid_price = body
+        .get("bidPrice")
+        .and_then(Value::as_str)
+        .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+        .unwrap_or_default();
+    let ask_price = body
+        .get("askPrice")
+        .and_then(Value::as_str)
+        .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+        .unwrap_or_default();
+    Ok(FuturesBookTicker {
+        bid_price,
+        ask_price,
+    })
+}
+
+/// Fetch recent 1m close prices for short-window realized-vol scoring.
+pub async fn get_1m_closes(
+    http: &HttpClient,
+    base_url: &str,
+    symbol: &str,
+    limit: u32,
+) -> Result<Vec<tikr_core::Decimal>, VenueError> {
+    let limit = limit.clamp(2, 100);
+    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let Some(rows) = body.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut closes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(close) = row
+            .as_array()
+            .and_then(|cols| cols.get(4))
+            .and_then(Value::as_str)
+            .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+        else {
+            continue;
+        };
+        if close > tikr_core::Decimal::ZERO {
+            closes.push(close);
+        }
+    }
+    Ok(closes)
 }
 
 /// Fetch the current position size for `symbol` (USD-M Perp).
