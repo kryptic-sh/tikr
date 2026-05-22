@@ -363,8 +363,8 @@ impl StaticGrid {
             .count();
         let sells = open_quotes.len() - buys;
 
-        // Both sides empty (or wiped by external cancel): full rebuild.
-        if buys == 0 && sells == 0 {
+        // Both sides partial = full rebuild.
+        if buys == 1 && sells == 1 {
             return RebuildDecision::FullRebuild;
         }
 
@@ -623,11 +623,37 @@ mod tests {
     }
 
     #[test]
-    fn both_sides_present_does_not_rebuild() {
+    fn single_per_side_triggers_full_rebuild() {
         let g = StaticGrid::new(cfg("0", 60, "1", "4"));
         assert_eq!(
             g.rebuild_decision(&[quote(Side::Bid), quote(Side::Ask)], Decimal::ZERO),
+            RebuildDecision::FullRebuild
+        );
+    }
+
+    #[test]
+    fn both_sides_healthy_does_not_rebuild() {
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert_eq!(
+            g.rebuild_decision(
+                &[
+                    quote(Side::Bid),
+                    quote(Side::Bid),
+                    quote(Side::Ask),
+                    quote(Side::Ask),
+                ],
+                Decimal::ZERO
+            ),
             RebuildDecision::None
+        );
+    }
+
+    #[test]
+    fn empty_both_sides_triggers_full_rebuild() {
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert_eq!(
+            g.rebuild_decision(&[], Decimal::ZERO),
+            RebuildDecision::FullRebuild
         );
     }
 
