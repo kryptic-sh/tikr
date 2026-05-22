@@ -157,6 +157,12 @@ where
                 }
             }
         }
+        // Also check event-level fields for a `symbol` field so logs
+        // emitted outside a bot span (e.g. account/position poller) still
+        // route to the correct per-symbol tab instead of system-wide.
+        if sym.0.is_none() {
+            event.record(&mut sym);
+        }
         let mut msg = MessageVisitor(String::new());
         event.record(&mut msg);
 

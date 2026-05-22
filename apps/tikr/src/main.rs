@@ -143,12 +143,6 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
             .await
             {
                 Ok(balance) => {
-                    tracing::info!(
-                        wallet = %balance.wallet_balance,
-                        available = %balance.available_balance,
-                        api_unrealized = %balance.cross_unrealized_pnl,
-                        "account balance poll"
-                    );
                     cfg.shared_state.set_api_account(ApiAccountSnapshot {
                         asset: "USDT".to_string(),
                         wallet_balance: balance.wallet_balance,
@@ -163,6 +157,15 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                             / bot_count;
                     if notional != *cfg.notional_tx.borrow() {
                         let _ = cfg.notional_tx.send(notional);
+                    }
+                    for symbol in &cfg.symbols {
+                        tracing::info!(
+                            symbol,
+                            wallet = %balance.wallet_balance,
+                            available = %balance.available_balance,
+                            api_unrealized = %balance.cross_unrealized_pnl,
+                            "account balance poll"
+                        );
                     }
                 }
                 Err(e) => tracing::warn!(error = ?e, "account balance poll failed"),
