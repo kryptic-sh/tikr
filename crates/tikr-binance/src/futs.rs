@@ -724,6 +724,63 @@ pub async fn get_balance(
     })
 }
 
+/// Per-symbol commission rate from Binance.
+#[derive(Debug, Clone, Copy)]
+pub struct CommissionRate {
+    /// Maker fee rate (e.g. 0.0002 for 2 bps).
+    pub maker: tikr_core::Decimal,
+    /// Taker fee rate (e.g. 0.0004 for 4 bps).
+    pub taker: tikr_core::Decimal,
+}
+
+/// Fetch the maker/taker commission rate for a single symbol.
+///
+/// Endpoint: `GET /fapi/v1/commissionRate?symbol=<symbol>`
+pub async fn get_commission_rate(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+) -> Result<CommissionRate, VenueError> {
+    use std::str::FromStr;
+
+    let signed = append_auth_dispatch(&format!("symbol={symbol}"), key_material);
+    let url = format!("{base_url}/fapi/v1/commissionRate?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+
+    let parse = |field: &str| -> Result<tikr_core::Decimal, VenueError> {
+        let s = body.get(field).and_then(Value::as_str).unwrap_or("0");
+        tikr_core::Decimal::from_str(s).map_err(|e| {
+            VenueError::Internal(Box::new(std::io::Error::other(format!(
+                "commissionRate parse {field}='{s}': {e}"
+            ))))
+        })
+    };
+
+    Ok(CommissionRate {
+        maker: parse("makerCommissionRate")?,
+        taker: parse("takerCommissionRate")?,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

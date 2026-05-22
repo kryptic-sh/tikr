@@ -679,6 +679,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format!("--sg-scale-max '{}' invalid: {}", args.sg_scale_max, e)
                 })?,
                 auto_skew: !args.sg_no_auto_skew,
+                step_size: venue.step_size(&symbol).unwrap_or(Decimal::ONE),
+                min_notional: venue.min_notional(&symbol).unwrap_or(Decimal::ZERO),
             });
             run_with_resume(
                 venue,

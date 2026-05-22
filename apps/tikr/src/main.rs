@@ -310,11 +310,12 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_state = SharedBotState::new();
 
-    let rotation_enabled = cfg.scalp_rotation.as_ref().is_some_and(|r| r.enabled);
+    let rotation_enabled = cfg.scalp_rotation.as_ref().is_some_and(|r| r.enabled)
+        || cfg.static_grid_rotation.as_ref().is_some_and(|r| r.enabled);
 
     // Pre-seed static BotViews so the TUI has tabs from frame 1. Rotating
-    // scalp mode inserts real active symbols after the volatility scan; do not
-    // insert the template bot or it appears stuck in `starting` forever.
+    // modes insert real active symbols after the volatility scan; do not
+    // insert template bots or they appear stuck in `starting` forever.
     if !rotation_enabled {
         for b in &cfg.bots {
             let view = BotView {
@@ -335,6 +336,19 @@ async fn main() -> anyhow::Result<()> {
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
     let (notional_tx, notional_rx) = watch::channel(Decimal::ZERO);
 
+    let total_slots = cfg
+        .scalp_rotation
+        .as_ref()
+        .filter(|r| r.enabled)
+        .map(|r| r.slots)
+        .unwrap_or(0)
+        + cfg
+            .static_grid_rotation
+            .as_ref()
+            .filter(|r| r.enabled)
+            .map(|r| r.slots)
+            .unwrap_or(0);
+
     spawn_account_balance_poller(AccountPollerConfig {
         shared_state: shared_state.clone(),
         notional_tx,
@@ -342,19 +356,13 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         key_material: key_material.clone(),
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
-        bot_count: cfg
-            .scalp_rotation
-            .as_ref()
-            .filter(|r| r.enabled)
-            .map(|r| r.slots)
-            .unwrap_or(cfg.bots.len()),
+        bot_count: total_slots.max(1),
         order_balance_pct: cfg.account.order_balance_pct,
         margin_multiplier: cfg.account.margin_multiplier,
         shutdown: global_shutdown_rx.clone(),
     });
 
-    // Spawn supervisors. In rotating scalp mode, one manager owns the active
-    // 4-slot supervisor set and swaps symbols on volatility scans.
+    // Spawn supervisors. Each enabled rotation type gets its own manager.
     let mut supervisors = Vec::new();
     if let Some(rotation) = cfg.scalp_rotation.clone().filter(|r| r.enabled) {
         supervisors.push(scalp_rotation::spawn_rotation_manager(
@@ -372,7 +380,25 @@ async fn main() -> anyhow::Result<()> {
             shared_state.clone(),
             global_shutdown_rx.clone(),
         ));
-    } else {
+    }
+    if let Some(rotation) = cfg.static_grid_rotation.clone().filter(|r| r.enabled) {
+        supervisors.push(scalp_rotation::spawn_rotation_manager(
+            rotation,
+            cfg.bots.clone(),
+            scalp_rotation::RotationAccountCtx {
+                env,
+                api_key: api_key.clone(),
+                key_material: key_material.clone(),
+                base_state_dir: cfg.account.state_dir.clone(),
+                order_balance_pct: cfg.account.order_balance_pct,
+                margin_multiplier: cfg.account.margin_multiplier,
+                notional_rx: notional_rx.clone(),
+            },
+            shared_state.clone(),
+            global_shutdown_rx.clone(),
+        ));
+    }
+    if !rotation_enabled {
         supervisors.reserve(cfg.bots.len());
         for b in &cfg.bots {
             let ctx = SupervisorCtx {

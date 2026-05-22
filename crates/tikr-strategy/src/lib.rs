@@ -31,6 +31,7 @@
 
 pub mod avellaneda_stoikov;
 pub mod glft;
+pub mod kline_scalp;
 pub mod ladder_reentry;
 pub mod layered_grid;
 pub mod micro_mean_reversion;
@@ -43,6 +44,7 @@ pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
 pub use glft::{Glft, GlftConfig};
+pub use kline_scalp::{KlineScalp, KlineScalpConfig};
 pub use ladder_reentry::{LadderReentry, LadderReentryConfig};
 pub use layered_grid::{LayeredGrid, LayeredGridConfig};
 pub use micro_mean_reversion::{MicroMeanReversion, MicroMeanReversionConfig};

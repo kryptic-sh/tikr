@@ -692,6 +692,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         levels_per_side: levels,
                                         inner_bps: inner,
                                         step_bps: step,
+                                        step_size: Decimal::from(1),
+                                        min_notional: Decimal::ZERO,
                                         target_fills_per_min: fpm_target,
                                         fillrate_window_secs: fpm_window,
                                         scale_min: sc_min,

@@ -51,6 +51,10 @@ pub struct StaticGridConfig {
     pub inner_bps: u32,
     /// Step between consecutive levels on the same side in bps.
     pub step_bps: u32,
+    /// Venue lot step size for quantity rounding.
+    pub step_size: Decimal,
+    /// Minimum order notional required by the venue.
+    pub min_notional: Decimal,
     /// Adaptive fill-rate scaler. Widens `inner_bps`/`step_bps` when
     /// realised fills/min exceed `target_fills_per_min`. `0` disables
     /// (no scaling applied). Default `5.0` fills/min target — tune to
@@ -139,12 +143,24 @@ fn sort_inside_out(actions: &mut [Action], mid: Price) {
 
 impl StaticGrid {
     fn make_quote(&self, symbol: &Symbol, side: Side, price: Price) -> Action {
-        let qty = Size(self.config.notional_per_order / price.0);
+        let step = self.config.step_size;
+        let raw_size = self.config.notional_per_order / price.0;
+        let mut qty = if step > Decimal::ZERO {
+            (raw_size / step).floor() * step
+        } else {
+            raw_size
+        };
+        if self.config.min_notional > Decimal::ZERO && step > Decimal::ZERO {
+            let min_qty = (self.config.min_notional / price.0 / step).ceil() * step;
+            if qty < min_qty {
+                qty = min_qty + step;
+            }
+        }
         Action::Quote(QuoteIntent {
             symbol: symbol.clone(),
             side,
             price,
-            size: qty,
+            size: Size(qty),
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
@@ -614,6 +630,8 @@ mod tests {
             levels_per_side: 2,
             inner_bps: 3,
             step_bps: 2,
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
             target_fills_per_min: Decimal::from_str(target_fpm).unwrap(),
             fillrate_window_secs: window_secs,
             scale_min: Decimal::from_str(sc_min).unwrap(),

@@ -46,7 +46,10 @@ struct ActiveBot {
 #[derive(Debug, Clone)]
 struct ScoredSymbol {
     symbol: String,
-    score: Decimal,
+    /// Taker fee in bps (primary sort: lowest first).
+    fee_bps: Decimal,
+    /// Realized volatility in bps (secondary sort: highest first).
+    rv: Decimal,
 }
 
 /// Spawn the rotating scalp manager.
@@ -58,19 +61,18 @@ pub fn spawn_rotation_manager(
     mut global_shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(template) = bots
-            .iter()
-            .find(|b| matches!(b.strategy.as_str(), "spread-scalp" | "ss"))
-            .cloned()
-        else {
-            warn!("scalp rotation enabled but no spread-scalp bot template configured");
+        let Some(template) = bots.iter().find(|b| b.strategy == cfg.strategy).cloned() else {
+            warn!(
+                strategy = %cfg.strategy,
+                "rotation enabled but no bot template with matching strategy found"
+            );
             return;
         };
 
         let slots = cfg.slots.max(1);
         let mut active: Option<ActiveSet> = None;
         loop {
-            let ranked = match top_symbols(&cfg, &template, account.env, slots).await {
+            let ranked = match top_symbols(&cfg, &template, &account, slots).await {
                 Ok(symbols) => symbols,
                 Err(e) => {
                     warn!(error = ?e, "scalp rotation scan failed");
@@ -85,7 +87,7 @@ pub fn spawn_rotation_manager(
                     && a.started_at.elapsed() >= Duration::from_secs(cfg.refresh_secs.max(30))
             });
             if !next.is_empty() && should_rotate {
-                info!(symbols = ?next, "rotating spread-scalp symbols");
+                info!(symbols = ?next, strategy = %cfg.strategy, "rotating symbols");
                 active = Some(
                     update_active_set(
                         active.take(),
@@ -97,6 +99,8 @@ pub fn spawn_rotation_manager(
                     )
                     .await,
                 );
+            } else if next.is_empty() && active.is_none() {
+                warn!(strategy = %cfg.strategy, "rotation scan returned no candidates — check spread/volume filters");
             }
 
             tokio::select! {
@@ -251,9 +255,11 @@ fn symbol_set(symbols: &[String]) -> BTreeSet<String> {
 async fn top_symbols(
     cfg: &ScalpRotationConfig,
     template: &BotConfig,
-    env: BinanceEnv,
+    account: &RotationAccountCtx,
     slots: usize,
 ) -> Result<Vec<ScoredSymbol>, tikr_venue::VenueError> {
+    use rust_decimal::Decimal;
+
     let http = reqwest::Client::new();
     let allow = cfg
         .candidates
@@ -263,8 +269,9 @@ async fn top_symbols(
     let spread_cfg = template.spread_scalp.as_ref();
     let min_spread_bps = spread_cfg
         .map(|s| s.min_spread_bps)
-        .unwrap_or_else(|| Decimal::from(5));
-    let exchange_info = tikr_binance::futs::get_exchange_info(&http, env.rest_base_url()).await?;
+        .unwrap_or_else(|| Decimal::from(2)); // 2 bps minimum for any strategy
+    let exchange_info =
+        tikr_binance::futs::get_exchange_info(&http, account.env.rest_base_url()).await?;
     let tradable = exchange_info
         .symbols
         .iter()
@@ -275,7 +282,8 @@ async fn top_symbols(
         .map(|s| s.symbol.to_uppercase())
         .collect::<HashSet<_>>();
     let filters = tikr_binance::exchange_info::parse_exchange_info(&exchange_info);
-    let mut tickers = tikr_binance::futs::get_24hr_tickers(&http, env.rest_base_url()).await?;
+    let mut tickers =
+        tikr_binance::futs::get_24hr_tickers(&http, account.env.rest_base_url()).await?;
     tickers.retain(|t| {
         t.symbol.ends_with(&cfg.quote_asset)
             && (allow.is_empty() || allow.contains(&t.symbol))
@@ -294,7 +302,8 @@ async fn top_symbols(
             continue;
         };
         let Ok(book) =
-            tikr_binance::futs::get_book_ticker(&http, env.rest_base_url(), &ticker.symbol).await
+            tikr_binance::futs::get_book_ticker(&http, account.env.rest_base_url(), &ticker.symbol)
+                .await
         else {
             continue;
         };
@@ -313,24 +322,54 @@ async fn top_symbols(
         if spread_bps < min_spread_bps {
             continue;
         }
-        let rv =
-            match tikr_binance::futs::get_1m_closes(&http, env.rest_base_url(), &ticker.symbol, 30)
-                .await
-            {
-                Ok(closes) => realized_vol_bps(&closes),
-                Err(_) => Decimal::ZERO,
-            };
+        // Check fee rate.
+        let Ok(comm) = tikr_binance::futs::get_commission_rate(
+            &http,
+            account.env.rest_base_url(),
+            &account.api_key,
+            &account.key_material,
+            &ticker.symbol,
+        )
+        .await
+        else {
+            continue;
+        };
+        let fee_bps = comm.taker * Decimal::from(10_000);
+        let rv = match tikr_binance::futs::get_1m_closes(
+            &http,
+            account.env.rest_base_url(),
+            &ticker.symbol,
+            30,
+        )
+        .await
+        {
+            Ok(closes) => realized_vol_bps(&closes),
+            Err(_) => Decimal::ZERO,
+        };
         if rv <= Decimal::ZERO {
             continue;
         }
         let volume_score = (ticker.quote_volume / Decimal::from(1_000_000u64)).max(Decimal::ONE);
-        let score = rv * volume_score * spread_bps;
+        info!(
+            symbol = %ticker.symbol,
+            fee_bps = %fee_bps,
+            rv = %rv,
+            vol = %ticker.quote_volume,
+            "rotation candidate"
+        );
         scored.push(ScoredSymbol {
             symbol: ticker.symbol,
-            score,
+            fee_bps,
+            rv: rv * volume_score,
         });
     }
-    scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.symbol.cmp(&b.symbol)));
+    // Sort by fee ascending (primary), then volatility descending (secondary).
+    scored.sort_by(|a, b| {
+        a.fee_bps
+            .cmp(&b.fee_bps)
+            .then_with(|| b.rv.cmp(&a.rv))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
     Ok(scored)
 }
 
@@ -355,58 +394,24 @@ fn realized_vol_bps(closes: &[Decimal]) -> Decimal {
 }
 
 fn choose_symbols(ranked: &[ScoredSymbol], active: &[String], slots: usize) -> Vec<String> {
+    let ranked_set: HashSet<&str> = ranked.iter().map(|s| s.symbol.as_str()).collect();
     let mut selected = Vec::new();
-    let active_scores = ranked
-        .iter()
-        .map(|s| (s.symbol.as_str(), s.score))
-        .collect::<HashMap<_, _>>();
+    // Keep active symbols that are still ranked.
     for symbol in active {
         if selected.len() >= slots {
             break;
         }
-        if active_scores.contains_key(symbol.as_str()) {
+        if ranked_set.contains(symbol.as_str()) {
             selected.push(symbol.clone());
         }
     }
+    // Fill remaining slots from the top of the ranked list.
     for candidate in ranked {
-        if selected.iter().any(|s| s == &candidate.symbol) {
-            continue;
-        }
         if selected.len() >= slots {
-            if let Some((idx, weakest)) = selected
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, s)| active_scores.get(s.as_str()).map(|score| (idx, *score)))
-                .min_by(|a, b| a.1.cmp(&b.1))
-                && candidate.score >= weakest * Decimal::new(12, 1)
-            {
-                selected[idx] = candidate.symbol.clone();
-            }
-            continue;
+            break;
         }
-        if selected.len() < active.len().min(slots) {
-            let weakest_active = selected
-                .iter()
-                .filter_map(|s| active_scores.get(s.as_str()))
-                .min()
-                .copied()
-                .unwrap_or(Decimal::ZERO);
-            if weakest_active > Decimal::ZERO
-                && candidate.score < weakest_active * Decimal::new(12, 1)
-            {
-                continue;
-            }
-        }
-        selected.push(candidate.symbol.clone());
-    }
-    if selected.len() < slots {
-        for candidate in ranked {
-            if selected.len() >= slots {
-                break;
-            }
-            if !selected.iter().any(|s| s == &candidate.symbol) {
-                selected.push(candidate.symbol.clone());
-            }
+        if !selected.iter().any(|s| s == &candidate.symbol) {
+            selected.push(candidate.symbol.clone());
         }
     }
     selected

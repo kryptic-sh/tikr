@@ -20,6 +20,9 @@ pub struct DashboardConfig {
     /// Optional rotating SpreadScalp manager.
     #[serde(default)]
     pub scalp_rotation: Option<ScalpRotationConfig>,
+    /// Optional rotating StaticGrid manager.
+    #[serde(default)]
+    pub static_grid_rotation: Option<ScalpRotationConfig>,
 }
 
 /// Rotating SpreadScalp manager configuration.
@@ -29,6 +32,10 @@ pub struct ScalpRotationConfig {
     /// Enable rotating scalp mode.
     #[serde(default)]
     pub enabled: bool,
+    /// Bot strategy template name to match in the `[[bot]]` list, e.g.
+    /// `"spread-scalp"` or `"static-grid"`.
+    #[serde(default = "scalp_rotation_default_strategy")]
+    pub strategy: String,
     /// Number of active bots to keep running.
     #[serde(default = "scalp_rotation_default_slots")]
     pub slots: usize,
@@ -48,6 +55,9 @@ pub struct ScalpRotationConfig {
 
 fn scalp_rotation_default_slots() -> usize {
     4
+}
+fn scalp_rotation_default_strategy() -> String {
+    "spread-scalp".to_string()
 }
 fn scalp_rotation_default_refresh_secs() -> u64 {
     300

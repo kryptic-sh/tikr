@@ -132,11 +132,15 @@ fn build_sg(
         )
     })?;
     let notional = autobump_notional(sg.notional.unwrap_or(default_notional), symbol, venue)?;
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
     Ok(StrategyChoice::StaticGrid(StaticGridConfig {
         notional_per_order: notional,
         levels_per_side: sg.levels,
         inner_bps: sg.inner_bps,
         step_bps: sg.step_bps,
+        step_size,
+        min_notional,
         target_fills_per_min: sg.target_fills_per_min,
         fillrate_window_secs: sg.fillrate_window_secs,
         scale_min: sg.scale_min,
