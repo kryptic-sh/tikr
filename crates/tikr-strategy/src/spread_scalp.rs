@@ -54,8 +54,8 @@ impl SpreadScalp {
         if spread_bps < self.config.min_spread_bps {
             return None;
         }
-        let bid = Price(best_bid.0 + tick);
-        let ask = Price(best_ask.0 - tick);
+        let bid = Price(best_bid.0);
+        let ask = Price(best_ask.0);
         if bid.0 >= ask.0 {
             return None;
         }
@@ -135,9 +135,9 @@ impl SpreadScalp {
     fn inventory_size_multiplier(&self, ctx: &StrategyContext<'_>) -> (Decimal, Decimal) {
         let size = ctx.position.size.0;
         if size > Decimal::ZERO {
-            (Decimal::from(2), Decimal::ONE)
-        } else if size < Decimal::ZERO {
             (Decimal::ONE, Decimal::from(2))
+        } else if size < Decimal::ZERO {
+            (Decimal::from(2), Decimal::ONE)
         } else {
             (Decimal::ONE, Decimal::ONE)
         }
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_spread_quotes_one_tick_inside() {
+    fn wide_spread_quotes_at_best() {
         let symbol = sym();
         let snapshot = book(&symbol, 100, 110, 1);
         let position = pos(&symbol);
@@ -311,8 +311,8 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert_eq!(bid.price.0, Decimal::from(101));
-                assert_eq!(ask.price.0, Decimal::from(109));
+                assert_eq!(bid.price.0, Decimal::from(100));
+                assert_eq!(ask.price.0, Decimal::from(110));
             }
             _ => panic!("expected quotes"),
         }
@@ -382,15 +382,15 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert_eq!(bid.price.0, Decimal::from(103));
-                assert_eq!(ask.price.0, Decimal::from(111));
+                assert_eq!(bid.price.0, Decimal::from(102));
+                assert_eq!(ask.price.0, Decimal::from(112));
             }
             _ => panic!("expected quotes"),
         }
     }
 
     #[test]
-    fn long_inventory_sizes_bid_larger() {
+    fn long_inventory_sizes_ask_larger() {
         let symbol = sym();
         let snapshot = book(&symbol, 100, 110, 1);
         let position = pos_with_size(&symbol, Decimal::new(5, 1));
@@ -404,14 +404,14 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert!(bid.size.0 > ask.size.0);
+                assert!(ask.size.0 > bid.size.0);
             }
             _ => panic!("expected quotes"),
         }
     }
 
     #[test]
-    fn short_inventory_sizes_ask_larger() {
+    fn short_inventory_sizes_bid_larger() {
         let symbol = sym();
         let snapshot = book(&symbol, 100, 110, 1);
         let position = pos_with_size(&symbol, Decimal::new(-5, 1));
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert!(ask.size.0 > bid.size.0);
+                assert!(bid.size.0 > ask.size.0);
             }
             _ => panic!("expected quotes"),
         }

@@ -89,16 +89,16 @@ order_balance_pct = "1"
 # step_bps = 3
 
 
-# ─── DOGEUSDT ──────────────────────────────────────────────────────────────
-
-[[bot]]
-symbol = "DOGEUSDT"
-strategy = "static-grid"
-
-[bot.sg]
-levels = 3
-step_bps = 6
-inner_bps = 6
+# # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
+#
+# [[bot]]
+# symbol = "DOGEUSDT"
+# strategy = "static-grid"
+#
+# [bot.sg]
+# levels = 5
+# step_bps = 3
+# inner_bps = 3
 
 
 # ─── HYPERUSDT ─────────────────────────────────────────────────────────────
@@ -108,9 +108,9 @@ symbol = "HYPERUSDT"
 strategy = "static-grid"
 
 [bot.sg]
-levels = 3
+levels = 6
 step_bps = 6
-inner_bps = 6
+inner_bps = 12
 
 
 # ─── PROMPTUSDT ────────────────────────────────────────────────────────────
@@ -120,9 +120,9 @@ symbol = "PROMPTUSDT"
 strategy = "static-grid"
 
 [bot.sg]
-levels = 3
+levels = 6
 step_bps = 6
-inner_bps = 6
+inner_bps = 12
 
 
 # ─── LayeredGrid template (uncomment to use) ───────────────────────────────

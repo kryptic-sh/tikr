@@ -1,0 +1,47 @@
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+# "futures-testnet" | "futures-mainnet"
+env = "futures-testnet"
+
+state_dir = "./state"
+
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "micro-mean-reversion"
+[bot.micro_mean_reversion]
+notional = 5
+trigger_bps = 10
+entry_bps = 2
+exit_bps = 6
+max_open_entries = 1
+
+
+[[bot]]
+symbol = "HYPERUSDT"
+strategy = "micro-mean-reversion"
+[bot.micro_mean_reversion]
+notional = 5
+trigger_bps = 10
+entry_bps = 2
+exit_bps = 6
+max_open_entries = 1
+
+
+[[bot]]
+symbol = "PROMPTUSDT"
+strategy = "micro-mean-reversion"
+[bot.micro_mean_reversion]
+notional = 5
+trigger_bps = 10
+entry_bps = 2
+exit_bps = 6
+max_open_entries = 1
+
+
+# Defaults:
+# notional = 25          # fiat $ per order; auto-bumps to min_notional × 1.2
+# trigger_bps = 10       # trade distance from mid required before entering
+# entry_bps = 2          # passive entry distance from mid
+# exit_bps = 6           # opposite-side exit distance from filled price
+# max_open_entries = 1   # max same-side entry quotes kept open

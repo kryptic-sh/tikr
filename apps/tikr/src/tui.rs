@@ -18,6 +18,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use rust_decimal::Decimal;
 use tokio::sync::watch;
 use tracing::Level;
 
@@ -224,12 +225,14 @@ pub fn run(
                     .unwrap_or_else(|| logs.snapshot(crate::logs::SYSTEM_KEY));
                 let agg = AccountAggregate::compute(&views);
                 let api_account = state.api_account();
+                let start_balance = state.start_balance();
                 terminal.draw(|f| {
                     draw(
                         f,
                         &views,
                         &agg,
                         api_account.as_ref(),
+                        start_balance,
                         &log_lines,
                         &mut ui,
                         &config_path,
@@ -533,11 +536,13 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     f: &mut Frame<'_>,
     views: &[BotViewSnapshot],
     agg: &AccountAggregate,
     api_account: Option<&ApiAccountSnapshot>,
+    start_balance: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
     config_path: &std::path::Path,
@@ -559,6 +564,7 @@ fn draw(
         ui.active_tab,
         agg,
         api_account,
+        start_balance,
         log_lines,
         ui,
     );
@@ -763,6 +769,7 @@ fn draw_body(
     active: usize,
     agg: &AccountAggregate,
     api_account: Option<&ApiAccountSnapshot>,
+    start_balance: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
 ) {
@@ -777,7 +784,7 @@ fn draw_body(
 
     draw_bot_detail(f, cols[0], views.get(active));
     draw_logs(f, cols[1], views.get(active), log_lines, ui);
-    draw_account(f, cols[2], views, agg, api_account);
+    draw_account(f, cols[2], views, agg, api_account, start_balance);
 }
 
 fn draw_account(
@@ -786,6 +793,7 @@ fn draw_account(
     views: &[BotViewSnapshot],
     agg: &AccountAggregate,
     api_account: Option<&ApiAccountSnapshot>,
+    start_balance: Option<Decimal>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
@@ -811,22 +819,32 @@ fn draw_account(
             pnl_style(agg.realized),
         ),
     ]));
+    let unreal_display = if agg.api_unrealized != Decimal::ZERO {
+        agg.api_unrealized
+    } else {
+        agg.unrealized
+    };
     lines.push(Line::from(vec![
         Span::styled("unreal   ", Style::default().fg(Color::Gray)),
         Span::styled(
-            format!("{:>+10.2}", dec_to_f64(agg.unrealized)),
-            pnl_style(agg.unrealized),
+            format!("{:>+10.2}", dec_to_f64(unreal_display)),
+            pnl_style(unreal_display),
         ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("fees     ", Style::default().fg(Color::Gray)),
         Span::raw(format!("{:>10.2}", dec_to_f64(agg.fees))),
     ]));
+    let net_display = if agg.api_unrealized != Decimal::ZERO {
+        agg.realized + agg.api_unrealized - agg.fees
+    } else {
+        agg.net
+    };
     lines.push(Line::from(vec![
         Span::styled("NET      ", Style::default().fg(Color::White)),
         Span::styled(
-            format!("{:>+10.2}", dec_to_f64(agg.net)),
-            pnl_style(agg.net),
+            format!("{:>+10.2}", dec_to_f64(net_display)),
+            pnl_style(net_display),
         ),
     ]));
     lines.push(Line::from(""));
@@ -859,10 +877,10 @@ fn draw_account(
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("sym unrl ", Style::default().fg(Color::Gray)),
+            Span::styled("mid unrl ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:>+10.2}", dec_to_f64(agg.api_unrealized)),
-                pnl_style(agg.api_unrealized),
+                format!("{:>+10.2}", dec_to_f64(agg.unrealized)),
+                pnl_style(agg.unrealized),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -876,6 +894,16 @@ fn draw_account(
                 format_ago(millis_ago(api.fetched_at_ms) / 1000)
             )),
         ]));
+        if let Some(start) = start_balance {
+            let api_net = api.wallet_balance - start;
+            lines.push(Line::from(vec![
+                Span::styled("api net  ", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:>+10.2}", dec_to_f64(api_net)),
+                    pnl_style(api_net),
+                ),
+            ]));
+        }
     } else {
         lines.push(Line::styled(
             "waiting...",
@@ -949,8 +977,10 @@ fn draw_logs(
     log_lines: &[LogLine],
     ui: &mut UiState,
 ) {
-    let total = log_lines.len();
     let visible = area.height.saturating_sub(2) as usize; // borders eat 2 rows
+    let content_width = area.width.saturating_sub(2) as usize;
+    let rendered_lines = format_log_lines(log_lines, content_width.max(1));
+    let total = rendered_lines.len();
     ui.last_log_visible = visible;
     ui.last_log_total = total;
 
@@ -981,9 +1011,7 @@ fn draw_logs(
         Some(v) => format!(" {} logs{scroll_label}", v.symbol),
         None => " logs ".to_string(),
     };
-    let slice = &log_lines[start..end];
-
-    let lines: Vec<Line> = slice.iter().map(format_log_line).collect();
+    let lines: Vec<Line> = rendered_lines[start..end].to_vec();
     let logs = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
@@ -991,7 +1019,15 @@ fn draw_logs(
     ui.last_log_rect = Some(area);
 }
 
-fn format_log_line(ln: &LogLine) -> Line<'static> {
+fn format_log_lines(log_lines: &[LogLine], width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for ln in log_lines {
+        out.extend(format_log_line_wrapped(ln, width));
+    }
+    out
+}
+
+fn format_log_line_wrapped(ln: &LogLine, width: usize) -> Vec<Line<'static>> {
     let (lvl_tag, lvl_color) = match ln.level {
         Level::ERROR => ("ERROR", Color::Red),
         Level::WARN => ("WARN ", Color::Yellow),
@@ -1015,7 +1051,12 @@ fn format_log_line(ln: &LogLine) -> Line<'static> {
         }
     };
     let prefix = if ln.from_system { "·" } else { " " };
-    Line::from(vec![
+    let head = format!("{prefix}[{}] {lvl_tag} ", ln.ts);
+    let body_width = width.saturating_sub(head.len()).max(1);
+    let chunks = wrap_text(&ln.body, body_width);
+    let mut lines = Vec::with_capacity(chunks.len().max(1));
+    let first = chunks.first().cloned().unwrap_or_default();
+    lines.push(Line::from(vec![
         Span::styled(
             format!("{prefix}[{}] ", ln.ts),
             Style::default().fg(Color::Gray),
@@ -1025,8 +1066,60 @@ fn format_log_line(ln: &LogLine) -> Line<'static> {
             Style::default().fg(lvl_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(ln.body.clone(), Style::default().fg(body_color)),
-    ])
+        Span::styled(first, Style::default().fg(body_color)),
+    ]));
+    let cont_prefix = " ".repeat(head.len());
+    for chunk in chunks.into_iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::raw(cont_prefix.clone()),
+            Span::styled(chunk, Style::default().fg(body_color)),
+        ]));
+    }
+    lines
+}
+
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for word in s.split_whitespace() {
+        if current.is_empty() {
+            if word.len() <= width {
+                current.push_str(word);
+            } else {
+                split_long_word(word, width, &mut out);
+            }
+        } else if current.len() + 1 + word.len() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut current));
+            if word.len() <= width {
+                current.push_str(word);
+            } else {
+                split_long_word(word, width, &mut out);
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn split_long_word(word: &str, width: usize, out: &mut Vec<String>) {
+    let mut current = String::new();
+    for ch in word.chars() {
+        if current.chars().count() >= width {
+            out.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
 }
 
 fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapshot>) {
@@ -1065,11 +1158,21 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
                 pnl_style(r.realized.0),
             ),
         ]));
+        let unreal_display = v
+            .api_position
+            .as_ref()
+            .map(|api| api.unrealized_profit)
+            .unwrap_or(r.unrealized.0);
+        let net_display = v
+            .api_position
+            .as_ref()
+            .map(|_| r.realized.0 + unreal_display - r.fees.0 + r.funding.0)
+            .unwrap_or(r.net.0);
         lines.push(Line::from(vec![
             Span::styled("unreal   ", Style::default().fg(Color::Gray)),
             Span::styled(
-                format!("{:>+10.4}", dec_to_f64(r.unrealized.0)),
-                pnl_style(r.unrealized.0),
+                format!("{:>+10.4}", dec_to_f64(unreal_display)),
+                pnl_style(unreal_display),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -1083,8 +1186,8 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
         lines.push(Line::from(vec![
             Span::styled("NET      ", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{:>+10.4}", dec_to_f64(r.net.0)),
-                pnl_style(r.net.0),
+                format!("{:>+10.4}", dec_to_f64(net_display)),
+                pnl_style(net_display),
             ),
         ]));
         lines.push(Line::from(""));

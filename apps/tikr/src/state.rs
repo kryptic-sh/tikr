@@ -102,6 +102,8 @@ pub struct SharedBotState {
     /// the order bots were inserted.
     order: Arc<Mutex<Vec<String>>>,
     api_account: Arc<RwLock<Option<ApiAccountSnapshot>>>,
+    /// First wallet balance reading for API net calc.
+    start_balance: Arc<RwLock<Option<Decimal>>>,
 }
 
 impl Default for SharedBotState {
@@ -117,14 +119,26 @@ impl SharedBotState {
             inner: Arc::new(Mutex::new(HashMap::new())),
             order: Arc::new(Mutex::new(Vec::new())),
             api_account: Arc::new(RwLock::new(None)),
+            start_balance: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Update account-wide API balance snapshot.
+    /// Update account-wide API balance snapshot. Captures start balance on first call.
     pub fn set_api_account(&self, snapshot: ApiAccountSnapshot) {
+        if let Ok(mut start) = self.start_balance.write()
+            && start.is_none()
+            && snapshot.wallet_balance > Decimal::ZERO
+        {
+            *start = Some(snapshot.wallet_balance);
+        }
         if let Ok(mut g) = self.api_account.write() {
             *g = Some(snapshot);
         }
+    }
+
+    /// First wallet balance reading for API net calculation.
+    pub fn start_balance(&self) -> Option<Decimal> {
+        self.start_balance.read().ok().and_then(|g| *g)
     }
 
     /// Read latest account-wide API balance snapshot.

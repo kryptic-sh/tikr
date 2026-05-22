@@ -16,19 +16,25 @@ use crate::live::LiveSnapshot;
 use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
 use tikr_core::{
-    Decimal, Fill, MarketEvent, Notional, Position, Price, Snapshot, Symbol, Timestamp,
+    Decimal, Fill, MarketEvent, Notional, Position, Price, Side, Snapshot, Symbol, Timestamp,
 };
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
 use tikr_venue::{QuoteIntent, Venue};
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Max consecutive venue rejections per side before switching to single-sided quoting.
+/// When one side hits this threshold, that side is skipped in subsequent quote rounds
+/// until a full requote cycle resets the counters.
+const MAX_FAILS_PER_SIDE: u32 = 3;
 
 /// Runtime configuration for [`run`].
 #[derive(Debug, Clone)]
@@ -304,6 +310,10 @@ where
     let mut current_book = empty_snapshot(&symbol);
     let mut last_mid = Price(Decimal::ZERO);
     let mut last_fill: Option<Fill> = None;
+    // Per-symbol side-failure tracker. When one side's venue.quote() fails
+    // MAX_FAILS_PER_SIDE times consecutively, that side is skipped until the
+    // next CancelAll (full requote cycle) resets the counters.
+    let mut side_fails: HashMap<String, (u32, u32)> = HashMap::new();
     let started = Instant::now();
     // Decouple in-memory `snapshot_tap` updates from event-count disk
     // writes so the dashboard sidebar refreshes every ~250ms regardless
@@ -425,6 +435,7 @@ where
                             &pos,
                             &current_book,
                             live_mode,
+                            &mut side_fails,
                         ).await;
                     }
                 }
@@ -553,11 +564,29 @@ where
                             let mut run_intents: Vec<QuoteIntent> = Vec::new();
                             while i < filtered.len() {
                                 if let tikr_strategy::Action::Quote(intent) = &filtered[i] {
-                                    run_intents.push(intent.clone());
+                                    let state = side_fails
+                                        .entry(symbol.base.0.to_string())
+                                        .or_insert((0, 0));
+                                    let skip = match intent.side {
+                                        Side::Bid => state.0 >= MAX_FAILS_PER_SIDE,
+                                        Side::Ask => state.1 >= MAX_FAILS_PER_SIDE,
+                                    };
+                                    if !skip {
+                                        run_intents.push(intent.clone());
+                                    } else {
+                                        debug!(
+                                            side = ?intent.side, bid_fails = state.0, ask_fails = state.1,
+                                            "live: skipping quote — side exceeded max failures"
+                                        );
+                                    }
                                     i += 1;
                                 } else {
                                     break;
                                 }
+                            }
+                            if run_intents.is_empty() {
+                                debug!("live: all quote intents filtered — skipping dispatch");
+                                continue;
                             }
                             let results = futures::future::join_all(
                                 run_intents
@@ -566,16 +595,27 @@ where
                             )
                             .await;
                             for (intent, r) in run_intents.into_iter().zip(results.into_iter()) {
+                                let state = side_fails
+                                    .entry(symbol.base.0.to_string())
+                                    .or_insert((0, 0));
                                 match r {
                                     Ok(qid) => {
                                         info!(
                                             side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
                                             quote_id = ?qid, "live: order placed"
                                         );
+                                        match intent.side {
+                                            Side::Bid => state.0 = 0,
+                                            Side::Ask => state.1 = 0,
+                                        }
                                         fill_sim.enqueue_place_with_id(intent, ts, qid);
                                     }
                                     Err(e) => {
                                         warn!(error = ?e, "live: venue.quote failed");
+                                        match intent.side {
+                                            Side::Bid => state.0 += 1,
+                                            Side::Ask => state.1 += 1,
+                                        }
                                     }
                                 }
                             }
@@ -598,6 +638,7 @@ where
                                 }
                             }
                             tikr_strategy::Action::CancelAll => {
+                                side_fails.remove(symbol.base.0.as_ref());
                                 match venue.cancel_all(&symbol).await {
                                     Ok(()) => fill_sim.drop_quotes_for(&symbol),
                                     Err(e) => warn!(error = ?e, "live: venue.cancel_all failed"),
@@ -683,6 +724,7 @@ where
                             &post_fill_pos,
                             &current_book,
                             false,
+                            &mut side_fails,
                         )
                         .await;
                     }
@@ -848,6 +890,29 @@ where
                 )
                 .await;
                 last_fill = Some(fill_clone.clone());
+                if let Some(ref tap) = config.snapshot_tap {
+                    let mut report = finalize(
+                        &tracker,
+                        last_mid,
+                        started,
+                        events_processed,
+                        fills_emitted,
+                        &risk_gate,
+                        first_event_ts,
+                        last_event_ts,
+                        skim_cfg,
+                        skim_count,
+                        skim_total_usdt,
+                        base_stacked,
+                        &symbol,
+                    );
+                    report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
+                    report.sim_duration_secs =
+                        resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
+                    if let Ok(mut guard) = tap.try_write() {
+                        *guard = Some(report);
+                    }
+                }
                 // Partial fill: order is still resting on the book, do not
                 // drop from FillSim and do not notify the strategy — the
                 // strategy should keep waiting for the remaining size.
@@ -896,6 +961,7 @@ where
                     &post_fill_pos,
                     &current_book,
                     true,
+                    &mut side_fails,
                 )
                 .await;
                 // Publish AFTER local mirror has dropped the filled order and
@@ -1082,6 +1148,7 @@ async fn dispatch_post_fill_actions<V, S>(
     post_fill_pos: &tikr_core::Position,
     current_book: &tikr_core::Snapshot,
     live_mode: bool,
+    side_fails: &mut HashMap<String, (u32, u32)>,
 ) where
     V: Venue,
     S: Strategy,
@@ -1098,19 +1165,43 @@ async fn dispatch_post_fill_actions<V, S>(
     let mut rejected_intents: Vec<(QuoteIntent, String)> = Vec::new();
     for action in actions {
         match &action {
-            tikr_strategy::Action::Quote(intent) => match venue.quote(intent.clone()).await {
-                Ok(qid) => {
-                    info!(
-                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
-                        quote_id = ?qid, "live: order placed (post-fill)"
+            tikr_strategy::Action::Quote(intent) => {
+                let state = side_fails
+                    .entry(symbol.base.0.to_string())
+                    .or_insert((0, 0));
+                let skip = match intent.side {
+                    Side::Bid => state.0 >= MAX_FAILS_PER_SIDE,
+                    Side::Ask => state.1 >= MAX_FAILS_PER_SIDE,
+                };
+                if skip {
+                    warn!(
+                        side = ?intent.side, bid_fails = state.0, ask_fails = state.1,
+                        "live: skipping post-fill quote — side exceeded max failures"
                     );
-                    fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
+                    continue;
                 }
-                Err(e) => {
-                    warn!(error = ?e, "live: venue.quote failed (post-fill)");
-                    rejected_intents.push((intent.clone(), format!("{e:?}")));
+                match venue.quote(intent.clone()).await {
+                    Ok(qid) => {
+                        info!(
+                            side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
+                            quote_id = ?qid, "live: order placed (post-fill)"
+                        );
+                        match intent.side {
+                            Side::Bid => state.0 = 0,
+                            Side::Ask => state.1 = 0,
+                        }
+                        fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "live: venue.quote failed (post-fill)");
+                        match intent.side {
+                            Side::Bid => state.0 += 1,
+                            Side::Ask => state.1 += 1,
+                        }
+                        rejected_intents.push((intent.clone(), format!("{e:?}")));
+                    }
                 }
-            },
+            }
             tikr_strategy::Action::Requote { id, intent } => {
                 if let Err(e) = venue.requote(*id, intent.clone()).await {
                     warn!(error = ?e, "live: venue.requote failed (post-fill)");
@@ -1120,10 +1211,13 @@ async fn dispatch_post_fill_actions<V, S>(
                 Ok(()) => fill_sim.drop_quote(*id),
                 Err(e) => warn!(error = ?e, "live: venue.cancel failed (post-fill)"),
             },
-            tikr_strategy::Action::CancelAll => match venue.cancel_all(symbol).await {
-                Ok(()) => fill_sim.drop_quotes_for(symbol),
-                Err(e) => warn!(error = ?e, "live: venue.cancel_all failed (post-fill)"),
-            },
+            tikr_strategy::Action::CancelAll => {
+                side_fails.remove(symbol.base.0.as_ref());
+                match venue.cancel_all(symbol).await {
+                    Ok(()) => fill_sim.drop_quotes_for(symbol),
+                    Err(e) => warn!(error = ?e, "live: venue.cancel_all failed (post-fill)"),
+                }
+            }
             tikr_strategy::Action::NoOp => {}
         }
     }
@@ -1165,16 +1259,38 @@ async fn dispatch_post_fill_actions<V, S>(
             for action in recovery_actions {
                 match &action {
                     tikr_strategy::Action::Quote(intent) => {
+                        let state = side_fails
+                            .entry(symbol.base.0.to_string())
+                            .or_insert((0, 0));
+                        let skip = match intent.side {
+                            Side::Bid => state.0 >= MAX_FAILS_PER_SIDE,
+                            Side::Ask => state.1 >= MAX_FAILS_PER_SIDE,
+                        };
+                        if skip {
+                            warn!(
+                                side = ?intent.side, bid_fails = state.0, ask_fails = state.1, round,
+                                "live: skipping recovery quote — side exceeded max failures"
+                            );
+                            continue;
+                        }
                         match venue.quote(intent.clone()).await {
                             Ok(qid) => {
                                 info!(
                                     side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
                                     quote_id = ?qid, round, "live: order placed (recovery)"
                                 );
+                                match intent.side {
+                                    Side::Bid => state.0 = 0,
+                                    Side::Ask => state.1 = 0,
+                                }
                                 fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
                             }
                             Err(e) => {
                                 warn!(error = ?e, round, "live: venue.quote failed (recovery)");
+                                match intent.side {
+                                    Side::Bid => state.0 += 1,
+                                    Side::Ask => state.1 += 1,
+                                }
                                 rejected_intents.push((intent.clone(), format!("{e:?}")));
                             }
                         }
@@ -1183,12 +1299,15 @@ async fn dispatch_post_fill_actions<V, S>(
                         Ok(()) => fill_sim.drop_quote(*id),
                         Err(e) => warn!(error = ?e, round, "live: venue.cancel failed (recovery)"),
                     },
-                    tikr_strategy::Action::CancelAll => match venue.cancel_all(symbol).await {
-                        Ok(()) => fill_sim.drop_quotes_for(symbol),
-                        Err(e) => {
-                            warn!(error = ?e, round, "live: venue.cancel_all failed (recovery)")
+                    tikr_strategy::Action::CancelAll => {
+                        side_fails.remove(symbol.base.0.as_ref());
+                        match venue.cancel_all(symbol).await {
+                            Ok(()) => fill_sim.drop_quotes_for(symbol),
+                            Err(e) => {
+                                warn!(error = ?e, round, "live: venue.cancel_all failed (recovery)")
+                            }
                         }
-                    },
+                    }
                     tikr_strategy::Action::Requote { .. } | tikr_strategy::Action::NoOp => {}
                 }
             }
@@ -1219,7 +1338,15 @@ async fn apply_fill(
     alert_sink: Option<&dyn AlertSink>,
     symbol: &Symbol,
 ) {
-    info!(price = %fill.price.0, size = %fill.size.0, side = ?fill.side, "fill");
+    info!(
+        price = %fill.price.0,
+        size = %fill.size.0,
+        side = ?fill.side,
+        fee_asset = %fill.fee_asset.0,
+        fee_amount = %fill.fee_amount,
+        fee_quote = %fill.fee_quote.0,
+        "fill"
+    );
     tracker.apply(&fill);
     if let Some(gate) = risk_gate.as_mut() {
         gate.record_fill(fill.ts);

@@ -10,21 +10,24 @@ state_dir = "./state"
 symbol = "DOGEUSDT"
 strategy = "simple-gap"
 [bot.simple_gap]
-gap_bps = 5
+gap_bps = 6
+notional = 5
 
 
 [[bot]]
 symbol = "HYPERUSDT"
 strategy = "simple-gap"
 [bot.simple_gap]
-gap_bps = 5
+gap_bps = 6
+notional = 5
 
 
 [[bot]]
 symbol = "PROMPTUSDT"
 strategy = "simple-gap"
 [bot.simple_gap]
-gap_bps = 5
+gap_bps = 6
+notional = 5
 
 
 # ─── SimpleGap template (uncomment to use) ─────────────────────────────────

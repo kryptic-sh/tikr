@@ -29,7 +29,7 @@ symbol = "DOGEUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 5
-min_spread_bps = 5
+min_spread_bps = 8
 requote_interval_ms = 1000
 
 

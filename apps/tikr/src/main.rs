@@ -14,6 +14,7 @@
 mod build;
 mod config;
 mod logs;
+mod scalp_rotation;
 mod selection;
 mod state;
 mod supervisor;
@@ -111,6 +112,7 @@ struct AccountPollerConfig {
     api_key: String,
     key_material: Arc<tikr_binance::BinanceKeyMaterial>,
     symbols: Vec<String>,
+    bot_count: usize,
     order_balance_pct: Decimal,
     margin_multiplier: Decimal,
     shutdown: watch::Receiver<bool>,
@@ -150,7 +152,13 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                         cross_unrealized_pnl: balance.cross_unrealized_pnl,
                         fetched_at_ms: current_time_ms(),
                     });
-                    let bot_count = Decimal::from(cfg.symbols.len().max(1) as u64);
+                    let symbols = cfg.shared_state.symbols();
+                    let symbols = if symbols.is_empty() {
+                        cfg.symbols.clone()
+                    } else {
+                        symbols
+                    };
+                    let bot_count = Decimal::from(cfg.bot_count.max(1) as u64);
                     let notional =
                         balance.wallet_balance * cfg.margin_multiplier * cfg.order_balance_pct
                             / Decimal::from(100)
@@ -158,7 +166,7 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     if notional != *cfg.notional_tx.borrow() {
                         let _ = cfg.notional_tx.send(notional);
                     }
-                    for symbol in &cfg.symbols {
+                    for symbol in &symbols {
                         tracing::info!(
                             symbol,
                             wallet = %balance.wallet_balance,
@@ -171,7 +179,13 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                 Err(e) => tracing::warn!(error = ?e, "account balance poll failed"),
             }
 
-            for symbol in &cfg.symbols {
+            let symbols = cfg.shared_state.symbols();
+            let symbols = if symbols.is_empty() {
+                cfg.symbols.clone()
+            } else {
+                symbols
+            };
+            for symbol in &symbols {
                 match tikr_binance::futs::get_position_risk(
                     &http,
                     cfg.env.rest_base_url(),
@@ -296,19 +310,25 @@ async fn main() -> anyhow::Result<()> {
 
     let shared_state = SharedBotState::new();
 
-    // Pre-seed BotViews so the TUI has tabs to show from frame 1.
-    for b in &cfg.bots {
-        let view = BotView {
-            label: format!("{}/{}", b.symbol, b.strategy),
-            symbol: b.symbol.clone(),
-            strategy: b.strategy.clone(),
-            status: BotStatus::Starting,
-            snapshot: Arc::new(std::sync::RwLock::new(None)),
-            live: Arc::new(std::sync::RwLock::new(None)),
-            shutdown_tx: None,
-            api_position: Arc::new(std::sync::RwLock::new(None)),
-        };
-        shared_state.insert(&b.symbol, view);
+    let rotation_enabled = cfg.scalp_rotation.as_ref().is_some_and(|r| r.enabled);
+
+    // Pre-seed static BotViews so the TUI has tabs from frame 1. Rotating
+    // scalp mode inserts real active symbols after the volatility scan; do not
+    // insert the template bot or it appears stuck in `starting` forever.
+    if !rotation_enabled {
+        for b in &cfg.bots {
+            let view = BotView {
+                label: format!("{}/{}", b.symbol, b.strategy),
+                symbol: b.symbol.clone(),
+                strategy: b.strategy.clone(),
+                status: BotStatus::Starting,
+                snapshot: Arc::new(std::sync::RwLock::new(None)),
+                live: Arc::new(std::sync::RwLock::new(None)),
+                shutdown_tx: None,
+                api_position: Arc::new(std::sync::RwLock::new(None)),
+            };
+            shared_state.insert(&b.symbol, view);
+        }
     }
 
     // Global shutdown channel — TUI flips it on `q`; supervisors observe.
@@ -322,27 +342,53 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         key_material: key_material.clone(),
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
+        bot_count: cfg
+            .scalp_rotation
+            .as_ref()
+            .filter(|r| r.enabled)
+            .map(|r| r.slots)
+            .unwrap_or(cfg.bots.len()),
         order_balance_pct: cfg.account.order_balance_pct,
         margin_multiplier: cfg.account.margin_multiplier,
         shutdown: global_shutdown_rx.clone(),
     });
 
-    // Spawn one supervisor per bot.
-    let mut supervisors = Vec::with_capacity(cfg.bots.len());
-    for b in &cfg.bots {
-        let ctx = SupervisorCtx {
-            cfg: b.clone(),
-            env,
-            api_key: api_key.clone(),
-            key_material: key_material.clone(),
-            base_state_dir: cfg.account.state_dir.clone(),
-            order_balance_pct: cfg.account.order_balance_pct,
-            margin_multiplier: cfg.account.margin_multiplier,
-            bot_count: cfg.bots.len(),
-            notional_rx: notional_rx.clone(),
-        };
-        let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());
-        supervisors.push(h);
+    // Spawn supervisors. In rotating scalp mode, one manager owns the active
+    // 4-slot supervisor set and swaps symbols on volatility scans.
+    let mut supervisors = Vec::new();
+    if let Some(rotation) = cfg.scalp_rotation.clone().filter(|r| r.enabled) {
+        supervisors.push(scalp_rotation::spawn_rotation_manager(
+            rotation,
+            cfg.bots.clone(),
+            scalp_rotation::RotationAccountCtx {
+                env,
+                api_key: api_key.clone(),
+                key_material: key_material.clone(),
+                base_state_dir: cfg.account.state_dir.clone(),
+                order_balance_pct: cfg.account.order_balance_pct,
+                margin_multiplier: cfg.account.margin_multiplier,
+                notional_rx: notional_rx.clone(),
+            },
+            shared_state.clone(),
+            global_shutdown_rx.clone(),
+        ));
+    } else {
+        supervisors.reserve(cfg.bots.len());
+        for b in &cfg.bots {
+            let ctx = SupervisorCtx {
+                cfg: b.clone(),
+                env,
+                api_key: api_key.clone(),
+                key_material: key_material.clone(),
+                base_state_dir: cfg.account.state_dir.clone(),
+                order_balance_pct: cfg.account.order_balance_pct,
+                margin_multiplier: cfg.account.margin_multiplier,
+                bot_count: cfg.bots.len(),
+                notional_rx: notional_rx.clone(),
+            };
+            let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());
+            supervisors.push(h);
+        }
     }
 
     if args.headless {

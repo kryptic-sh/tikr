@@ -13,8 +13,9 @@ use tikr_backtest::fill_sim::FillSim;
 use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, LadderReentry,
-    LadderReentryConfig, LayeredGrid, LayeredGridConfig, SimpleGap, SimpleGapConfig, StaticGrid,
-    StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, MicroMeanReversion,
+    MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig,
+    StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -46,6 +47,10 @@ pub enum StrategyChoice {
     TopOfBook(TopOfBookConfig),
     /// [`SimpleGap`] — fixed-gap pair, add another pair after each fill.
     SimpleGap(SimpleGapConfig),
+    /// [`MicroMeanReversion`] — overshoot capture with passive reversion exits.
+    MicroMeanReversion(MicroMeanReversionConfig),
+    /// [`SpreadScalp`] — quote inside wide spreads for passive scalp fills.
+    SpreadScalp(SpreadScalpConfig),
 }
 
 impl StrategyChoice {
@@ -59,6 +64,8 @@ impl StrategyChoice {
             Self::Glft(_) => "glft",
             Self::TopOfBook(_) => "top-of-book",
             Self::SimpleGap(_) => "simple-gap",
+            Self::MicroMeanReversion(_) => "micro-mean-reversion",
+            Self::SpreadScalp(_) => "spread-scalp",
         }
     }
 }
@@ -249,6 +256,38 @@ where
                 }
                 StrategyChoice::SimpleGap(cfg) => {
                     let strategy = SimpleGap::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::MicroMeanReversion(cfg) => {
+                    let strategy = MicroMeanReversion::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                    )
+                    .await
+                }
+                StrategyChoice::SpreadScalp(cfg) => {
+                    let strategy = SpreadScalp::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,
