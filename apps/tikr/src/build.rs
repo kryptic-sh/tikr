@@ -28,6 +28,7 @@ pub fn to_spec(
     base_state_dir: &std::path::Path,
     default_notional: Decimal,
     notional_rx: Option<watch::Receiver<Decimal>>,
+    max_position_usdt_default: Decimal,
 ) -> Result<BotSpec> {
     let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
@@ -38,7 +39,9 @@ pub fn to_spec(
         "micro-mean-reversion" | "mmr" => {
             build_micro_mean_reversion(cfg, &symbol, venue, default_notional)?
         }
-        "spread-scalp" | "ss" => build_spread_scalp(cfg, &symbol, venue, default_notional)?,
+        "spread-scalp" | "ss" => {
+            build_spread_scalp(cfg, &symbol, venue, default_notional, max_position_usdt_default)?
+        }
         other => {
             return Err(anyhow::anyhow!(
                 "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp)"
@@ -233,6 +236,7 @@ fn build_spread_scalp(
     symbol: &Symbol,
     venue: &BinanceClient,
     default_notional: Decimal,
+    max_position_usdt_default: Decimal,
 ) -> Result<StrategyChoice> {
     let spread_scalp = cfg.spread_scalp.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -261,7 +265,11 @@ fn build_spread_scalp(
         min_notional,
         min_spread_bps: spread_scalp.min_spread_bps,
         requote_interval_ms: spread_scalp.requote_interval_ms,
-        max_position_usdt: spread_scalp.max_position_usdt,
+        max_position_usdt: if spread_scalp.max_position_usdt > Decimal::ZERO {
+            spread_scalp.max_position_usdt
+        } else {
+            max_position_usdt_default
+        },
     }))
 }
 

@@ -180,6 +180,9 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     .await?;
 
     let default_notional = default_order_notional(&venue_for_run, ctx).await?;
+    let max_pos_default = default_notional * Decimal::from(100)
+        / ctx.order_balance_pct
+        * Decimal::new(8, 1);
     let spec = to_spec(
         &ctx.cfg,
         symbol,
@@ -187,6 +190,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         &ctx.base_state_dir,
         default_notional,
         Some(ctx.notional_rx.clone()),
+        max_pos_default,
     )?;
     info!(strategy = %spec.strategy.label(), default_notional = %default_notional, "spawning bot");
     let handle = tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx));

@@ -31,7 +31,6 @@ strategy = "spread-scalp"
 notional = 5
 min_spread_bps = 6
 requote_interval_ms = 1000
-max_position_usdt = 500
 
 
 # Defaults:
