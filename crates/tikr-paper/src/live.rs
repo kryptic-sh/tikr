@@ -31,6 +31,10 @@ pub struct LiveSnapshot {
     pub buy_fills: u64,
     /// Cumulative sell-side fill count this session.
     pub sell_fills: u64,
+    /// Cumulative buy-side volume (price × size) in quote currency.
+    pub buy_volume: Decimal,
+    /// Cumulative sell-side volume (price × size) in quote currency.
+    pub sell_volume: Decimal,
     /// Total resting open quotes (buys + sells).
     pub open_quotes: u32,
     /// Resting buy-side quotes.

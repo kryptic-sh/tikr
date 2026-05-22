@@ -305,6 +305,10 @@ pub struct SpreadScalpParams {
     /// Requote interval in ms.
     #[serde(default = "spread_scalp_default_requote_interval_ms")]
     pub requote_interval_ms: u64,
+    /// Max position in quote currency before switching to one-sided quoting.
+    /// 0 = disabled.
+    #[serde(default)]
+    pub max_position_usdt: Decimal,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {

@@ -928,6 +928,18 @@ fn draw_account(
         ),
     ]));
     lines.push(Line::from(vec![
+        Span::styled("vol      ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{:>5.0}", dec_to_f64(agg.buy_volume)),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw(" / "),
+        Span::styled(
+            format!("{:>5.0}", dec_to_f64(agg.sell_volume)),
+            Style::default().fg(Color::Red),
+        ),
+    ]));
+    lines.push(Line::from(vec![
         Span::styled("open b/s ", Style::default().fg(Color::Gray)),
         Span::styled(
             format!("{:>5}", agg.open_buys),

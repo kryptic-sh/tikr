@@ -261,6 +261,7 @@ fn build_spread_scalp(
         min_notional,
         min_spread_bps: spread_scalp.min_spread_bps,
         requote_interval_ms: spread_scalp.requote_interval_ms,
+        max_position_usdt: spread_scalp.max_position_usdt,
     }))
 }
 

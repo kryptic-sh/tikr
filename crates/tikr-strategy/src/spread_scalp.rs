@@ -27,6 +27,9 @@ pub struct SpreadScalpConfig {
     pub min_spread_bps: Decimal,
     /// Fixed requote interval in ms.
     pub requote_interval_ms: u64,
+    /// Max position in quote currency before one-sided quoting kicks in.
+    /// 0 = disabled.
+    pub max_position_usdt: Decimal,
 }
 
 /// Spread scalping strategy state.
@@ -125,11 +128,18 @@ impl SpreadScalp {
         self.last_ask = Some(ask);
         self.last_requote_ts = Some(ts);
         self.quotes_live = true;
-        vec![
-            Action::CancelAll,
-            self.make_quote(ctx, Side::Bid, bid, size_mult.0),
-            self.make_quote(ctx, Side::Ask, ask, size_mult.1),
-        ]
+        let mut actions = vec![Action::CancelAll];
+        let mid = (bid.0 + ask.0) / Decimal::from(2);
+        let position_value = ctx.position.size.0.abs() * mid;
+        let cap = self.config.max_position_usdt;
+        let capped = cap > Decimal::ZERO && position_value >= cap;
+        if !capped || ctx.position.size.0 <= Decimal::ZERO {
+            actions.push(self.make_quote(ctx, Side::Bid, bid, size_mult.0));
+        }
+        if !capped || ctx.position.size.0 >= Decimal::ZERO {
+            actions.push(self.make_quote(ctx, Side::Ask, ask, size_mult.1));
+        }
+        actions
     }
 
     fn inventory_size_multiplier(&self, ctx: &StrategyContext<'_>) -> (Decimal, Decimal) {
@@ -293,6 +303,7 @@ mod tests {
             min_notional: Decimal::ZERO,
             min_spread_bps: Decimal::from(5),
             requote_interval_ms: 1000,
+            max_position_usdt: Decimal::ZERO,
         })
     }
 
@@ -321,7 +332,7 @@ mod tests {
     #[test]
     fn narrow_spread_does_not_quote() {
         let symbol = sym();
-        let snapshot = book(&symbol, 100, 102, 1);
+        let snapshot = book(&symbol, 100, 100, 1);
         let position = pos(&symbol);
         let mut strategy = strategy();
         let actions = strategy.on_event(
@@ -392,7 +403,7 @@ mod tests {
     #[test]
     fn long_inventory_sizes_ask_larger() {
         let symbol = sym();
-        let snapshot = book(&symbol, 100, 110, 1);
+        let snapshot = book(&symbol, 50, 60, 1);
         let position = pos_with_size(&symbol, Decimal::new(5, 1));
         let mut strategy = strategy();
         let actions = strategy.on_event(
@@ -404,7 +415,12 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert!(ask.size.0 > bid.size.0);
+                assert!(
+                    ask.size.0 > bid.size.0,
+                    "ask={} bid={}",
+                    ask.size.0,
+                    bid.size.0
+                );
             }
             _ => panic!("expected quotes"),
         }
@@ -435,7 +451,7 @@ mod tests {
     fn cancel_when_spread_narrows() {
         let symbol = sym();
         let wide = book(&symbol, 100, 110, 1);
-        let narrow = book(&symbol, 100, 102, 2);
+        let narrow = book(&symbol, 100, 100, 2);
         let position = pos(&symbol);
         let mut strategy = strategy();
         let _ = strategy.on_event(

@@ -280,6 +280,8 @@ where
     // to PaperReport — resume always starts these at 0.
     let mut buy_fills: u64 = 0;
     let mut sell_fills: u64 = 0;
+    let mut buy_volume: Decimal = Decimal::ZERO;
+    let mut sell_volume: Decimal = Decimal::ZERO;
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
     let resumed_sim_duration_secs: u64 = resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
 
@@ -675,6 +677,8 @@ where
                             &mut fills_emitted,
                             &mut buy_fills,
                             &mut sell_fills,
+                            &mut buy_volume,
+                            &mut sell_volume,
                             alert_sink.as_deref(),
                             &symbol,
                         )
@@ -689,6 +693,8 @@ where
                             &current_book,
                             buy_fills,
                             sell_fills,
+                            buy_volume,
+                            sell_volume,
                             &last_fill,
                         );
                         // Partial: the LiveQuote is still on the book (FillSim
@@ -806,6 +812,8 @@ where
                     &current_book,
                     buy_fills,
                     sell_fills,
+                    buy_volume,
+                    sell_volume,
                     &last_fill,
                 );
 
@@ -885,6 +893,8 @@ where
                     &mut fills_emitted,
                     &mut buy_fills,
                     &mut sell_fills,
+                    &mut buy_volume,
+                    &mut sell_volume,
                     alert_sink.as_deref(),
                     &symbol,
                 )
@@ -917,17 +927,19 @@ where
                 // drop from FillSim and do not notify the strategy — the
                 // strategy should keep waiting for the remaining size.
                 if !fill_is_full {
-                    publish_live(
-                        &config.live_tap,
-                        &tracker,
-                        &fill_sim,
-                        &symbol,
-                        last_mid,
-                        &current_book,
-                        buy_fills,
-                        sell_fills,
-                        &last_fill,
-                    );
+                publish_live(
+                    &config.live_tap,
+                    &tracker,
+                    &fill_sim,
+                    &symbol,
+                    last_mid,
+                    &current_book,
+                    buy_fills,
+                    sell_fills,
+                    buy_volume,
+                    sell_volume,
+                    &last_fill,
+                );
                     continue;
                 }
                 // Sync FillSim: drop the consumed quote so `live_quotes_for`
@@ -976,6 +988,8 @@ where
                     &current_book,
                     buy_fills,
                     sell_fills,
+                    buy_volume,
+                    sell_volume,
                     &last_fill,
                 );
             }
@@ -1045,17 +1059,19 @@ where
                                 venue_open,
                                 "order reconciliation: synced FillSim mirror to venue"
                             );
-                            publish_live(
-                                &config.live_tap,
-                                &tracker,
-                                &fill_sim,
-                                &symbol,
-                                last_mid,
-                                &current_book,
-                                buy_fills,
-                                sell_fills,
-                                &last_fill,
-                            );
+                publish_live(
+                    &config.live_tap,
+                    &tracker,
+                    &fill_sim,
+                    &symbol,
+                    last_mid,
+                    &current_book,
+                    buy_fills,
+                    sell_fills,
+                    buy_volume,
+                    sell_volume,
+                    &last_fill,
+                );
                         }
                     }
                     Err(e) => {
@@ -1335,6 +1351,8 @@ async fn apply_fill(
     fills_emitted: &mut u64,
     buy_fills: &mut u64,
     sell_fills: &mut u64,
+    buy_volume: &mut Decimal,
+    sell_volume: &mut Decimal,
     alert_sink: Option<&dyn AlertSink>,
     symbol: &Symbol,
 ) {
@@ -1354,8 +1372,14 @@ async fn apply_fill(
     // Display/report fill counters track every execution, including partials.
     *fills_emitted += 1;
     match fill.side {
-        tikr_core::Side::Bid => *buy_fills += 1,
-        tikr_core::Side::Ask => *sell_fills += 1,
+        tikr_core::Side::Bid => {
+            *buy_fills += 1;
+            *buy_volume += fill.price.0 * fill.size.0;
+        }
+        tikr_core::Side::Ask => {
+            *sell_fills += 1;
+            *sell_volume += fill.price.0 * fill.size.0;
+        }
     }
     if let Some(sink) = alert_sink {
         let _ = sink
@@ -1447,6 +1471,8 @@ fn publish_live(
     last_book: &Snapshot,
     buy_fills: u64,
     sell_fills: u64,
+    buy_volume: Decimal,
+    sell_volume: Decimal,
     last_fill: &Option<Fill>,
 ) {
     let Some(tap) = tap.as_ref() else {
@@ -1480,6 +1506,8 @@ fn publish_live(
         last_ask,
         buy_fills,
         sell_fills,
+        buy_volume,
+        sell_volume,
         open_quotes: open_buys.saturating_add(open_sells),
         open_buys,
         open_sells,

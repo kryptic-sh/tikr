@@ -223,7 +223,9 @@ pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core
                 Side::Bid
             };
             let notional_approx = qty * pos.avg_entry.0;
+            let avg_entry_known = pos.avg_entry.0 > Decimal::ZERO;
             if let Some(min_n) = venue.min_notional(symbol)
+                && avg_entry_known
                 && notional_approx < min_n
             {
                 info!(

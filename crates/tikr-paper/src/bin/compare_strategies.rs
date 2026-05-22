@@ -649,6 +649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_notional: Decimal::ZERO,
                 min_spread_bps,
                 requote_interval_ms: 1000,
+                max_position_usdt: Decimal::ZERO,
             }),
             fees,
             skim_cfg,

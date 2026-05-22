@@ -282,6 +282,10 @@ pub struct AccountAggregate {
     pub buy_fills: u64,
     /// Σ sell-side fills.
     pub sell_fills: u64,
+    /// Σ buy-side volume in quote currency.
+    pub buy_volume: Decimal,
+    /// Σ sell-side volume in quote currency.
+    pub sell_volume: Decimal,
     /// Σ resting buy quotes.
     pub open_buys: u64,
     /// Σ resting sell quotes.
@@ -324,6 +328,8 @@ impl AccountAggregate {
             if let Some(ref lv) = v.live {
                 a.buy_fills = a.buy_fills.saturating_add(lv.buy_fills);
                 a.sell_fills = a.sell_fills.saturating_add(lv.sell_fills);
+                a.buy_volume += lv.buy_volume;
+                a.sell_volume += lv.sell_volume;
                 a.open_buys = a.open_buys.saturating_add(lv.open_buys as u64);
                 a.open_sells = a.open_sells.saturating_add(lv.open_sells as u64);
                 a.net_inventory += lv.inventory_usdt;
