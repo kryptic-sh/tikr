@@ -180,9 +180,8 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     .await?;
 
     let default_notional = default_order_notional(&venue_for_run, ctx).await?;
-    let max_pos_default = default_notional * Decimal::from(100)
-        / ctx.order_balance_pct
-        * Decimal::new(8, 1);
+    let max_pos_default =
+        default_notional * Decimal::from(100) / ctx.order_balance_pct * Decimal::new(8, 1);
     let spec = to_spec(
         &ctx.cfg,
         symbol,
@@ -241,12 +240,95 @@ pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core
                 );
                 return;
             }
-            info!(symbol = %tikr_venue::Venue::id(venue), side = ?close_side, qty = %qty, "flattening position with market order");
-            if let Err(e) = venue.market_close(symbol, close_side, Size(qty)).await {
-                warn!(error = ?e, "market_close failed");
-            }
+            flatten_with_limit_fallback(venue, symbol, close_side, Size(qty)).await;
         }
         Ok(_) => {}
         Err(e) => warn!(error = ?e, "venue.position failed"),
+    }
+}
+
+/// Try to close with a limit order at mid; fall back to market after 10s.
+async fn flatten_with_limit_fallback(
+    venue: &BinanceClient,
+    symbol: &tikr_core::Symbol,
+    side: tikr_core::Side,
+    qty: tikr_core::Size,
+) {
+    use std::time::Duration;
+    use tikr_core::{Price, QuoteKind, Size, TimeInForce};
+    use tikr_venue::QuoteIntent;
+    use tikr_venue::Venue;
+    use tracing::info;
+
+    let limit_price = match venue.snapshot(symbol).await {
+        Ok(snap) => {
+            let bid = snap
+                .bids
+                .first()
+                .map(|l| l.price.0)
+                .unwrap_or(Decimal::ZERO);
+            let ask = snap
+                .asks
+                .first()
+                .map(|l| l.price.0)
+                .unwrap_or(Decimal::ZERO);
+            if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
+                info!("invalid book for limit close, using market order");
+                let _ = venue.market_close(symbol, side, qty).await;
+                return;
+            }
+            // Use mid price — aggressive enough to likely fill within 10s
+            Price((bid + ask) / Decimal::from(2))
+        }
+        Err(e) => {
+            warn!(error = ?e, "snapshot failed for limit close, using market order");
+            let _ = venue.market_close(symbol, side, qty).await;
+            return;
+        }
+    };
+
+    info!(
+        symbol = %tikr_venue::Venue::id(venue),
+        side = ?side,
+        qty = %qty.0,
+        price = %limit_price.0,
+        "flattening with limit order at mid"
+    );
+
+    let intent = QuoteIntent {
+        symbol: symbol.clone(),
+        side,
+        price: limit_price,
+        size: qty,
+        tif: TimeInForce::GTC,
+        kind: QuoteKind::Point,
+    };
+
+    match venue.quote(intent).await {
+        Ok(_) => {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            match venue.position(symbol).await {
+                Ok(new_pos) if new_pos.size.0.abs() > Decimal::ZERO => {
+                    let remaining = new_pos.size.0.abs();
+                    info!(
+                        remaining = %remaining,
+                        "limit close did not fully fill in 10s, using market order for remainder"
+                    );
+                    let _ = venue.cancel_all(symbol).await;
+                    let _ = venue.market_close(symbol, side, Size(remaining)).await;
+                }
+                Ok(_) => {
+                    info!("limit close fully filled");
+                }
+                Err(e) => {
+                    warn!(error = ?e, "position check after limit close failed");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = ?e, "limit close failed, falling back to market order");
+            let _ = venue.market_close(symbol, side, qty).await;
+        }
     }
 }

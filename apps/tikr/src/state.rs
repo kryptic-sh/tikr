@@ -272,6 +272,8 @@ pub struct AccountAggregate {
     pub unrealized: Decimal,
     /// Σ fees paid.
     pub fees: Decimal,
+    /// Σ funding accrued (Phase 3: always zero).
+    pub funding: Decimal,
     /// Σ NET (realized + unrealized − fees + funding).
     pub net: Decimal,
     /// Σ events processed.
@@ -298,12 +300,16 @@ pub struct AccountAggregate {
     pub api_unrealized: Decimal,
     /// Σ local unrealized PnL re-marked with Binance mark prices.
     pub mark_unrealized: Decimal,
+    /// At least one view has an API position snapshot (reliable API-data flag).
+    pub has_api_positions: bool,
     /// Count of bots currently in `Running` state.
     pub running_count: usize,
     /// Count of bots in `Crashed` state.
     pub crashed_count: usize,
     /// Count of bots in `Restarting` state.
     pub restarting_count: usize,
+    /// Count of bots in `Starting` state.
+    pub starting_count: usize,
 }
 
 impl AccountAggregate {
@@ -315,12 +321,13 @@ impl AccountAggregate {
                 BotStatus::Running => a.running_count += 1,
                 BotStatus::Crashed(_) => a.crashed_count += 1,
                 BotStatus::Restarting(_) => a.restarting_count += 1,
-                _ => {}
+                BotStatus::Starting => a.starting_count += 1,
             }
             if let Some(ref r) = v.snapshot {
                 a.realized += r.realized.0;
                 a.unrealized += r.unrealized.0;
                 a.fees += r.fees.0;
+                a.funding += r.funding.0;
                 a.net += r.net.0;
                 a.events = a.events.saturating_add(r.events_processed);
                 a.fills = a.fills.saturating_add(r.fills_emitted);
@@ -336,6 +343,7 @@ impl AccountAggregate {
                 a.gross_inventory += lv.inventory_usdt.abs();
             }
             if let Some(ref api) = v.api_position {
+                a.has_api_positions = true;
                 a.api_unrealized += api.unrealized_profit;
                 if let (Some(r), Some(lv)) = (&v.snapshot, &v.live) {
                     a.mark_unrealized += mark_unrealized(r.unrealized.0, lv, api.mark_price);

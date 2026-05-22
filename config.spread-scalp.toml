@@ -29,8 +29,9 @@ symbol = "DOGEUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 5
-min_spread_bps = 6
+min_spread_bps = 12
 requote_interval_ms = 1000
+take_profit_usdt = 1.0     # lock in small profits early
 
 
 # Defaults:

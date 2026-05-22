@@ -30,6 +30,10 @@ pub struct SpreadScalpConfig {
     /// Max position in quote currency before one-sided quoting kicks in.
     /// 0 = disabled.
     pub max_position_usdt: Decimal,
+    /// Unrealized PnL threshold in quote currency to activate take-profit.
+    /// When exceeded, quotes only the reducing side at mid price to close
+    /// the position aggressively. 0 = disabled.
+    pub take_profit_usdt: Decimal,
 }
 
 /// Spread scalping strategy state.
@@ -57,13 +61,12 @@ impl SpreadScalp {
         if spread_bps < self.config.min_spread_bps {
             return None;
         }
-        let bid = Price(best_bid.0);
-        let ask = Price(best_ask.0);
+        // Quote 1 tick inside the best level so PostOnly orders don't get
+        // rejected (-5022) when the market moves between snapshot and
+        // placement.
+        let bid = Price(best_bid.0 + tick);
+        let ask = Price(best_ask.0 - tick);
         if bid.0 >= ask.0 {
-            return None;
-        }
-        let edge_bps = (ask.0 - bid.0) / mid * Decimal::from(10_000);
-        if edge_bps < self.config.min_spread_bps {
             return None;
         }
         Some((bid, ask))
@@ -133,6 +136,31 @@ impl SpreadScalp {
         let position_value = ctx.position.size.0.abs() * mid;
         let cap = self.config.max_position_usdt;
         let capped = cap > Decimal::ZERO && position_value >= cap;
+
+        // Take-profit: if unrealized PnL >= threshold, quote reducing side at
+        // mid and skip the increasing side to close aggressively.
+        let tp_threshold = self.config.take_profit_usdt;
+        let tp_triggered = tp_threshold > Decimal::ZERO
+            && ctx.position.avg_entry.0 > Decimal::ZERO
+            && ctx.position.size.0 != Decimal::ZERO;
+        if tp_triggered {
+            let (long, pos_abs) = (
+                ctx.position.size.0 > Decimal::ZERO,
+                ctx.position.size.0.abs(),
+            );
+            let profit = if long {
+                mid - ctx.position.avg_entry.0
+            } else {
+                ctx.position.avg_entry.0 - mid
+            };
+            let unrealized = profit * pos_abs;
+            if unrealized >= tp_threshold {
+                let tp_side = if long { Side::Ask } else { Side::Bid };
+                actions.push(self.make_quote(ctx, tp_side, Price(mid), Decimal::ONE));
+                return actions;
+            }
+        }
+
         if !capped || ctx.position.size.0 <= Decimal::ZERO {
             actions.push(self.make_quote(ctx, Side::Bid, bid, size_mult.0));
         }
@@ -304,6 +332,7 @@ mod tests {
             min_spread_bps: Decimal::from(5),
             requote_interval_ms: 1000,
             max_position_usdt: Decimal::ZERO,
+            take_profit_usdt: Decimal::ZERO,
         })
     }
 
@@ -322,8 +351,9 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert_eq!(bid.price.0, Decimal::from(100));
-                assert_eq!(ask.price.0, Decimal::from(110));
+                // 1 tick inside best bid/ask
+                assert_eq!(bid.price.0, Decimal::from(101));
+                assert_eq!(ask.price.0, Decimal::from(109));
             }
             _ => panic!("expected quotes"),
         }
@@ -393,8 +423,9 @@ mod tests {
         assert_eq!(actions.len(), 3);
         match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert_eq!(bid.price.0, Decimal::from(102));
-                assert_eq!(ask.price.0, Decimal::from(112));
+                // 1 tick inside best bid/ask
+                assert_eq!(bid.price.0, Decimal::from(103));
+                assert_eq!(ask.price.0, Decimal::from(111));
             }
             _ => panic!("expected quotes"),
         }

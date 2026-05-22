@@ -810,6 +810,8 @@ fn draw_account(
         Span::raw(format!("{}", agg.crashed_count)),
         Span::styled("   ↻    ", Style::default().fg(Color::Yellow)),
         Span::raw(format!("{}", agg.restarting_count)),
+        Span::styled("   ↑   ", Style::default().fg(Color::Cyan)),
+        Span::raw(format!("{}", agg.starting_count)),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -819,7 +821,7 @@ fn draw_account(
             pnl_style(agg.realized),
         ),
     ]));
-    let unreal_display = if agg.api_unrealized != Decimal::ZERO {
+    let unreal_display = if agg.has_api_positions {
         agg.api_unrealized
     } else {
         agg.unrealized
@@ -835,8 +837,12 @@ fn draw_account(
         Span::styled("fees     ", Style::default().fg(Color::Gray)),
         Span::raw(format!("{:>10.2}", dec_to_f64(agg.fees))),
     ]));
-    let net_display = if agg.api_unrealized != Decimal::ZERO {
-        agg.realized + agg.api_unrealized - agg.fees
+    lines.push(Line::from(vec![
+        Span::styled("funding  ", Style::default().fg(Color::Gray)),
+        Span::raw(format!("{:>+10.2}", dec_to_f64(agg.funding))),
+    ]));
+    let net_display = if agg.has_api_positions {
+        agg.realized + agg.api_unrealized - agg.fees + agg.funding
     } else {
         agg.net
     };
@@ -968,7 +974,13 @@ fn draw_account(
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     ));
     for v in views {
-        let net = v.snapshot.as_ref().map(|r| r.net.0).unwrap_or_default();
+        let net = v.snapshot.as_ref().map_or(Decimal::ZERO, |r| {
+            if let Some(api) = &v.api_position {
+                r.realized.0 + api.unrealized_profit - r.fees.0 + r.funding.0
+            } else {
+                r.net.0
+            }
+        });
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:<10}", v.symbol),

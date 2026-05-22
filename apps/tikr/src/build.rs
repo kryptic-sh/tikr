@@ -39,9 +39,13 @@ pub fn to_spec(
         "micro-mean-reversion" | "mmr" => {
             build_micro_mean_reversion(cfg, &symbol, venue, default_notional)?
         }
-        "spread-scalp" | "ss" => {
-            build_spread_scalp(cfg, &symbol, venue, default_notional, max_position_usdt_default)?
-        }
+        "spread-scalp" | "ss" => build_spread_scalp(
+            cfg,
+            &symbol,
+            venue,
+            default_notional,
+            max_position_usdt_default,
+        )?,
         other => {
             return Err(anyhow::anyhow!(
                 "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp)"
@@ -270,6 +274,7 @@ fn build_spread_scalp(
         } else {
             max_position_usdt_default
         },
+        take_profit_usdt: spread_scalp.take_profit_usdt,
     }))
 }
 

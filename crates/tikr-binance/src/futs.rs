@@ -169,7 +169,7 @@ pub async fn place_market_order(
         Side::Bid => "BUY",
         Side::Ask => "SELL",
     };
-    let client_order_id = format!("mkclose_{}", Uuid::new_v4().as_simple());
+    let client_order_id = format!("mc_{}", Uuid::new_v4().as_simple());
     let params = format!(
         "symbol={symbol}&side={side_str}&type=MARKET\
          &quantity={quantity}\

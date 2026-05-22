@@ -309,6 +309,11 @@ pub struct SpreadScalpParams {
     /// 0 = disabled.
     #[serde(default)]
     pub max_position_usdt: Decimal,
+    /// Unrealized PnL threshold to trigger take-profit. When exceeded, the
+    /// reducing-side quote moves to mid price and the increasing side is
+    /// skipped. 0 = disabled.
+    #[serde(default)]
+    pub take_profit_usdt: Decimal,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
