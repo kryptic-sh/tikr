@@ -98,7 +98,7 @@ strategy = "static-grid"
 [bot.sg]
 levels = 3
 step_bps = 3
-inner_bps = 6
+inner_bps = 10
 
 
 # ─── HYPERUSDT ─────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ strategy = "static-grid"
 [bot.sg]
 levels = 3
 step_bps = 3
-inner_bps = 6
+inner_bps = 10
 
 
 # ─── PROMPTUSDT ────────────────────────────────────────────────────────────
@@ -122,7 +122,7 @@ strategy = "static-grid"
 [bot.sg]
 levels = 3
 step_bps = 3
-inner_bps = 6
+inner_bps = 10
 
 
 # ─── LayeredGrid template (uncomment to use) ───────────────────────────────
