@@ -357,9 +357,22 @@ impl SpreadScalp {
 
     /// When `compute_targets` returned None (spread below threshold)
     /// AND we hold inventory AND `close_side_always_quotes` is on,
-    /// keep the close-side quote alive at the current touch (no
-    /// improve, no spread gate) so the position can close at maker
-    /// fee. Add-side gets cancelled.
+    /// keep the close-side quote alive at the ORIGINAL profit target
+    /// (avg_entry ± min_spread_bps) so the position drains at maker
+    /// fee for the spread we originally tried to capture — not at
+    /// whatever the current touch happens to be (which can be a
+    /// loss when the market cools off in the direction we hold).
+    ///
+    /// Two cases:
+    /// - **Market moved against us** (mark closer to or past entry):
+    ///   target sits above touch (long) / below touch (short).
+    ///   PostOnly happily rests there until a rebound or taker fills.
+    /// - **Market moved past our target in our favour**: we'd be
+    ///   leaving money on the table by posting at the original
+    ///   target. Use the more aggressive touch quote
+    ///   (best_ask − 1 tick for long, best_bid + 1 tick for short)
+    ///   so we capture the bonus instead of sitting deep behind the
+    ///   queue.
     ///
     /// Returns `Some(actions)` when the close-side path engaged (a
     /// quote was posted or kept alive + add-side cancelled). `None`
@@ -376,13 +389,61 @@ impl SpreadScalp {
         }
         let close_side = Self::close_side_for(ctx.position.size.0)?;
         let top = Top::from_snapshot(snapshot)?;
-        // Use the closing-side touch — no 1-tick improve. We're not
-        // trying to scalp here, just sit at the front of the queue
-        // so a natural taker closes our position at maker fee.
-        let price = match close_side {
-            Side::Ask => top.ask,
-            Side::Bid => top.bid,
+        let entry = ctx.position.avg_entry.0;
+        if entry <= Decimal::ZERO {
+            return None;
+        }
+        let tick = self.config.tick_size;
+        let bp = self.config.min_spread_bps / Decimal::from(10_000);
+        // Profit-target price relative to entry. The min_spread_bps
+        // value already encodes the operator's intended round-trip
+        // capture, so re-using it here keeps "what we were trying to
+        // earn" consistent with "what we hold out for on the exit".
+        let target_from_entry = match close_side {
+            Side::Ask => Price(entry * (Decimal::ONE + bp)),
+            Side::Bid => Price(entry * (Decimal::ONE - bp)),
         };
+        // Aggressive touch fallback for the case where the market
+        // moved PAST our target — use 1 tick inside the touch so a
+        // natural taker closes us at the bonus price.
+        let aggressive_touch = match close_side {
+            Side::Ask => Price(top.ask.0 - tick),
+            Side::Bid => Price(top.bid.0 + tick),
+        };
+        let price = match close_side {
+            // Long → take the HIGHER ask of (target_from_entry,
+            // aggressive_touch). If market rallied past target,
+            // aggressive_touch wins.
+            Side::Ask => {
+                if aggressive_touch.0 > target_from_entry.0 {
+                    aggressive_touch
+                } else {
+                    target_from_entry
+                }
+            }
+            // Short → take the LOWER bid.
+            Side::Bid => {
+                if aggressive_touch.0 < target_from_entry.0 {
+                    aggressive_touch
+                } else {
+                    target_from_entry
+                }
+            }
+        };
+        // Safety: refuse to post if it would cross the opposite side
+        // (PostOnly would reject anyway; cheaper to skip). Long's Ask
+        // must be > best_bid; short's Bid must be < best_ask.
+        let crosses = match close_side {
+            Side::Ask => price.0 <= top.bid.0,
+            Side::Bid => price.0 >= top.ask.0,
+        };
+        if crosses {
+            // Falling through to cancel_if_live is wrong here — we'd
+            // strand the position. Return empty so the existing
+            // resting close-side quote (if any) stays in place; no
+            // new placement attempt.
+            return Some(Vec::new());
+        }
         // Drop the add-side regardless of whether we already have one.
         let add_side = match close_side {
             Side::Ask => Side::Bid,
