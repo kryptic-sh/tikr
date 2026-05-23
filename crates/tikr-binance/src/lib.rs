@@ -165,6 +165,33 @@ impl fmt::Debug for BinanceClient {
 }
 
 impl BinanceClient {
+    /// Snapshot the current futures position-risk row for `symbol` —
+    /// signed amount, entry price, mark, unrealized PnL. Used by
+    /// `tikr` supervisor to seed the local PositionTracker when
+    /// `--clear` is OFF so the strategy doesn't think it's flat when
+    /// the venue still holds inventory.
+    ///
+    /// Returns a `Default` value (all zeros) on non-futures envs since
+    /// spot doesn't have a position concept.
+    pub async fn position_risk(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<crate::futs::FuturesPositionRisk, VenueError> {
+        if !self.env.is_futures() {
+            return Ok(crate::futs::FuturesPositionRisk::default());
+        }
+        let sym_str = binance_symbol(symbol);
+        let base_url = self.env.rest_base_url();
+        crate::futs::get_position_risk(
+            &self.http,
+            base_url,
+            &self.api_key,
+            &self.key_material,
+            &sym_str,
+        )
+        .await
+    }
+
     /// Build a fully write-capable client.
     ///
     /// Steps:

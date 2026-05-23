@@ -93,6 +93,10 @@ pub fn to_spec(
             .as_ref()
             .map(|p| p.window_secs)
             .unwrap_or(0),
+        // Supervisor fills this in from venue.position_risk on
+        // `--clear`-off startup. build.rs leaves it None — the spec is
+        // constructed before supervisor knows whether to seed.
+        seed_position: None,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

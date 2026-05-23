@@ -1,0 +1,66 @@
+# Majors-basket sweep — SG / LG / SS across BTC/ETH/BNB/SOL/DOGE.
+#
+# Run with:
+#   compare --config ./sweeps/majors_basket.toml
+#
+# Override individual knobs on the CLI: clap last-wins so e.g.
+# `compare --config majors_basket.toml --output csv` works.
+
+# ─── Data + symbol selection ───────────────────────────────────────────────
+# `data-root` enables basket mode — every subdir whose name ends in
+# USDT/USDC is treated as a per-symbol bucket. Per-symbol `data-dir` +
+# `symbol` overrides are derived automatically.
+data-root = "/home/mxaddict/Projects/kryptic-sh/tikr/data/2h"
+
+# Tick + step auto-detected from the static map (BTCUSDT etc are known)
+# with parquet sniff fallback for unknown symbols.
+tick-size = "auto"
+step-size = "auto"
+
+# ─── Runtime ───────────────────────────────────────────────────────────────
+# Cap concurrent presets so the machine stays usable. 8 = half of a
+# 16-core box. Bump on a beefier machine.
+parallel = 8
+
+# Drop preset rows with fewer than this many fills — kills the noise
+# from min_spread variants that produced 0 fills.
+min-fills = 1
+
+# MySQL-style table by default; pass `--output csv` (or markdown) to
+# override.
+output = "table"
+
+# ─── FillSim hard cap ──────────────────────────────────────────────────────
+# Prevents per-event runaway position growth on small-tick assets
+# (DOGE/HYPER). Matches per-strategy max-pos-usdt so the cap is the
+# same value enforced at both the strategy + fill sim level.
+sim-max-position-notional = 200.0
+
+# ─── Strategies to run ─────────────────────────────────────────────────────
+# Comma-separated allowlist. Aliases sg/lg/ss/lf accepted.
+strategies = "sg,lg,ss"
+
+# ─── StaticGrid sweep ──────────────────────────────────────────────────────
+[sg]
+inner-bps-list = "3,5,8"
+step-bps-list = "2,3"
+levels-list = "2,3,5"
+max-pos-usdt = "200"
+take-profit-bps = 15
+stop-loss-bps = 30
+
+# ─── LayeredGrid sweep ─────────────────────────────────────────────────────
+[lg]
+bps-list = "4,6,8"
+levels-list = "2,3"
+max-pos-usdt = "200"
+take-profit-bps = 15
+stop-loss-bps = 30
+
+# ─── SpreadScalp sweep ─────────────────────────────────────────────────────
+[spread-scalp]
+min-spread-bps-list = "2,3,5"
+max-pos-usdt = "200"
+# close_side_always_quotes defaults to true (in the strategy default);
+# uncomment to A/B against the legacy cancel-both behaviour.
+# close-side-always-quotes = false

@@ -478,6 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         live_tap: None,
         notional_rx: None,
         liq_window_secs: 0,
+        seed_position: None,
     };
 
     info!(strategy = ?args.strategy, "strategy selected");

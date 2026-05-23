@@ -79,6 +79,14 @@ pub struct RunnerConfig {
     /// prunes the buffer to this window so per-event memory stays
     /// bounded. Non-LiqFade strategies leave this 0.
     pub liq_window_secs: u32,
+    /// Optional pre-existing position to seed the PositionTracker with.
+    /// Used by the `tikr` supervisor when `--clear` is off so the
+    /// tracker mirrors the venue's actual inventory (queried via
+    /// `position_risk`) — otherwise the bot starts believing it's
+    /// flat while the venue holds inherited inventory, and the
+    /// strategy + cap + risk gates all reason against the wrong state.
+    /// `None` (default) = fresh-flat start.
+    pub seed_position: Option<Position>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -119,6 +127,7 @@ impl Default for RunnerConfig {
             live_tap: None,
             notional_rx: None,
             liq_window_secs: 0,
+            seed_position: None,
         }
     }
 }
@@ -336,24 +345,64 @@ where
 {
     let mut liq_window = LiqWindow::new(external_liqs, config.liq_window_secs);
 
-    // Reconstruct tracker from resume if provided, else fresh.
-    // v0 limitation: position size is reset to zero — see run_with_resume docs.
-    let mut tracker = if let Some(ref prior) = resume {
-        let pos = Position {
-            symbol: symbol.clone(),
-            size: tikr_core::SignedSize(Decimal::ZERO),
-            avg_entry: Price(Decimal::ZERO),
-            realized_pnl: prior.realized,
-        };
-        PositionTracker::from_snapshot(
-            symbol.clone(),
-            pos,
-            prior.realized,
-            prior.fees,
-            prior.funding,
-        )
-    } else {
-        PositionTracker::new(symbol.clone())
+    // Reconstruct tracker from resume + optional seed_position.
+    // - PaperReport `resume` carries running aggregates (realized/fees/
+    //   funding) but NOT position size/avg_entry.
+    // - `config.seed_position` carries the actual position to start
+    //   from (e.g. fetched from venue.position_risk on `tikr` startup
+    //   when --clear is OFF). When both present, seed_position's
+    //   size + avg_entry win; resume's aggregates still apply.
+    let mut tracker = match (resume.as_ref(), config.seed_position.as_ref()) {
+        (Some(prior), Some(seed)) => {
+            let pos = Position {
+                symbol: symbol.clone(),
+                size: seed.size,
+                avg_entry: seed.avg_entry,
+                realized_pnl: prior.realized,
+            };
+            PositionTracker::from_snapshot(
+                symbol.clone(),
+                pos,
+                prior.realized,
+                prior.fees,
+                prior.funding,
+            )
+        }
+        (Some(prior), None) => {
+            // Legacy resume — aggregates only, position reset (v0).
+            let pos = Position {
+                symbol: symbol.clone(),
+                size: tikr_core::SignedSize(Decimal::ZERO),
+                avg_entry: Price(Decimal::ZERO),
+                realized_pnl: prior.realized,
+            };
+            PositionTracker::from_snapshot(
+                symbol.clone(),
+                pos,
+                prior.realized,
+                prior.fees,
+                prior.funding,
+            )
+        }
+        (None, Some(seed)) => {
+            // Fresh start but with an inherited position from the venue
+            // (the `--clear`-off path: bot resumes against existing
+            // live inventory).
+            let pos = Position {
+                symbol: symbol.clone(),
+                size: seed.size,
+                avg_entry: seed.avg_entry,
+                realized_pnl: tikr_core::Notional(Decimal::ZERO),
+            };
+            PositionTracker::from_snapshot(
+                symbol.clone(),
+                pos,
+                tikr_core::Notional(Decimal::ZERO),
+                tikr_core::Notional(Decimal::ZERO),
+                tikr_core::Notional(Decimal::ZERO),
+            )
+        }
+        (None, None) => PositionTracker::new(symbol.clone()),
     };
 
     // Seed counters from resume.
@@ -1788,6 +1837,7 @@ mod tests {
             live_tap: None,
             notional_rx: None,
             liq_window_secs: 0,
+            seed_position: None,
         }
     }
 
@@ -2131,6 +2181,7 @@ mod tests {
             live_tap: None,
             notional_rx: None,
             liq_window_secs: 0,
+            seed_position: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2217,6 +2268,7 @@ mod tests {
             live_tap: None,
             notional_rx: None,
             liq_window_secs: 0,
+            seed_position: None,
         };
         let (_tx, rx) = watch::channel(false);
 

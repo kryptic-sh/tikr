@@ -1639,6 +1639,7 @@ async fn run_one<S: Strategy>(
         live_tap: None,
         notional_rx: None,
         liq_window_secs: 0,
+            seed_position: None,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -1715,6 +1716,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             live_tap: None,
             notional_rx: None,
             liq_window_secs,
+            seed_position: None,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");

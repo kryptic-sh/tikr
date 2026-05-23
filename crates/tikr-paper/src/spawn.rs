@@ -366,5 +366,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         live_tap: None,
         notional_rx: None,
         liq_window_secs: 0,
+        seed_position: None,
     }
 }

@@ -230,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         live_tap: None,
         notional_rx: None,
         liq_window_secs: 0,
+        seed_position: None,
     };
 
     let report = run_with_resume(

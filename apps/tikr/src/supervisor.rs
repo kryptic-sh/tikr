@@ -197,15 +197,54 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     let default_notional = default_order_notional(&venue_for_run, ctx).await?;
     let max_pos_default =
         default_notional * Decimal::from(100) / ctx.order_balance_pct * Decimal::new(8, 1);
-    let spec = to_spec(
+    let mut spec = to_spec(
         &ctx.cfg,
-        symbol,
+        symbol.clone(),
         &venue_for_run,
         &ctx.base_state_dir,
         default_notional,
         Some(ctx.notional_rx.clone()),
         max_pos_default,
     )?;
+
+    // Resume path (--clear OFF): seed the strategy's local position
+    // tracker from the venue's positionRisk so the bot doesn't think
+    // it's flat while the venue still holds inherited inventory. Bug
+    // reported 2026-05-24: dashboard showed local position +0.0000 but
+    // unrealized +0.5384 because the local tracker was empty while
+    // Binance positionRisk reported a residual position from a prior
+    // bot incarnation. Without this seed, strategies would over-quote
+    // (they reason against the wrong inventory state) and `max_position
+    // _usdt` caps wouldn't engage.
+    if !ctx.clear_on_start {
+        match venue_for_run.position_risk(&symbol).await {
+            Ok(pr) if pr.position_amount != Decimal::ZERO => {
+                info!(
+                    size = %pr.position_amount,
+                    entry = %pr.entry_price,
+                    mark = %pr.mark_price,
+                    unreal = %pr.unrealized_profit,
+                    "seeding tracker from venue positionRisk (resume path)"
+                );
+                spec.runner_config.seed_position = Some(tikr_core::Position {
+                    symbol: spec.symbol.clone(),
+                    size: tikr_core::SignedSize(pr.position_amount),
+                    avg_entry: tikr_core::Price(pr.entry_price),
+                    realized_pnl: tikr_core::Notional(Decimal::ZERO),
+                });
+            }
+            Ok(_) => {
+                info!("venue position is flat — no tracker seed needed");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "position_risk lookup failed — tracker starts flat (may desync if venue holds inventory)"
+                );
+            }
+        }
+    }
+
     info!(strategy = %spec.strategy.label(), default_notional = %default_notional, "spawning bot");
     // LiqFade needs the `@forceOrder` mainnet stream. For other
     // strategies the channel is unused, so we only subscribe when the
