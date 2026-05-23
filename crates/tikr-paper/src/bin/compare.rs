@@ -68,6 +68,18 @@ struct Args {
     #[arg(long, default_value = "table")]
     output: String,
 
+    /// Sort rows by NET descending before printing (best-first). Set
+    /// `false` to keep spawn-order (the original behaviour) — useful
+    /// when comparing the same preset across runs by row index.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    sort_by_net: bool,
+
+    /// Drop presets with fewer than this many fills from the output
+    /// (and from cross-symbol totals). `0` (default) keeps every row.
+    /// `1` is the common "trim 0-fill noise" setting on big sweeps.
+    #[arg(long, default_value_t = 0u64)]
+    min_fills: u64,
+
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
     size: String,
@@ -1295,6 +1307,28 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         crashed = crashed.len(),
         "all presets done"
     );
+
+    // Drop low-fill noise and (optionally) sort best-first so the
+    // operator can scan the top of the table without grep.
+    if args.min_fills > 0 {
+        let before = results.len();
+        results.retain(|(_, r)| r.fills_emitted >= args.min_fills);
+        let dropped = before - results.len();
+        if dropped > 0 {
+            info!(
+                dropped,
+                min_fills = args.min_fills,
+                "filtered low-fill presets"
+            );
+        }
+    }
+    if args.sort_by_net {
+        results.sort_by(|(_, a), (_, b)| {
+            decimal_to_f64(&b.net.0)
+                .partial_cmp(&decimal_to_f64(&a.net.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 
     match args.output.as_str() {
         "csv" => print_csv(&args.symbol, &results),
