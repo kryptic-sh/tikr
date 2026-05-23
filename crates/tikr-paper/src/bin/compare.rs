@@ -1267,15 +1267,35 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let sweep_start = std::time::Instant::now();
-    info!(
-        presets = handles.len(),
-        "awaiting parallel preset completion"
-    );
-    let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(handles.len());
+    let total = handles.len();
+    info!(presets = total, "awaiting parallel preset completion");
+    let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(total);
     let mut crashed: Vec<String> = Vec::new();
+    let mut done = 0usize;
     for h in handles {
+        let preset_start = std::time::Instant::now();
         match h.await {
-            Ok(pair) => results.push(pair),
+            Ok((name, report)) => {
+                done += 1;
+                let elapsed = preset_start.elapsed().as_secs_f64();
+                let total_elapsed = sweep_start.elapsed().as_secs_f64();
+                let eta_secs = if done > 0 {
+                    (total_elapsed / done as f64) * (total - done) as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[{}/{}] {} — {:.0}s — fills={} NET={:.2} — eta {}",
+                    done,
+                    total,
+                    name,
+                    elapsed,
+                    report.fills_emitted,
+                    decimal_to_f64(&report.net.0),
+                    format_eta(eta_secs)
+                );
+                results.push((name, report));
+            }
             Err(e) if e.is_panic() => {
                 // Tokio captures panic payload; extract a short message
                 // so the user sees what blew up without dragging the
@@ -1294,10 +1314,12 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 eprintln!("WARN: preset CRASHED: {msg}");
                 crashed.push(msg);
+                done += 1;
             }
             Err(e) => {
                 eprintln!("WARN: preset join error: {e}");
                 crashed.push(e.to_string());
+                done += 1;
             }
         }
     }
@@ -1491,6 +1513,24 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         let r = run_one(sd, sym, state_id, strategy, fees, skim, funding, sim_cfg).await;
         (display, r)
     }));
+}
+
+/// Compact ETA string for the per-preset progress line:
+/// `<5s` / `42s` / `5m12s` / `1h22m`. Anything < 1s rounds to `<1s`.
+fn format_eta(secs: f64) -> String {
+    if !secs.is_finite() || secs <= 0.0 {
+        return "<1s".to_string();
+    }
+    let s = secs as u64;
+    if s < 5 {
+        "<5s".to_string()
+    } else if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
 }
 
 /// Comma-separated row per preset, with a header line. Numeric columns
