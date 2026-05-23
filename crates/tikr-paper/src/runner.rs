@@ -433,6 +433,11 @@ where
     let mut sell_fills: u64 = 0;
     let mut buy_volume: Decimal = Decimal::ZERO;
     let mut sell_volume: Decimal = Decimal::ZERO;
+    // Peak absolute position notional (|size| × mid) seen during the
+    // run. Sampled on BookUpdate events so a strategy that grew to its
+    // cap then traded out still shows the high-water mark in the
+    // final report.
+    let mut peak_position_usdt: Decimal = Decimal::ZERO;
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
     let resumed_sim_duration_secs: u64 = resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
 
@@ -526,6 +531,9 @@ where
                 skim_total_usdt,
                 base_stacked,
                 &symbol,
+                buy_volume,
+                sell_volume,
+                peak_position_usdt,
             );
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
@@ -623,6 +631,13 @@ where
                     current_book = snapshot.clone();
                     if let (Some(b), Some(a)) = (snapshot.bids.first(), snapshot.asks.first()) {
                         last_mid = Price((b.price.0 + a.price.0) / Decimal::from(2));
+                        // Sample peak position notional at this fresh
+                        // mid. tracker.snapshot() is cheap (struct copy)
+                        // so once-per-book is fine even on chatty syms.
+                        let pos_notional = tracker.snapshot().size.0.abs() * last_mid.0;
+                        if pos_notional > peak_position_usdt {
+                            peak_position_usdt = pos_notional;
+                        }
                     }
                 }
 
@@ -1031,6 +1046,9 @@ where
                         skim_total_usdt,
                         base_stacked,
                         &symbol,
+                        buy_volume,
+                        sell_volume,
+                        peak_position_usdt,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1155,6 +1173,9 @@ where
                         skim_total_usdt,
                         base_stacked,
                         &symbol,
+                        buy_volume,
+                        sell_volume,
+                        peak_position_usdt,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1364,6 +1385,9 @@ where
         skim_total_usdt,
         base_stacked,
         &symbol,
+        buy_volume,
+        sell_volume,
+        peak_position_usdt,
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
@@ -1640,6 +1664,7 @@ async fn apply_fill(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn finalize(
     tracker: &PositionTracker,
     last_mid: Price,
@@ -1654,6 +1679,9 @@ fn finalize(
     skim_total_usdt: Decimal,
     base_stacked: Decimal,
     symbol: &Symbol,
+    buy_volume: Decimal,
+    sell_volume: Decimal,
+    peak_position_usdt: Decimal,
 ) -> PaperReport {
     let base = tracker.report(last_mid);
     let sim_duration_secs = match (first_event_ts, last_event_ts) {
@@ -1690,6 +1718,9 @@ fn finalize(
         } else {
             String::new()
         },
+        buy_volume_usdt: Notional(buy_volume),
+        sell_volume_usdt: Notional(sell_volume),
+        peak_position_usdt: Notional(peak_position_usdt),
     }
 }
 

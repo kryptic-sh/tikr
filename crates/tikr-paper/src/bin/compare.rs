@@ -853,11 +853,13 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
     println!("║  {body}  ║");
     println!("╚{bar}╝");
     println!(
-        "{:<10} {:>11} {:>9} {:<40}",
-        "symbol", "NET", "fills", "preset"
+        "{:<10} {:>11} {:>9} {:>10} {:>9} {:>7} {:<40}",
+        "symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset"
     );
-    println!("{}", "-".repeat(75));
+    println!("{}", "-".repeat(105));
     let mut total_net = 0.0;
+    let mut total_volume = 0.0;
+    let mut max_peak = 0.0;
     for (sym, results) in per_symbol {
         if let Some((name, report)) = results
             .iter()
@@ -868,20 +870,38 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
             })
         {
             let net = decimal_to_f64(&report.net.0);
+            let volume = decimal_to_f64(&report.buy_volume_usdt.0)
+                + decimal_to_f64(&report.sell_volume_usdt.0);
+            let peak = decimal_to_f64(&report.peak_position_usdt.0);
+            let roi = if peak > 0.0 {
+                format!("{:.3}", net / peak * 100.0)
+            } else {
+                "—".to_string()
+            };
             total_net += net;
+            total_volume += volume;
+            if peak > max_peak {
+                max_peak = peak;
+            }
             println!(
-                "{:<10} {:>11.4} {:>9} {:<40}",
-                sym, net, report.fills_emitted, name
+                "{:<10} {:>11.4} {:>9} {:>10.0} {:>9.0} {:>7} {:<40}",
+                sym, net, report.fills_emitted, volume, peak, roi, name
             );
         } else {
             println!(
-                "{:<10} {:>11} {:>9} {:<40}",
-                sym, "—", "—", "(no results)"
+                "{:<10} {:>11} {:>9} {:>10} {:>9} {:>7} {:<40}",
+                sym, "—", "—", "—", "—", "—", "(no results)"
             );
         }
     }
-    println!("{}", "-".repeat(75));
-    println!("{:<10} {:>11.4} {:>9}", "TOTAL", total_net, "");
+    println!("{}", "-".repeat(105));
+    // Total NET + summed volume. Peak shown as max-across-symbols
+    // (caps are per-symbol; summing implies all peaked simultaneously
+    // which would be misleading for capital-deployed reasoning).
+    println!(
+        "{:<10} {:>11.4} {:>9} {:>10.0} {:>9.0} {:>7} {:<40}",
+        "TOTAL", total_net, "", total_volume, max_peak, "(peak=max,vol=sum)", ""
+    );
 }
 
 async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -2143,7 +2163,7 @@ fn format_eta(secs: f64) -> String {
 /// basket-mode CSV streams stay row-addressable when concatenated.
 fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
     println!(
-        "symbol,preset,fills,fills_per_min,realized,unrealized,fees,net,dollars_per_fill"
+        "symbol,preset,fills,fills_per_min,volume_usdt,peak_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -2161,6 +2181,10 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
         } else {
             0.0
         };
+        let volume = decimal_to_f64(&r.buy_volume_usdt.0)
+            + decimal_to_f64(&r.sell_volume_usdt.0);
+        let peak = decimal_to_f64(&r.peak_position_usdt.0);
+        let roi = if peak > 0.0 { net / peak * 100.0 } else { 0.0 };
         // CSV escape: wrap preset name in quotes if it contains a comma.
         let safe_name = if name.contains(',') {
             format!("\"{}\"", name.replace('"', "\"\""))
@@ -2168,8 +2192,8 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             name.clone()
         };
         println!(
-            "{symbol},{safe_name},{},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6}",
-            r.fills_emitted, fpm, realized, unrealized, fees, net, per_fill,
+            "{symbol},{safe_name},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            r.fills_emitted, fpm, volume, peak, realized, unrealized, fees, net, per_fill, roi,
         );
     }
 }
@@ -2180,8 +2204,8 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
 fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!("### {symbol}");
     println!();
-    println!("| preset | fills | fills/min | realized | unrealized | fees | NET | $/fill |");
-    println!("|--------|------:|----------:|---------:|-----------:|-----:|----:|-------:|");
+    println!("| preset | fills | fills/min | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |");
+    println!("|--------|------:|----------:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|");
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
         let fpm = if sim_min > 0.0 {
@@ -2198,10 +2222,18 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
         } else {
             0.0
         };
+        let volume = decimal_to_f64(&r.buy_volume_usdt.0)
+            + decimal_to_f64(&r.sell_volume_usdt.0);
+        let peak = decimal_to_f64(&r.peak_position_usdt.0);
+        let roi = if peak > 0.0 {
+            format!("{:.3}", net / peak * 100.0)
+        } else {
+            "—".to_string()
+        };
         // Markdown escape: pipes inside cell text break the row.
         let safe_name = name.replace('|', "\\|");
         println!(
-            "| {safe_name} | {} | {:.2} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} |",
+            "| {safe_name} | {} | {:.2} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
             r.fills_emitted, fpm, realized, unrealized, fees, net, per_fill,
         );
     }
@@ -2329,11 +2361,14 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             "preset",
             "fills",
             "fills/min",
+            "volume",
+            "peak_pos",
             "realized",
             "unrealized",
             "fees",
             "NET",
             "$/fill",
+            "ROI%",
         ]);
         if baseline_net.is_some() {
             headers.push("ΔNET");
@@ -2351,15 +2386,29 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             } else {
                 0.0
             };
+            let volume = decimal_to_f64(&r.buy_volume_usdt.0)
+                + decimal_to_f64(&r.sell_volume_usdt.0);
+            let peak = decimal_to_f64(&r.peak_position_usdt.0);
+            // ROI% = NET / peak_position × 100 — return on the largest
+            // capital deployed at any moment. `—` when peak is zero
+            // (preset never opened a position).
+            let roi = if peak > 0.0 {
+                format!("{:.3}", net / peak * 100.0)
+            } else {
+                "—".to_string()
+            };
             let mut row = vec![
                 name.clone(),
                 r.fills_emitted.to_string(),
                 format!("{fpm:.2}"),
+                format!("{volume:.0}"),
+                format!("{peak:.0}"),
                 format!("{:.4}", decimal_to_f64(&r.realized.0)),
                 format!("{:.4}", decimal_to_f64(&r.unrealized.0)),
                 format!("{:.4}", decimal_to_f64(&r.fees.0)),
                 format!("{net:.4}"),
                 format!("{dpf:.5}"),
+                roi,
             ];
             if let Some(bn) = baseline_net {
                 let delta = net - bn;

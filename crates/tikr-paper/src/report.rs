@@ -65,6 +65,16 @@ pub struct PaperReport {
     /// Empty when skim disabled. For cross-base aggregates in
     /// [`crate::multi`], may be `"MIXED"`.
     pub base_asset: String,
+    /// Total Bid-side USDT notional crossed (sum of `price × size` for
+    /// every Bid fill the runner observed). Useful for backtests to
+    /// quantify deployed capital independent of NET / fees.
+    pub buy_volume_usdt: Notional,
+    /// Total Ask-side USDT notional crossed. See `buy_volume_usdt`.
+    pub sell_volume_usdt: Notional,
+    /// Peak absolute position value seen during the run, in USDT
+    /// (`|size| × last_mid` sampled on every event). Shows how close
+    /// the strategy came to its `max_position_usdt` cap.
+    pub peak_position_usdt: Notional,
 }
 
 // --- serde wire format ---------------------------------------------------
@@ -96,6 +106,12 @@ struct PaperReportWire {
     final_base_value: String,
     #[serde(default)]
     base_asset: String,
+    #[serde(default)]
+    buy_volume_usdt: String,
+    #[serde(default)]
+    sell_volume_usdt: String,
+    #[serde(default)]
+    peak_position_usdt: String,
 }
 
 impl Serialize for PaperReport {
@@ -118,6 +134,9 @@ impl Serialize for PaperReport {
             final_perp_balance: self.final_perp_balance.0.to_string(),
             final_base_value: self.final_base_value.0.to_string(),
             base_asset: self.base_asset.clone(),
+            buy_volume_usdt: self.buy_volume_usdt.0.to_string(),
+            sell_volume_usdt: self.sell_volume_usdt.0.to_string(),
+            peak_position_usdt: self.peak_position_usdt.0.to_string(),
         }
         .serialize(serializer)
     }
@@ -171,6 +190,21 @@ impl<'de> Deserialize<'de> for PaperReport {
                 parse(&wire.final_base_value)?
             },
             base_asset: wire.base_asset,
+            buy_volume_usdt: if wire.buy_volume_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.buy_volume_usdt)?
+            },
+            sell_volume_usdt: if wire.sell_volume_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.sell_volume_usdt)?
+            },
+            peak_position_usdt: if wire.peak_position_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.peak_position_usdt)?
+            },
         })
     }
 }

@@ -78,6 +78,9 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
     let mut total_base_stacked = Decimal::ZERO;
     let mut total_perp_balance = Decimal::ZERO;
     let mut total_base_value = Decimal::ZERO;
+    let mut total_buy_volume = Decimal::ZERO;
+    let mut total_sell_volume = Decimal::ZERO;
+    let mut max_peak_position = Decimal::ZERO;
     let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in reports {
         realized += r.realized.0;
@@ -94,6 +97,14 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         total_base_stacked += r.base_stacked.0;
         total_perp_balance += r.final_perp_balance.0;
         total_base_value += r.final_base_value.0;
+        total_buy_volume += r.buy_volume_usdt.0;
+        total_sell_volume += r.sell_volume_usdt.0;
+        // Peak across symbols is the MAX, not the sum (caps are
+        // per-symbol; summing implies all peaked simultaneously which
+        // is misleading for capital-deployed reasoning).
+        if r.peak_position_usdt.0 > max_peak_position {
+            max_peak_position = r.peak_position_usdt.0;
+        }
         if !r.base_asset.is_empty() {
             bases.insert(r.base_asset.as_str());
         }
@@ -124,5 +135,8 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         final_perp_balance: Notional(total_perp_balance),
         final_base_value: Notional(total_base_value),
         base_asset: aggregate_base,
+        buy_volume_usdt: Notional(total_buy_volume),
+        sell_volume_usdt: Notional(total_sell_volume),
+        peak_position_usdt: Notional(max_peak_position),
     }
 }
