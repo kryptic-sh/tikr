@@ -242,6 +242,15 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     lg_stop_loss_bps: u32,
 
+    /// SpreadScalp: keep the close-side passive quote alive even when
+    /// book spread falls below `min_spread_bps`, so a held position
+    /// can drain at maker fee once the cascade event that triggered
+    /// the entry cools off. Default `true`. Pass
+    /// `--spread-scalp-close-side-always-quotes=false` for the legacy
+    /// behaviour (both sides cancel when targets unavailable).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    spread_scalp_close_side_always_quotes: bool,
+
     /// LiqFade: directory holding `record_liquidations`-style parquet
     /// shards (per-day `YYYY-MM-DD/all_symbols.parquet`). Empty (default)
     /// disables LiqFade — the preset is skipped even when included in
@@ -1315,6 +1324,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                         } else {
                             tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled()
                         },
+                        close_side_always_quotes: args.spread_scalp_close_side_always_quotes,
                     }),
                     fees,
                     skim_cfg,

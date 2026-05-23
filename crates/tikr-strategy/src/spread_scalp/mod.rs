@@ -75,6 +75,15 @@ pub struct SpreadScalpConfig {
     /// exceeds `threshold_bps`. Set fields all to zero / disabled to
     /// keep the legacy fixed-threshold behaviour.
     pub adverse: AdverseConfig,
+    /// When `true` (default), the close-side passive quote stays alive
+    /// even when book spread is below `min_spread_bps`. Lets a held
+    /// position close at maker fee instead of drifting unhedged once
+    /// the cascade event that triggered the entry cools off.
+    /// Add-side (the side that would deepen inventory) still respects
+    /// the spread gate. `false` restores the legacy behaviour where
+    /// BOTH sides cancel when targets unavailable — useful for backtest
+    /// A/B but not recommended for live trading.
+    pub close_side_always_quotes: bool,
 }
 
 /// Spread scalping strategy state.
@@ -331,6 +340,76 @@ impl SpreadScalp {
             Vec::new()
         }
     }
+
+    /// Which side is the "closing" side for the current position. Long
+    /// → Ask reduces. Short → Bid reduces. Flat → None (nothing to
+    /// close). Used by `try_keep_close_side` to filter the cancel-when-
+    /// targets-unavailable path.
+    fn close_side_for(position_size: Decimal) -> Option<Side> {
+        if position_size > Decimal::ZERO {
+            Some(Side::Ask)
+        } else if position_size < Decimal::ZERO {
+            Some(Side::Bid)
+        } else {
+            None
+        }
+    }
+
+    /// When `compute_targets` returned None (spread below threshold)
+    /// AND we hold inventory AND `close_side_always_quotes` is on,
+    /// keep the close-side quote alive at the current touch (no
+    /// improve, no spread gate) so the position can close at maker
+    /// fee. Add-side gets cancelled.
+    ///
+    /// Returns `Some(actions)` when the close-side path engaged (a
+    /// quote was posted or kept alive + add-side cancelled). `None`
+    /// when the gate is off, the position is flat, or the book is
+    /// unusable — caller falls back to `cancel_if_live`.
+    fn try_keep_close_side(
+        &mut self,
+        ctx: &StrategyContext<'_>,
+        snapshot: &Snapshot,
+        ts: Timestamp,
+    ) -> Option<Vec<Action>> {
+        if !self.config.close_side_always_quotes {
+            return None;
+        }
+        let close_side = Self::close_side_for(ctx.position.size.0)?;
+        let top = Top::from_snapshot(snapshot)?;
+        // Use the closing-side touch — no 1-tick improve. We're not
+        // trying to scalp here, just sit at the front of the queue
+        // so a natural taker closes our position at maker fee.
+        let price = match close_side {
+            Side::Ask => top.ask,
+            Side::Bid => top.bid,
+        };
+        // Drop the add-side regardless of whether we already have one.
+        let add_side = match close_side {
+            Side::Ask => Side::Bid,
+            Side::Bid => Side::Ask,
+        };
+        let mut actions = self.drop_tracked_side(add_side);
+        // Mirror cancel_if_live's per-side bookkeeping for the side we
+        // just cancelled so the next refresh re-enters cleanly.
+        match add_side {
+            Side::Bid => self.last_bid = None,
+            Side::Ask => self.last_ask = None,
+        }
+        // Place / refresh the close-side quote.
+        let close_actions = self.diff_emit(ctx, close_side, price, Decimal::ONE);
+        actions.extend(close_actions);
+        // Stamp state: we still have at least the close side live.
+        // Reset last_requote_ts so the next spread-widening event can
+        // immediately switch back to full two-sided quoting without
+        // sitting behind requote_interval_ms.
+        self.last_requote_ts = Some(ts);
+        match close_side {
+            Side::Ask => self.last_ask = Some(price),
+            Side::Bid => self.last_bid = Some(price),
+        }
+        self.quotes_live = self.resting.current_for(close_side).is_some();
+        Some(actions)
+    }
 }
 
 impl Strategy for SpreadScalp {
@@ -442,6 +521,14 @@ impl Strategy for SpreadScalp {
                 self.clear_reject(fill.side);
                 self.resting.drop_side(fill.side);
                 let Some((bid, ask)) = self.compute_targets(ctx.latest_book) else {
+                    // Spread too tight for normal entry. If we hold
+                    // inventory + close_side_always_quotes is on, keep
+                    // the close-side passive quote alive so the
+                    // position can drain at maker fee; otherwise drop
+                    // everything.
+                    if let Some(actions) = self.try_keep_close_side(ctx, ctx.latest_book, ts) {
+                        return actions;
+                    }
                     return self.cancel_if_live(ts);
                 };
                 let size_mult = self.inventory_size_multiplier(ctx);
@@ -549,11 +636,18 @@ impl Strategy for SpreadScalp {
             }
         };
         let Some((bid, ask)) = self.compute_targets(snapshot) else {
-            // cancel_if_live might emit CancelAll; merge with any
-            // cap_cancels collected above so a cap-fired cancel isn't
-            // lost when the spread also closes.
+            // Spread below threshold. Try to keep the close-side
+            // passive quote alive (when configured + holding inventory)
+            // so the position doesn't sit naked once the cascade event
+            // that triggered the entry cools off; fall back to
+            // cancel_if_live when not applicable. cap_cancels merge
+            // preserved either way.
             let mut actions = cap_cancels;
-            actions.extend(self.cancel_if_live(ts));
+            if let Some(close_actions) = self.try_keep_close_side(ctx, snapshot, ts) {
+                actions.extend(close_actions);
+            } else {
+                actions.extend(self.cancel_if_live(ts));
+            }
             return actions;
         };
         if !self.should_requote(bid, ask, ts) {
@@ -587,6 +681,9 @@ impl Strategy for SpreadScalp {
         self.last_ask = None;
         self.last_requote_ts = None;
         let Some((bid, ask)) = self.compute_targets(ctx.latest_book) else {
+            if let Some(actions) = self.try_keep_close_side(ctx, ctx.latest_book, ts) {
+                return actions;
+            }
             return self.cancel_if_live(ts);
         };
         self.emit_requote(ctx, bid, ask, ts)
@@ -682,6 +779,11 @@ mod tests {
             take_profit_bps: 0,
             stop_loss_bps: 0,
             adverse: AdverseConfig::disabled(),
+            // Default-on in production; default-OFF in unit tests so
+            // existing flat-position cancel-on-tight-spread assertions
+            // don't regress. Tests that need the new behaviour can opt
+            // in by mutating this field on the config.
+            close_side_always_quotes: false,
         })
     }
 

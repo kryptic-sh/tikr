@@ -343,6 +343,7 @@ fn build_spread_scalp(
         } else {
             tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled()
         },
+        close_side_always_quotes: spread_scalp.close_side_always_quotes,
     }))
 }
 

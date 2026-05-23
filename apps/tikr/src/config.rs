@@ -477,6 +477,13 @@ pub struct SpreadScalpParams {
     /// Only used when `adverse_window_ms > 0`.
     #[serde(default = "spread_scalp_default_adverse_max_widen_bps")]
     pub adverse_max_widen_bps: u32,
+    /// Keep the close-side passive quote alive even when book spread
+    /// falls below `min_spread_bps`, so a held position can drain at
+    /// maker fee once the cascade event that triggered the entry cools
+    /// off. Default `true`. Set `false` for the legacy behaviour where
+    /// BOTH sides cancel when targets are unavailable.
+    #[serde(default = "spread_scalp_default_close_side_always_quotes")]
+    pub close_side_always_quotes: bool,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
@@ -496,6 +503,9 @@ fn spread_scalp_default_adverse_half_life() -> u32 {
 }
 fn spread_scalp_default_adverse_threshold_bps() -> Decimal {
     Decimal::from(3)
+}
+fn spread_scalp_default_close_side_always_quotes() -> bool {
+    true
 }
 fn spread_scalp_default_adverse_max_widen_bps() -> u32 {
     10
