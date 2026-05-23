@@ -12,6 +12,16 @@
 # wakes up on momentary widening bursts (news, liq cascades, low-volume
 # windows). Expect long idle stretches between fills on BTC/ETH; DOGE
 # will be the most active.
+#
+# ─── Stage 4-6 knobs ──────────────────────────────────────────────────────
+# After the refactor, the per-bot block accepts:
+#   take_profit_bps         (preferred over `take_profit_usdt`; bps-of-notional)
+#   stop_loss_bps           (new — bounded downside, IOC-flatten at touch)
+#   price_tolerance_ticks   (skip requote within ±N ticks; default 1)
+#   adverse_window_ms       (>0 turns on dynamic min_spread widening)
+#   adverse_half_life_fills, adverse_threshold_bps, adverse_max_widen_bps
+#
+# Defaults are listed at the bottom of this file.
 
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
@@ -28,7 +38,9 @@ order_balance_pct = "1"
 # ─── BTCUSDT ───────────────────────────────────────────────────────────────
 #
 # Typical spread 0.5-1 bps; will fire only on widening events. High
-# `min_spread_bps` to avoid losing money on fees alone.
+# `min_spread_bps` to avoid losing money on fees alone. TP at 5 bps of
+# position notional (~$0.0125 per $25 notional) locks tiny wins fast;
+# SL at 20 bps caps a bad fill at $0.05 before it grows.
 
 [[bot]]
 symbol = "BTCUSDT"
@@ -39,8 +51,10 @@ notional             = 25
 min_spread_bps       = 5
 requote_interval_ms  = 1000
 max_position_usdt    = 100
-take_profit_usdt     = 0.50
 reject_cooldown_ms   = 2000
+price_tolerance_ticks = 1
+take_profit_bps      = 5      # bps of position notional — replaces take_profit_usdt
+stop_loss_bps        = 20     # IOC-flatten on adverse 20bps drift
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────
@@ -54,8 +68,10 @@ notional             = 25
 min_spread_bps       = 5
 requote_interval_ms  = 1000
 max_position_usdt    = 100
-take_profit_usdt     = 0.50
 reject_cooldown_ms   = 2000
+price_tolerance_ticks = 1
+take_profit_bps      = 5
+stop_loss_bps        = 20
 
 
 # ─── BNBUSDT ───────────────────────────────────────────────────────────────
@@ -69,8 +85,10 @@ notional             = 25
 min_spread_bps       = 6
 requote_interval_ms  = 1000
 max_position_usdt    = 100
-take_profit_usdt     = 0.50
 reject_cooldown_ms   = 2000
+price_tolerance_ticks = 1
+take_profit_bps      = 6
+stop_loss_bps        = 24
 
 
 # ─── SOLUSDT ───────────────────────────────────────────────────────────────
@@ -84,15 +102,21 @@ notional             = 25
 min_spread_bps       = 6
 requote_interval_ms  = 1000
 max_position_usdt    = 100
-take_profit_usdt     = 0.50
 reject_cooldown_ms   = 2000
+price_tolerance_ticks = 1
+take_profit_bps      = 6
+stop_loss_bps        = 24
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
 #
 # Wider native spread (3-5 bps typical) — most active SS bot in the
 # basket. Bumped `min_spread_bps=8` so accepted fills clear fees with
-# meaningful capture.
+# meaningful capture. Adverse-selection tracker turned ON here:
+# DOGE sees the most toxic flow in the basket (retail-driven, illiquid
+# enough for whales to walk the book). When the rolling EMA of post-fill
+# adverse drift exceeds 3 bps, `min_spread_bps` widens by `(ema - 3)`
+# capped at +10 bps — bot quotes less but cleaner during toxic bursts.
 
 [[bot]]
 symbol = "DOGEUSDT"
@@ -103,15 +127,29 @@ notional             = 25
 min_spread_bps       = 8
 requote_interval_ms  = 1000
 max_position_usdt    = 100
-take_profit_usdt     = 1.0
 reject_cooldown_ms   = 2000
+price_tolerance_ticks = 1
+take_profit_bps      = 8
+stop_loss_bps        = 30
+# Adverse-selection tracker (Stage 6): set window > 0 to enable.
+adverse_window_ms          = 5000
+adverse_half_life_fills    = 10
+adverse_threshold_bps      = "3"
+adverse_max_widen_bps      = 10
 
 
-# Defaults reference (uncomment to override):
-# tick_size            = "0.0001"  # optional; auto-detected from exchangeInfo
-# notional             = 25        # fiat $ per order
-# min_spread_bps       = 5         # minimum market spread to quote
-# requote_interval_ms  = 1000      # fixed requote interval
-# max_position_usdt    = 0         # 0 = uncapped (use balance × leverage)
-# take_profit_usdt     = 0         # 0 = TP disabled
-# reject_cooldown_ms   = 2000      # 0 = no cooldown (legacy)
+# ─── Defaults reference ───────────────────────────────────────────────────
+# tick_size                = "0.0001"  # auto-detected from exchangeInfo
+# notional                 = 25        # fiat $ per order
+# min_spread_bps           = 5         # minimum market spread to quote
+# requote_interval_ms      = 1000      # fixed requote interval
+# max_position_usdt        = 0         # 0 = uncapped (uses balance × leverage)
+# take_profit_usdt         = 0         # legacy abs USDT; falls back when bps == 0
+# take_profit_bps          = 0         # bps of position notional (preferred)
+# stop_loss_bps            = 0         # bps of position notional
+# reject_cooldown_ms       = 2000      # 0 = no per-side cooldown
+# price_tolerance_ticks    = 1         # 0 = exact match required
+# adverse_window_ms        = 0         # 0 = adverse tracker disabled
+# adverse_half_life_fills  = 10
+# adverse_threshold_bps    = "3"
+# adverse_max_widen_bps    = 10

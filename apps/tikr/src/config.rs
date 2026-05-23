@@ -328,6 +328,35 @@ pub struct SpreadScalpParams {
     /// rebuild is allowed. Default 2000 mirrors SG. 0 disables.
     #[serde(default = "spread_scalp_default_reject_cooldown_ms")]
     pub reject_cooldown_ms: u64,
+    /// Per-side requote price tolerance in ticks. 0 = exact-price
+    /// match required for skip; 1-2 absorbs micro-mid jitter. Default 1.
+    #[serde(default = "spread_scalp_default_price_tolerance_ticks")]
+    pub price_tolerance_ticks: u32,
+    /// Take-profit threshold in bps of position notional (entry × qty).
+    /// When non-zero, wins over `take_profit_usdt`. 0 = disabled.
+    #[serde(default)]
+    pub take_profit_bps: u32,
+    /// Stop-loss threshold in bps of position notional. 0 = disabled.
+    /// Fires an IOC at the opposing touch on every event.
+    #[serde(default)]
+    pub stop_loss_bps: u32,
+    /// Adverse-selection window for dynamic min_spread widening, in ms.
+    /// 0 = adverse tracker disabled (legacy fixed-threshold behaviour).
+    #[serde(default)]
+    pub adverse_window_ms: u64,
+    /// EMA half-life in fills for the adverse-drift average.
+    /// Only used when `adverse_window_ms > 0`.
+    #[serde(default = "spread_scalp_default_adverse_half_life")]
+    pub adverse_half_life_fills: u32,
+    /// Adverse-drift threshold in bps. EMA above this widens
+    /// `min_spread_bps` by `(ema - threshold)` capped at
+    /// `adverse_max_widen_bps`. Only used when `adverse_window_ms > 0`.
+    #[serde(default = "spread_scalp_default_adverse_threshold_bps")]
+    pub adverse_threshold_bps: Decimal,
+    /// Cap on the dynamic `min_spread_bps` surcharge in bps.
+    /// Only used when `adverse_window_ms > 0`.
+    #[serde(default = "spread_scalp_default_adverse_max_widen_bps")]
+    pub adverse_max_widen_bps: u32,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
@@ -338,6 +367,18 @@ fn spread_scalp_default_requote_interval_ms() -> u64 {
 }
 fn spread_scalp_default_reject_cooldown_ms() -> u64 {
     2000
+}
+fn spread_scalp_default_price_tolerance_ticks() -> u32 {
+    1
+}
+fn spread_scalp_default_adverse_half_life() -> u32 {
+    10
+}
+fn spread_scalp_default_adverse_threshold_bps() -> Decimal {
+    Decimal::from(3)
+}
+fn spread_scalp_default_adverse_max_widen_bps() -> u32 {
+    10
 }
 
 /// Parse a TOML config file.

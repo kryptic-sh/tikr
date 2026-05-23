@@ -280,10 +280,19 @@ fn build_spread_scalp(
         },
         take_profit_usdt: spread_scalp.take_profit_usdt,
         reject_cooldown_ms: spread_scalp.reject_cooldown_ms,
-            price_tolerance_ticks: 1,
-            take_profit_bps: 0,
-            stop_loss_bps: 0,
-            adverse: tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled(),
+        price_tolerance_ticks: spread_scalp.price_tolerance_ticks,
+        take_profit_bps: spread_scalp.take_profit_bps,
+        stop_loss_bps: spread_scalp.stop_loss_bps,
+        adverse: if spread_scalp.adverse_window_ms > 0 {
+            tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig {
+                snapshot_window_ms: spread_scalp.adverse_window_ms,
+                ema_half_life_fills: spread_scalp.adverse_half_life_fills,
+                threshold_bps: spread_scalp.adverse_threshold_bps,
+                max_widen_bps: spread_scalp.adverse_max_widen_bps,
+            }
+        } else {
+            tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled()
+        },
     }))
 }
 
