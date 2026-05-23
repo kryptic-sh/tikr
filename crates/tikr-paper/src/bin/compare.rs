@@ -926,6 +926,26 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
         "parquet load done"
     );
 
+    // Spread-gate pre-check: scan the loaded book to derive `(median, max)`
+    // observed top-of-book spread in bps. Any spread-gated preset whose
+    // `min_spread_bps` exceeds the max-observed spread provably never
+    // satisfies its gate on this dataset, so the runner pre-skips it +
+    // prints a one-line summary instead of spawning a guaranteed 0-fill
+    // task. `max_observed_spread_bps` is `Decimal::ZERO` when the dataset
+    // has no completed snapshots (heartbeat-only fixtures).
+    let (median_spread_bps, max_observed_spread_bps) = shared_data
+        .book_spread_stats_bps()
+        .map(|(m, x)| (m, x))
+        .unwrap_or((Decimal::ZERO, Decimal::ZERO));
+    if max_observed_spread_bps > Decimal::ZERO {
+        info!(
+            median_bps = %median_spread_bps,
+            max_bps = %max_observed_spread_bps,
+            "book spread profile (presets with min_spread_bps > max will be skipped)"
+        );
+    }
+    let mut skipped_presets: Vec<String> = Vec::new();
+
     // Build all preset handles up front; each runs as a tokio task. The
     // multi-thread runtime fans them across cores. State dirs are unique
     // per preset (derived from the preset name) so concurrent snapshot /
@@ -1340,6 +1360,14 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
     if included("spread-scalp", &allow) || included("spread-scalp-old", &allow) {
         let spread_scalp_spread_sweep = parse_decimal_list(&args.spread_scalp_min_spread_bps_list)?;
         for &min_spread_bps in &spread_scalp_spread_sweep {
+            // Pre-skip: gate above max observed spread → 0-fill guaranteed.
+            if max_observed_spread_bps > Decimal::ZERO
+                && min_spread_bps > max_observed_spread_bps
+            {
+                skipped_presets
+                    .push(format!("SpreadScalp(*) spread>={min_spread_bps}bps"));
+                continue;
+            }
             if included("spread-scalp", &allow) {
                 let label = format!("SpreadScalp spread>={min_spread_bps}bps");
                 spawn_preset(
@@ -1514,6 +1542,12 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                         let label = format!(
                             "Hawk lv={levels} in={inner} st={step} ms={min_spread}"
                         );
+                        if max_observed_spread_bps > Decimal::ZERO
+                            && min_spread > max_observed_spread_bps
+                        {
+                            skipped_presets.push(label);
+                            continue;
+                        }
                         spawn_preset(
                             &mut handles,
                             &shared_data,
@@ -1587,6 +1621,17 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
 
     let sweep_start = std::time::Instant::now();
     let total = handles.len();
+    if !skipped_presets.is_empty() {
+        eprintln!(
+            "pre-skip: {} preset(s) gated above max-observed spread (median={}bps, max={}bps) — skipping:",
+            skipped_presets.len(),
+            median_spread_bps.round_dp(3),
+            max_observed_spread_bps.round_dp(3)
+        );
+        for name in &skipped_presets {
+            eprintln!("  - {name}");
+        }
+    }
     info!(presets = total, "awaiting parallel preset completion");
     let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(total);
     let mut crashed: Vec<String> = Vec::new();

@@ -226,6 +226,84 @@ impl LoadedReplayData {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// `(median, max)` observed top-of-book spread in bps across all completed
+    /// snapshots in the loaded stream. Used by sweep callers (e.g. `compare`)
+    /// to pre-skip spread-gated presets whose `min_spread_bps` exceeds the
+    /// realistic book spread for the symbol — saves wall-time on doomed
+    /// 0-fill runs.
+    ///
+    /// Filter rule: a preset with `min_spread_bps > max` provably never
+    /// satisfies its gate in this dataset, so the runner can skip it before
+    /// spawning.
+    ///
+    /// Returns `None` when no completed snapshot has both sides populated.
+    pub fn book_spread_stats_bps(&self) -> Option<(Decimal, Decimal)> {
+        let tick = self.cfg.tick_size;
+        let mut books: Vec<BookState> = (0..self.cfg.symbols.len().max(1))
+            .map(|_| BookState::default())
+            .collect();
+        let mut samples: Vec<Decimal> = Vec::new();
+        let push_sample = |book: &BookState, samples: &mut Vec<Decimal>| {
+            if let (Some((bid_ticks, _)), Some((ask_ticks, _))) =
+                (book.bids.iter().next_back(), book.asks.iter().next())
+            {
+                let bid_px = Decimal::from(*bid_ticks) * tick;
+                let ask_px = Decimal::from(*ask_ticks) * tick;
+                if bid_px > Decimal::ZERO && ask_px > bid_px {
+                    let mid = (bid_px + ask_px) / Decimal::from(2);
+                    let spread_bps = (ask_px - bid_px) / mid * Decimal::from(10_000);
+                    samples.push(spread_bps);
+                }
+            }
+        };
+        for ev in &self.events {
+            if let EventPayload::BookDelta {
+                side,
+                price_ticks,
+                size,
+                ..
+            } = &ev.payload
+            {
+                let book = &mut books[ev.symbol_idx];
+                // ts boundary → previous snapshot is complete; sample it.
+                if ev.ts_ns != book.last_applied_ts {
+                    push_sample(book, &mut samples);
+                    book.bids.clear();
+                    book.asks.clear();
+                    book.last_applied_ts = ev.ts_ns;
+                }
+                let levels = if *side == 0 {
+                    &mut book.bids
+                } else {
+                    &mut book.asks
+                };
+                if size.is_zero() {
+                    levels.remove(price_ticks);
+                } else {
+                    let price = Price(Decimal::from(*price_ticks) * tick);
+                    levels.insert(
+                        *price_ticks,
+                        Level {
+                            price,
+                            size: Size(*size),
+                        },
+                    );
+                }
+            }
+        }
+        // Flush the final snapshot.
+        for book in &books {
+            push_sample(book, &mut samples);
+        }
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort();
+        let median = samples[samples.len() / 2];
+        let max = *samples.last().unwrap();
+        Some((median, max))
+    }
 }
 
 /// Parquet-backed [`Replay`] implementation.
