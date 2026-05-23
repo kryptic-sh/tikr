@@ -1682,6 +1682,67 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!();
 }
 
+/// MySQL-CLI-style table renderer:
+///
+/// ```text
+/// +-----------+-------+
+/// | preset    | fills |
+/// +-----------+-------+
+/// | LG b=6 v=2|    29 |
+/// +-----------+-------+
+/// ```
+///
+/// First column is left-aligned (the preset name); remaining columns
+/// are right-aligned (numerics). Column widths grow to fit the widest
+/// cell in each. Headers + body must have the same column count.
+fn render_mysql_table(headers: &[&str], rows: &[Vec<String>]) {
+    let cols = headers.len();
+    if cols == 0 {
+        return;
+    }
+    let widths: Vec<usize> = (0..cols)
+        .map(|i| {
+            let h = headers[i].len();
+            rows.iter()
+                .map(|r| r.get(i).map(String::len).unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+                .max(h)
+        })
+        .collect();
+    // Border: `+-(w+2)-+...+`
+    let mut border = String::from("+");
+    for &w in &widths {
+        border.push_str(&"-".repeat(w + 2));
+        border.push('+');
+    }
+    // Format one row given alignment per col (true = right, false = left).
+    let row_line = |cells: &[String], rights: &[bool]| -> String {
+        let mut s = String::from("|");
+        for ((cell, w), right) in cells.iter().zip(widths.iter()).zip(rights.iter()) {
+            if *right {
+                s.push_str(&format!(" {:>w$} |", cell, w = w));
+            } else {
+                s.push_str(&format!(" {:<w$} |", cell, w = w));
+            }
+        }
+        s
+    };
+    // Header: all left-aligned (matches MySQL).
+    let header_align = vec![false; cols];
+    // Body: column 0 left, rest right.
+    let mut body_align = vec![true; cols];
+    body_align[0] = false;
+    let header_cells: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
+    println!("{border}");
+    println!("{}", row_line(&header_cells, &header_align));
+    println!("{border}");
+    for row in rows {
+        println!("{}", row_line(row, &body_align));
+    }
+    println!("{border}");
+}
+
 fn print_table(results: &[(String, PaperReport)]) {
     let skim_active = results
         .iter()
@@ -1700,39 +1761,45 @@ fn print_table(results: &[(String, PaperReport)]) {
         })
         .unwrap_or_else(|| "base stack".to_string());
 
-    // Compute the actual preset-name column width from the data so long
-    // labels (e.g. SG with custom scaler knobs) don't spill past the
-    // column and break alignment for subsequent shorter rows. Floor at
-    // the header width "preset" + 2 spacing, cap at 80 chars to avoid
-    // pathological wraps on narrow terminals.
-    let name_width = results
-        .iter()
-        .map(|(n, _)| n.len())
-        .max()
-        .unwrap_or(0)
-        .max("preset".len())
-        .min(80);
-    println!();
+    // Build header + rows as Vec<Vec<String>> so a generic MySQL-style
+    // renderer can compute column widths and draw the table once.
+    let mut headers: Vec<&str> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(results.len());
     if skim_active {
-        let header = format!(
-            "{:<nw$} {:>7} {:>9} {:>11} {:>11} {:>6} {:>11} {:>12} {:>12}",
+        headers.extend([
             "preset",
             "fills",
             "fills/min",
             "realized",
             "fees",
             "skims",
-            base_label,
+            base_label.as_str(),
             "perp+unreal",
             "TOTAL ACCT",
-            nw = name_width,
-        );
-        let bar = "-".repeat(header.len());
-        println!("{header}");
-        println!("{bar}");
+        ]);
+        for (name, r) in results {
+            let sim_min = (r.sim_duration_secs as f64) / 60.0;
+            let fpm = if sim_min > 0.0 {
+                r.fills_emitted as f64 / sim_min
+            } else {
+                0.0
+            };
+            let perp = decimal_to_f64(&r.final_perp_balance.0);
+            let btc_v = decimal_to_f64(&r.final_base_value.0);
+            rows.push(vec![
+                name.clone(),
+                r.fills_emitted.to_string(),
+                format!("{fpm:.2}"),
+                format!("{:.4}", decimal_to_f64(&r.realized.0)),
+                format!("{:.4}", decimal_to_f64(&r.fees.0)),
+                r.skim_count.to_string(),
+                format!("{:.6}", decimal_to_f64(&r.base_stacked.0)),
+                format!("{perp:.4}"),
+                format!("{:.4}", perp + btc_v),
+            ]);
+        }
     } else {
-        let header = format!(
-            "{:<nw$} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11} {:>11}",
+        headers.extend([
             "preset",
             "fills",
             "fills/min",
@@ -1741,60 +1808,38 @@ fn print_table(results: &[(String, PaperReport)]) {
             "fees",
             "NET",
             "$/fill",
-            nw = name_width,
-        );
-        let bar = "-".repeat(header.len());
-        println!("{header}");
-        println!("{bar}");
-    }
-    for (name, r) in results {
-        // Use sim_duration (data-time span) not runtime_secs (wall-clock
-        // replay speed) so fills/min reflects market-time throughput.
-        let sim_min = (r.sim_duration_secs as f64) / 60.0;
-        let fills_per_min = if sim_min > 0.0 {
-            r.fills_emitted as f64 / sim_min
-        } else {
-            0.0
-        };
-        let net = decimal_to_f64(&r.net.0);
-        if skim_active {
-            let perp = decimal_to_f64(&r.final_perp_balance.0);
-            let btc_v = decimal_to_f64(&r.final_base_value.0);
-            let total = perp + btc_v;
-            println!(
-                "{:<nw$} {:>7} {:>9.2} {:>11.4} {:>11.4} {:>6} {:>10.6} {:>12.4} {:>12.4}",
-                name,
-                r.fills_emitted,
-                fills_per_min,
-                decimal_to_f64(&r.realized.0),
-                decimal_to_f64(&r.fees.0),
-                r.skim_count,
-                decimal_to_f64(&r.base_stacked.0),
-                perp,
-                total,
-                nw = name_width,
-            );
-        } else {
-            let dollars_per_fill = if r.fills_emitted > 0 {
+        ]);
+        for (name, r) in results {
+            let sim_min = (r.sim_duration_secs as f64) / 60.0;
+            let fpm = if sim_min > 0.0 {
+                r.fills_emitted as f64 / sim_min
+            } else {
+                0.0
+            };
+            let net = decimal_to_f64(&r.net.0);
+            let dpf = if r.fills_emitted > 0 {
                 net / r.fills_emitted as f64
             } else {
                 0.0
             };
-            println!(
-                "{:<nw$} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.4} {:>11.5}",
-                name,
-                r.fills_emitted,
-                fills_per_min,
-                decimal_to_f64(&r.realized.0),
-                decimal_to_f64(&r.unrealized.0),
-                decimal_to_f64(&r.fees.0),
-                net,
-                dollars_per_fill,
-                nw = name_width,
-            );
+            rows.push(vec![
+                name.clone(),
+                r.fills_emitted.to_string(),
+                format!("{fpm:.2}"),
+                format!("{:.4}", decimal_to_f64(&r.realized.0)),
+                format!("{:.4}", decimal_to_f64(&r.unrealized.0)),
+                format!("{:.4}", decimal_to_f64(&r.fees.0)),
+                format!("{net:.4}"),
+                format!("{dpf:.5}"),
+            ]);
         }
     }
     println!();
+    render_mysql_table(&headers, &rows);
+    // Stash name_width for the best/worst footer alignment below.
+    let name_width = headers[0]
+        .len()
+        .max(rows.iter().map(|r| r[0].len()).max().unwrap_or(0));
     // Footer: best/worst NET.
     if let (Some(best), Some(worst)) = (
         results.iter().max_by(|a, b| {
