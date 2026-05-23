@@ -101,6 +101,45 @@ pub async fn subscribe_liquidations(
     Ok(Box::pin(boxed))
 }
 
+/// Subscribe to `!forceOrder@arr` and forward filtered events to an
+/// unbounded channel as [`tikr_core::LiqEvent`]s. The filter matches
+/// the raw Binance symbol string (e.g. `"BTCUSDT"`) — events for other
+/// symbols are dropped silently.
+///
+/// The returned receiver is the shape `tikr_paper::spawn_bot` expects
+/// as `external_liqs`. The spawned forwarder task exits on receiver
+/// drop. Failure to subscribe returns the same `VenueError::Rejected`
+/// as [`subscribe_liquidations`] (non-mainnet env, etc.).
+pub async fn subscribe_liq_fade(
+    env: BinanceEnv,
+    symbol_filter: String,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<tikr_core::LiqEvent>, VenueError> {
+    let mut upstream = subscribe_liquidations(env).await?;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<tikr_core::LiqEvent>();
+    tokio::spawn(async move {
+        while let Some(ev) = upstream.next().await {
+            if ev.symbol != symbol_filter {
+                continue;
+            }
+            // Repack the venue type into the strategy-side type.
+            // `LiquidationEvent` carries `symbol` + bare `Decimal`s;
+            // `LiqEvent` is single-symbol and uses typed wrappers.
+            let liq = tikr_core::LiqEvent {
+                ts: ev.ts,
+                side: ev.side,
+                qty: tikr_core::Size(ev.qty),
+                price: ev.price,
+                notional: tikr_core::Notional(ev.notional),
+            };
+            if tx.send(liq).is_err() {
+                // Runner dropped the receiver — quit silently.
+                break;
+            }
+        }
+    });
+    Ok(rx)
+}
+
 /// Build the `!forceOrder@arr` WS URL for the given env.
 ///
 /// Only `FuturesMainnet` is meaningful; other variants are included for

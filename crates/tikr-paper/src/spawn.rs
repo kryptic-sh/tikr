@@ -131,6 +131,7 @@ pub fn spawn_bot<V>(
     spec: BotSpec,
     venue: V,
     external_fills: Option<mpsc::UnboundedReceiver<Fill>>,
+    external_liqs: Option<mpsc::UnboundedReceiver<tikr_core::LiqEvent>>,
 ) -> BotHandle
 where
     V: Venue + Send + 'static,
@@ -315,14 +316,12 @@ where
                     .await
                 }
                 StrategyChoice::LiqFade(cfg) => {
-                    // Live LiqFade requires the runner to be fed
-                    // from a `@forceOrder` subscription task. The
-                    // wiring for that lands when the dashboard adds
-                    // per-bot liq channels (issue: TODO). For now
-                    // this arm passes `None` so the strategy compiles
-                    // + runs but sees no liq events — effectively
-                    // an Idle no-op. Backtest mode wires through
-                    // `compare_strategies` directly.
+                    // Live LiqFade consumes the `external_liqs`
+                    // channel — caller spawns the venue-side
+                    // `@forceOrder` subscription task and forwards
+                    // events here. Backtest mode (compare_strategies)
+                    // pre-loads the channel from
+                    // `LiqEventStream::into_events()`.
                     let strategy = LiqFade::new(cfg);
                     run_with_resume(
                         venue,
@@ -335,7 +334,7 @@ where
                         None,
                         None,
                         external_fills,
-                        None,
+                        external_liqs,
                     )
                     .await
                 }

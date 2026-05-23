@@ -192,7 +192,35 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         max_pos_default,
     )?;
     info!(strategy = %spec.strategy.label(), default_notional = %default_notional, "spawning bot");
-    let handle = tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx));
+    // LiqFade needs the `@forceOrder` mainnet stream. For other
+    // strategies the channel is unused, so we only subscribe when the
+    // strategy is liq-fade AND env is futures-mainnet (testnet returns
+    // an error from `subscribe_liq_fade`).
+    let external_liqs = if spec.strategy.label() == "liq-fade"
+        && ctx.env == tikr_binance::BinanceEnv::FuturesMainnet
+    {
+        let raw_symbol = format!(
+            "{}{}",
+            spec.symbol.base.0.as_ref(),
+            spec.symbol.quote.0.as_ref()
+        )
+        .to_uppercase();
+        match tikr_binance::liquidation_stream::subscribe_liq_fade(ctx.env, raw_symbol.clone())
+            .await
+        {
+            Ok(rx) => {
+                info!(symbol = %raw_symbol, "subscribed @forceOrder for LiqFade");
+                Some(rx)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "subscribe_liq_fade failed — LiqFade will see no liqs");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let handle = tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx), external_liqs);
     Ok(SpawnedBot {
         handle,
         us_shutdown_tx,
