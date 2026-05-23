@@ -60,6 +60,14 @@ struct Args {
     #[arg(long, default_value = "")]
     symbols_filter: String,
 
+    /// Output format: `table` (default, pretty-aligned columns), `csv`
+    /// (one row per preset, header on first line), or `markdown`
+    /// (pipe-separated table). CSV is suitable for piping into
+    /// spreadsheets or downstream plotting; markdown for pasting into
+    /// commit messages or Github discussions.
+    #[arg(long, default_value = "table")]
+    output: String,
+
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
     size: String,
@@ -1288,7 +1296,11 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "all presets done"
     );
 
-    print_table(&results);
+    match args.output.as_str() {
+        "csv" => print_csv(&args.symbol, &results),
+        "markdown" | "md" => print_markdown(&args.symbol, &results),
+        _ => print_table(&results),
+    }
     if !crashed.is_empty() {
         eprintln!("\n{} preset(s) CRASHED during sweep:", crashed.len());
         for (i, msg) in crashed.iter().enumerate() {
@@ -1445,6 +1457,77 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         let r = run_one(sd, sym, state_id, strategy, fees, skim, funding, sim_cfg).await;
         (display, r)
     }));
+}
+
+/// Comma-separated row per preset, with a header line. Numeric columns
+/// emit decimals (no formatting) so downstream tooling can parse without
+/// stripping currency symbols. `symbol` is repeated on every row so
+/// basket-mode CSV streams stay row-addressable when concatenated.
+fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
+    println!(
+        "symbol,preset,fills,fills_per_min,realized,unrealized,fees,net,dollars_per_fill"
+    );
+    for (name, r) in results {
+        let sim_min = (r.sim_duration_secs as f64) / 60.0;
+        let fpm = if sim_min > 0.0 {
+            r.fills_emitted as f64 / sim_min
+        } else {
+            0.0
+        };
+        let realized = decimal_to_f64(&r.realized.0);
+        let unrealized = decimal_to_f64(&r.unrealized.0);
+        let fees = decimal_to_f64(&r.fees.0);
+        let net = decimal_to_f64(&r.net.0);
+        let per_fill = if r.fills_emitted > 0 {
+            net / r.fills_emitted as f64
+        } else {
+            0.0
+        };
+        // CSV escape: wrap preset name in quotes if it contains a comma.
+        let safe_name = if name.contains(',') {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        } else {
+            name.clone()
+        };
+        println!(
+            "{symbol},{safe_name},{},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            r.fills_emitted, fpm, realized, unrealized, fees, net, per_fill,
+        );
+    }
+}
+
+/// Github-flavoured Markdown table — paste-friendly for commit messages
+/// or PR descriptions. Numeric formatting matches the table printer's
+/// columns but with `|` separators + a header underline row.
+fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
+    println!("### {symbol}");
+    println!();
+    println!("| preset | fills | fills/min | realized | unrealized | fees | NET | $/fill |");
+    println!("|--------|------:|----------:|---------:|-----------:|-----:|----:|-------:|");
+    for (name, r) in results {
+        let sim_min = (r.sim_duration_secs as f64) / 60.0;
+        let fpm = if sim_min > 0.0 {
+            r.fills_emitted as f64 / sim_min
+        } else {
+            0.0
+        };
+        let realized = decimal_to_f64(&r.realized.0);
+        let unrealized = decimal_to_f64(&r.unrealized.0);
+        let fees = decimal_to_f64(&r.fees.0);
+        let net = decimal_to_f64(&r.net.0);
+        let per_fill = if r.fills_emitted > 0 {
+            net / r.fills_emitted as f64
+        } else {
+            0.0
+        };
+        // Markdown escape: pipes inside cell text break the row.
+        let safe_name = name.replace('|', "\\|");
+        println!(
+            "| {safe_name} | {} | {:.2} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} |",
+            r.fills_emitted, fpm, realized, unrealized, fees, net, per_fill,
+        );
+    }
+    println!();
 }
 
 fn print_table(results: &[(String, PaperReport)]) {
