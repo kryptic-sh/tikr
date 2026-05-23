@@ -10,6 +10,7 @@
 #![deny(missing_docs)]
 
 pub mod fill_sim;
+pub mod liq_replay;
 pub mod pnl;
 pub mod replay;
 pub mod runner;
