@@ -31,6 +31,7 @@
 
 pub mod avellaneda_stoikov;
 pub mod glft;
+pub mod hawk;
 pub mod ladder_reentry;
 pub mod layered_grid;
 pub mod liq_fade;
@@ -46,6 +47,7 @@ pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
 pub use glft::{Glft, GlftConfig};
+pub use hawk::{Hawk, HawkConfig};
 pub use ladder_reentry::{LadderReentry, LadderReentryConfig};
 pub use layered_grid::{LayeredGrid, LayeredGridConfig};
 pub use liq_fade::{LiqFade, LiqFadeConfig};

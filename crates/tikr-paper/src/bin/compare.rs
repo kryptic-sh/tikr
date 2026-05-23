@@ -19,8 +19,8 @@ use tikr_core::{
 };
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LadderReentry,
-    LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, Hawk, HawkConfig,
+    LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
     MicroMeanReversion, MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap,
     SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy,
     TopOfBook, TopOfBookConfig,
@@ -309,6 +309,44 @@ struct Args {
     #[arg(long, default_value = "0")]
     liq_max_pos_usdt: String,
 
+    /// Hawk: fiat notional per quote level.
+    #[arg(long, default_value = "100")]
+    hawk_notional: String,
+
+    /// Hawk: comma-separated `levels_per_side` sweep.
+    #[arg(long, default_value = "2,3")]
+    hawk_levels_list: String,
+
+    /// Hawk: comma-separated `inner_bps` sweep.
+    #[arg(long, default_value = "3,5")]
+    hawk_inner_bps_list: String,
+
+    /// Hawk: comma-separated `step_bps` sweep.
+    #[arg(long, default_value = "2,3")]
+    hawk_step_bps_list: String,
+
+    /// Hawk: comma-separated `min_spread_bps` sweep — the spread gate
+    /// that decides hot vs cold mode.
+    #[arg(long, default_value = "3,5")]
+    hawk_min_spread_bps_list: String,
+
+    /// Hawk: hard inventory cap in USDT notional.
+    #[arg(long, default_value = "200")]
+    hawk_max_pos_usdt: String,
+
+    /// Hawk: close-side target offset (bps from avg_entry) in cold
+    /// mode. `0` (default) falls back to `min_spread_bps`.
+    #[arg(long, default_value_t = 0u32)]
+    hawk_close_target_bps: u32,
+
+    /// Hawk: take-profit threshold in bps of position notional.
+    #[arg(long, default_value_t = 0u32)]
+    hawk_take_profit_bps: u32,
+
+    /// Hawk: stop-loss threshold in bps of position notional.
+    #[arg(long, default_value_t = 0u32)]
+    hawk_stop_loss_bps: u32,
+
     /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
@@ -447,6 +485,7 @@ fn parse_strategies(s: &str) -> Option<std::collections::HashSet<String>> {
             "ss-old" | "ssold" | "old" => "spread-scalp-old".to_string(),
             "sg" => "static-grid".to_string(),
             "lf" => "liq-fade".to_string(),
+            "hk" => "hawk".to_string(),
             _ => t,
         })
         .collect();
@@ -1451,6 +1490,51 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Hawk — SS spread-gate + SG ladder + always-alive close-side.
+    if included("hawk", &allow) {
+        let hawk_notional = Decimal::from_str(&args.hawk_notional)?;
+        let hawk_max_pos = Decimal::from_str(&args.hawk_max_pos_usdt)?;
+        let hawk_levels = parse_u32_list(&args.hawk_levels_list)?;
+        let hawk_inner = parse_u32_list(&args.hawk_inner_bps_list)?;
+        let hawk_step = parse_u32_list(&args.hawk_step_bps_list)?;
+        let hawk_min_spread = parse_decimal_list(&args.hawk_min_spread_bps_list)?;
+        for &levels in &hawk_levels {
+            for &inner in &hawk_inner {
+                for &step in &hawk_step {
+                    for &min_spread in &hawk_min_spread {
+                        let label = format!(
+                            "Hawk lv={levels} in={inner} st={step} ms={min_spread}"
+                        );
+                        spawn_preset(
+                            &mut handles,
+                            &shared_data,
+                            &symbol,
+                            &label,
+                            Hawk::new(HawkConfig {
+                                notional_per_order: hawk_notional,
+                                tick_size: tick,
+                                step_size: lot_step,
+                                min_notional: Decimal::ZERO,
+                                levels_per_side: levels,
+                                inner_bps: inner,
+                                step_bps: step,
+                                min_spread_bps: min_spread,
+                                max_position_usdt: hawk_max_pos,
+                                close_target_bps: args.hawk_close_target_bps,
+                                take_profit_bps: args.hawk_take_profit_bps,
+                                stop_loss_bps: args.hawk_stop_loss_bps,
+                            }),
+                            fees,
+                            skim_cfg,
+                            funding_cfg,
+                            sim_cfg_template.clone(),
+                        );
                     }
                 }
             }
