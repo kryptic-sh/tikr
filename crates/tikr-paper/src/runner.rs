@@ -17,12 +17,14 @@ use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
 use tikr_core::{
-    Decimal, Fill, MarketEvent, Notional, Position, Price, Side, Snapshot, Symbol, Timestamp,
+    Decimal, Fill, LiqEvent, MarketEvent, Notional, Position, Price, Side, Snapshot, Symbol,
+    Timestamp,
 };
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
@@ -70,6 +72,13 @@ pub struct RunnerConfig {
     /// Optional live per-order notional updates derived from account wallet
     /// balance. Strategies decide how to refresh resting orders.
     pub notional_rx: Option<watch::Receiver<Decimal>>,
+    /// Rolling-window length (seconds) for `StrategyContext::recent_liqs`.
+    /// `0` (default) disables the liq window — the slice exposed to
+    /// strategies is always empty even when `external_liqs` is set.
+    /// LiqFade defaults to 60-300s in its config; the runner just
+    /// prunes the buffer to this window so per-event memory stays
+    /// bounded. Non-LiqFade strategies leave this 0.
+    pub liq_window_secs: u32,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -109,7 +118,76 @@ impl Default for RunnerConfig {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            liq_window_secs: 0,
         }
+    }
+}
+
+/// Rolling-window buffer of forced-liquidation events, drained from an
+/// optional [`tokio::sync::mpsc::UnboundedReceiver`] on every market
+/// event. Exposes a contiguous slice via [`Self::observe`] for
+/// inclusion in [`StrategyContext::recent_liqs`].
+///
+/// Backtest path: caller pre-loads the channel with sorted events from
+/// `LiqEventStream` (or feeds them through during replay).
+/// Live path: a background task subscribes to `@forceOrder` and forwards.
+///
+/// The buffer holds BOTH past-and-visible events (`ts <= now`) AND
+/// future events (`ts > now`, only possible in the backtest path where
+/// all liqs are loaded upfront). The visible slice returned by
+/// `observe` is the prefix whose timestamps are within
+/// `[now - window_ns, now]`. Future events stay in the back of the
+/// buffer until `now` advances past them.
+struct LiqWindow {
+    rx: Option<mpsc::UnboundedReceiver<LiqEvent>>,
+    buffer: VecDeque<LiqEvent>,
+    window_ns: u64,
+}
+
+impl LiqWindow {
+    fn new(rx: Option<mpsc::UnboundedReceiver<LiqEvent>>, window_secs: u32) -> Self {
+        Self {
+            rx,
+            buffer: VecDeque::new(),
+            window_ns: (window_secs as u64).saturating_mul(1_000_000_000),
+        }
+    }
+
+    /// Drain pending events from `rx` into the buffer, prune events
+    /// outside the rolling window relative to `now_ns`, and return a
+    /// contiguous slice of currently-visible events
+    /// (`now - window_ns <= ts <= now_ns`).
+    ///
+    /// Returns `&[]` when the window is disabled (`window_ns == 0`) or
+    /// no events are visible.
+    fn observe(&mut self, now_ns: u64) -> &[LiqEvent] {
+        if self.window_ns == 0 {
+            return &[];
+        }
+        if let Some(rx) = self.rx.as_mut() {
+            while let Ok(ev) = rx.try_recv() {
+                self.buffer.push_back(ev);
+            }
+        }
+        // Prune events older than the window.
+        let cutoff = now_ns.saturating_sub(self.window_ns);
+        while let Some(front) = self.buffer.front() {
+            if front.ts.0 < cutoff {
+                self.buffer.pop_front();
+            } else {
+                break;
+            }
+        }
+        // Contiguousify so we can return a single slice. Cheap — the
+        // buffer is bounded by `window_ns × event_rate` (tens of entries
+        // typical for a 60-300s liq window).
+        self.buffer.make_contiguous();
+        let (head, _tail) = self.buffer.as_slices();
+        // Visible prefix = events whose ts <= now. Backtest pre-loads
+        // all events upfront, so the tail may hold future liqs; those
+        // stay in the buffer until `now` advances.
+        let visible = head.partition_point(|e| e.ts.0 <= now_ns);
+        &head[..visible]
     }
 }
 
@@ -137,7 +215,7 @@ where
     S: Strategy,
 {
     run_inner(
-        venue, strategy, fill_sim, symbol, shutdown, config, None, None, None, None,
+        venue, strategy, fill_sim, symbol, shutdown, config, None, None, None, None, None,
     )
     .await
 }
@@ -208,6 +286,7 @@ pub async fn run_with_resume<V, S>(
     risk_gate: Option<Box<dyn RiskGate>>,
     alert_sink: Option<Box<dyn AlertSink>>,
     external_fills: Option<mpsc::UnboundedReceiver<Fill>>,
+    external_liqs: Option<mpsc::UnboundedReceiver<LiqEvent>>,
 ) -> PaperReport
 where
     V: Venue,
@@ -232,6 +311,7 @@ where
         risk_gate,
         alert_sink,
         external_fills,
+        external_liqs,
     )
     .await
 }
@@ -248,11 +328,14 @@ async fn run_inner<V, S>(
     mut risk_gate: Option<Box<dyn RiskGate>>,
     alert_sink: Option<Box<dyn AlertSink>>,
     mut external_fills: Option<mpsc::UnboundedReceiver<Fill>>,
+    external_liqs: Option<mpsc::UnboundedReceiver<LiqEvent>>,
 ) -> PaperReport
 where
     V: Venue,
     S: Strategy,
 {
+    let mut liq_window = LiqWindow::new(external_liqs, config.liq_window_secs);
+
     // Reconstruct tracker from resume if provided, else fresh.
     // v0 limitation: position size is reset to zero — see run_with_resume docs.
     let mut tracker = if let Some(ref prior) = resume {
@@ -416,6 +499,7 @@ where
                     let next_notional = *rx.borrow();
                     let pos = tracker.snapshot();
                     let open_quotes = fill_sim.live_quotes_for(&symbol);
+                    let liqs = liq_window.observe(last_event_ts.unwrap_or(Timestamp(0)).0);
                     let ctx = StrategyContext {
                         symbol: &symbol,
                         now: last_event_ts.unwrap_or(Timestamp(0)),
@@ -423,7 +507,7 @@ where
                         recent_fills: &[],
                         latest_book: &current_book,
                         open_quotes: &open_quotes,
-            recent_liqs: &[],
+                        recent_liqs: liqs,
                     };
                     let actions = strategy.on_notional_updated(&ctx, next_notional);
                     if !actions.is_empty() {
@@ -485,6 +569,7 @@ where
 
                 let pos = tracker.snapshot();
                 let open_quotes = fill_sim.live_quotes_for(&symbol);
+                let liqs = liq_window.observe(ts.0);
                 let ctx = StrategyContext {
                     symbol: &symbol,
                     now: ts,
@@ -492,7 +577,7 @@ where
                     recent_fills: &[],
                     latest_book: &current_book,
                     open_quotes: &open_quotes,
-            recent_liqs: &[],
+                    recent_liqs: liqs,
                 };
 
                 let actions = strategy.on_event(&ctx, &event);
@@ -713,6 +798,7 @@ where
                         let post_fill_pos = tracker.snapshot();
                         let post_fill_quotes = fill_sim.live_quotes_for(&symbol);
                         let fill_event = MarketEvent::Fill(fill_clone.clone());
+                        let liqs = liq_window.observe(ts.0);
                         let fill_ctx = StrategyContext {
                             symbol: &symbol,
                             now: ts,
@@ -720,7 +806,7 @@ where
                             recent_fills: std::slice::from_ref(&fill_clone),
                             latest_book: &current_book,
                             open_quotes: &post_fill_quotes,
-            recent_liqs: &[],
+                            recent_liqs: liqs,
                         };
                         let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
                         dispatch_post_fill_actions(
@@ -755,6 +841,7 @@ where
                         let rec_pos = tracker.snapshot();
                         for (rej_intent, rej_reason) in rejections {
                             let rec_quotes = fill_sim.live_quotes_for(&symbol);
+                            let liqs = liq_window.observe(ts.0);
                             let rec_ctx = StrategyContext {
                                 symbol: &symbol,
                                 now: ts,
@@ -762,7 +849,7 @@ where
                                 recent_fills: &[],
                                 latest_book: &current_book,
                                 open_quotes: &rec_quotes,
-            recent_liqs: &[],
+                                recent_liqs: liqs,
                             };
                             let recovery_actions =
                                 strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
@@ -958,6 +1045,7 @@ where
                 let post_fill_pos = tracker.snapshot();
                 let post_fill_quotes = fill_sim.live_quotes_for(&symbol);
                 let fill_event = MarketEvent::Fill(fill_clone.clone());
+                let liqs = liq_window.observe(fill_clone.ts.0);
                 let fill_ctx = StrategyContext {
                     symbol: &symbol,
                     now: fill_clone.ts,
@@ -965,7 +1053,7 @@ where
                     recent_fills: std::slice::from_ref(&fill_clone),
                     latest_book: &current_book,
                     open_quotes: &post_fill_quotes,
-            recent_liqs: &[],
+                    recent_liqs: liqs,
                 };
                 let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
                 dispatch_post_fill_actions(
@@ -1098,6 +1186,7 @@ where
     let pos = tracker.snapshot();
     let now_ts = current_book.ts;
     let shutdown_quotes = fill_sim.live_quotes_for(&symbol);
+    let liqs = liq_window.observe(now_ts.0);
     let ctx = StrategyContext {
         symbol: &symbol,
         now: now_ts,
@@ -1105,7 +1194,7 @@ where
         recent_fills: &[],
         latest_book: &current_book,
         open_quotes: &shutdown_quotes,
-        recent_liqs: &[],
+        recent_liqs: liqs,
     };
     let shutdown_actions = strategy.on_shutdown(&ctx);
     for action in shutdown_actions {
@@ -1698,6 +1787,7 @@ mod tests {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            liq_window_secs: 0,
         }
     }
 
@@ -1844,6 +1934,7 @@ mod tests {
             None,
             None,
             None, // no external fills (paper mode)
+            None, // no external liqs
         )
         .await;
         assert_eq!(report.realized.0, Decimal::from(5));
@@ -1890,6 +1981,7 @@ mod tests {
             None,
             None,
             None, // no external fills (paper mode)
+            None, // no external liqs
         )
         .await;
     }
@@ -2038,6 +2130,7 @@ mod tests {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            liq_window_secs: 0,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2055,6 +2148,7 @@ mod tests {
             None,
             None,
             Some(fill_rx),
+            None,
         )
         .await;
 
@@ -2122,12 +2216,14 @@ mod tests {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            liq_window_secs: 0,
         };
         let (_tx, rx) = watch::channel(false);
 
         let _report = run_with_resume(
             venue, strategy, fill_sim, symbol, rx, config, None, None, None,
             None, // paper mode
+            None,
         )
         .await;
 

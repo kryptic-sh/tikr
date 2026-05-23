@@ -477,6 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        liq_window_secs: 0,
     };
 
     info!(strategy = ?args.strategy, "strategy selected");
@@ -510,6 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }
@@ -538,6 +540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }
@@ -566,6 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }
@@ -607,6 +611,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }
@@ -643,6 +648,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }
@@ -702,6 +708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }
@@ -738,6 +745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 Some(fill_rx),
+                None,
             )
             .await
         }

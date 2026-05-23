@@ -202,6 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notional_per_order: Decimal::from(25),
         levels_per_side: 1,
         inner_bps: 6, // 0.06% half-spread
+        max_position_usdt: Decimal::ZERO,
+        take_profit_bps: 0,
+        stop_loss_bps: 0,
     });
 
     // FillSim is required by the runner trait but synthesized fills are
@@ -226,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        liq_window_secs: 0,
     };
 
     let report = run_with_resume(
@@ -239,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,          // no risk gate (add tikr-risk::BasicRiskGate for production)
         None,          // no alert sink (add tikr-paper::alerts for production)
         Some(fill_rx), // live mode: fills from userEvents WS
+        None,
     )
     .await;
 

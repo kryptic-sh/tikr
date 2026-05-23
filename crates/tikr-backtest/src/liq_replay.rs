@@ -24,8 +24,8 @@
 use std::path::{Path, PathBuf};
 
 use polars::prelude::*;
-use tikr_core::{LiqEvent, Notional, Price, Side, Size, Timestamp};
 use tikr_core::Decimal;
+use tikr_core::{LiqEvent, Notional, Price, Side, Size, Timestamp};
 
 /// Errors returned by liquidation-replay construction or iteration.
 #[derive(Debug, thiserror::Error)]
@@ -144,7 +144,9 @@ fn load_one(
         .column("symbol")
         .map_err(|e| LiqReplayError::Schema(format!("missing symbol in {}: {e}", path.display())))?
         .str()
-        .map_err(|e| LiqReplayError::Schema(format!("symbol not str in {}: {e}", path.display())))?;
+        .map_err(|e| {
+            LiqReplayError::Schema(format!("symbol not str in {}: {e}", path.display()))
+        })?;
     let side = df
         .column("side")
         .map_err(|e| LiqReplayError::Schema(format!("missing side in {}: {e}", path.display())))?
@@ -162,9 +164,13 @@ fn load_one(
         .map_err(|e| LiqReplayError::Schema(format!("price not f64 in {}: {e}", path.display())))?;
     let notional = df
         .column("notional")
-        .map_err(|e| LiqReplayError::Schema(format!("missing notional in {}: {e}", path.display())))?
+        .map_err(|e| {
+            LiqReplayError::Schema(format!("missing notional in {}: {e}", path.display()))
+        })?
         .f64()
-        .map_err(|e| LiqReplayError::Schema(format!("notional not f64 in {}: {e}", path.display())))?;
+        .map_err(|e| {
+            LiqReplayError::Schema(format!("notional not f64 in {}: {e}", path.display()))
+        })?;
 
     let n = df.height();
     for i in 0..n {

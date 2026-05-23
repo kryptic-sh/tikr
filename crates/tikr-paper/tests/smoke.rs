@@ -54,6 +54,7 @@ async fn paper_runner_against_testnet_5min() {
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        liq_window_secs: 0,
     };
 
     let (tx, rx) = watch::channel(false);

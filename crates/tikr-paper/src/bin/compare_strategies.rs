@@ -1007,6 +1007,7 @@ async fn run_one<S: Strategy>(
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        liq_window_secs: 0,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -1022,6 +1023,7 @@ async fn run_one<S: Strategy>(
         None,
         None,
         external_fills,
+        None,
     )
     .await;
     info!(

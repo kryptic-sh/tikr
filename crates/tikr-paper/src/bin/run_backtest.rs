@@ -163,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        liq_window_secs: 0,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.
@@ -202,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 external_fills,
+                None,
             )
             .await
         }
@@ -228,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 external_fills,
+                None,
             )
             .await
         }
@@ -252,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 external_fills,
+                None,
             )
             .await
         }
@@ -275,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 None,
                 external_fills,
+                None,
             )
             .await
         }

@@ -370,6 +370,7 @@ async fn risk_resume_alerting_capstone() {
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        liq_window_secs: 0,
     };
     let (_tx1, rx1) = watch::channel(false);
 
@@ -384,6 +385,7 @@ async fn risk_resume_alerting_capstone() {
         Some(risk_gate1),
         Some(alert_sink1),
         None, // no external fills (paper mode)
+        None,
     )
     .await;
 
@@ -446,6 +448,7 @@ async fn risk_resume_alerting_capstone() {
         Some(risk_gate2),
         Some(alert_sink2),
         None, // no external fills (paper mode)
+        None,
     )
     .await;
 
@@ -509,6 +512,7 @@ async fn risk_resume_alerting_capstone() {
         Some(Box::new(risk_gate3)),
         Some(alert_sink3),
         None, // no external fills (paper mode)
+        None,
     )
     .await;
 
