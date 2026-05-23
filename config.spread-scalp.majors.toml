@@ -5,23 +5,32 @@
 # Run with:
 #   tikr --config ./config.spread-scalp.majors.toml
 #
-# ─── Caveat ────────────────────────────────────────────────────────────────
-# Spread on major-cap perps is usually 0.5-3 bps. Tier-0 Binance Futures
-# round-trip fee is 4 bps. SpreadScalp won't quote until book spread
-# exceeds `min_spread_bps` — set just above the fee floor so the bot only
-# wakes up on momentary widening bursts (news, liq cascades, low-volume
-# windows). Expect long idle stretches between fills on BTC/ETH; DOGE
-# will be the most active.
+# ─── Testnet vs mainnet ────────────────────────────────────────────────────
+# This file is tuned for `futures-testnet` where the spread on majors is
+# routinely 5-20 bps (thin book, sparse MMs), so the 5-8 bps
+# `min_spread_bps` thresholds below fire often enough to be useful.
 #
-# ─── Stage 4-6 knobs ──────────────────────────────────────────────────────
-# After the refactor, the per-bot block accepts:
-#   take_profit_bps         (preferred over `take_profit_usdt`; bps-of-notional)
-#   stop_loss_bps           (new — bounded downside, IOC-flatten at touch)
-#   price_tolerance_ticks   (skip requote within ±N ticks; default 1)
-#   adverse_window_ms       (>0 turns on dynamic min_spread widening)
-#   adverse_half_life_fills, adverse_threshold_bps, adverse_max_widen_bps
+# On mainnet majors spread sits at 0.5-2 bps and these thresholds give
+# near-zero fills (verified against 24h recordings 2026-05-22..23).
+# Lower min_spread to 2-3 to actually trade on mainnet — but adverse
+# selection eats the captured spread. Honest mainnet recipe: gate on a
+# liq-cascade event instead (see `LiqFade` strategy).
 #
-# Defaults are listed at the bottom of this file.
+# ─── Fees ──────────────────────────────────────────────────────────────────
+# Binance Futures USD-M tier 0: 2 bps maker / 5 bps taker = 4 bps maker
+# round-trip. `min_spread_bps` is set above this floor so accepted fills
+# clear fees with some captured spread.
+#
+# ─── Active knobs ──────────────────────────────────────────────────────────
+# Each [bot.spread_scalp] block sets:
+#   notional, min_spread_bps, requote_interval_ms,
+#   max_position_usdt, reject_cooldown_ms, price_tolerance_ticks
+#
+# TP/SL and adverse-tracker fields are intentionally NOT set — the
+# 2026-05-22 ETH/DOGE live A/B showed both flipped sign-negative
+# (IOC-on-loss closer eats taker fee; adverse-tracker cut fills
+# without improving NET). Defaults reference at the bottom lists every
+# available knob if you want to re-enable for experimentation.
 
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
@@ -37,12 +46,12 @@ order_balance_pct = "1"
 
 # ─── BTCUSDT ───────────────────────────────────────────────────────────────
 #
-# Typical spread 0.5-1 bps; will fire only on widening events. High
-# `min_spread_bps` to avoid losing money on fees alone. **No TP** — we
-# let the opposite-side maker quote close the position at maker fees
-# (2bps) instead of paying taker (5bps) via an IOC. Live a/b showed
-# the IOC TP path eats ~3bps per round-trip vs the natural close.
-# SL kept at 20 bps to cap a bad fill before it grinds.
+# Mainnet spread 0.5-1 bps → near-zero fills at min_spread=5; testnet
+# spread 5-15 bps → frequent fills. **No TP / no SL** — the natural
+# opposite-side maker quote closes the position at 2 bps maker fee
+# instead of paying taker (5 bps) via an IOC close, and the live A/B
+# showed the IOC closer net-negative. `max_position_usdt` caps inventory
+# at ~1-2 fills' worth so a bad fill can't grind unbounded.
 
 [[bot]]
 symbol = "BTCUSDT"
@@ -104,13 +113,11 @@ price_tolerance_ticks = 1
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
 #
-# Wider native spread (3-5 bps typical) — most active SS bot in the
-# basket. Bumped `min_spread_bps=8` so accepted fills clear fees with
-# meaningful capture. Adverse-selection tracker turned ON here:
-# DOGE sees the most toxic flow in the basket (retail-driven, illiquid
-# enough for whales to walk the book). When the rolling EMA of post-fill
-# adverse drift exceeds 3 bps, `min_spread_bps` widens by `(ema - 3)`
-# capped at +10 bps — bot quotes less but cleaner during toxic bursts.
+# Mainnet native spread 1-2 bps; testnet spread 5-15 bps. Bumped
+# `min_spread_bps=8` (vs 5/6 for the rest of the basket) because DOGE
+# sees the heaviest toxic flow on testnet — wider entry threshold filters
+# out the worst adverse selection. Most active bot in the basket on
+# testnet; mainnet-side near-silent at this threshold (see header note).
 
 [[bot]]
 symbol = "DOGEUSDT"
