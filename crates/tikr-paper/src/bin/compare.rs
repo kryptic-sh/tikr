@@ -444,6 +444,101 @@ fn parse_strategies(s: &str) -> Option<std::collections::HashSet<String>> {
     Some(set)
 }
 
+/// Read a TOML file of `kebab-case-key = value` (or `snake_case_key`)
+/// pairs and convert each pair into a pair of CLI args `--key value`.
+/// Lets `compare --config sweep.toml` replace 30+ CLI flags with a
+/// versionable text file.
+///
+/// Recognised TOML value types:
+/// - `bool` → emitted as `"true"` / `"false"` (clap parses these)
+/// - integer / float → stringified
+/// - string → emitted as-is
+/// - array of integers/strings → joined with `,` (matches the existing
+///   CSV-list arg style for sweep ranges, e.g. `lg-bps-list = "2,4,6"`
+///   or `lg-bps-list = [2, 4, 6]` both work)
+///
+/// Nested tables are flattened — `[sg]` + `inner-bps-list = "3,5,8"`
+/// becomes `--sg-inner-bps-list 3,5,8`. Lets the operator group
+/// related knobs visually.
+///
+/// The args are injected before any CLI flags so clap's last-wins
+/// behaviour means a CLI flag still overrides the TOML default — the
+/// TOML is for sweep templates, CLI for one-off tweaks.
+fn toml_to_args(path: &std::path::Path) -> Result<Vec<String>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let value: toml::Value = toml::from_str(&raw)
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let table = value
+        .as_table()
+        .ok_or_else(|| format!("{}: top-level must be a TOML table", path.display()))?;
+    let mut out: Vec<String> = Vec::new();
+    flatten_table(table, "", &mut out);
+    Ok(out)
+}
+
+/// Recursive helper for `toml_to_args`. `prefix` is the section path
+/// joined by `-`. Empty prefix = top-level.
+fn flatten_table(table: &toml::Table, prefix: &str, out: &mut Vec<String>) {
+    for (key, val) in table {
+        // Both kebab + snake forms accepted in the TOML; emit as kebab
+        // (matches clap's flag style).
+        let key_kebab = key.replace('_', "-");
+        let flag = if prefix.is_empty() {
+            format!("--{key_kebab}")
+        } else {
+            format!("--{prefix}-{key_kebab}")
+        };
+        match val {
+            toml::Value::Table(inner) => {
+                let new_prefix = if prefix.is_empty() {
+                    key_kebab
+                } else {
+                    format!("{prefix}-{key_kebab}")
+                };
+                flatten_table(inner, &new_prefix, out);
+            }
+            toml::Value::Array(arr) => {
+                // Join scalars with `,` to match the existing CSV-list
+                // arg style. Tables-in-arrays are silently skipped —
+                // not used by any current sweep schema.
+                let joined: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| match v {
+                        toml::Value::Integer(i) => Some(i.to_string()),
+                        toml::Value::Float(f) => Some(f.to_string()),
+                        toml::Value::String(s) => Some(s.clone()),
+                        toml::Value::Boolean(b) => Some(b.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                out.push(flag);
+                out.push(joined.join(","));
+            }
+            toml::Value::Boolean(b) => {
+                out.push(flag);
+                out.push(b.to_string());
+            }
+            toml::Value::Integer(i) => {
+                out.push(flag);
+                out.push(i.to_string());
+            }
+            toml::Value::Float(f) => {
+                out.push(flag);
+                out.push(f.to_string());
+            }
+            toml::Value::String(s) => {
+                out.push(flag);
+                out.push(s.clone());
+            }
+            toml::Value::Datetime(d) => {
+                out.push(flag);
+                out.push(d.to_string());
+            }
+        }
+    }
+}
+
 /// Inclusion predicate: `None` allowlist ⇒ everything runs.
 fn included(category: &str, allow: &Option<std::collections::HashSet<String>>) -> bool {
     match allow {
@@ -471,7 +566,29 @@ fn parse_decimal_list(s: &str) -> Result<Vec<Decimal>, String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+
+    // `--config <path>` extends the CLI args from a TOML file BEFORE
+    // clap parses, so the TOML's pairs land in argv and clap's
+    // last-wins behaviour means an explicit CLI flag still overrides
+    // the TOML default. Hand-scanned because `--config` itself
+    // wouldn't be visible inside `Args` until after parsing.
+    let mut argv: Vec<String> = std::env::args().collect();
+    if let Some(idx) = argv.iter().position(|a| a == "--config") {
+        if idx + 1 >= argv.len() {
+            return Err("--config requires a path argument".into());
+        }
+        let path = argv.remove(idx + 1);
+        argv.remove(idx);
+        let toml_args = toml_to_args(std::path::Path::new(&path))?;
+        if !toml_args.is_empty() {
+            info!(path, count = toml_args.len(), "loaded sweep config from TOML");
+        }
+        // Insert TOML-derived args after argv[0] (the binary name) so
+        // they're earlier in clap's sequence than any explicit CLI
+        // flag — clap's last-wins gives CLI the final say.
+        argv.splice(1..1, toml_args);
+    }
+    let args = Args::parse_from(argv);
 
     if !args.data_root.is_empty() {
         return run_basket(args).await;
