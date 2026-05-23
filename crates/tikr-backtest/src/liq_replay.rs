@@ -103,6 +103,20 @@ impl LiqEventStream {
         }
         &self.events[start..self.cursor]
     }
+
+    /// Borrow the full sorted event vector. Used by the backtest path
+    /// to pre-load the runner's liq channel with every known event in
+    /// one go — the runner timestamp-filters them on observe.
+    pub fn events(&self) -> &[LiqEvent] {
+        &self.events
+    }
+
+    /// Consume the stream and return the inner sorted Vec — cheaper
+    /// than cloning when the caller owns the stream and just needs the
+    /// data to push into an mpsc channel.
+    pub fn into_events(self) -> Vec<LiqEvent> {
+        self.events
+    }
 }
 
 /// Walk `dir` recursively and return every `*.parquet` path.

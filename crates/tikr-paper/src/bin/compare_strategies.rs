@@ -20,10 +20,10 @@ use tikr_core::{
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, LadderReentry,
-    LadderReentryConfig, LayeredGrid, LayeredGridConfig, MicroMeanReversion,
-    MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig,
-    SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook,
-    TopOfBookConfig,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
+    MicroMeanReversion, MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap,
+    SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy,
+    TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -187,6 +187,64 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     lg_stop_loss_bps: u32,
 
+    /// LiqFade: directory holding `record_liquidations`-style parquet
+    /// shards (per-day `YYYY-MM-DD/all_symbols.parquet`). Empty (default)
+    /// disables LiqFade — the preset is skipped even when included in
+    /// `--strategies` because the strategy needs the @forceOrder feed.
+    #[arg(long, default_value = "")]
+    liq_data_dir: String,
+
+    /// LiqFade: rolling window (seconds) for runner-side liq buffer.
+    /// Must be ≥ the strategy's longest internal timeout
+    /// (`entry_timeout_secs` + `position_timeout_secs`). Default `120`.
+    #[arg(long, default_value_t = 120u32)]
+    liq_window_secs: u32,
+
+    /// LiqFade: fiat notional per fade entry.
+    #[arg(long, default_value = "100")]
+    liq_notional: String,
+
+    /// LiqFade: per-side liquidation USDT threshold to arm.
+    /// Default `5_000_000`. Lower for alts where 5M is too rare.
+    #[arg(long, default_value = "5000000")]
+    liq_arm_threshold_usdt: String,
+
+    /// LiqFade: dominance ratio of light side / heavy side at arm.
+    /// `0.5` = heavy ≥ 2× light. Range `(0, 1)`.
+    #[arg(long, default_value = "0.5")]
+    liq_arm_dominance: String,
+
+    /// LiqFade: capitulation overshoot in bps past pre-liq mid before
+    /// posting the fade quote. Default `15`.
+    #[arg(long, default_value_t = 15u32)]
+    liq_capit_bps: u32,
+
+    /// LiqFade: fade-quote offset in bps deeper than the dislocated
+    /// touch. Default `5`.
+    #[arg(long, default_value_t = 5u32)]
+    liq_fade_offset_bps: u32,
+
+    /// LiqFade: TP target in bps of revert toward pre-liq mid.
+    /// Must be < `liq_capit_bps`. Default `10`.
+    #[arg(long, default_value_t = 10u32)]
+    liq_revert_target_bps: u32,
+
+    /// LiqFade: entry-quote rest timeout in seconds. Default `30`.
+    #[arg(long, default_value_t = 30u32)]
+    liq_entry_timeout_secs: u32,
+
+    /// LiqFade: position time-stop (force IOC flatten). Default `120`.
+    #[arg(long, default_value_t = 120u32)]
+    liq_position_timeout_secs: u32,
+
+    /// LiqFade: stop-loss in bps of position notional. `0` disables.
+    #[arg(long, default_value_t = 0u32)]
+    liq_stop_loss_bps: u32,
+
+    /// LiqFade: hard inventory cap in USDT notional. `0` disables.
+    #[arg(long, default_value = "0")]
+    liq_max_pos_usdt: String,
+
     /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
@@ -324,6 +382,7 @@ fn parse_strategies(s: &str) -> Option<std::collections::HashSet<String>> {
             "ss" => "spread-scalp".to_string(),
             "ss-old" | "ssold" | "old" => "spread-scalp-old".to_string(),
             "sg" => "static-grid".to_string(),
+            "lf" => "liq-fade".to_string(),
             _ => t,
         })
         .collect();
@@ -429,6 +488,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sg_regime_eff_threshold = Decimal::from_str(&args.sg_regime_efficiency_threshold)?;
     let sg_max_pos = Decimal::from_str(&args.sg_max_pos_usdt)?;
     let lg_max_pos = Decimal::from_str(&args.lg_max_pos_usdt)?;
+    let liq_notional = Decimal::from_str(&args.liq_notional)?;
+    let liq_arm_threshold = Decimal::from_str(&args.liq_arm_threshold_usdt)?;
+    let liq_arm_dominance = Decimal::from_str(&args.liq_arm_dominance)?;
+    let liq_max_pos = Decimal::from_str(&args.liq_max_pos_usdt)?;
     let spread_scalp_adverse_threshold =
         Decimal::from_str(&args.spread_scalp_adverse_threshold_bps)?;
 
@@ -456,6 +519,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(set) = &allow {
         info!(allowed = ?set, "strategy filter active — only listed categories will run");
     }
+
+    // Load liq parquet once if a dir is provided + LiqFade is requested.
+    // The Vec is cloned into a fresh mpsc channel per preset so each LiqFade
+    // sweep gets its own pre-loaded receiver.
+    let liq_events: Vec<tikr_core::LiqEvent> = if !args.liq_data_dir.is_empty()
+        && included("liq-fade", &allow)
+    {
+        let dir = std::path::Path::new(&args.liq_data_dir);
+        match tikr_backtest::liq_replay::LiqEventStream::load(dir, &args.symbol) {
+            Ok(s) => {
+                info!(
+                    liq_events = s.len(),
+                    dir = %dir.display(),
+                    "loaded liq parquet for LiqFade"
+                );
+                s.into_events()
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: failed to load liq dir {}: {e}; LiqFade preset will see no liqs",
+                    dir.display()
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     if included("avellaneda-stoikov", &allow) {
         spawn_preset(
@@ -967,6 +1058,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // LiqFade — gated on `@forceOrder` cluster + price overshoot.
+    // Skipped silently when no liq_data_dir was provided OR loading
+    // returned zero events (warn already emitted above).
+    if included("liq-fade", &allow) && !liq_events.is_empty() {
+        let label = format!(
+            "LiqFade arm={}/dom={}/capit={}bps/fade={}bps/tp={}bps",
+            liq_arm_threshold,
+            liq_arm_dominance,
+            args.liq_capit_bps,
+            args.liq_fade_offset_bps,
+            args.liq_revert_target_bps
+        );
+        spawn_preset_with_liqs(
+            &mut handles,
+            &shared_data,
+            &symbol,
+            &label,
+            LiqFade::new(LiqFadeConfig {
+                notional_per_entry: liq_notional,
+                tick_size: tick,
+                step_size: lot_step,
+                min_notional: Decimal::ZERO,
+                max_position_usdt: liq_max_pos,
+                arm_threshold_usdt: liq_arm_threshold,
+                arm_dominance: liq_arm_dominance,
+                capitulation_overshoot_bps: args.liq_capit_bps,
+                fade_offset_bps: args.liq_fade_offset_bps,
+                revert_target_bps: args.liq_revert_target_bps,
+                entry_timeout_secs: args.liq_entry_timeout_secs,
+                position_timeout_secs: args.liq_position_timeout_secs,
+                stop_loss_bps: args.liq_stop_loss_bps,
+            }),
+            fees,
+            skim_cfg,
+            funding_cfg,
+            sim_cfg_template.clone(),
+            liq_events.clone(),
+            args.liq_window_secs,
+        );
+    }
+
     let sweep_start = std::time::Instant::now();
     info!(
         presets = handles.len(),
@@ -1036,6 +1168,80 @@ async fn run_one<S: Strategy>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// LiqFade preset spawn — pre-loads the liq channel with all events
+/// from `liq_events` before invoking `run_with_resume`. Distinct fn so
+/// the (now bigger) run wrapper doesn't touch the existing
+/// `spawn_preset` callers.
+#[allow(clippy::too_many_arguments)]
+fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
+    handles: &mut Vec<JoinHandle<(String, PaperReport)>>,
+    shared_data: &Arc<LoadedReplayData>,
+    symbol: &Symbol,
+    name: &str,
+    strategy: S,
+    fees: VenueFees,
+    skim: Option<SkimConfig>,
+    funding: Option<FundingConfig>,
+    sim_cfg: FillSimConfig,
+    liq_events: Vec<tikr_core::LiqEvent>,
+    liq_window_secs: u32,
+) {
+    let sd = Arc::clone(shared_data);
+    let sym = symbol.clone();
+    let display = name.to_string();
+    let state_id = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>();
+    handles.push(tokio::spawn(async move {
+        // Pre-load the liq channel — events are sorted; the runner
+        // timestamp-gates them on observe so the strategy only sees
+        // those whose ts <= current event ts.
+        let (liq_tx, liq_rx) = tokio::sync::mpsc::unbounded_channel::<tikr_core::LiqEvent>();
+        for ev in liq_events {
+            // Unbounded send; recv side reads when the runner ticks.
+            let _ = liq_tx.send(ev);
+        }
+        drop(liq_tx);
+        let replay = ParquetReplay::from_shared(sd);
+        let venue = BacktestVenue::new(replay);
+        let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
+        let runner_config = RunnerConfig {
+            state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
+            snapshot_every_n_events: 0,
+            skim,
+            funding,
+            snapshot_tap: None,
+            live_tap: None,
+            notional_rx: None,
+            liq_window_secs,
+        };
+        let (_tx, rx) = watch::channel(false);
+        info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");
+        let report = run_with_resume(
+            venue,
+            strategy,
+            fill_sim,
+            sym,
+            rx,
+            runner_config,
+            None,
+            None,
+            None,
+            None,
+            Some(liq_rx),
+        )
+        .await;
+        info!(
+            preset = %state_id,
+            events = report.events_processed,
+            fills = report.fills_emitted,
+            "preset done (liq-gated)"
+        );
+        (display, report)
+    }));
+}
+
 fn spawn_preset<S: Strategy + Send + 'static>(
     handles: &mut Vec<JoinHandle<(String, PaperReport)>>,
     shared_data: &Arc<LoadedReplayData>,
