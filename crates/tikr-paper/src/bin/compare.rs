@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -79,6 +79,13 @@ struct Args {
     /// `1` is the common "trim 0-fill noise" setting on big sweeps.
     #[arg(long, default_value_t = 0u64)]
     min_fills: u64,
+
+    /// Maximum number of presets to run concurrently. `0` (default) =
+    /// unlimited (tokio runtime decides). Set to `cpus` or a smaller
+    /// number to keep the machine usable while a big sweep runs —
+    /// 135-preset sweeps can otherwise pin every core for 20+ minutes.
+    #[arg(long, default_value_t = 0usize)]
+    parallel: usize,
 
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
@@ -750,6 +757,13 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
     let allow = parse_strategies(&args.strategies);
     if let Some(set) = &allow {
         info!(allowed = ?set, "strategy filter active — only listed categories will run");
+    }
+    // Install the global concurrency limiter on first call. Subsequent
+    // sweeps (basket mode iterates per symbol) reuse the existing
+    // semaphore — `set` only succeeds once. When `--parallel 0`,
+    // SWEEP_LIMITER stays empty and every preset runs immediately.
+    if args.parallel > 0 {
+        let _ = SWEEP_LIMITER.set(Arc::new(tokio::sync::Semaphore::new(args.parallel)));
     }
 
     // Load liq parquet once if a dir is provided + LiqFade is requested.
@@ -1521,6 +1535,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
     handles.push(tokio::spawn(async move {
+        let _permit = acquire_sweep_permit().await;
         // Pre-load the liq channel — events are sorted; the runner
         // timestamp-gates them on observe so the strategy only sees
         // those whose ts <= current event ts.
@@ -1569,6 +1584,25 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
     }));
 }
 
+/// Global semaphore set once by `run_sweep_collect` when `--parallel N`
+/// is non-zero. Each spawned preset awaits an owned permit before
+/// starting the heavy work, then drops it on completion — caps active
+/// presets at N regardless of how many were spawned.
+///
+/// `None` when `--parallel 0` (default): no limit, every spawn runs
+/// immediately on the tokio worker pool.
+static SWEEP_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+
+/// Acquire a permit from `SWEEP_LIMITER` if the limiter is set; returns
+/// `None` when unlimited. Held permit is dropped when the returned
+/// `Option<OwnedSemaphorePermit>` falls out of scope.
+async fn acquire_sweep_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match SWEEP_LIMITER.get() {
+        Some(sem) => Some(sem.clone().acquire_owned().await.expect("sweep limiter closed")),
+        None => None,
+    }
+}
+
 fn spawn_preset<S: Strategy + Send + 'static>(
     handles: &mut Vec<JoinHandle<(String, PaperReport)>>,
     shared_data: &Arc<LoadedReplayData>,
@@ -1588,6 +1622,7 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
     handles.push(tokio::spawn(async move {
+        let _permit = acquire_sweep_permit().await;
         let r = run_one(sd, sym, state_id, strategy, fees, skim, funding, sim_cfg).await;
         (display, r)
     }));
