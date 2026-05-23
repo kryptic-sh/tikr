@@ -129,6 +129,78 @@ pub struct BotConfig {
     /// SpreadScalp params.
     #[serde(default)]
     pub spread_scalp: Option<SpreadScalpParams>,
+    /// LiqFade params (only honored when `strategy = "liq-fade"`).
+    #[serde(default)]
+    pub liq_fade: Option<LiqFadeParams>,
+}
+
+/// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus
+/// `arm_window_secs` which sets the runner-side rolling buffer length.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiqFadeParams {
+    /// Fiat notional per fade entry.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Per-side liquidation USDT threshold to arm. `5_000_000` for
+    /// BTC, smaller for alts.
+    #[serde(default = "liq_default_arm_threshold")]
+    pub arm_threshold_usdt: Decimal,
+    /// Dominance ratio of light side / heavy side at arm.
+    #[serde(default = "liq_default_arm_dominance")]
+    pub arm_dominance: Decimal,
+    /// Capitulation overshoot in bps past pre-liq mid.
+    #[serde(default = "liq_default_capit_bps")]
+    pub capitulation_overshoot_bps: u32,
+    /// Fade-quote offset in bps deeper than dislocated touch.
+    #[serde(default = "liq_default_fade_offset_bps")]
+    pub fade_offset_bps: u32,
+    /// TP target in bps of revert toward pre-liq mid.
+    #[serde(default = "liq_default_revert_target_bps")]
+    pub revert_target_bps: u32,
+    /// Entry quote rest timeout (seconds).
+    #[serde(default = "liq_default_entry_timeout_secs")]
+    pub entry_timeout_secs: u32,
+    /// Position time-stop (seconds).
+    #[serde(default = "liq_default_position_timeout_secs")]
+    pub position_timeout_secs: u32,
+    /// Stop-loss in bps of position notional. `0` disables.
+    #[serde(default)]
+    pub stop_loss_bps: u32,
+    /// Hard inventory cap in USDT notional. `0` falls back to the
+    /// account-level cap.
+    #[serde(default)]
+    pub max_position_usdt: Decimal,
+    /// Rolling-window length (seconds) for the runner-side liq buffer.
+    /// Must be ≥ `entry_timeout_secs + position_timeout_secs`. Sets
+    /// `RunnerConfig.liq_window_secs` for this bot.
+    #[serde(default = "liq_default_window_secs")]
+    pub window_secs: u32,
+}
+
+fn liq_default_arm_threshold() -> Decimal {
+    Decimal::from(5_000_000u64)
+}
+fn liq_default_arm_dominance() -> Decimal {
+    Decimal::from_str_exact("0.5").unwrap()
+}
+fn liq_default_capit_bps() -> u32 {
+    15
+}
+fn liq_default_fade_offset_bps() -> u32 {
+    5
+}
+fn liq_default_revert_target_bps() -> u32 {
+    10
+}
+fn liq_default_entry_timeout_secs() -> u32 {
+    30
+}
+fn liq_default_position_timeout_secs() -> u32 {
+    120
+}
+fn liq_default_window_secs() -> u32 {
+    180
 }
 
 /// StaticGrid configuration.

@@ -10,8 +10,8 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
-    LadderReentryConfig, LayeredGridConfig, MicroMeanReversionConfig, SimpleGapConfig,
-    SpreadScalpConfig, StaticGridConfig,
+    LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MicroMeanReversionConfig,
+    SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
 };
 use tokio::sync::watch;
 
@@ -58,9 +58,16 @@ pub fn to_spec(
             default_notional,
             max_position_usdt_default,
         )?,
+        "liq-fade" | "lf" => build_liq_fade(
+            cfg,
+            &symbol,
+            venue,
+            default_notional,
+            max_position_usdt_default,
+        )?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade)"
             ));
         }
     };
@@ -79,6 +86,13 @@ pub fn to_spec(
         } else {
             None
         },
+        // LiqFade is the only consumer; other strategies leave the
+        // buffer empty regardless of this value.
+        liq_window_secs: cfg
+            .liq_fade
+            .as_ref()
+            .map(|p| p.window_secs)
+            .unwrap_or(0),
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.
@@ -120,6 +134,11 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
             .unwrap_or(None)),
         "spread-scalp" | "ss" => Ok(cfg
             .spread_scalp
+            .as_ref()
+            .map(|p| p.notional)
+            .unwrap_or(None)),
+        "liq-fade" | "lf" => Ok(cfg
+            .liq_fade
             .as_ref()
             .map(|p| p.notional)
             .unwrap_or(None)),
@@ -324,6 +343,44 @@ fn build_spread_scalp(
         } else {
             tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled()
         },
+    }))
+}
+
+fn build_liq_fade(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+    max_position_usdt_default: Decimal,
+) -> Result<StrategyChoice> {
+    let lf = cfg.liq_fade.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=liq-fade but [bot.liq_fade] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(lf.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::ONE);
+    let step_size = venue.step_size(symbol).unwrap_or(tick_size);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::LiqFade(LiqFadeConfig {
+        notional_per_entry: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        max_position_usdt: if lf.max_position_usdt > Decimal::ZERO {
+            lf.max_position_usdt
+        } else {
+            max_position_usdt_default
+        },
+        arm_threshold_usdt: lf.arm_threshold_usdt,
+        arm_dominance: lf.arm_dominance,
+        capitulation_overshoot_bps: lf.capitulation_overshoot_bps,
+        fade_offset_bps: lf.fade_offset_bps,
+        revert_target_bps: lf.revert_target_bps,
+        entry_timeout_secs: lf.entry_timeout_secs,
+        position_timeout_secs: lf.position_timeout_secs,
+        stop_loss_bps: lf.stop_loss_bps,
     }))
 }
 

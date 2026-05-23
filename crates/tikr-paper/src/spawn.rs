@@ -13,9 +13,9 @@ use tikr_backtest::fill_sim::FillSim;
 use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, LadderReentry,
-    LadderReentryConfig, LayeredGrid, LayeredGridConfig, MicroMeanReversion,
-    MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig,
-    StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
+    MicroMeanReversion, MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp,
+    SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -51,6 +51,8 @@ pub enum StrategyChoice {
     MicroMeanReversion(MicroMeanReversionConfig),
     /// [`SpreadScalp`] — quote inside wide spreads for passive scalp fills.
     SpreadScalp(SpreadScalpConfig),
+    /// [`LiqFade`] — liquidation-cascade mean-revert stat-arb.
+    LiqFade(LiqFadeConfig),
 }
 
 impl StrategyChoice {
@@ -66,6 +68,7 @@ impl StrategyChoice {
             Self::SimpleGap(_) => "simple-gap",
             Self::MicroMeanReversion(_) => "micro-mean-reversion",
             Self::SpreadScalp(_) => "spread-scalp",
+            Self::LiqFade(_) => "liq-fade",
         }
     }
 }
@@ -296,6 +299,31 @@ where
                 }
                 StrategyChoice::SpreadScalp(cfg) => {
                     let strategy = SpreadScalp::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
+                    )
+                    .await
+                }
+                StrategyChoice::LiqFade(cfg) => {
+                    // Live LiqFade requires the runner to be fed
+                    // from a `@forceOrder` subscription task. The
+                    // wiring for that lands when the dashboard adds
+                    // per-bot liq channels (issue: TODO). For now
+                    // this arm passes `None` so the strategy compiles
+                    // + runs but sees no liq events — effectively
+                    // an Idle no-op. Backtest mode wires through
+                    // `compare_strategies` directly.
+                    let strategy = LiqFade::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,
