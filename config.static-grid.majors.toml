@@ -1,0 +1,139 @@
+# StaticGrid on the major-cap pairs currently active in `config.toml`
+# (BTC, ETH, BNB, SOL, DOGE). Fixed-symbol layout — no rotation — so the
+# strategy can build up per-symbol regime state.
+#
+# Run with:
+#   tikr --config ./config.static-grid.majors.toml
+#
+# ─── Tuning source ─────────────────────────────────────────────────────────
+# Per-symbol `(inner_bps, step_bps, levels)` picked from 24h backtest sweep
+# on /data/24h/* using efficiency-gated regime skew. Single-sample picks —
+# re-tune after a longer baseline.
+#
+#   symbol    inner step levels   24h NET (eff-gated)
+#   BTCUSDT     3    3    5       +14.30
+#   ETHUSDT     5    2    3       +57.78
+#   BNBUSDT     5    3    2        +0.13   ← barely positive, watch
+#   SOLUSDT     8    2    2        +7.39
+#   DOGEUSDT    8    2    5       +51.72
+#
+# ─── Regime gating ─────────────────────────────────────────────────────────
+# `regime_efficiency_threshold = "0.3"` enables Kaufman's directional
+# efficiency ratio (signed_drift / total_path_length over the rolling
+# window). Self-scales per symbol — no per-symbol bps tuning needed.
+# Skew engages only when |efficiency| ≥ 0.3 (genuinely trending); chop
+# stays symmetric. Set the threshold to `0` to fall back to the bps path
+# (`regime_trend_threshold_bps`), or set `regime_window_secs = 0` to
+# disable gating entirely and apply `auto_skew` unconditionally.
+
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+env = "futures-testnet"
+state_dir = "./state"
+
+# 1% of margin balance split across 5 bots = 0.2% per bot per order.
+# Per-bot `notional` below overrides this when set explicitly.
+order_balance_pct = "1"
+
+# key_file = "./keys/binance-testnet.txt"
+
+
+# ─── BTCUSDT ───────────────────────────────────────────────────────────────
+
+[[bot]]
+symbol = "BTCUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+notional = 120
+levels = 2
+inner_bps = 8
+step_bps = 2
+auto_skew = true
+regime_window_secs = 300
+regime_efficiency_threshold = "0.3"
+
+
+# ─── ETHUSDT ───────────────────────────────────────────────────────────────
+
+[[bot]]
+symbol = "ETHUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+notional = 120
+levels = 2
+inner_bps = 8
+step_bps = 2
+auto_skew = true
+regime_window_secs = 300
+regime_efficiency_threshold = "0.3"
+
+
+# ─── BNBUSDT ───────────────────────────────────────────────────────────────
+#
+# Sweep flagged BNB as borderline (NET +0.13 over 24h). Smallest ladder
+# in the basket; widen step_bps if PnL still grinds after a few sessions.
+
+[[bot]]
+symbol = "BNBUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+notional = 120
+levels = 2
+inner_bps = 8
+step_bps = 2
+auto_skew = true
+regime_window_secs = 300
+regime_efficiency_threshold = "0.3"
+
+
+# ─── SOLUSDT ───────────────────────────────────────────────────────────────
+
+[[bot]]
+symbol = "SOLUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+notional = 120
+levels = 2
+inner_bps = 8
+step_bps = 2
+auto_skew = true
+regime_window_secs = 300
+regime_efficiency_threshold = "0.3"
+
+
+# ─── DOGEUSDT ──────────────────────────────────────────────────────────────
+#
+# Widest native spread + most active in the basket. inner=8 keeps quotes
+# clear of toxic 1-tick flow.
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+notional = 120
+levels = 2
+inner_bps = 8
+step_bps = 2
+auto_skew = true
+regime_window_secs = 300
+regime_efficiency_threshold = "0.3"
+
+
+# ─── Defaults reference ───────────────────────────────────────────────────
+# notional                       = (account.order_balance_pct split)
+# levels                         = 3      # orders/side
+# inner_bps                      = 3      # innermost offset from mid
+# step_bps                       = 3      # spacing between levels
+# target_fills_per_min           = 0      # adaptive scaler off
+# fillrate_window_secs           = 60
+# scale_min                      = "1.0"
+# scale_max                      = "4.0"
+# auto_skew                      = true
+# regime_window_secs             = 0      # 0 disables regime gating
+# regime_trend_threshold_bps     = 10     # used when efficiency_threshold == 0
+# regime_efficiency_threshold    = "0"    # Kaufman ratio gate, "0.3" recommended

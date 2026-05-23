@@ -55,7 +55,6 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-stop_loss_bps = 20         # IOC-flatten on adverse 20bps drift
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────
@@ -71,7 +70,6 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-stop_loss_bps = 20
 
 
 # ─── BNBUSDT ───────────────────────────────────────────────────────────────
@@ -87,7 +85,6 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-stop_loss_bps = 24
 
 
 # ─── SOLUSDT ───────────────────────────────────────────────────────────────
@@ -103,7 +100,6 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-stop_loss_bps = 24
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
@@ -127,12 +123,6 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-stop_loss_bps = 30
-# Adverse-selection tracker (Stage 6): set window > 0 to enable.
-adverse_window_ms = 5000
-adverse_half_life_fills = 10
-adverse_threshold_bps = "3"
-adverse_max_widen_bps = 10
 
 
 # ─── Defaults reference ───────────────────────────────────────────────────

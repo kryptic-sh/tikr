@@ -513,7 +513,7 @@ mod tests {
         }
     }
 
-    fn strategy() -> SpreadScalp {
+    fn strategy() -> SpreadScalpOld {
         SpreadScalpOld::new(SpreadScalpOldConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
