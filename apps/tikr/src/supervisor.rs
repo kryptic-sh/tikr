@@ -42,6 +42,14 @@ pub struct SupervisorCtx {
     pub bot_count: usize,
     /// Live per-bot notional updates from the account balance poller.
     pub notional_rx: watch::Receiver<Decimal>,
+    /// When `true`, the supervisor cancels all resting orders + flattens
+    /// any open position for this symbol on each spawn cycle, giving
+    /// the bot a clean slate. When `false` (default for `tikr` CLI),
+    /// the bot resumes against whatever live state exists — handy for
+    /// fast code-change / restart cycles without churning positions.
+    /// Rotation always sets this `true` because each rotation cycle
+    /// hands the slot to a different symbol with no shared history.
+    pub clear_on_start: bool,
 }
 
 /// Spawn the supervisor for a single bot. Returns the supervisor's join
@@ -158,11 +166,18 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     let symbol = venue::perp_symbol(&ctx.cfg.symbol);
 
     // Reset uses a throwaway client so the run_with_resume venue can be
-    // moved into spawn_bot below.
-    info!("startup reset (cancel + flatten)");
-    let reset_venue = venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol).await?;
-    reset_symbol_state(&reset_venue, &symbol).await;
-    drop(reset_venue);
+    // moved into spawn_bot below. Skipped when clear_on_start is false
+    // (default for `tikr` CLI invocations) so a fast code-change /
+    // restart cycle doesn't churn the open position.
+    if ctx.clear_on_start {
+        info!("startup reset (cancel + flatten) — --clear was set");
+        let reset_venue =
+            venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol).await?;
+        reset_symbol_state(&reset_venue, &symbol).await;
+        drop(reset_venue);
+    } else {
+        info!("resuming live state — pass --clear to flatten + cancel-all at startup");
+    }
 
     info!("building venue for runner");
     let venue_for_run =

@@ -238,6 +238,9 @@ fn spawn_one_bot(
             margin_multiplier: account.margin_multiplier,
             bot_count: slots,
             notional_rx: account.notional_rx.clone(),
+            // Rotation always starts a fresh symbol — leftover state
+            // from a different bot in this slot would be stale.
+            clear_on_start: true,
         },
         shared_state.clone(),
         shutdown_rx,

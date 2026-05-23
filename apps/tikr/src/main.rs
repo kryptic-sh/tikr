@@ -66,6 +66,14 @@ struct Args {
     /// Override [account].margin_multiplier for computed order notional.
     #[arg(long)]
     margin_multiplier: Option<Decimal>,
+
+    /// Reset open positions + cancel all resting orders at startup
+    /// before spawning bots. Default `false` — the bot resumes against
+    /// the existing live state so a quick code-change / restart cycle
+    /// doesn't churn positions. Pass `--clear` for a clean-slate boot
+    /// (mirrors the pre-2026-05-24 default behaviour).
+    #[arg(long, default_value_t = false)]
+    clear: bool,
 }
 
 /// Resolve the config path using cwd-first → XDG fallback discovery.
@@ -411,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
                 margin_multiplier: cfg.account.margin_multiplier,
                 bot_count: cfg.bots.len(),
                 notional_rx: notional_rx.clone(),
+                clear_on_start: args.clear,
             };
             let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());
             supervisors.push(h);
