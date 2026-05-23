@@ -1252,15 +1252,49 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "awaiting parallel preset completion"
     );
     let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(handles.len());
+    let mut crashed: Vec<String> = Vec::new();
     for h in handles {
-        results.push(h.await?);
+        match h.await {
+            Ok(pair) => results.push(pair),
+            Err(e) if e.is_panic() => {
+                // Tokio captures panic payload; extract a short message
+                // so the user sees what blew up without dragging the
+                // whole sweep down with it.
+                let msg = match e.try_into_panic() {
+                    Ok(p) => {
+                        if let Some(s) = p.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = p.downcast_ref::<&str>() {
+                            (*s).to_string()
+                        } else {
+                            "<unknown panic payload>".to_string()
+                        }
+                    }
+                    Err(_) => "<panic, payload uncapturable>".to_string(),
+                };
+                eprintln!("WARN: preset CRASHED: {msg}");
+                crashed.push(msg);
+            }
+            Err(e) => {
+                eprintln!("WARN: preset join error: {e}");
+                crashed.push(e.to_string());
+            }
+        }
     }
     info!(
         elapsed_ms = sweep_start.elapsed().as_millis() as u64,
+        completed = results.len(),
+        crashed = crashed.len(),
         "all presets done"
     );
 
     print_table(&results);
+    if !crashed.is_empty() {
+        eprintln!("\n{} preset(s) CRASHED during sweep:", crashed.len());
+        for (i, msg) in crashed.iter().enumerate() {
+            eprintln!("  [{}] {msg}", i + 1);
+        }
+    }
     Ok(())
 }
 
