@@ -85,7 +85,7 @@ Binaries land in `./target/release/`. Key entry points:
 | `record_binance`     | tikr-backtest | Record Binance market data (depth + aggTrade) to parquet |
 | `record`             | tikr-backtest | Record Hyperliquid market data to parquet                |
 | `run_backtest`       | tikr-paper    | Run one strategy against parquet data, emit P&L report   |
-| `compare_strategies` | tikr-paper    | Run a strategy preset sweep, emit comparison table       |
+| `compare`            | tikr-paper    | Run a strategy preset sweep, emit comparison table       |
 | `run_perp` (example) | tikr-binance  | Live Binance Futures runner (testnet/mainnet)            |
 | `run_spot` (example) | tikr-binance  | Live Binance Spot runner (testnet/mainnet)               |
 | `supervisor`         | tikr-paper    | Multi-symbol paper-trading supervisor                    |
@@ -133,7 +133,7 @@ Strategies: `naive-grid`, `avellaneda-stoikov` (alias `as`), `glft`,
 ### Compare strategies on the same data
 
 ```bash
-cargo run --release --bin compare_strategies -- \
+cargo run --release --bin compare -- \
   --data-dir ./data --symbol BTCUSDT \
   --maker-bps 2 --taker-bps 5
 ```

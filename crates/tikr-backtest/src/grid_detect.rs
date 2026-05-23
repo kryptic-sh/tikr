@@ -10,8 +10,8 @@
 //!    from a `trades_*.parquet` size column when available, else falls
 //!    back to tick.
 //!
-//! Used by `compare_strategies --tick-size auto --step-size auto` so the
-//! operator doesn't have to remember per-symbol filters.
+//! Used by `compare --tick-size auto --step-size auto` so the operator
+//! doesn't have to remember per-symbol filters.
 
 use std::path::{Path, PathBuf};
 

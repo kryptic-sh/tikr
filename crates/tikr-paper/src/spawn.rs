@@ -319,7 +319,7 @@ where
                     // Live LiqFade consumes the `external_liqs`
                     // channel — caller spawns the venue-side
                     // `@forceOrder` subscription task and forwards
-                    // events here. Backtest mode (compare_strategies)
+                    // events here. Backtest mode (`compare` binary)
                     // pre-loads the channel from
                     // `LiqEventStream::into_events()`.
                     let strategy = LiqFade::new(cfg);

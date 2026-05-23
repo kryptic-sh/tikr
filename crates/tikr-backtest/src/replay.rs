@@ -105,7 +105,7 @@ enum EventPayload {
 /// and shared across replay instances via `Arc`. Holds the parquet-decoded +
 /// sorted + seq-validated event vector plus the config used to load it.
 ///
-/// `compare_strategies`-style sweeps wrap this in `Arc` and hand it to each
+/// `compare`-style sweeps wrap this in `Arc` and hand it to each
 /// preset's [`ParquetReplay::from_shared`] so file I/O and the big sort run
 /// exactly once.
 pub struct LoadedReplayData {

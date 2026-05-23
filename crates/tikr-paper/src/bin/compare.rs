@@ -32,7 +32,7 @@ use tracing::info;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
-    name = "compare_strategies",
+    name = "compare",
     about = "Run a strategy suite over recorded parquet data and print a comparison"
 )]
 struct Args {

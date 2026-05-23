@@ -45,5 +45,5 @@ name = "run_backtest"
 path = "src/bin/run_backtest.rs"
 
 [[bin]]
-name = "compare_strategies"
-path = "src/bin/compare_strategies.rs"
+name = "compare"
+path = "src/bin/compare.rs"
