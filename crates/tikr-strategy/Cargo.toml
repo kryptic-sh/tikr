@@ -15,3 +15,7 @@ readme.workspace = true
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"
+# Direct dep so hydra can `use rust_decimal::prelude::ToPrimitive` for
+# the band-index Decimal → u32 cast. tikr-core re-exports `Decimal` but
+# not the prelude traits.
+rust_decimal = { version = "1", default-features = false }

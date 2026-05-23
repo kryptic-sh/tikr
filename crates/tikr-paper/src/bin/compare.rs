@@ -20,10 +20,10 @@ use tikr_core::{
 use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, Hawk, HawkConfig,
-    LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
-    MicroMeanReversion, MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap,
-    SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy,
-    TopOfBook, TopOfBookConfig,
+    Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig,
+    LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig, MicroPrice,
+    MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
+    StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -357,6 +357,52 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     hawk_stop_loss_bps: u32,
 
+    /// Hydra: fiat notional per straddle leg / per add.
+    #[arg(long, default_value = "100")]
+    hydra_notional: String,
+
+    /// Hydra: comma-separated `entry_offset_bps` sweep — straddle
+    /// distance from mid. Wider = bigger-move filter; tighter = more
+    /// chop fills.
+    #[arg(long, default_value = "10,20,30")]
+    hydra_entry_offset_bps_list: String,
+
+    /// Hydra: comma-separated `pyramid_step_bps` sweep — favorable-
+    /// drift band that triggers a pyramid add.
+    #[arg(long, default_value = "15,25")]
+    hydra_pyramid_step_bps_list: String,
+
+    /// Hydra: max pyramid adds. `0` disables the pyramid arm.
+    #[arg(long, default_value_t = 2u32)]
+    hydra_pyramid_max_adds: u32,
+
+    /// Hydra: comma-separated `dca_step_bps` sweep — adverse-drift
+    /// band that triggers a DCA add.
+    #[arg(long, default_value = "20,30")]
+    hydra_dca_step_bps_list: String,
+
+    /// Hydra: max DCA adds. `0` disables the DCA arm.
+    #[arg(long, default_value_t = 2u32)]
+    hydra_dca_max_adds: u32,
+
+    /// Hydra: take-profit threshold in bps from rolling avg_entry.
+    #[arg(long, default_value_t = 30u32)]
+    hydra_tp_bps_from_avg: u32,
+
+    /// Hydra: stop-loss threshold in bps from the ORIGINAL first-fill
+    /// price. Anchored on first fill so DCA can't drag the trigger
+    /// out indefinitely.
+    #[arg(long, default_value_t = 100u32)]
+    hydra_sl_bps_from_first: u32,
+
+    /// Hydra: hard inventory cap in USDT notional.
+    #[arg(long, default_value = "500")]
+    hydra_max_pos_usdt: String,
+
+    /// Hydra: minimum elapsed time between adds (ms).
+    #[arg(long, default_value_t = 500u64)]
+    hydra_add_cooldown_ms: u64,
+
     /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
@@ -496,6 +542,7 @@ fn parse_strategies(s: &str) -> Option<std::collections::HashSet<String>> {
             "sg" => "static-grid".to_string(),
             "lf" => "liq-fade".to_string(),
             "hk" => "hawk".to_string(),
+            "hd" | "hy" => "hydra".to_string(),
             _ => t,
         })
         .collect();
@@ -1629,6 +1676,54 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                             equity_csv_dir.clone(),
                         );
                     }
+                }
+            }
+        }
+    }
+
+    // Hydra — straddle-bracket entry + pyramid/DCA adds + bracketed exit.
+    if included("hydra", &allow) {
+        let hydra_notional = Decimal::from_str(&args.hydra_notional)?;
+        let hydra_max_pos = Decimal::from_str(&args.hydra_max_pos_usdt)?;
+        let hydra_entry = parse_u32_list(&args.hydra_entry_offset_bps_list)?;
+        let hydra_pyr = parse_u32_list(&args.hydra_pyramid_step_bps_list)?;
+        let hydra_dca = parse_u32_list(&args.hydra_dca_step_bps_list)?;
+        for &entry_off in &hydra_entry {
+            for &pyr_step in &hydra_pyr {
+                for &dca_step in &hydra_dca {
+                    let label = format!(
+                        "Hydra eo={entry_off} pyr={pyr_step}x{} dca={dca_step}x{} tp={} sl={}",
+                        args.hydra_pyramid_max_adds,
+                        args.hydra_dca_max_adds,
+                        args.hydra_tp_bps_from_avg,
+                        args.hydra_sl_bps_from_first,
+                    );
+                    spawn_preset(
+                        &mut handles,
+                        &shared_data,
+                        &symbol,
+                        &label,
+                        Hydra::new(HydraConfig {
+                            notional_per_order: hydra_notional,
+                            tick_size: tick,
+                            step_size: lot_step,
+                            min_notional: Decimal::ZERO,
+                            entry_offset_bps: entry_off,
+                            pyramid_step_bps: pyr_step,
+                            pyramid_max_adds: args.hydra_pyramid_max_adds,
+                            dca_step_bps: dca_step,
+                            dca_max_adds: args.hydra_dca_max_adds,
+                            tp_bps_from_avg: args.hydra_tp_bps_from_avg,
+                            sl_bps_from_first: args.hydra_sl_bps_from_first,
+                            max_position_usdt: hydra_max_pos,
+                            add_cooldown_ms: args.hydra_add_cooldown_ms,
+                        }),
+                        fees,
+                        skim_cfg,
+                        funding_cfg,
+                        sim_cfg_template.clone(),
+                        equity_csv_dir.clone(),
+                    );
                 }
             }
         }
