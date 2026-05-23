@@ -529,15 +529,18 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut per_symbol: Vec<(String, Vec<(String, PaperReport)>)> = Vec::new();
     for (i, (sym, dir)) in symbols.iter().enumerate() {
-        println!(
-            "\n╔══════════════════════════════════════════════════════════════╗"
+        let body = format!(
+            "[{}/{}] {sym}  ({})",
+            i + 1,
+            symbols.len(),
+            dir.display()
         );
-        println!(
-            "║ [{}/{}] {sym}  ({})", i + 1, symbols.len(), dir.display()
-        );
-        println!(
-            "╚══════════════════════════════════════════════════════════════╝"
-        );
+        // Banner sized to the content so the right edge always aligns.
+        let bar_len = body.chars().count() + 4;
+        let bar: String = "═".repeat(bar_len);
+        println!("\n╔{bar}╗");
+        println!("║  {body}  ║");
+        println!("╚{bar}╝");
         let mut sub = args.clone();
         sub.symbol = sym.clone();
         sub.data_dir = dir.clone();
@@ -1245,9 +1248,22 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                                     if sc_min > sc_max {
                                         continue;
                                     }
-                                    let label = format!(
-                                        "SG in={inner} st={step} lv={levels} fpm={fpm_target} w={fpm_window} sm={sc_min} sM={sc_max}",
+                                    // Hide scaler knobs from the label when
+                                    // they're at their defaults (fpm=0 means
+                                    // adaptive off, window/scale_min/scale_max
+                                    // are inert). Keeps the column narrow on
+                                    // the common case where only inner/step/
+                                    // levels vary.
+                                    let mut label = format!(
+                                        "SG in={inner} st={step} lv={levels}"
                                     );
+                                    if fpm_target > Decimal::ZERO {
+                                        use std::fmt::Write;
+                                        let _ = write!(
+                                            label,
+                                            " fpm={fpm_target} w={fpm_window} sm={sc_min} sM={sc_max}"
+                                        );
+                                    }
                                     spawn_preset(
                                         &mut handles,
                                         &shared_data,
@@ -1684,10 +1700,22 @@ fn print_table(results: &[(String, PaperReport)]) {
         })
         .unwrap_or_else(|| "base stack".to_string());
 
+    // Compute the actual preset-name column width from the data so long
+    // labels (e.g. SG with custom scaler knobs) don't spill past the
+    // column and break alignment for subsequent shorter rows. Floor at
+    // the header width "preset" + 2 spacing, cap at 80 chars to avoid
+    // pathological wraps on narrow terminals.
+    let name_width = results
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(0)
+        .max("preset".len())
+        .min(80);
     println!();
     if skim_active {
-        println!(
-            "{:<36} {:>7} {:>9} {:>11} {:>11} {:>6} {:>11} {:>12} {:>12}",
+        let header = format!(
+            "{:<nw$} {:>7} {:>9} {:>11} {:>11} {:>6} {:>11} {:>12} {:>12}",
             "preset",
             "fills",
             "fills/min",
@@ -1696,15 +1724,28 @@ fn print_table(results: &[(String, PaperReport)]) {
             "skims",
             base_label,
             "perp+unreal",
-            "TOTAL ACCT"
+            "TOTAL ACCT",
+            nw = name_width,
         );
-        println!("{}", "-".repeat(120));
+        let bar = "-".repeat(header.len());
+        println!("{header}");
+        println!("{bar}");
     } else {
-        println!(
-            "{:<36} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11} {:>11}",
-            "preset", "fills", "fills/min", "realized", "unrealized", "fees", "NET", "$/fill"
+        let header = format!(
+            "{:<nw$} {:>7} {:>9} {:>11} {:>10} {:>11} {:>11} {:>11}",
+            "preset",
+            "fills",
+            "fills/min",
+            "realized",
+            "unrealized",
+            "fees",
+            "NET",
+            "$/fill",
+            nw = name_width,
         );
-        println!("{}", "-".repeat(110));
+        let bar = "-".repeat(header.len());
+        println!("{header}");
+        println!("{bar}");
     }
     for (name, r) in results {
         // Use sim_duration (data-time span) not runtime_secs (wall-clock
@@ -1721,7 +1762,7 @@ fn print_table(results: &[(String, PaperReport)]) {
             let btc_v = decimal_to_f64(&r.final_base_value.0);
             let total = perp + btc_v;
             println!(
-                "{:<36} {:>7} {:>9.2} {:>11.4} {:>11.4} {:>6} {:>10.6} {:>12.4} {:>12.4}",
+                "{:<nw$} {:>7} {:>9.2} {:>11.4} {:>11.4} {:>6} {:>10.6} {:>12.4} {:>12.4}",
                 name,
                 r.fills_emitted,
                 fills_per_min,
@@ -1731,6 +1772,7 @@ fn print_table(results: &[(String, PaperReport)]) {
                 decimal_to_f64(&r.base_stacked.0),
                 perp,
                 total,
+                nw = name_width,
             );
         } else {
             let dollars_per_fill = if r.fills_emitted > 0 {
@@ -1739,7 +1781,7 @@ fn print_table(results: &[(String, PaperReport)]) {
                 0.0
             };
             println!(
-                "{:<36} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.4} {:>11.5}",
+                "{:<nw$} {:>7} {:>9.2} {:>11.4} {:>10.4} {:>11.4} {:>11.4} {:>11.5}",
                 name,
                 r.fills_emitted,
                 fills_per_min,
@@ -1748,6 +1790,7 @@ fn print_table(results: &[(String, PaperReport)]) {
                 decimal_to_f64(&r.fees.0),
                 net,
                 dollars_per_fill,
+                nw = name_width,
             );
         }
     }
@@ -1766,14 +1809,16 @@ fn print_table(results: &[(String, PaperReport)]) {
         }),
     ) {
         println!(
-            "best:  {:<36} NET = {:>11.4}",
+            "best:  {:<nw$} NET = {:>11.4}",
             best.0,
-            decimal_to_f64(&best.1.net.0)
+            decimal_to_f64(&best.1.net.0),
+            nw = name_width,
         );
         println!(
-            "worst: {:<36} NET = {:>11.4}",
+            "worst: {:<nw$} NET = {:>11.4}",
             worst.0,
-            decimal_to_f64(&worst.1.net.0)
+            decimal_to_f64(&worst.1.net.0),
+            nw = name_width,
         );
     }
     println!();
