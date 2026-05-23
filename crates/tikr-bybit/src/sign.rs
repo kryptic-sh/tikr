@@ -31,8 +31,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// `secret` is the API secret (UTF-8 bytes). `payload` is the
 /// concatenation described in the module docstring.
 pub fn sign_hmac_sha256(secret: &str, payload: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(payload.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }

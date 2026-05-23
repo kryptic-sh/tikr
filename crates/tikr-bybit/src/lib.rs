@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::str::FromStr;
 
-use tikr_core::{Fill, MarketEvent, Position, SignedSize, Symbol, Decimal, Notional, Price};
+use tikr_core::{Decimal, Fill, MarketEvent, Notional, Position, Price, SignedSize, Symbol};
 use tikr_venue::{OpenOrder, QuoteId, QuoteIntent, Venue, VenueError};
 
 /// Bybit V5 environment (mainnet vs testnet, linear product).
@@ -110,10 +110,7 @@ impl Venue for BybitClient {
         rest::orderbook_snapshot(&self.http, self.env, symbol).await
     }
 
-    async fn subscribe(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
+    async fn subscribe(&self, symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
         // Merge depth + trade streams. Both arrive on independent WS
         // connections so per-stream reconnects don't bring down the
         // sibling — same shape as `tikr-binance::BinanceClient::subscribe`.

@@ -410,7 +410,15 @@ impl FillSim {
                 .get(&intent.symbol)
                 .copied()
                 .unwrap_or(Decimal::ZERO);
-            let delta = intent.price.0 * intent.size.0;
+            // Scale-bounded: the position_notional accumulator path
+            // re-rounds to 8 dp, but `intent.price × intent.size` can
+            // independently produce a high-scale value (DOGE
+            // 0.20123 × 5-decimal sizes → scale 8+). Round both
+            // operands BEFORE the addition so neither the inner
+            // multiplication nor the sum exceeds rust_decimal's
+            // 96-bit mantissa.
+            let delta = (intent.price.0 * intent.size.0).round_dp(8);
+            let pos = pos.round_dp(8);
             let projected = match intent.side {
                 Side::Bid => pos + delta,
                 Side::Ask => pos - delta,
@@ -442,9 +450,15 @@ impl FillSim {
                 return None;
             }
             let fill_size = intent.size.0;
-            // Taker fee is always positive (no rebate). cfg.fees.taker_bps is u32.
-            let fee_amount = touch_price.0 * fill_size * Decimal::from(self.cfg.fees.taker_bps)
-                / Decimal::from(10_000);
+            // Taker fee — round each operand to bound scale; on DOGE
+            // (price scale 5+) the mul chain can produce a scale-9+
+            // intermediate that, when summed with the existing
+            // accumulator, overflows rust_decimal's 96-bit mantissa.
+            let fee_amount = (touch_price.0.round_dp(8)
+                * fill_size.round_dp(8)
+                * Decimal::from(self.cfg.fees.taker_bps)
+                / Decimal::from(10_000))
+            .round_dp(8);
             // Decrement the touched side's aggregate so subsequent cancel
             // attribution doesn't see the consumed liquidity as a cancel.
             let touched_side = match intent.side {
@@ -452,14 +466,21 @@ impl FillSim {
                 Side::Ask => Side::Bid,
             };
             st.decrement_level(touched_side, touch_price, fill_size);
-            let delta = touch_price.0 * fill_size;
+            // Bound Decimal scale on every accumulation. Each
+            // `delta = price × size` can grow the running scale by 4-8
+            // digits; on long sessions with many fills the cumulative
+            // scale exceeds rust_decimal's 28-digit cap and triggers
+            // an `Addition overflowed` panic. Re-rounding to 8 dp keeps
+            // the value bounded without losing meaningful precision —
+            // USDT exposures don't need sub-satoshi resolution.
+            let delta = (touch_price.0 * fill_size).round_dp(8);
             let entry = self
                 .position_notional
                 .entry(intent.symbol.clone())
                 .or_insert(Decimal::ZERO);
             match intent.side {
-                Side::Bid => *entry += delta,
-                Side::Ask => *entry -= delta,
+                Side::Bid => *entry = (*entry + delta).round_dp(8),
+                Side::Ask => *entry = (*entry - delta).round_dp(8),
             }
             return Some(Fill {
                 quote_id: QuoteId::new(),
@@ -739,8 +760,11 @@ impl FillSim {
             let fill_amount = q.size_remaining.0.min(trade_remaining);
             let fill_price = q.price;
             // fee_amount is signed; positive = paid, negative = rebated.
-            let fee_amount = fill_price.0 * fill_amount * Decimal::from(self.cfg.fees.maker_bps)
-                / Decimal::from(10_000);
+            let fee_amount = (fill_price.0.round_dp(8)
+                * fill_amount.round_dp(8)
+                * Decimal::from(self.cfg.fees.maker_bps)
+                / Decimal::from(10_000))
+            .round_dp(8);
             let is_full = fill_amount >= q.size_remaining.0;
             out.push(Fill {
                 quote_id: q.id,
@@ -753,14 +777,15 @@ impl FillSim {
                 ts: trade_ts,
                 is_full,
             });
-            let delta = fill_price.0 * fill_amount;
+            // Same scale-bound treatment as the IOC arm; see comment above.
+            let delta = (fill_price.0 * fill_amount).round_dp(8);
             let entry = self
                 .position_notional
                 .entry(symbol.clone())
                 .or_insert(Decimal::ZERO);
             match q.side {
-                Side::Bid => *entry += delta,
-                Side::Ask => *entry -= delta,
+                Side::Bid => *entry = (*entry + delta).round_dp(8),
+                Side::Ask => *entry = (*entry - delta).round_dp(8),
             }
             q.size_remaining = Size(q.size_remaining.0 - fill_amount);
             trade_remaining -= fill_amount;

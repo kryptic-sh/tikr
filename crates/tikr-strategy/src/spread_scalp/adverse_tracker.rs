@@ -196,8 +196,7 @@ impl AdverseTracker {
         // ema = alpha · sample + (1 - alpha) · ema
         // Multiplied through by alpha_den to stay in integer-style math:
         // ema · alpha_den = alpha_num · sample + (alpha_den - alpha_num) · ema
-        let weighted = alpha_num * sample_bps
-            + (alpha_den - alpha_num) * self.ema_adverse_bps;
+        let weighted = alpha_num * sample_bps + (alpha_den - alpha_num) * self.ema_adverse_bps;
         self.ema_adverse_bps = weighted / alpha_den;
     }
 

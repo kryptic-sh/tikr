@@ -80,8 +80,7 @@ pub fn evaluate(position: &Position, mid: Price, cfg: RiskConfig) -> RiskDecisio
     // apply.
     let drift = mid.0 - position.avg_entry.0;
     let signed_drift = if long { drift } else { -drift };
-    let drift_bps =
-        signed_drift / position.avg_entry.0 * Decimal::from(10_000);
+    let drift_bps = signed_drift / position.avg_entry.0 * Decimal::from(10_000);
     // Take-profit (positive drift = profit).
     if cfg.take_profit_bps > 0 {
         let tp_bps = Decimal::from(cfg.take_profit_bps);

@@ -5,27 +5,16 @@
 //! unless quotes are already at the best market prices. Inventory-aware sizing
 //! increases the reducing-side order size.
 
-pub mod adverse_tracker;
-pub mod book_state;
-pub mod policy;
-pub mod resting_orders;
-pub mod risk;
-
 use tikr_core::{
     Decimal, MarketEvent, Price, QuoteKind, Side, Size, Snapshot, TimeInForce, Timestamp,
 };
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
-use adverse_tracker::{AdverseConfig, AdverseTracker};
-use book_state::{Top, quote_size, size_at_least_min_notional};
-use policy::{DiffDecision, apply as policy_apply, diff as policy_diff};
-use resting_orders::RestingOrders;
-use risk::{RiskConfig, RiskDecision};
 
 /// Configuration for [`SpreadScalp`].
 #[derive(Debug, Clone)]
-pub struct SpreadScalpConfig {
+pub struct SpreadScalpOldConfig {
     /// Fiat notional per order.
     pub notional_per_order: Decimal,
     /// Venue tick size (price increment).
@@ -49,33 +38,11 @@ pub struct SpreadScalpConfig {
     /// is allowed. Prevents -5022 / -2019 hot loops on fast markets.
     /// 0 disables the gate (legacy behaviour).
     pub reject_cooldown_ms: u64,
-    /// Per-side requote price tolerance, in ticks. Stage-4 `policy::diff`
-    /// skips a requote when the new target is within `±N ticks` of the
-    /// resting quote, killing churn on micro-mid jitter. 0 = exact
-    /// match required; 1-2 is sensible for most venues.
-    pub price_tolerance_ticks: u32,
-    /// Take-profit threshold in bps of position notional (entry × qty).
-    /// `0` disables — falls back to `take_profit_usdt`. Stage 5: when
-    /// non-zero, position closes via IOC at the opposing touch as soon
-    /// as unrealized PnL ≥ this many bps of notional, checked on every
-    /// event (not just at requote time).
-    pub take_profit_bps: u32,
-    /// Stop-loss threshold in bps of position notional. `0` disables.
-    /// Same trigger shape as `take_profit_bps` — IOC at opposing touch
-    /// on every event. Bounds the bad-tail when a position is grinding
-    /// against the strategy.
-    pub stop_loss_bps: u32,
-    /// Adverse-selection tracker config (Stage 6). When non-zero
-    /// `max_widen_bps`, `min_spread_bps` is bumped dynamically by
-    /// `current_widen_bps` whenever rolling post-fill adverse drift
-    /// exceeds `threshold_bps`. Set fields all to zero / disabled to
-    /// keep the legacy fixed-threshold behaviour.
-    pub adverse: AdverseConfig,
 }
 
 /// Spread scalping strategy state.
-pub struct SpreadScalp {
-    config: SpreadScalpConfig,
+pub struct SpreadScalpOld {
+    config: SpreadScalpOldConfig,
     last_bid: Option<Price>,
     last_ask: Option<Price>,
     last_requote_ts: Option<Timestamp>,
@@ -85,35 +52,29 @@ pub struct SpreadScalp {
     /// `reject_cooldown_ms`, matching the SG pattern.
     last_reject_bid_ts: Option<Timestamp>,
     last_reject_ask_ts: Option<Timestamp>,
-    /// Strategy-owned view of resting orders. Stage 3 introduces this
-    /// as the authoritative quote book; Stage 4 will retire
-    /// `last_bid`/`last_ask`/`quotes_live` in favour of it.
-    resting: RestingOrders,
-    /// Adverse-selection tracker (Stage 6). Disabled when
-    /// `config.adverse.snapshot_window_ms == 0`.
-    adverse: AdverseTracker,
 }
 
-impl SpreadScalp {
+impl SpreadScalpOld {
     fn compute_targets(&self, snapshot: &Snapshot) -> Option<(Price, Price)> {
-        let top = Top::from_snapshot(snapshot)?;
+        let best_bid = snapshot.bids.first()?.price;
+        let best_ask = snapshot.asks.first()?.price;
         let tick = self.config.tick_size;
-        if tick <= Decimal::ZERO || top.ask.0 <= top.bid.0 {
+        if tick <= Decimal::ZERO || best_ask.0 <= best_bid.0 {
             return None;
         }
-        let spread_bps = top.spread_bps()?;
-        // Stage 6: effective threshold = baseline + adverse widen.
-        // When adverse tracker is disabled, widen is 0 and behaviour
-        // collapses to the legacy fixed threshold.
-        let effective_min = self.config.min_spread_bps + self.adverse.current_widen_bps();
-        if spread_bps < effective_min {
+        let mid = (best_bid.0 + best_ask.0) / Decimal::from(2);
+        if mid <= Decimal::ZERO {
+            return None;
+        }
+        let spread_bps = (best_ask.0 - best_bid.0) / mid * Decimal::from(10_000);
+        if spread_bps < self.config.min_spread_bps {
             return None;
         }
         // Quote 1 tick inside the best level so PostOnly orders don't get
         // rejected (-5022) when the market moves between snapshot and
         // placement.
-        let bid = Price(top.bid.0 + tick);
-        let ask = Price(top.ask.0 - tick);
+        let bid = Price(best_bid.0 + tick);
+        let ask = Price(best_ask.0 - tick);
         if bid.0 >= ask.0 {
             return None;
         }
@@ -121,12 +82,13 @@ impl SpreadScalp {
     }
 
     fn quote_size(&self, price: Price, size_multiplier: Decimal) -> Decimal {
-        quote_size(
-            self.config.notional_per_order,
-            price,
-            size_multiplier,
-            self.config.step_size,
-        )
+        let raw_size = self.config.notional_per_order / price.0 * size_multiplier;
+        let step = self.config.step_size;
+        if step > Decimal::ZERO {
+            (raw_size / step).floor() * step
+        } else {
+            raw_size
+        }
     }
 
     fn make_quote(
@@ -147,65 +109,38 @@ impl SpreadScalp {
         })
     }
 
-    /// Risk-policy config snapshot. Lets the risk module stay stateless
-    /// while the strategy owns the configurable knobs.
-    fn risk_cfg(&self) -> RiskConfig {
-        RiskConfig {
-            take_profit_bps: self.config.take_profit_bps,
-            stop_loss_bps: self.config.stop_loss_bps,
-            take_profit_usdt_legacy: self.config.take_profit_usdt,
-        }
-    }
-
-    /// Build a fresh intent for `side` at `price` with inventory-bias
-    /// `size_multiplier`, then run it through [`policy::diff`] against
-    /// the tracked resting quote. Emits the minimum action set
-    /// (`[]` / `[Quote]` / `[Cancel, Quote]`) and updates the tracker
-    /// on emit. Stage 4 entry point.
-    fn diff_emit(
-        &mut self,
-        ctx: &StrategyContext<'_>,
-        side: Side,
-        price: Price,
-        size_multiplier: Decimal,
-    ) -> Vec<Action> {
-        let action = self.make_quote(ctx, side, price, size_multiplier);
-        let Action::Quote(intent) = action else {
-            // make_quote always returns Action::Quote.
-            unreachable!()
-        };
-        let decision = policy_diff(
-            self.resting.current_for(side),
-            intent.price,
-            intent.size,
-            Decimal::from(self.config.price_tolerance_ticks),
-            self.config.tick_size,
-        );
-        if matches!(decision, DiffDecision::Unchanged) {
-            return Vec::new();
-        }
-        // Update tracker BEFORE emitting so the next reconcile pass
-        // sees the new intent (id will get stamped by reconcile once
-        // the runner places it).
-        self.resting.record_place(&intent);
-        policy_apply(decision, intent)
-    }
-
-    /// Emit a side-cancel for a tracked-but-no-longer-wanted side.
-    /// Drops the tracker entry too.
-    fn drop_tracked_side(&mut self, side: Side) -> Vec<Action> {
-        let actions = policy::drop_side(self.resting.current_for(side));
-        if !actions.is_empty() || self.resting.current_for(side).is_some() {
-            self.resting.drop_side(side);
-        }
-        actions
-    }
-
-    /// Delegates to [`book_state::size_at_least_min_notional`].
+    /// Round-up size so `size × price >= min_notional`. A single step
+    /// bump can still leave the order under min_notional when the gap
+    /// is larger than `step_size × price`, which then re-triggers the
+    /// venue rejection → recovery hot loop. Compute the exact ceil.
     fn size_at_least_min_notional(&self, price: Price, size_multiplier: Decimal) -> Decimal {
         let raw = self.quote_size(price, size_multiplier);
-        size_at_least_min_notional(raw, price, self.config.min_notional, self.config.step_size)
+        let min = self.config.min_notional;
+        let step = self.config.step_size;
+        if min <= Decimal::ZERO || price.0 <= Decimal::ZERO {
+            return raw;
+        }
+        let current = raw * price.0;
+        if current >= min {
+            return raw;
+        }
+        if step <= Decimal::ZERO {
+            // No lot step: bump straight to min_notional / price.
+            return min / price.0;
+        }
+        let gap = min - current;
+        // ceil(gap / (price × step)) steps to clear min_notional.
+        let step_value = price.0 * step;
+        if step_value <= Decimal::ZERO {
+            return raw;
+        }
+        let mut needed_steps = (gap / step_value).floor();
+        if needed_steps * step_value < gap {
+            needed_steps += Decimal::ONE;
+        }
+        raw + needed_steps * step
     }
+
     /// Whether the strategy is allowed to (re-)place orders on `side`
     /// right now given the per-side reject cooldown.
     fn side_in_cooldown(&self, side: Side, now: Timestamp) -> bool {
@@ -266,35 +201,59 @@ impl SpreadScalp {
         self.last_ask = Some(ask);
         self.last_requote_ts = Some(ts);
         self.quotes_live = true;
-        // Per-side diff — emit only the deltas instead of nuking both
-        // sides every cycle. CancelAll is reserved for `cancel_if_live`
-        // (spread narrowed below threshold) and TP closes.
-        let mut actions: Vec<Action> = Vec::new();
+        let mut actions = vec![Action::CancelAll];
         let mid = (bid.0 + ask.0) / Decimal::from(2);
         let position_value = ctx.position.size.0.abs() * mid;
         let cap = self.config.max_position_usdt;
         let capped = cap > Decimal::ZERO && position_value >= cap;
 
-        // Stage 5: TP/SL moved to the `risk` module and evaluated at
-        // the top of `on_event` — no inline check needed here.
+        // Take-profit: when unrealized PnL >= threshold, fire an IOC
+        // taker on the reducing side at the opposing touch. PostOnly at
+        // mid (the old behaviour) was passive — it sat in the queue
+        // waiting for someone to cross, which contradicts the
+        // "aggressively close" intent. IOC at the opposing best
+        // crosses immediately as taker for the full position size.
+        let tp_threshold = self.config.take_profit_usdt;
+        let tp_triggered = tp_threshold > Decimal::ZERO
+            && ctx.position.avg_entry.0 > Decimal::ZERO
+            && ctx.position.size.0 != Decimal::ZERO;
+        if tp_triggered {
+            let long = ctx.position.size.0 > Decimal::ZERO;
+            let pos_abs = ctx.position.size.0.abs();
+            let profit = if long {
+                mid - ctx.position.avg_entry.0
+            } else {
+                ctx.position.avg_entry.0 - mid
+            };
+            let unrealized = profit * pos_abs;
+            if unrealized >= tp_threshold {
+                // Reducing side + opposing touch = guaranteed taker.
+                let (tp_side, tp_price) = if long {
+                    (Side::Ask, bid)
+                } else {
+                    (Side::Bid, ask)
+                };
+                actions.push(Action::Quote(QuoteIntent {
+                    symbol: ctx.symbol.clone(),
+                    side: tp_side,
+                    price: tp_price,
+                    size: Size(pos_abs),
+                    tif: TimeInForce::IOC,
+                    kind: QuoteKind::Point,
+                }));
+                return actions;
+            }
+        }
 
         let want_bid = (!capped || ctx.position.size.0 <= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Bid, ts);
         let want_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Ask, ts);
         if want_bid {
-            actions.extend(self.diff_emit(ctx, Side::Bid, bid, size_mult.0));
-        } else {
-            // Side not wanted — drop the resting quote on it.
-            actions.extend(self.drop_tracked_side(Side::Bid));
+            actions.push(self.make_quote(ctx, Side::Bid, bid, size_mult.0));
         }
         if want_ask {
-            actions.extend(self.diff_emit(ctx, Side::Ask, ask, size_mult.1));
-        } else {
-            actions.extend(self.drop_tracked_side(Side::Ask));
-        }
-        if actions.is_empty() {
-            actions.push(Action::NoOp);
+            actions.push(self.make_quote(ctx, Side::Ask, ask, size_mult.1));
         }
         actions
     }
@@ -321,7 +280,6 @@ impl SpreadScalp {
         self.last_requote_ts = None;
         if self.quotes_live {
             self.quotes_live = false;
-            self.resting.drop_all();
             vec![Action::CancelAll]
         } else {
             Vec::new()
@@ -329,11 +287,10 @@ impl SpreadScalp {
     }
 }
 
-impl Strategy for SpreadScalp {
-    type Config = SpreadScalpConfig;
+impl Strategy for SpreadScalpOld {
+    type Config = SpreadScalpOldConfig;
 
     fn new(config: Self::Config) -> Self {
-        let adverse = AdverseTracker::new(config.adverse);
         Self {
             config,
             last_bid: None,
@@ -342,90 +299,14 @@ impl Strategy for SpreadScalp {
             quotes_live: false,
             last_reject_bid_ts: None,
             last_reject_ask_ts: None,
-            resting: RestingOrders::new(),
-            adverse,
         }
     }
 
     fn name(&self) -> &str {
-        "spread-scalp"
+        "spread-scalp-old"
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
-        // Pull venue truth into the tracker so in-flight quotes get
-        // their ids stamped + ghosts (silently cancelled / expired)
-        // drop out of our view. Cheap — `ctx.open_quotes` is a slice,
-        // reconcile is O(N).
-        self.resting.reconcile(ctx.open_quotes);
-
-        // Stage 6: fold any due post-fill snapshots into the adverse
-        // tracker. Cheap, runs every event but no-op when nothing's
-        // pending or the tracker is disabled.
-        if let Some(top_for_adverse) = Top::from_snapshot(ctx.latest_book) {
-            self.adverse
-                .process_due_snapshots(ctx.now, top_for_adverse.mid());
-        }
-
-        // Stage 6: record fills for adverse-drift tracking. We do
-        // this BEFORE the risk gate so a TP-triggered close itself
-        // doesn't poison the EMA (TP fires at a favourable moment by
-        // construction). NOTE: this fires on EVERY Fill, including
-        // partials — adverse drift is the same regardless of fill
-        // fraction.
-        if let MarketEvent::Fill(fill) = event {
-            self.adverse.record_fill(fill.ts, fill.side, fill.price);
-        }
-
-        // Stage 5 risk gate: TP/SL checked every event, before any
-        // requote logic. Fires regardless of `min_spread_bps` — we want
-        // to close on a favourable spike even when the book is too
-        // tight to scalp. Reducing-side IOC at the opposing touch is
-        // a guaranteed taker fill (subject to venue liquidity at touch).
-        let mut cap_cancels: Vec<Action> = Vec::new();
-        if let Some(top) = Top::from_snapshot(ctx.latest_book) {
-            let mid = top.mid();
-            if let RiskDecision::Close { side, qty, .. } =
-                risk::evaluate(ctx.position, mid, self.risk_cfg())
-            {
-                // Stage 5 fires close + cancels any resting quotes so
-                // the runner doesn't keep two intents alive on the
-                // same side. CancelAll is justified here — we're
-                // exiting the position, not refining quotes.
-                self.resting.drop_all();
-                self.quotes_live = false;
-                self.last_bid = None;
-                self.last_ask = None;
-                return vec![
-                    Action::CancelAll,
-                    risk::build_close(ctx.symbol, side, qty, top.bid, top.ask),
-                ];
-            }
-
-            // Stage 4 bug-fix: position-cap-driven side cancel must
-            // fire on EVERY event, not only when `should_requote`
-            // returns true. The previous design put this gate inside
-            // `emit_requote` — which is skipped when prices haven't
-            // moved enough. In a stable-book live setting that meant
-            // the bid kept resting + filling past the cap (the live
-            // BTC bot accumulated 36× over its 100-USDT cap that way).
-            //
-            // Now: on every event, check position vs cap; if breached
-            // on a side, drop that side's resting quote (which emits
-            // Cancel(id) if the runner has stamped the venue id).
-            let position_value = ctx.position.size.0.abs() * mid.0;
-            let cap = self.config.max_position_usdt;
-            let capped = cap > Decimal::ZERO && position_value >= cap;
-            if capped {
-                if ctx.position.size.0 > Decimal::ZERO {
-                    // Long over cap — kill the resting bid that keeps
-                    // adding to inventory.
-                    cap_cancels.extend(self.drop_tracked_side(Side::Bid));
-                } else if ctx.position.size.0 < Decimal::ZERO {
-                    cap_cancels.extend(self.drop_tracked_side(Side::Ask));
-                }
-            }
-        }
-
         let (snapshot, ts) = match event {
             MarketEvent::BookUpdate { snapshot } => (snapshot, snapshot.ts),
             MarketEvent::Heartbeat { ts } => (ctx.latest_book, *ts),
@@ -433,10 +314,8 @@ impl Strategy for SpreadScalp {
             MarketEvent::Fill(fill) => {
                 let ts = ctx.now;
                 // Fill = inventory just moved; whatever rejection state
-                // was tracked for the filled side is stale. The tracked
-                // resting quote on the filled side is also gone now.
+                // was tracked for the filled side is stale.
                 self.clear_reject(fill.side);
-                self.resting.drop_side(fill.side);
                 let Some((bid, ask)) = self.compute_targets(ctx.latest_book) else {
                     return self.cancel_if_live(ts);
                 };
@@ -474,7 +353,7 @@ impl Strategy for SpreadScalp {
                     Side::Ask => allow_ask,
                 };
                 if allow_filled_side {
-                    let action = self.make_quote(
+                    actions.push(self.make_quote(
                         ctx,
                         fill_side,
                         if fill_side == Side::Bid { bid } else { ask },
@@ -483,11 +362,7 @@ impl Strategy for SpreadScalp {
                         } else {
                             size_mult.1
                         },
-                    );
-                    if let Action::Quote(intent) = &action {
-                        self.resting.record_place(intent);
-                    }
-                    actions.push(action);
+                    ));
                 }
 
                 // Opp-side top-up — only if cap allows growing that side.
@@ -518,51 +393,27 @@ impl Strategy for SpreadScalp {
                             extra
                         };
                         if extra > Decimal::ZERO {
-                            let intent = QuoteIntent {
+                            actions.push(Action::Quote(QuoteIntent {
                                 symbol: ctx.symbol.clone(),
                                 side: opp_side,
                                 price: opp_price,
                                 size: Size(extra),
                                 tif: TimeInForce::PostOnly,
                                 kind: QuoteKind::Point,
-                            };
-                            // Opp-side top-up adds to whatever's already
-                            // tracked at that side. We overwrite the
-                            // entry with the latest intent — Stage 4's
-                            // multi-quote support will replace this
-                            // with proper additive bookkeeping.
-                            self.resting.record_place(&intent);
-                            actions.push(Action::Quote(intent));
+                            }));
                         }
                     }
                 }
-                // Prepend cap-driven cancels collected at the top of
-                // on_event so a Fill that puts us over the cap also
-                // tears down the exposing side immediately.
-                let mut out = cap_cancels;
-                out.extend(actions);
-                return out;
+                return actions;
             }
         };
         let Some((bid, ask)) = self.compute_targets(snapshot) else {
-            // cancel_if_live might emit CancelAll; merge with any
-            // cap_cancels collected above so a cap-fired cancel isn't
-            // lost when the spread also closes.
-            let mut actions = cap_cancels;
-            actions.extend(self.cancel_if_live(ts));
-            return actions;
+            return self.cancel_if_live(ts);
         };
         if !self.should_requote(bid, ask, ts) {
-            // CRITICAL: do NOT return a bare NoOp here — that swallows
-            // any cap-driven cancels we built at the top of on_event.
-            if cap_cancels.is_empty() {
-                return vec![Action::NoOp];
-            }
-            return cap_cancels;
+            return vec![Action::NoOp];
         }
-        let mut actions = cap_cancels;
-        actions.extend(self.emit_requote(ctx, bid, ask, ts));
-        actions
+        self.emit_requote(ctx, bid, ask, ts)
     }
 
     fn on_quote_rejected(
@@ -663,7 +514,7 @@ mod tests {
     }
 
     fn strategy() -> SpreadScalp {
-        SpreadScalp::new(SpreadScalpConfig {
+        SpreadScalpOld::new(SpreadScalpOldConfig {
             notional_per_order: Decimal::from(100),
             tick_size: Decimal::from(1),
             step_size: Decimal::from(1),
@@ -673,10 +524,6 @@ mod tests {
             max_position_usdt: Decimal::ZERO,
             take_profit_usdt: Decimal::ZERO,
             reject_cooldown_ms: 0,
-            price_tolerance_ticks: 0,
-            take_profit_bps: 0,
-            stop_loss_bps: 0,
-            adverse: AdverseConfig::disabled(),
         })
     }
 
@@ -692,8 +539,8 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(actions.len(), 2);
-        match (&actions[0], &actions[1]) {
+        assert_eq!(actions.len(), 3);
+        match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 // 1 tick inside best bid/ask
                 assert_eq!(bid.price.0, Decimal::from(101));
@@ -734,7 +581,7 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 3);
 
         let second = strategy.on_event(
             &ctx(&symbol, &snapshot, &position),
@@ -764,8 +611,8 @@ mod tests {
                 snapshot: moved.clone(),
             },
         );
-        assert_eq!(actions.len(), 2);
-        match (&actions[0], &actions[1]) {
+        assert_eq!(actions.len(), 3);
+        match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 // 1 tick inside best bid/ask
                 assert_eq!(bid.price.0, Decimal::from(103));
@@ -787,8 +634,8 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(actions.len(), 2);
-        match (&actions[0], &actions[1]) {
+        assert_eq!(actions.len(), 3);
+        match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 assert!(
                     ask.size.0 > bid.size.0,
@@ -813,8 +660,8 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(actions.len(), 2);
-        match (&actions[0], &actions[1]) {
+        assert_eq!(actions.len(), 3);
+        match (&actions[1], &actions[2]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 assert!(bid.size.0 > ask.size.0);
             }

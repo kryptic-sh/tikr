@@ -78,9 +78,7 @@ pub async fn orderbook_snapshot(
         ))));
     }
     let env_json: OrderbookEnvelope = serde_json::from_str(&text).map_err(|e| {
-        VenueError::Internal(
-            format!("bybit snapshot parse: {e} (body={text})").into(),
-        )
+        VenueError::Internal(format!("bybit snapshot parse: {e} (body={text})").into())
     })?;
     if env_json.ret_code != 0 {
         return Err(VenueError::Rejected {

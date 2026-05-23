@@ -38,23 +38,24 @@ order_balance_pct = "1"
 # ─── BTCUSDT ───────────────────────────────────────────────────────────────
 #
 # Typical spread 0.5-1 bps; will fire only on widening events. High
-# `min_spread_bps` to avoid losing money on fees alone. TP at 5 bps of
-# position notional (~$0.0125 per $25 notional) locks tiny wins fast;
-# SL at 20 bps caps a bad fill at $0.05 before it grows.
+# `min_spread_bps` to avoid losing money on fees alone. **No TP** — we
+# let the opposite-side maker quote close the position at maker fees
+# (2bps) instead of paying taker (5bps) via an IOC. Live a/b showed
+# the IOC TP path eats ~3bps per round-trip vs the natural close.
+# SL kept at 20 bps to cap a bad fill before it grinds.
 
 [[bot]]
 symbol = "BTCUSDT"
 strategy = "spread-scalp"
 
 [bot.spread_scalp]
-notional             = 25
-min_spread_bps       = 5
-requote_interval_ms  = 1000
-max_position_usdt    = 100
-reject_cooldown_ms   = 2000
+notional = 120
+min_spread_bps = 5
+requote_interval_ms = 1000
+max_position_usdt = 200
+reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-take_profit_bps      = 5      # bps of position notional — replaces take_profit_usdt
-stop_loss_bps        = 20     # IOC-flatten on adverse 20bps drift
+stop_loss_bps = 20         # IOC-flatten on adverse 20bps drift
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────
@@ -64,14 +65,13 @@ symbol = "ETHUSDT"
 strategy = "spread-scalp"
 
 [bot.spread_scalp]
-notional             = 25
-min_spread_bps       = 5
-requote_interval_ms  = 1000
-max_position_usdt    = 100
-reject_cooldown_ms   = 2000
+notional = 120
+min_spread_bps = 5
+requote_interval_ms = 1000
+max_position_usdt = 200
+reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-take_profit_bps      = 5
-stop_loss_bps        = 20
+stop_loss_bps = 20
 
 
 # ─── BNBUSDT ───────────────────────────────────────────────────────────────
@@ -81,14 +81,13 @@ symbol = "BNBUSDT"
 strategy = "spread-scalp"
 
 [bot.spread_scalp]
-notional             = 25
-min_spread_bps       = 6
-requote_interval_ms  = 1000
-max_position_usdt    = 100
-reject_cooldown_ms   = 2000
+notional = 120
+min_spread_bps = 6
+requote_interval_ms = 1000
+max_position_usdt = 200
+reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-take_profit_bps      = 6
-stop_loss_bps        = 24
+stop_loss_bps = 24
 
 
 # ─── SOLUSDT ───────────────────────────────────────────────────────────────
@@ -98,14 +97,13 @@ symbol = "SOLUSDT"
 strategy = "spread-scalp"
 
 [bot.spread_scalp]
-notional             = 25
-min_spread_bps       = 6
-requote_interval_ms  = 1000
-max_position_usdt    = 100
-reject_cooldown_ms   = 2000
+notional = 120
+min_spread_bps = 6
+requote_interval_ms = 1000
+max_position_usdt = 200
+reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-take_profit_bps      = 6
-stop_loss_bps        = 24
+stop_loss_bps = 24
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
@@ -123,19 +121,18 @@ symbol = "DOGEUSDT"
 strategy = "spread-scalp"
 
 [bot.spread_scalp]
-notional             = 25
-min_spread_bps       = 8
-requote_interval_ms  = 1000
-max_position_usdt    = 100
-reject_cooldown_ms   = 2000
+notional = 120
+min_spread_bps = 8
+requote_interval_ms = 1000
+max_position_usdt = 200
+reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
-take_profit_bps      = 8
-stop_loss_bps        = 30
+stop_loss_bps = 30
 # Adverse-selection tracker (Stage 6): set window > 0 to enable.
-adverse_window_ms          = 5000
-adverse_half_life_fills    = 10
-adverse_threshold_bps      = "3"
-adverse_max_widen_bps      = 10
+adverse_window_ms = 5000
+adverse_half_life_fills = 10
+adverse_threshold_bps = "3"
+adverse_max_widen_bps = 10
 
 
 # ─── Defaults reference ───────────────────────────────────────────────────

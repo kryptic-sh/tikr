@@ -129,9 +129,7 @@ impl RestingOrders {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{
-        Asset, Decimal, MarketKind, QuoteKind, Symbol, TimeInForce, VenueId,
-    };
+    use tikr_core::{Asset, Decimal, MarketKind, QuoteKind, Symbol, TimeInForce, VenueId};
 
     fn intent(side: Side, price: i64, size: i64) -> QuoteIntent {
         QuoteIntent {
@@ -155,8 +153,14 @@ mod tests {
         ro.record_place(&intent(Side::Bid, 100, 1));
         ro.record_place(&intent(Side::Ask, 110, 1));
         assert_eq!(ro.len(), 2);
-        assert_eq!(ro.current_for(Side::Bid).unwrap().price.0, Decimal::from(100));
-        assert_eq!(ro.current_for(Side::Ask).unwrap().price.0, Decimal::from(110));
+        assert_eq!(
+            ro.current_for(Side::Bid).unwrap().price.0,
+            Decimal::from(100)
+        );
+        assert_eq!(
+            ro.current_for(Side::Ask).unwrap().price.0,
+            Decimal::from(110)
+        );
     }
 
     #[test]
@@ -164,7 +168,10 @@ mod tests {
         let mut ro = RestingOrders::new();
         ro.record_place(&intent(Side::Bid, 100, 1));
         ro.record_place(&intent(Side::Bid, 101, 1));
-        assert_eq!(ro.current_for(Side::Bid).unwrap().price.0, Decimal::from(101));
+        assert_eq!(
+            ro.current_for(Side::Bid).unwrap().price.0,
+            Decimal::from(101)
+        );
     }
 
     #[test]

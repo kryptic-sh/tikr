@@ -22,8 +22,8 @@
 use tikr_core::{Decimal, Price, Size};
 use tikr_venue::{QuoteId, QuoteIntent};
 
-use crate::Action;
 use super::resting_orders::Resting;
+use crate::Action;
 
 /// Outcome of a per-side diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
