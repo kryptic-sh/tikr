@@ -5,12 +5,15 @@
 //! unless quotes are already at the best market prices. Inventory-aware sizing
 //! increases the reducing-side order size.
 
+pub mod book_state;
+
 use tikr_core::{
     Decimal, MarketEvent, Price, QuoteKind, Side, Size, Snapshot, TimeInForce, Timestamp,
 };
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
+use book_state::{Top, quote_size, size_at_least_min_notional};
 
 /// Configuration for [`SpreadScalp`].
 #[derive(Debug, Clone)]
@@ -56,25 +59,20 @@ pub struct SpreadScalp {
 
 impl SpreadScalp {
     fn compute_targets(&self, snapshot: &Snapshot) -> Option<(Price, Price)> {
-        let best_bid = snapshot.bids.first()?.price;
-        let best_ask = snapshot.asks.first()?.price;
+        let top = Top::from_snapshot(snapshot)?;
         let tick = self.config.tick_size;
-        if tick <= Decimal::ZERO || best_ask.0 <= best_bid.0 {
+        if tick <= Decimal::ZERO || top.ask.0 <= top.bid.0 {
             return None;
         }
-        let mid = (best_bid.0 + best_ask.0) / Decimal::from(2);
-        if mid <= Decimal::ZERO {
-            return None;
-        }
-        let spread_bps = (best_ask.0 - best_bid.0) / mid * Decimal::from(10_000);
+        let spread_bps = top.spread_bps()?;
         if spread_bps < self.config.min_spread_bps {
             return None;
         }
         // Quote 1 tick inside the best level so PostOnly orders don't get
         // rejected (-5022) when the market moves between snapshot and
         // placement.
-        let bid = Price(best_bid.0 + tick);
-        let ask = Price(best_ask.0 - tick);
+        let bid = Price(top.bid.0 + tick);
+        let ask = Price(top.ask.0 - tick);
         if bid.0 >= ask.0 {
             return None;
         }
@@ -82,13 +80,12 @@ impl SpreadScalp {
     }
 
     fn quote_size(&self, price: Price, size_multiplier: Decimal) -> Decimal {
-        let raw_size = self.config.notional_per_order / price.0 * size_multiplier;
-        let step = self.config.step_size;
-        if step > Decimal::ZERO {
-            (raw_size / step).floor() * step
-        } else {
-            raw_size
-        }
+        quote_size(
+            self.config.notional_per_order,
+            price,
+            size_multiplier,
+            self.config.step_size,
+        )
     }
 
     fn make_quote(
@@ -109,38 +106,11 @@ impl SpreadScalp {
         })
     }
 
-    /// Round-up size so `size × price >= min_notional`. A single step
-    /// bump can still leave the order under min_notional when the gap
-    /// is larger than `step_size × price`, which then re-triggers the
-    /// venue rejection → recovery hot loop. Compute the exact ceil.
+    /// Delegates to [`book_state::size_at_least_min_notional`].
     fn size_at_least_min_notional(&self, price: Price, size_multiplier: Decimal) -> Decimal {
         let raw = self.quote_size(price, size_multiplier);
-        let min = self.config.min_notional;
-        let step = self.config.step_size;
-        if min <= Decimal::ZERO || price.0 <= Decimal::ZERO {
-            return raw;
-        }
-        let current = raw * price.0;
-        if current >= min {
-            return raw;
-        }
-        if step <= Decimal::ZERO {
-            // No lot step: bump straight to min_notional / price.
-            return min / price.0;
-        }
-        let gap = min - current;
-        // ceil(gap / (price × step)) steps to clear min_notional.
-        let step_value = price.0 * step;
-        if step_value <= Decimal::ZERO {
-            return raw;
-        }
-        let mut needed_steps = (gap / step_value).floor();
-        if needed_steps * step_value < gap {
-            needed_steps += Decimal::ONE;
-        }
-        raw + needed_steps * step
+        size_at_least_min_notional(raw, price, self.config.min_notional, self.config.step_size)
     }
-
     /// Whether the strategy is allowed to (re-)place orders on `side`
     /// right now given the per-side reject cooldown.
     fn side_in_cooldown(&self, side: Side, now: Timestamp) -> bool {
