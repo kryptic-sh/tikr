@@ -153,6 +153,17 @@ impl LoadedReplayData {
                         continue;
                     }
                     let path = entry.path();
+                    // Skip files the recorder is still flushing — no
+                    // trailing `PAR1` magic means polars would error out
+                    // and abort the whole sweep. Lets `compare` run
+                    // against a live recording dir.
+                    if !crate::parquet_util::is_complete_parquet(&path) {
+                        tracing::debug!(
+                            path = %path.display(),
+                            "skipping incomplete parquet (no trailing PAR1 magic)"
+                        );
+                        continue;
+                    }
                     if name.starts_with(&book_prefix) {
                         load_book_parquet(&path, symbol_idx, cfg.tick_size, &mut events)?;
                     } else if name.starts_with(&trade_prefix) {

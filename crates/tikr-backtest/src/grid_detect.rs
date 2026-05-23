@@ -87,7 +87,7 @@ fn sniff_from_parquet(data_dir: &Path) -> Result<(Decimal, Decimal), GridDetectE
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if name.ends_with(".parquet") {
+        if name.ends_with(".parquet") && crate::parquet_util::is_complete_parquet(&path) {
             if book_path.is_none() && name.starts_with("book_") {
                 book_path = Some(path.clone());
             } else if trade_path.is_none() && name.starts_with("trades_") {

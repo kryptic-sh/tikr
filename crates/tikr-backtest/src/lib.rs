@@ -12,6 +12,7 @@
 pub mod fill_sim;
 pub mod grid_detect;
 pub mod liq_replay;
+pub mod parquet_util;
 pub mod pnl;
 pub mod replay;
 pub mod runner;

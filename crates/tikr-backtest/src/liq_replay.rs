@@ -119,7 +119,10 @@ impl LiqEventStream {
     }
 }
 
-/// Walk `dir` recursively and return every `*.parquet` path.
+/// Walk `dir` recursively and return every `*.parquet` path that's
+/// finished writing (trailing `PAR1` magic). Incomplete files are
+/// skipped silently — lets the loader run against a live recording
+/// directory without polars erroring on the in-flight shard.
 fn collect_parquets(dir: &Path) -> Result<Vec<PathBuf>, LiqReplayError> {
     let mut out = Vec::new();
     if !dir.exists() {
@@ -132,7 +135,9 @@ fn collect_parquets(dir: &Path) -> Result<Vec<PathBuf>, LiqReplayError> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+            } else if path.extension().and_then(|s| s.to_str()) == Some("parquet")
+                && crate::parquet_util::is_complete_parquet(&path)
+            {
                 out.push(path);
             }
         }
