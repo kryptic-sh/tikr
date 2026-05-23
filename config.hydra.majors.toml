@@ -33,6 +33,12 @@
 # bumps the average winning trade's notional, so the realized PnL
 # advantage compounds beyond the bare win-rate math.
 #
+# DCA arm is intentionally disabled (`dca_max_adds = 0`). The
+# 2026-05-24 sweep showed every DCA variant net-negative: when SL is
+# anchored to the first-fill price, adding more notional on adverse
+# drift just enlarges the loss when SL fires. Anchoring SL on rolling
+# avg would let DCA pay off but that's the classic account-killer.
+#
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-testnet"
@@ -55,7 +61,7 @@ entry_offset_bps = 100
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
-dca_max_adds = 1
+dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
 max_position_usdt = 500
@@ -75,7 +81,7 @@ entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
-dca_max_adds = 1
+dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
 max_position_usdt = 500
@@ -95,7 +101,7 @@ entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
-dca_max_adds = 1
+dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
 max_position_usdt = 500
@@ -115,7 +121,7 @@ entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
-dca_max_adds = 1
+dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
 max_position_usdt = 500
@@ -135,7 +141,7 @@ entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
-dca_max_adds = 1
+dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
 max_position_usdt = 500
