@@ -68,10 +68,6 @@ path = "src/bin/record_liquidations.rs"
 name = "backtest_liquidation_cascade"
 path = "src/bin/backtest_liquidation_cascade.rs"
 
-[[bin]]
-name = "backtest_kline_scalp"
-path = "src/bin/backtest_kline_scalp.rs"
-
 [dependencies]
 tikr-core = "0.1"
 tikr-venue = "0.1"
