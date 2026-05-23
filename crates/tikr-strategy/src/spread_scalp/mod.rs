@@ -8,6 +8,7 @@
 pub mod book_state;
 pub mod policy;
 pub mod resting_orders;
+pub mod risk;
 
 use tikr_core::{
     Decimal, MarketEvent, Price, QuoteKind, Side, Size, Snapshot, TimeInForce, Timestamp,
@@ -18,6 +19,7 @@ use crate::{Action, Strategy, StrategyContext};
 use book_state::{Top, quote_size, size_at_least_min_notional};
 use policy::{DiffDecision, apply as policy_apply, diff as policy_diff};
 use resting_orders::RestingOrders;
+use risk::{RiskConfig, RiskDecision};
 
 /// Configuration for [`SpreadScalp`].
 #[derive(Debug, Clone)]
@@ -50,6 +52,17 @@ pub struct SpreadScalpConfig {
     /// resting quote, killing churn on micro-mid jitter. 0 = exact
     /// match required; 1-2 is sensible for most venues.
     pub price_tolerance_ticks: u32,
+    /// Take-profit threshold in bps of position notional (entry × qty).
+    /// `0` disables — falls back to `take_profit_usdt`. Stage 5: when
+    /// non-zero, position closes via IOC at the opposing touch as soon
+    /// as unrealized PnL ≥ this many bps of notional, checked on every
+    /// event (not just at requote time).
+    pub take_profit_bps: u32,
+    /// Stop-loss threshold in bps of position notional. `0` disables.
+    /// Same trigger shape as `take_profit_bps` — IOC at opposing touch
+    /// on every event. Bounds the bad-tail when a position is grinding
+    /// against the strategy.
+    pub stop_loss_bps: u32,
 }
 
 /// Spread scalping strategy state.
@@ -117,6 +130,16 @@ impl SpreadScalp {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
+    }
+
+    /// Risk-policy config snapshot. Lets the risk module stay stateless
+    /// while the strategy owns the configurable knobs.
+    fn risk_cfg(&self) -> RiskConfig {
+        RiskConfig {
+            take_profit_bps: self.config.take_profit_bps,
+            stop_loss_bps: self.config.stop_loss_bps,
+            take_profit_usdt_legacy: self.config.take_profit_usdt,
+        }
     }
 
     /// Build a fresh intent for `side` at `price` with inventory-bias
@@ -237,43 +260,8 @@ impl SpreadScalp {
         let cap = self.config.max_position_usdt;
         let capped = cap > Decimal::ZERO && position_value >= cap;
 
-        // Take-profit: when unrealized PnL >= threshold, fire an IOC
-        // taker on the reducing side at the opposing touch. PostOnly at
-        // mid (the old behaviour) was passive — it sat in the queue
-        // waiting for someone to cross, which contradicts the
-        // "aggressively close" intent. IOC at the opposing best
-        // crosses immediately as taker for the full position size.
-        let tp_threshold = self.config.take_profit_usdt;
-        let tp_triggered = tp_threshold > Decimal::ZERO
-            && ctx.position.avg_entry.0 > Decimal::ZERO
-            && ctx.position.size.0 != Decimal::ZERO;
-        if tp_triggered {
-            let long = ctx.position.size.0 > Decimal::ZERO;
-            let pos_abs = ctx.position.size.0.abs();
-            let profit = if long {
-                mid - ctx.position.avg_entry.0
-            } else {
-                ctx.position.avg_entry.0 - mid
-            };
-            let unrealized = profit * pos_abs;
-            if unrealized >= tp_threshold {
-                // Reducing side + opposing touch = guaranteed taker.
-                let (tp_side, tp_price) = if long {
-                    (Side::Ask, bid)
-                } else {
-                    (Side::Bid, ask)
-                };
-                actions.push(Action::Quote(QuoteIntent {
-                    symbol: ctx.symbol.clone(),
-                    side: tp_side,
-                    price: tp_price,
-                    size: Size(pos_abs),
-                    tif: TimeInForce::IOC,
-                    kind: QuoteKind::Point,
-                }));
-                return actions;
-            }
-        }
+        // Stage 5: TP/SL moved to the `risk` module and evaluated at
+        // the top of `on_event` — no inline check needed here.
 
         let want_bid = (!capped || ctx.position.size.0 <= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Bid, ts);
@@ -352,6 +340,32 @@ impl Strategy for SpreadScalp {
         // drop out of our view. Cheap — `ctx.open_quotes` is a slice,
         // reconcile is O(N).
         self.resting.reconcile(ctx.open_quotes);
+
+        // Stage 5 risk gate: TP/SL checked every event, before any
+        // requote logic. Fires regardless of `min_spread_bps` — we want
+        // to close on a favourable spike even when the book is too
+        // tight to scalp. Reducing-side IOC at the opposing touch is
+        // a guaranteed taker fill (subject to venue liquidity at touch).
+        if let Some(top) = Top::from_snapshot(ctx.latest_book) {
+            let mid = top.mid();
+            if let RiskDecision::Close { side, qty, .. } =
+                risk::evaluate(ctx.position, mid, self.risk_cfg())
+            {
+                // Stage 5 fires close + cancels any resting quotes so
+                // the runner doesn't keep two intents alive on the
+                // same side. CancelAll is justified here — we're
+                // exiting the position, not refining quotes.
+                self.resting.drop_all();
+                self.quotes_live = false;
+                self.last_bid = None;
+                self.last_ask = None;
+                return vec![
+                    Action::CancelAll,
+                    risk::build_close(ctx.symbol, side, qty, top.bid, top.ask),
+                ];
+            }
+        }
+
         let (snapshot, ts) = match event {
             MarketEvent::BookUpdate { snapshot } => (snapshot, snapshot.ts),
             MarketEvent::Heartbeat { ts } => (ctx.latest_book, *ts),
@@ -583,6 +597,8 @@ mod tests {
             take_profit_usdt: Decimal::ZERO,
             reject_cooldown_ms: 0,
             price_tolerance_ticks: 0,
+            take_profit_bps: 0,
+            stop_loss_bps: 0,
         })
     }
 

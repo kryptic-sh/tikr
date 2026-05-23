@@ -281,6 +281,8 @@ fn build_spread_scalp(
         take_profit_usdt: spread_scalp.take_profit_usdt,
         reject_cooldown_ms: spread_scalp.reject_cooldown_ms,
             price_tolerance_ticks: 1,
+            take_profit_bps: 0,
+            stop_loss_bps: 0,
     }))
 }
 

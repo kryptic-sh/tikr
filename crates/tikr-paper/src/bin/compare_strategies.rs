@@ -653,6 +653,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 take_profit_usdt: Decimal::ZERO,
                 reject_cooldown_ms: 0,
             price_tolerance_ticks: 1,
+            take_profit_bps: 0,
+            stop_loss_bps: 0,
             }),
             fees,
             skim_cfg,
