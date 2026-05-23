@@ -1,0 +1,117 @@
+# SpreadScalp on the major-cap pairs currently active in `config.toml`
+# (BTC, ETH, BNB, SOL, DOGE). Fixed-symbol layout — no rotation — so the
+# strategy can build up symbol-specific state.
+#
+# Run with:
+#   tikr --config ./config.spread-scalp.majors.toml
+#
+# ─── Caveat ────────────────────────────────────────────────────────────────
+# Spread on major-cap perps is usually 0.5-3 bps. Tier-0 Binance Futures
+# round-trip fee is 4 bps. SpreadScalp won't quote until book spread
+# exceeds `min_spread_bps` — set just above the fee floor so the bot only
+# wakes up on momentary widening bursts (news, liq cascades, low-volume
+# windows). Expect long idle stretches between fills on BTC/ETH; DOGE
+# will be the most active.
+
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+env = "futures-testnet"
+state_dir = "./state"
+
+# 1% of margin balance split across 5 bots = 0.2% per bot per order.
+# Per-bot strategy `notional` below overrides this when set explicitly.
+order_balance_pct = "1"
+
+# key_file = "./keys/binance-testnet.txt"
+
+
+# ─── BTCUSDT ───────────────────────────────────────────────────────────────
+#
+# Typical spread 0.5-1 bps; will fire only on widening events. High
+# `min_spread_bps` to avoid losing money on fees alone.
+
+[[bot]]
+symbol = "BTCUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional             = 25
+min_spread_bps       = 5
+requote_interval_ms  = 1000
+max_position_usdt    = 100
+take_profit_usdt     = 0.50
+reject_cooldown_ms   = 2000
+
+
+# ─── ETHUSDT ───────────────────────────────────────────────────────────────
+
+[[bot]]
+symbol = "ETHUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional             = 25
+min_spread_bps       = 5
+requote_interval_ms  = 1000
+max_position_usdt    = 100
+take_profit_usdt     = 0.50
+reject_cooldown_ms   = 2000
+
+
+# ─── BNBUSDT ───────────────────────────────────────────────────────────────
+
+[[bot]]
+symbol = "BNBUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional             = 25
+min_spread_bps       = 6
+requote_interval_ms  = 1000
+max_position_usdt    = 100
+take_profit_usdt     = 0.50
+reject_cooldown_ms   = 2000
+
+
+# ─── SOLUSDT ───────────────────────────────────────────────────────────────
+
+[[bot]]
+symbol = "SOLUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional             = 25
+min_spread_bps       = 6
+requote_interval_ms  = 1000
+max_position_usdt    = 100
+take_profit_usdt     = 0.50
+reject_cooldown_ms   = 2000
+
+
+# ─── DOGEUSDT ──────────────────────────────────────────────────────────────
+#
+# Wider native spread (3-5 bps typical) — most active SS bot in the
+# basket. Bumped `min_spread_bps=8` so accepted fills clear fees with
+# meaningful capture.
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional             = 25
+min_spread_bps       = 8
+requote_interval_ms  = 1000
+max_position_usdt    = 100
+take_profit_usdt     = 1.0
+reject_cooldown_ms   = 2000
+
+
+# Defaults reference (uncomment to override):
+# tick_size            = "0.0001"  # optional; auto-detected from exchangeInfo
+# notional             = 25        # fiat $ per order
+# min_spread_bps       = 5         # minimum market spread to quote
+# requote_interval_ms  = 1000      # fixed requote interval
+# max_position_usdt    = 0         # 0 = uncapped (use balance × leverage)
+# take_profit_usdt     = 0         # 0 = TP disabled
+# reject_cooldown_ms   = 2000      # 0 = no cooldown (legacy)
