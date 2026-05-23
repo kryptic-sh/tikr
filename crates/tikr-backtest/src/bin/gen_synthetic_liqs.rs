@@ -45,46 +45,82 @@ struct Args {
     /// Side of the burst — SELL → forces price down → LiqFade buys.
     #[arg(long, value_enum, default_value = "sell")]
     side: SideArg,
-    /// How far into the book-data window to plant the burst (0.0..1.0).
+    /// How far into the book-data window to plant the FIRST burst (0.0..1.0).
+    /// Subsequent bursts (when `--burst-count > 1`) are spaced evenly out
+    /// to `--offset-end-pct`.
     #[arg(long, default_value_t = 0.25)]
     offset_pct: f64,
+    /// How far into the window the LAST burst lands (0.0..1.0). Only used
+    /// when `--burst-count > 1`. Defaults to `0.95` so the final burst
+    /// stays inside the data window.
+    #[arg(long, default_value_t = 0.95)]
+    offset_end_pct: f64,
+    /// Number of bursts to scatter across the window. `1` (default)
+    /// plants a single cluster at `--offset-pct`.
+    #[arg(long, default_value_t = 1)]
+    burst_count: u32,
     /// Per-event notional in USDT.
     #[arg(long, default_value_t = 200_000.0)]
     event_notional_usdt: f64,
-    /// Number of events in the burst.
+    /// Events per burst.
     #[arg(long, default_value_t = 10)]
     event_count: u32,
-    /// Spacing between events in ms.
+    /// Spacing between events in ms within a burst.
     #[arg(long, default_value_t = 100)]
     spacing_ms: u64,
     /// Reference price (USDT). If 0, defaults to 100_000 (BTC-ish).
     #[arg(long, default_value_t = 0.0)]
     price: f64,
+    /// Alternate side per burst. Default plants every burst on the same
+    /// side as `--side`. With this on, burst 0 = `--side`, burst 1 =
+    /// opposite, etc.
+    #[arg(long, default_value_t = false)]
+    alternate_sides: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (start_ns, end_ns) = scan_ts_range(&args.book_dir)?;
     let span = end_ns.saturating_sub(start_ns);
-    let burst_start = start_ns + ((span as f64 * args.offset_pct) as u64);
     let price = if args.price > 0.0 { args.price } else { 100_000.0 };
     let qty = args.event_notional_usdt / price;
-    let side_str = args.side.as_str();
+    let burst_count = args.burst_count.max(1);
 
-    let mut ts_ns: Vec<u64> = Vec::with_capacity(args.event_count as usize);
-    let mut symbol: Vec<String> = Vec::with_capacity(args.event_count as usize);
-    let mut side: Vec<String> = Vec::with_capacity(args.event_count as usize);
-    let mut qtys: Vec<f64> = Vec::with_capacity(args.event_count as usize);
-    let mut prices: Vec<f64> = Vec::with_capacity(args.event_count as usize);
-    let mut notionals: Vec<f64> = Vec::with_capacity(args.event_count as usize);
-    for i in 0..args.event_count {
-        let t = burst_start + (i as u64) * args.spacing_ms * 1_000_000;
-        ts_ns.push(t);
-        symbol.push(args.symbol.clone());
-        side.push(side_str.to_string());
-        qtys.push(qty);
-        prices.push(price);
-        notionals.push(args.event_notional_usdt);
+    // Compute per-burst start ts. Single burst → exactly at offset_pct.
+    // Multiple bursts → evenly spaced from offset_pct to offset_end_pct.
+    let total_events = (burst_count * args.event_count) as usize;
+    let mut ts_ns: Vec<u64> = Vec::with_capacity(total_events);
+    let mut symbol: Vec<String> = Vec::with_capacity(total_events);
+    let mut side: Vec<String> = Vec::with_capacity(total_events);
+    let mut qtys: Vec<f64> = Vec::with_capacity(total_events);
+    let mut prices: Vec<f64> = Vec::with_capacity(total_events);
+    let mut notionals: Vec<f64> = Vec::with_capacity(total_events);
+    for b in 0..burst_count {
+        let pct = if burst_count == 1 {
+            args.offset_pct
+        } else {
+            args.offset_pct
+                + (args.offset_end_pct - args.offset_pct) * (b as f64)
+                    / ((burst_count - 1) as f64)
+        };
+        let burst_start = start_ns + ((span as f64 * pct) as u64);
+        let burst_side = if args.alternate_sides && b % 2 == 1 {
+            match args.side {
+                SideArg::Buy => "SELL",
+                SideArg::Sell => "BUY",
+            }
+        } else {
+            args.side.as_str()
+        };
+        for i in 0..args.event_count {
+            let t = burst_start + (i as u64) * args.spacing_ms * 1_000_000;
+            ts_ns.push(t);
+            symbol.push(args.symbol.clone());
+            side.push(burst_side.to_string());
+            qtys.push(qty);
+            prices.push(price);
+            notionals.push(args.event_notional_usdt);
+        }
     }
 
     let mut df = df!(
@@ -96,9 +132,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "notional" => notionals,
     )?;
 
+    let label_ts = ts_ns.first().copied().unwrap_or(start_ns);
     let label = DateTime::<Utc>::from_timestamp(
-        (burst_start / 1_000_000_000) as i64,
-        (burst_start % 1_000_000_000) as u32,
+        (label_ts / 1_000_000_000) as i64,
+        (label_ts % 1_000_000_000) as u32,
     )
     .map(|d| d.format("%Y-%m-%d").to_string())
     .unwrap_or_else(|| "1970-01-01".to_string());
@@ -109,11 +146,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ParquetWriter::new(file).finish(&mut df)?;
 
     println!(
-        "wrote {} synthetic {} liqs ({} USDT each, total {:.0} USDT) for {} → {} (ts {}..{})",
-        args.event_count,
-        side_str,
+        "wrote {} synthetic liqs across {} burst(s) ({} USDT/event, total {:.0} USDT) for {} → {} (ts {}..{})",
+        total_events,
+        burst_count,
         args.event_notional_usdt,
-        args.event_notional_usdt * args.event_count as f64,
+        args.event_notional_usdt * total_events as f64,
         args.symbol,
         path.display(),
         ts_ns.first().copied().unwrap_or(0),

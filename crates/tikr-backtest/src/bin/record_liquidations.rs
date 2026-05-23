@@ -185,10 +185,13 @@ async fn main() {
     // Install ring crypto provider so rustls doesn't panic on TLS handshake.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Default log level: INFO in release (so per-flush + lifecycle lines are
+    // visible without forcing RUST_LOG), DEBUG in debug. RUST_LOG overrides
+    // when set (e.g. `RUST_LOG=warn` to quiet it).
     let default_level = if cfg!(debug_assertions) {
         "debug"
     } else {
-        "warn"
+        "info"
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));

@@ -76,12 +76,14 @@ async fn main() {
     // provider defaults; install ring explicitly so TLS handshakes don't
     // panic at first use.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    // Default log level: WARN in release, DEBUG in debug. RUST_LOG overrides
-    // when set (e.g. `RUST_LOG=info,tikr_binance=debug` for surgical traces).
+    // Default log level: INFO in release (so per-flush + lifecycle lines are
+    // visible without forcing RUST_LOG), DEBUG in debug. RUST_LOG overrides
+    // when set (e.g. `RUST_LOG=warn` to quiet it, or
+    // `RUST_LOG=info,tikr_binance=debug` for surgical traces).
     let default_level = if cfg!(debug_assertions) {
         "debug"
     } else {
-        "warn"
+        "info"
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
