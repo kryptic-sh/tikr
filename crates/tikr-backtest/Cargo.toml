@@ -65,6 +65,10 @@ name = "record_liquidations"
 path = "src/bin/record_liquidations.rs"
 
 [[bin]]
+name = "gen_synthetic_liqs"
+path = "src/bin/gen_synthetic_liqs.rs"
+
+[[bin]]
 name = "backtest_liquidation_cascade"
 path = "src/bin/backtest_liquidation_cascade.rs"
 
