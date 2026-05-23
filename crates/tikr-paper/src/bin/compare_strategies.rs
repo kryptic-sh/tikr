@@ -30,7 +30,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "compare_strategies",
     about = "Run a strategy suite over recorded parquet data and print a comparison"
@@ -43,6 +43,22 @@ struct Args {
     /// Binance-style symbol (e.g. `BTCUSDT`).
     #[arg(long, default_value = "BTCUSDT")]
     symbol: String,
+
+    /// Basket mode: directory containing one subdir per symbol (e.g.
+    /// `./data/24h/{BTCUSDT,ETHUSDT,DOGEUSDT}/`). When set, overrides
+    /// `--data-dir` + `--symbol` and runs the full sweep for every
+    /// matching subdir, printing a per-symbol table followed by a
+    /// summary row totalling each symbol's best-preset NET.
+    /// Empty (default) = single-symbol mode.
+    #[arg(long, default_value = "")]
+    data_root: String,
+
+    /// Basket mode allow-list — only run for symbols whose subdir name
+    /// matches one of these (comma-separated). Empty (default) accepts
+    /// every subdir whose name matches `*USDT`/`*USDC`. Use to limit a
+    /// basket sweep to a subset without trimming the directory.
+    #[arg(long, default_value = "")]
+    symbols_filter: String,
 
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
@@ -421,6 +437,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    if !args.data_root.is_empty() {
+        return run_basket(args).await;
+    }
+    run_sweep(args).await
+}
+
+/// Discover symbol subdirs under `data_root`, filter via `symbols_filter`
+/// when provided, and run a full sweep per symbol with the per-symbol
+/// `data_dir` + `symbol` overrides. Prints each symbol's table inline
+/// (delegated to `run_sweep` per call). Cross-symbol summary aggregation
+/// lives here — currently a placeholder banner; deeper aggregation
+/// lands when results are surfaced back to the basket layer.
+async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::path::Path::new(&args.data_root);
+    if !root.exists() {
+        return Err(format!("--data-root path not found: {}", root.display()).into());
+    }
+    let allow: Option<std::collections::HashSet<String>> = {
+        let filter = args.symbols_filter.trim();
+        if filter.is_empty() {
+            None
+        } else {
+            Some(
+                filter
+                    .split(',')
+                    .map(|s| s.trim().to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            )
+        }
+    };
+    // Discover subdirs whose name ends in a known quote-asset suffix.
+    let mut symbols: Vec<(String, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let upper = name.to_uppercase();
+        let known_quote = ["USDT", "USDC", "BUSD", "TUSD"]
+            .iter()
+            .any(|q| upper.ends_with(q));
+        if !known_quote {
+            continue;
+        }
+        if let Some(ref a) = allow {
+            if !a.contains(&upper) {
+                continue;
+            }
+        }
+        symbols.push((upper, path));
+    }
+    symbols.sort_by(|a, b| a.0.cmp(&b.0));
+    if symbols.is_empty() {
+        return Err(format!(
+            "no symbol subdirs found under {} (filter={:?})",
+            root.display(),
+            allow
+        )
+        .into());
+    }
+    info!(
+        symbol_count = symbols.len(),
+        root = %root.display(),
+        "basket sweep starting"
+    );
+    for (i, (sym, dir)) in symbols.iter().enumerate() {
+        println!(
+            "\n╔══════════════════════════════════════════════════════════════╗"
+        );
+        println!(
+            "║ [{}/{}] {sym}  ({})", i + 1, symbols.len(), dir.display()
+        );
+        println!(
+            "╚══════════════════════════════════════════════════════════════╝"
+        );
+        let mut sub = args.clone();
+        sub.symbol = sym.clone();
+        sub.data_dir = dir.clone();
+        // Per-symbol liq subdir if the user pointed `--liq-data-dir` at
+        // a basket root too. Same `<liq_root>/<SYMBOL>/` convention.
+        if !sub.liq_data_dir.is_empty() {
+            let liq_per_sym = std::path::Path::new(&sub.liq_data_dir).join(sym);
+            if liq_per_sym.exists() {
+                sub.liq_data_dir = liq_per_sym.to_string_lossy().to_string();
+            }
+        }
+        // Clear data_root so the inner call doesn't recurse.
+        sub.data_root = String::new();
+        sub.symbols_filter = String::new();
+        if let Err(e) = run_sweep(sub).await {
+            eprintln!("WARN: symbol {sym} sweep failed: {e} — continuing");
+        }
+    }
+    Ok(())
+}
+
+async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let (base_str, quote_str) = split_symbol(&args.symbol);
     let symbol = Symbol {
         base: Asset::new(base_str),
