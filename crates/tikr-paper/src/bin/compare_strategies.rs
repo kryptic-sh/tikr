@@ -60,16 +60,19 @@ struct Args {
     #[arg(long, default_value_t = 1000u64)]
     heartbeat_ms: u64,
 
-    /// Tick size for TopOfBook presets.
-    #[arg(long, default_value = "0.1")]
+    /// Venue tick size (price increment). Defaults to `auto` — detected
+    /// from a static map of known Binance USD-M perps, falling back to
+    /// sniffing the first `book_*.parquet` for the smallest non-zero
+    /// price gap. Pass an explicit decimal (`0.1`, `0.00001`, etc.) to
+    /// override.
+    #[arg(long, default_value = "auto")]
     tick_size: String,
 
-    /// Lot step size for size rounding. Falls back to `tick_size` when
-    /// unset — but for BTC perp the venue step (0.001) is much smaller
-    /// than the price tick (0.1), so notionals computed as
-    /// `notional / price` would floor to 0 and every fill would have
-    /// size=0. Pass `--step-size 0.001` for BTC.
-    #[arg(long, default_value = "")]
+    /// Venue lot step size (quantity rounding). `auto` (default) → same
+    /// detection path as `--tick-size` (static map → parquet sniff on
+    /// the trades file). `""` (empty) falls back to `tick_size` — kept
+    /// for back-compat with old invocations.
+    #[arg(long, default_value = "auto")]
     step_size: String,
 
     /// Skim mode: starting USDT budget per preset. `0` disables (default).
@@ -427,8 +430,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let size_per_quote = Size(Decimal::from_str(&args.size)?);
-    let tick = Decimal::from_str(&args.tick_size)?;
-    let lot_step = if args.step_size.trim().is_empty() {
+    // Auto-detect tick + step when either is set to "auto". Static map
+    // covers the major Binance USD-M perps; falls back to parquet sniff
+    // for unknown symbols.
+    let (auto_tick, auto_step) = if args.tick_size == "auto" || args.step_size == "auto" {
+        match tikr_backtest::grid_detect::detect_grid(&args.data_dir, &args.symbol) {
+            Ok((t, s)) => {
+                info!(tick = %t, step = %s, symbol = %args.symbol, "auto-detected grid");
+                (Some(t), Some(s))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "auto-detect failed for {}: {e}; pass --tick-size + --step-size explicitly",
+                    args.symbol
+                )
+                .into());
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let tick = if args.tick_size == "auto" {
+        auto_tick.unwrap()
+    } else {
+        Decimal::from_str(&args.tick_size)?
+    };
+    let lot_step = if args.step_size == "auto" {
+        auto_step.unwrap()
+    } else if args.step_size.trim().is_empty() {
         tick
     } else {
         Decimal::from_str(args.step_size.trim())?
