@@ -87,6 +87,15 @@ struct Args {
     #[arg(long, default_value_t = 0usize)]
     parallel: usize,
 
+    /// Baseline preset name (or substring match). When set, the table
+    /// gets an extra ΔNET column showing each preset's NET minus the
+    /// baseline's NET. Lets you A/B knob changes against a reference
+    /// without eyeballing the numeric diff. The baseline row itself
+    /// shows ΔNET = `0.0000`. Empty (default) skips the column.
+    /// Example: `--baseline "SG in=3 st=3 lv=3"` (partial match OK).
+    #[arg(long, default_value = "")]
+    baseline: String,
+
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
     size: String,
@@ -1444,10 +1453,32 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
         });
     }
 
+    // Resolve baseline NET (if any) once — match is a substring search
+    // on the preset name. First match wins. None when --baseline empty
+    // or no preset matched (warn so the user notices a typo).
+    let baseline_net: Option<f64> = if args.baseline.is_empty() {
+        None
+    } else {
+        match results.iter().find(|(n, _)| n.contains(&args.baseline)) {
+            Some((n, r)) => {
+                let net = decimal_to_f64(&r.net.0);
+                info!(baseline = %n, baseline_net = net, "baseline preset resolved");
+                Some(net)
+            }
+            None => {
+                eprintln!(
+                    "WARN: --baseline {:?} matched no preset; ΔNET column omitted",
+                    args.baseline
+                );
+                None
+            }
+        }
+    };
+
     match args.output.as_str() {
         "csv" => print_csv(&args.symbol, &results),
         "markdown" | "md" => print_markdown(&args.symbol, &results),
-        _ => print_table(&results),
+        _ => print_table(&results, baseline_net),
     }
     if !crashed.is_empty() {
         eprintln!("\n{} preset(s) CRASHED during sweep:", crashed.len());
@@ -1778,7 +1809,7 @@ fn render_mysql_table(headers: &[&str], rows: &[Vec<String>]) {
     println!("{border}");
 }
 
-fn print_table(results: &[(String, PaperReport)]) {
+fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
     let skim_active = results
         .iter()
         .any(|(_, r)| r.skim_count > 0 || decimal_to_f64(&r.final_perp_balance.0) != 0.0);
@@ -1844,6 +1875,9 @@ fn print_table(results: &[(String, PaperReport)]) {
             "NET",
             "$/fill",
         ]);
+        if baseline_net.is_some() {
+            headers.push("ΔNET");
+        }
         for (name, r) in results {
             let sim_min = (r.sim_duration_secs as f64) / 60.0;
             let fpm = if sim_min > 0.0 {
@@ -1857,7 +1891,7 @@ fn print_table(results: &[(String, PaperReport)]) {
             } else {
                 0.0
             };
-            rows.push(vec![
+            let mut row = vec![
                 name.clone(),
                 r.fills_emitted.to_string(),
                 format!("{fpm:.2}"),
@@ -1866,7 +1900,19 @@ fn print_table(results: &[(String, PaperReport)]) {
                 format!("{:.4}", decimal_to_f64(&r.fees.0)),
                 format!("{net:.4}"),
                 format!("{dpf:.5}"),
-            ]);
+            ];
+            if let Some(bn) = baseline_net {
+                let delta = net - bn;
+                // Prefix `+` on positive deltas so the sign is immediately
+                // visible at a glance.
+                let s = if delta >= 0.0 {
+                    format!("+{delta:.4}")
+                } else {
+                    format!("{delta:.4}")
+                };
+                row.push(s);
+            }
+            rows.push(row);
         }
     }
     println!();
