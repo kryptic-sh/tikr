@@ -5,6 +5,7 @@
 //! unless quotes are already at the best market prices. Inventory-aware sizing
 //! increases the reducing-side order size.
 
+pub mod adverse_tracker;
 pub mod book_state;
 pub mod policy;
 pub mod resting_orders;
@@ -16,6 +17,7 @@ use tikr_core::{
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
+use adverse_tracker::{AdverseConfig, AdverseTracker};
 use book_state::{Top, quote_size, size_at_least_min_notional};
 use policy::{DiffDecision, apply as policy_apply, diff as policy_diff};
 use resting_orders::RestingOrders;
@@ -63,6 +65,12 @@ pub struct SpreadScalpConfig {
     /// on every event. Bounds the bad-tail when a position is grinding
     /// against the strategy.
     pub stop_loss_bps: u32,
+    /// Adverse-selection tracker config (Stage 6). When non-zero
+    /// `max_widen_bps`, `min_spread_bps` is bumped dynamically by
+    /// `current_widen_bps` whenever rolling post-fill adverse drift
+    /// exceeds `threshold_bps`. Set fields all to zero / disabled to
+    /// keep the legacy fixed-threshold behaviour.
+    pub adverse: AdverseConfig,
 }
 
 /// Spread scalping strategy state.
@@ -81,6 +89,9 @@ pub struct SpreadScalp {
     /// as the authoritative quote book; Stage 4 will retire
     /// `last_bid`/`last_ask`/`quotes_live` in favour of it.
     resting: RestingOrders,
+    /// Adverse-selection tracker (Stage 6). Disabled when
+    /// `config.adverse.snapshot_window_ms == 0`.
+    adverse: AdverseTracker,
 }
 
 impl SpreadScalp {
@@ -91,7 +102,11 @@ impl SpreadScalp {
             return None;
         }
         let spread_bps = top.spread_bps()?;
-        if spread_bps < self.config.min_spread_bps {
+        // Stage 6: effective threshold = baseline + adverse widen.
+        // When adverse tracker is disabled, widen is 0 and behaviour
+        // collapses to the legacy fixed threshold.
+        let effective_min = self.config.min_spread_bps + self.adverse.current_widen_bps();
+        if spread_bps < effective_min {
             return None;
         }
         // Quote 1 tick inside the best level so PostOnly orders don't get
@@ -318,6 +333,7 @@ impl Strategy for SpreadScalp {
     type Config = SpreadScalpConfig;
 
     fn new(config: Self::Config) -> Self {
+        let adverse = AdverseTracker::new(config.adverse);
         Self {
             config,
             last_bid: None,
@@ -327,6 +343,7 @@ impl Strategy for SpreadScalp {
             last_reject_bid_ts: None,
             last_reject_ask_ts: None,
             resting: RestingOrders::new(),
+            adverse,
         }
     }
 
@@ -340,6 +357,24 @@ impl Strategy for SpreadScalp {
         // drop out of our view. Cheap — `ctx.open_quotes` is a slice,
         // reconcile is O(N).
         self.resting.reconcile(ctx.open_quotes);
+
+        // Stage 6: fold any due post-fill snapshots into the adverse
+        // tracker. Cheap, runs every event but no-op when nothing's
+        // pending or the tracker is disabled.
+        if let Some(top_for_adverse) = Top::from_snapshot(ctx.latest_book) {
+            self.adverse
+                .process_due_snapshots(ctx.now, top_for_adverse.mid());
+        }
+
+        // Stage 6: record fills for adverse-drift tracking. We do
+        // this BEFORE the risk gate so a TP-triggered close itself
+        // doesn't poison the EMA (TP fires at a favourable moment by
+        // construction). NOTE: this fires on EVERY Fill, including
+        // partials — adverse drift is the same regardless of fill
+        // fraction.
+        if let MarketEvent::Fill(fill) = event {
+            self.adverse.record_fill(fill.ts, fill.side, fill.price);
+        }
 
         // Stage 5 risk gate: TP/SL checked every event, before any
         // requote logic. Fires regardless of `min_spread_bps` — we want
@@ -599,6 +634,7 @@ mod tests {
             price_tolerance_ticks: 0,
             take_profit_bps: 0,
             stop_loss_bps: 0,
+            adverse: AdverseConfig::disabled(),
         })
     }
 

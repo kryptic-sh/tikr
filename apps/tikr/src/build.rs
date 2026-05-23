@@ -283,6 +283,7 @@ fn build_spread_scalp(
             price_tolerance_ticks: 1,
             take_profit_bps: 0,
             stop_loss_bps: 0,
+            adverse: tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled(),
     }))
 }
 
