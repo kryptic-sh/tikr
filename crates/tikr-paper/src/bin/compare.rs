@@ -527,6 +527,7 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         root = %root.display(),
         "basket sweep starting"
     );
+    let mut per_symbol: Vec<(String, Vec<(String, PaperReport)>)> = Vec::new();
     for (i, (sym, dir)) in symbols.iter().enumerate() {
         println!(
             "\n╔══════════════════════════════════════════════════════════════╗"
@@ -551,14 +552,75 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // Clear data_root so the inner call doesn't recurse.
         sub.data_root = String::new();
         sub.symbols_filter = String::new();
-        if let Err(e) = run_sweep(sub).await {
-            eprintln!("WARN: symbol {sym} sweep failed: {e} — continuing");
+        match run_sweep_collect(sub).await {
+            Ok(results) => per_symbol.push((sym.clone(), results)),
+            Err(e) => {
+                eprintln!("WARN: symbol {sym} sweep failed: {e} — continuing");
+                per_symbol.push((sym.clone(), Vec::new()));
+            }
         }
     }
+
+    // Cross-symbol summary: best (highest-NET) preset per symbol +
+    // total basket NET. Skipped when only one symbol contributed
+    // results (the per-symbol table already shows the same info).
+    print_basket_summary(&per_symbol);
     Ok(())
 }
 
+/// Per-symbol best preset + basket NET sum. Empty result vectors
+/// (symbol whose sweep failed) contribute zero to the basket but show
+/// `—` in the per-symbol cells so the operator sees the gap.
+fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
+    let non_empty = per_symbol.iter().filter(|(_, r)| !r.is_empty()).count();
+    if non_empty < 2 {
+        return;
+    }
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════╗");
+    println!("║ BASKET SUMMARY — best preset per symbol + total NET           ║");
+    println!("╚══════════════════════════════════════════════════════════════╝");
+    println!(
+        "{:<10} {:>11} {:>9} {:<40}",
+        "symbol", "NET", "fills", "preset"
+    );
+    println!("{}", "-".repeat(75));
+    let mut total_net = 0.0;
+    for (sym, results) in per_symbol {
+        if let Some((name, report)) = results
+            .iter()
+            .max_by(|(_, a), (_, b)| {
+                decimal_to_f64(&a.net.0)
+                    .partial_cmp(&decimal_to_f64(&b.net.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            let net = decimal_to_f64(&report.net.0);
+            total_net += net;
+            println!(
+                "{:<10} {:>11.4} {:>9} {:<40}",
+                sym, net, report.fills_emitted, name
+            );
+        } else {
+            println!(
+                "{:<10} {:>11} {:>9} {:<40}",
+                sym, "—", "—", "(no results)"
+            );
+        }
+    }
+    println!("{}", "-".repeat(75));
+    println!("{:<10} {:>11.4} {:>9}", "TOTAL", total_net, "");
+}
+
 async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = run_sweep_collect(args).await?;
+    Ok(())
+}
+
+/// Body of `run_sweep`, but returns the sorted/filtered results so
+/// basket mode can aggregate across symbols. Single-symbol path stays
+/// at `run_sweep` for the void return + side-effect printing.
+async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box<dyn std::error::Error>> {
     let (base_str, quote_str) = split_symbol(&args.symbol);
     let symbol = Symbol {
         base: Asset::new(base_str),
@@ -1363,7 +1425,7 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("  [{}] {msg}", i + 1);
         }
     }
-    Ok(())
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
