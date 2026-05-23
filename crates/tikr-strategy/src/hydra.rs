@@ -74,6 +74,30 @@ pub struct HydraConfig {
     /// spike from triggering N adds in one second at near-identical
     /// prices.
     pub add_cooldown_ms: u64,
+    /// Re-anchor the resting straddle when this many seconds have
+    /// elapsed since it was placed. `0` disables time-based refresh.
+    /// Default `60`. Prevents the slower leg from being adversely
+    /// selected by a drifting market — without refresh the bot fills
+    /// only when the market sweeps THROUGH the stale price, which is
+    /// the worst possible entry.
+    pub straddle_refresh_secs: u32,
+    /// Re-anchor the resting straddle when mid has drifted this many
+    /// bps from the price the straddle was anchored at. `0` disables
+    /// drift-based refresh. Default `40`. Fires sooner than the time-
+    /// based gate on fast moves.
+    pub straddle_drift_bps: u32,
+    /// Per-add notional multiplier for the pyramid arm — applied on
+    /// top of `notional_per_order`. `1.0` (default) = same size as the
+    /// straddle leg; `<1` = smaller (lighten as we run favorable);
+    /// `>1` = bigger (martingale the winner — careful, blows the cap
+    /// fast).
+    pub pyramid_size_mult: Decimal,
+    /// Per-add notional multiplier for the DCA arm. `1.0` (default) =
+    /// same size; `>1` = bigger DCA chunks (martingale the loser —
+    /// classic account-killer when combined with a non-frozen SL);
+    /// `<1` = smaller DCA (gentler averaging, more SL hits but less
+    /// catastrophic drawdown per).
+    pub dca_size_mult: Decimal,
 }
 
 /// Internal state machine.
@@ -109,6 +133,14 @@ pub struct Hydra {
     /// True once we've placed the straddle at least once in the current
     /// Idle cycle — drives "Have I posted the bracket yet?".
     straddle_placed: bool,
+    /// Sim-time at which the current resting straddle was placed.
+    /// `None` when straddle not yet placed. Used by the time-based
+    /// refresh gate.
+    straddle_placed_ts_ns: Option<u64>,
+    /// Mid price at which the current straddle was anchored. Used by
+    /// the drift-based refresh gate so we re-anchor when the market
+    /// has walked away from where we planted the bracket.
+    straddle_anchor_mid: Option<Decimal>,
 }
 
 impl Hydra {
@@ -244,6 +276,8 @@ impl Strategy for Hydra {
             last_bid: None,
             last_ask: None,
             straddle_placed: false,
+            straddle_placed_ts_ns: None,
+            straddle_anchor_mid: None,
         }
     }
 
@@ -322,6 +356,8 @@ impl Strategy for Hydra {
                         last_tp_price: tp_price_placed,
                     };
                     self.straddle_placed = false;
+                    self.straddle_placed_ts_ns = None;
+                    self.straddle_anchor_mid = None;
                     return actions;
                 }
             }
@@ -329,6 +365,8 @@ impl Strategy for Hydra {
                 if pos_size == Decimal::ZERO {
                     self.phase = Phase::Idle;
                     self.straddle_placed = false;
+                    self.straddle_placed_ts_ns = None;
+                    self.straddle_anchor_mid = None;
                     // Don't immediately re-arm in the same handler call —
                     // wait for the next BookUpdate so we reanchor on a
                     // fresh mid.
@@ -340,12 +378,44 @@ impl Strategy for Hydra {
         // --- Phase-dispatch ---
         match self.phase {
             Phase::Idle => {
-                // Re-post the straddle on every BookUpdate when we
-                // haven't placed it yet for this cycle. CancelAll on
-                // re-arm so any stale resting from a prior cycle is
-                // cleared before placing the fresh pair.
-                if !self.straddle_placed {
+                // Initial placement OR refresh. Refresh triggers:
+                //   (a) time gate: now − placed_ts ≥ refresh_secs
+                //   (b) drift gate: |mid − anchor_mid|/anchor_mid ≥ drift_bps
+                // Either gate fires → CancelAll + re-build at the
+                // current mid. Without refresh the slower leg gets
+                // adversely selected as the market walks away from
+                // the anchor.
+                let needs_refresh = if !self.straddle_placed {
+                    true
+                } else {
+                    let time_gate = self.config.straddle_refresh_secs > 0
+                        && self
+                            .straddle_placed_ts_ns
+                            .map(|t| {
+                                let elapsed_ns = ctx.now.0.saturating_sub(t);
+                                let refresh_ns = (self.config.straddle_refresh_secs as u64)
+                                    .saturating_mul(1_000_000_000);
+                                elapsed_ns >= refresh_ns
+                            })
+                            .unwrap_or(false);
+                    let drift_gate = self.config.straddle_drift_bps > 0
+                        && self
+                            .straddle_anchor_mid
+                            .map(|anchor| {
+                                if anchor <= Decimal::ZERO {
+                                    return false;
+                                }
+                                let diff = (mid - anchor).abs();
+                                let drift_bps = diff / anchor * Decimal::from(10_000);
+                                drift_bps >= Decimal::from(self.config.straddle_drift_bps)
+                            })
+                            .unwrap_or(false);
+                    time_gate || drift_gate
+                };
+                if needs_refresh {
                     self.straddle_placed = true;
+                    self.straddle_placed_ts_ns = Some(ctx.now.0);
+                    self.straddle_anchor_mid = Some(mid);
                     let mut actions = vec![Action::CancelAll];
                     actions.extend(self.build_straddle(ctx.symbol, best_bid, best_ask));
                     return actions;
@@ -524,9 +594,32 @@ impl Hydra {
         best_ask: Price,
         is_pyramid: bool,
     ) -> Option<Action> {
-        let _ = is_pyramid; // currently no per-arm size differentiation
         let touch_price = if side_long { best_ask } else { best_bid };
-        let add_size = self.quote_size(touch_price);
+        let mult = if is_pyramid {
+            self.config.pyramid_size_mult
+        } else {
+            self.config.dca_size_mult
+        };
+        if mult <= Decimal::ZERO {
+            return None;
+        }
+        // Scale notional by the per-arm multiplier then divide by price
+        // for the base-asset quantity. Lot-step rounded, with a
+        // half-step "always at least one lot" fallback so a 0.5×-tiny
+        // notional doesn't silently zero out.
+        let scaled_notional = self.config.notional_per_order * mult;
+        let raw = if touch_price.0 <= Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            scaled_notional / touch_price.0
+        };
+        let mut add_size = round_down_to_step(raw, self.config.step_size);
+        if add_size <= Decimal::ZERO
+            && self.config.step_size > Decimal::ZERO
+            && raw > self.config.step_size / Decimal::from(2)
+        {
+            add_size = self.config.step_size;
+        }
         if add_size <= Decimal::ZERO {
             return None;
         }
@@ -652,6 +745,11 @@ mod tests {
             sl_bps_from_first: 100,
             max_position_usdt: Decimal::from(500),
             add_cooldown_ms: 0,
+            // Tests are short-lived + don't want refresh to fire.
+            straddle_refresh_secs: 0,
+            straddle_drift_bps: 0,
+            pyramid_size_mult: Decimal::ONE,
+            dca_size_mult: Decimal::ONE,
         }
     }
 

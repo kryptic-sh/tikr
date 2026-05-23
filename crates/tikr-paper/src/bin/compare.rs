@@ -403,6 +403,27 @@ struct Args {
     #[arg(long, default_value_t = 500u64)]
     hydra_add_cooldown_ms: u64,
 
+    /// Hydra: refresh the resting straddle this many seconds after
+    /// placement. `0` (default) disables — the naive refresh tends
+    /// to cancel the closer-to-touch leg before it can fill, which
+    /// HURT net on the 2026-05-24 sweep (basket dropped from +\$7.82
+    /// to +\$1.95). Left in for experimentation but off by default.
+    #[arg(long, default_value_t = 0u32)]
+    hydra_straddle_refresh_secs: u32,
+
+    /// Hydra: refresh the straddle when mid drifts this many bps from
+    /// the anchor. `0` (default) disables — same observation as above.
+    #[arg(long, default_value_t = 0u32)]
+    hydra_straddle_drift_bps: u32,
+
+    /// Hydra: pyramid arm notional multiplier (× notional).
+    #[arg(long, default_value = "1.0")]
+    hydra_pyramid_size_mult: String,
+
+    /// Hydra: DCA arm notional multiplier (× notional).
+    #[arg(long, default_value = "1.0")]
+    hydra_dca_size_mult: String,
+
     /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
@@ -1688,6 +1709,8 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
         let hydra_entry = parse_u32_list(&args.hydra_entry_offset_bps_list)?;
         let hydra_pyr = parse_u32_list(&args.hydra_pyramid_step_bps_list)?;
         let hydra_dca = parse_u32_list(&args.hydra_dca_step_bps_list)?;
+        let hydra_pyr_mult = Decimal::from_str(&args.hydra_pyramid_size_mult)?;
+        let hydra_dca_mult = Decimal::from_str(&args.hydra_dca_size_mult)?;
         for &entry_off in &hydra_entry {
             for &pyr_step in &hydra_pyr {
                 for &dca_step in &hydra_dca {
@@ -1717,6 +1740,10 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                             sl_bps_from_first: args.hydra_sl_bps_from_first,
                             max_position_usdt: hydra_max_pos,
                             add_cooldown_ms: args.hydra_add_cooldown_ms,
+                            straddle_refresh_secs: args.hydra_straddle_refresh_secs,
+                            straddle_drift_bps: args.hydra_straddle_drift_bps,
+                            pyramid_size_mult: hydra_pyr_mult,
+                            dca_size_mult: hydra_dca_mult,
                         }),
                         fees,
                         skim_cfg,

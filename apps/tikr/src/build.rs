@@ -437,6 +437,10 @@ fn build_hydra(
             max_position_usdt_default
         },
         add_cooldown_ms: hd.add_cooldown_ms,
+        straddle_refresh_secs: hd.straddle_refresh_secs,
+        straddle_drift_bps: hd.straddle_drift_bps,
+        pyramid_size_mult: hd.pyramid_size_mult,
+        dca_size_mult: hd.dca_size_mult,
     }))
 }
 

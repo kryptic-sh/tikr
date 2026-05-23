@@ -241,6 +241,20 @@ pub struct HydraParams {
     /// Min elapsed time between adds (ms).
     #[serde(default = "hydra_default_add_cooldown_ms")]
     pub add_cooldown_ms: u64,
+    /// Refresh the resting straddle this many seconds after it was
+    /// placed. `0` disables. Default `60`.
+    #[serde(default = "hydra_default_straddle_refresh_secs")]
+    pub straddle_refresh_secs: u32,
+    /// Refresh the straddle when mid has drifted this many bps from
+    /// the anchor. `0` disables. Default `40`.
+    #[serde(default = "hydra_default_straddle_drift_bps")]
+    pub straddle_drift_bps: u32,
+    /// Per-add multiplier for the pyramid arm (× `notional`).
+    #[serde(default = "hydra_default_pyramid_size_mult")]
+    pub pyramid_size_mult: Decimal,
+    /// Per-add multiplier for the DCA arm (× `notional`).
+    #[serde(default = "hydra_default_dca_size_mult")]
+    pub dca_size_mult: Decimal,
 }
 
 fn hydra_default_entry_offset_bps() -> u32 {
@@ -266,6 +280,18 @@ fn hydra_default_sl_bps_from_first() -> u32 {
 }
 fn hydra_default_add_cooldown_ms() -> u64 {
     1_000
+}
+fn hydra_default_straddle_refresh_secs() -> u32 {
+    0
+}
+fn hydra_default_straddle_drift_bps() -> u32 {
+    0
+}
+fn hydra_default_pyramid_size_mult() -> Decimal {
+    Decimal::ONE
+}
+fn hydra_default_dca_size_mult() -> Decimal {
+    Decimal::ONE
 }
 
 /// StaticGrid configuration.

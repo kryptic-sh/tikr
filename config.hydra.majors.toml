@@ -16,18 +16,22 @@
 #     adverse drift bands. Both capped at `max_position_usdt`.
 #
 # ─── Per-symbol entry_offset tuning ────────────────────────────────────────
-# 72h backtest (2026-05-23 recording) winners with the maker-exit v1:
-#   BTC eo=100, BNB/ETH/SOL eo=150, DOGE eo=100.
-# Wider straddle filters chop better on the lower-vol majors; DOGE pays at
-# the tighter eo because its book moves enough that a 100-bps bracket
-# still fills regularly. BTC's optimum was eo=100 in the v1 sweep — the
-# extra fees from the wider eo=150 didn't pay back on BTC's thinner moves.
+# 72h backtest winners with the v2 maker-exit + asymmetric-mult tuning
+# (TP=30, SL=35, pyramid×1.5, dca×0.5):
+#   BNB eo=50, BTC eo=100, DOGE eo=50, ETH eo=50, SOL eo=50.
+# Tighter SL flipped optimal entry-offset to mostly eo=50 (the wider
+# brackets gave fewer fills per unit time — losing the volume game even
+# though per-trade edge was better). BTC stayed at eo=100 because its
+# book is thin enough that eo=50 churns too many losers.
 #
 # ─── Fees ──────────────────────────────────────────────────────────────────
 # Binance Futures USD-M tier 0: 2 bps maker / 5 bps taker. With maker-exit
 # v1, a TP round-trip = 2 + 2 = 4 bps. An SL round-trip = 2 + 5 = 7 bps.
-# tp=30 / sl=60 → win pays 26 bps, loss costs 67 bps → break-even win
-# rate 72%. v1 backtest cleared this on all 5 majors.
+# v2 winner is tp=30 / sl=35 → win pays 26 bps (TP, maker-maker = 4bps
+# round-trip), loss costs 42 bps (SL, maker-taker = 7bps round-trip) →
+# break-even win rate 62%. The pyramid×1.5 boost on favorable drift
+# bumps the average winning trade's notional, so the realized PnL
+# advantage compounds beyond the bare win-rate math.
 #
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
@@ -53,9 +57,11 @@ pyramid_max_adds = 2
 dca_step_bps = 60
 dca_max_adds = 1
 tp_bps_from_avg = 30
-sl_bps_from_first = 60
+sl_bps_from_first = 35
 max_position_usdt = 500
 add_cooldown_ms = 1000
+pyramid_size_mult = "1.5"
+dca_size_mult = "0.5"
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────
@@ -65,15 +71,17 @@ strategy = "hydra"
 
 [bot.hydra]
 notional = 120
-entry_offset_bps = 150
+entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
 dca_max_adds = 1
 tp_bps_from_avg = 30
-sl_bps_from_first = 60
+sl_bps_from_first = 35
 max_position_usdt = 500
 add_cooldown_ms = 1000
+pyramid_size_mult = "1.5"
+dca_size_mult = "0.5"
 
 
 # ─── BNBUSDT ───────────────────────────────────────────────────────────────
@@ -83,15 +91,17 @@ strategy = "hydra"
 
 [bot.hydra]
 notional = 120
-entry_offset_bps = 150
+entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
 dca_max_adds = 1
 tp_bps_from_avg = 30
-sl_bps_from_first = 60
+sl_bps_from_first = 35
 max_position_usdt = 500
 add_cooldown_ms = 1000
+pyramid_size_mult = "1.5"
+dca_size_mult = "0.5"
 
 
 # ─── SOLUSDT ───────────────────────────────────────────────────────────────
@@ -101,15 +111,17 @@ strategy = "hydra"
 
 [bot.hydra]
 notional = 120
-entry_offset_bps = 150
+entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
 dca_max_adds = 1
 tp_bps_from_avg = 30
-sl_bps_from_first = 60
+sl_bps_from_first = 35
 max_position_usdt = 500
 add_cooldown_ms = 1000
+pyramid_size_mult = "1.5"
+dca_size_mult = "0.5"
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
@@ -119,15 +131,17 @@ strategy = "hydra"
 
 [bot.hydra]
 notional = 120
-entry_offset_bps = 100
+entry_offset_bps = 50
 pyramid_step_bps = 50
 pyramid_max_adds = 2
 dca_step_bps = 60
 dca_max_adds = 1
 tp_bps_from_avg = 30
-sl_bps_from_first = 60
+sl_bps_from_first = 35
 max_position_usdt = 500
 add_cooldown_ms = 1000
+pyramid_size_mult = "1.5"
+dca_size_mult = "0.5"
 
 
 # ─── Defaults reference (commented) ────────────────────────────────────────
