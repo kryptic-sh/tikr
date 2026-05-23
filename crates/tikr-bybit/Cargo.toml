@@ -37,6 +37,3 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signa
 rustls = { version = "0.23", features = ["ring"] }
 dotenvy = "0.15"
 
-[[example]]
-name = "smoke"
-path = "examples/smoke.rs"

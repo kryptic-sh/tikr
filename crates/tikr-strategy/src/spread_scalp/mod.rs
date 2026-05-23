@@ -6,6 +6,7 @@
 //! increases the reducing-side order size.
 
 pub mod book_state;
+pub mod policy;
 pub mod resting_orders;
 
 use tikr_core::{
@@ -15,6 +16,7 @@ use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
 use book_state::{Top, quote_size, size_at_least_min_notional};
+use policy::{DiffDecision, apply as policy_apply, diff as policy_diff};
 use resting_orders::RestingOrders;
 
 /// Configuration for [`SpreadScalp`].
@@ -43,6 +45,11 @@ pub struct SpreadScalpConfig {
     /// is allowed. Prevents -5022 / -2019 hot loops on fast markets.
     /// 0 disables the gate (legacy behaviour).
     pub reject_cooldown_ms: u64,
+    /// Per-side requote price tolerance, in ticks. Stage-4 `policy::diff`
+    /// skips a requote when the new target is within `±N ticks` of the
+    /// resting quote, killing churn on micro-mid jitter. 0 = exact
+    /// match required; 1-2 is sensible for most venues.
+    pub price_tolerance_ticks: u32,
 }
 
 /// Spread scalping strategy state.
@@ -112,6 +119,50 @@ impl SpreadScalp {
         })
     }
 
+    /// Build a fresh intent for `side` at `price` with inventory-bias
+    /// `size_multiplier`, then run it through [`policy::diff`] against
+    /// the tracked resting quote. Emits the minimum action set
+    /// (`[]` / `[Quote]` / `[Cancel, Quote]`) and updates the tracker
+    /// on emit. Stage 4 entry point.
+    fn diff_emit(
+        &mut self,
+        ctx: &StrategyContext<'_>,
+        side: Side,
+        price: Price,
+        size_multiplier: Decimal,
+    ) -> Vec<Action> {
+        let action = self.make_quote(ctx, side, price, size_multiplier);
+        let Action::Quote(intent) = action else {
+            // make_quote always returns Action::Quote.
+            unreachable!()
+        };
+        let decision = policy_diff(
+            self.resting.current_for(side),
+            intent.price,
+            intent.size,
+            Decimal::from(self.config.price_tolerance_ticks),
+            self.config.tick_size,
+        );
+        if matches!(decision, DiffDecision::Unchanged) {
+            return Vec::new();
+        }
+        // Update tracker BEFORE emitting so the next reconcile pass
+        // sees the new intent (id will get stamped by reconcile once
+        // the runner places it).
+        self.resting.record_place(&intent);
+        policy_apply(decision, intent)
+    }
+
+    /// Emit a side-cancel for a tracked-but-no-longer-wanted side.
+    /// Drops the tracker entry too.
+    fn drop_tracked_side(&mut self, side: Side) -> Vec<Action> {
+        let actions = policy::drop_side(self.resting.current_for(side));
+        if !actions.is_empty() || self.resting.current_for(side).is_some() {
+            self.resting.drop_side(side);
+        }
+        actions
+    }
+
     /// Delegates to [`book_state::size_at_least_min_notional`].
     fn size_at_least_min_notional(&self, price: Price, size_multiplier: Decimal) -> Decimal {
         let raw = self.quote_size(price, size_multiplier);
@@ -177,11 +228,10 @@ impl SpreadScalp {
         self.last_ask = Some(ask);
         self.last_requote_ts = Some(ts);
         self.quotes_live = true;
-        // CancelAll wipes both sides on the venue → also wipe our
-        // tracker so it doesn't claim phantom resting orders into the
-        // next cycle.
-        self.resting.drop_all();
-        let mut actions = vec![Action::CancelAll];
+        // Per-side diff — emit only the deltas instead of nuking both
+        // sides every cycle. CancelAll is reserved for `cancel_if_live`
+        // (spread narrowed below threshold) and TP closes.
+        let mut actions: Vec<Action> = Vec::new();
         let mid = (bid.0 + ask.0) / Decimal::from(2);
         let position_value = ctx.position.size.0.abs() * mid;
         let cap = self.config.max_position_usdt;
@@ -230,18 +280,18 @@ impl SpreadScalp {
         let want_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Ask, ts);
         if want_bid {
-            let action = self.make_quote(ctx, Side::Bid, bid, size_mult.0);
-            if let Action::Quote(intent) = &action {
-                self.resting.record_place(intent);
-            }
-            actions.push(action);
+            actions.extend(self.diff_emit(ctx, Side::Bid, bid, size_mult.0));
+        } else {
+            // Side not wanted — drop the resting quote on it.
+            actions.extend(self.drop_tracked_side(Side::Bid));
         }
         if want_ask {
-            let action = self.make_quote(ctx, Side::Ask, ask, size_mult.1);
-            if let Action::Quote(intent) = &action {
-                self.resting.record_place(intent);
-            }
-            actions.push(action);
+            actions.extend(self.diff_emit(ctx, Side::Ask, ask, size_mult.1));
+        } else {
+            actions.extend(self.drop_tracked_side(Side::Ask));
+        }
+        if actions.is_empty() {
+            actions.push(Action::NoOp);
         }
         actions
     }
@@ -532,6 +582,7 @@ mod tests {
             max_position_usdt: Decimal::ZERO,
             take_profit_usdt: Decimal::ZERO,
             reject_cooldown_ms: 0,
+            price_tolerance_ticks: 0,
         })
     }
 
@@ -547,8 +598,8 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(actions.len(), 3);
-        match (&actions[1], &actions[2]) {
+        assert_eq!(actions.len(), 2);
+        match (&actions[0], &actions[1]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 // 1 tick inside best bid/ask
                 assert_eq!(bid.price.0, Decimal::from(101));
@@ -589,7 +640,7 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(first.len(), 3);
+        assert_eq!(first.len(), 2);
 
         let second = strategy.on_event(
             &ctx(&symbol, &snapshot, &position),
@@ -619,8 +670,8 @@ mod tests {
                 snapshot: moved.clone(),
             },
         );
-        assert_eq!(actions.len(), 3);
-        match (&actions[1], &actions[2]) {
+        assert_eq!(actions.len(), 2);
+        match (&actions[0], &actions[1]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 // 1 tick inside best bid/ask
                 assert_eq!(bid.price.0, Decimal::from(103));
@@ -642,8 +693,8 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(actions.len(), 3);
-        match (&actions[1], &actions[2]) {
+        assert_eq!(actions.len(), 2);
+        match (&actions[0], &actions[1]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 assert!(
                     ask.size.0 > bid.size.0,
@@ -668,8 +719,8 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
-        assert_eq!(actions.len(), 3);
-        match (&actions[1], &actions[2]) {
+        assert_eq!(actions.len(), 2);
+        match (&actions[0], &actions[1]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
                 assert!(bid.size.0 > ask.size.0);
             }
