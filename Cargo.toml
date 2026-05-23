@@ -27,6 +27,14 @@ tikr-risk = { path = "crates/tikr-risk" }
 lto = "thin"
 codegen-units = 1
 
+# Dev test profile — opt-level=1 keeps Decimal-heavy backtest tests fast
+# enough while skipping the full release LLVM pass. Cuts incremental
+# `cargo test` compile after a touch in tikr-strategy from ~3m → ~1m
+# vs `--release`. Use `cargo test --release` only for perf-sensitive
+# golden runs.
+[profile.test]
+opt-level = 1
+
 # Profile-friendly release build. Inherits release optimizations + adds debug
 # line tables so samply / flamegraph can map sampled PCs back to source.
 [profile.profiling]
