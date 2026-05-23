@@ -761,9 +761,12 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
         return;
     }
     println!();
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║ BASKET SUMMARY — best preset per symbol + total NET           ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
+    let body = "BASKET SUMMARY — best preset per symbol + total NET";
+    let bar_len = body.chars().count() + 4;
+    let bar: String = "═".repeat(bar_len);
+    println!("╔{bar}╗");
+    println!("║  {body}  ║");
+    println!("╚{bar}╝");
     println!(
         "{:<10} {:>11} {:>9} {:<40}",
         "symbol", "NET", "fills", "preset"
