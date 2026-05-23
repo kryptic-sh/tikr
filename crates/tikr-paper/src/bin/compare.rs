@@ -27,7 +27,7 @@ use tikr_strategy::{
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tracing::info;
 
 #[derive(Parser, Debug, Clone)]
@@ -888,7 +888,11 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
     // multi-thread runtime fans them across cores. State dirs are unique
     // per preset (derived from the preset name) so concurrent snapshot /
     // resume writes don't collide.
-    let mut handles: Vec<JoinHandle<(String, PaperReport)>> = Vec::new();
+    // JoinSet (vs Vec<JoinHandle>) so the await loop drains in
+    // COMPLETION order — the progress line for a fast preset isn't
+    // queued behind a slow earlier one. Per-preset wall-clock is
+    // measured inside the spawned task + returned with the report.
+    let mut handles: JoinSet<(String, PaperReport, std::time::Duration)> = JoinSet::new();
     let allow = parse_strategies(&args.strategies);
     if let Some(set) = &allow {
         info!(allowed = ?set, "strategy filter active — only listed categories will run");
@@ -1500,12 +1504,13 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
     let mut results: Vec<(String, PaperReport)> = Vec::with_capacity(total);
     let mut crashed: Vec<String> = Vec::new();
     let mut done = 0usize;
-    for h in handles {
-        let preset_start = std::time::Instant::now();
-        match h.await {
-            Ok((name, report)) => {
+    // JoinSet drains in completion order — fast presets get their
+    // progress line as soon as they finish, even when an earlier-
+    // spawned slow one is still running.
+    while let Some(joined) = handles.join_next().await {
+        match joined {
+            Ok((name, report, preset_elapsed)) => {
                 done += 1;
-                let elapsed = preset_start.elapsed().as_secs_f64();
                 let total_elapsed = sweep_start.elapsed().as_secs_f64();
                 let eta_secs = if done > 0 {
                     (total_elapsed / done as f64) * (total - done) as f64
@@ -1517,7 +1522,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                     done,
                     total,
                     name,
-                    elapsed,
+                    preset_elapsed.as_secs_f64(),
                     report.fills_emitted,
                     decimal_to_f64(&report.net.0),
                     format_eta(eta_secs)
@@ -1674,7 +1679,7 @@ async fn run_one<S: Strategy>(
 /// `spawn_preset` callers.
 #[allow(clippy::too_many_arguments)]
 fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
-    handles: &mut Vec<JoinHandle<(String, PaperReport)>>,
+    handles: &mut JoinSet<(String, PaperReport, std::time::Duration)>,
     shared_data: &Arc<LoadedReplayData>,
     symbol: &Symbol,
     name: &str,
@@ -1693,8 +1698,9 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
-    handles.push(tokio::spawn(async move {
+    handles.spawn(async move {
         let _permit = acquire_sweep_permit().await;
+        let preset_start = std::time::Instant::now();
         // Pre-load the liq channel — events are sorted; the runner
         // timestamp-gates them on observe so the strategy only sees
         // those whose ts <= current event ts.
@@ -1740,8 +1746,8 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             fills = report.fills_emitted,
             "preset done (liq-gated)"
         );
-        (display, report)
-    }));
+        (display, report, preset_start.elapsed())
+    });
 }
 
 /// Global semaphore set once by `run_sweep_collect` when `--parallel N`
@@ -1764,7 +1770,7 @@ async fn acquire_sweep_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
 }
 
 fn spawn_preset<S: Strategy + Send + 'static>(
-    handles: &mut Vec<JoinHandle<(String, PaperReport)>>,
+    handles: &mut JoinSet<(String, PaperReport, std::time::Duration)>,
     shared_data: &Arc<LoadedReplayData>,
     symbol: &Symbol,
     name: &str,
@@ -1781,11 +1787,12 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
-    handles.push(tokio::spawn(async move {
+    handles.spawn(async move {
         let _permit = acquire_sweep_permit().await;
+        let preset_start = std::time::Instant::now();
         let r = run_one(sd, sym, state_id, strategy, fees, skim, funding, sim_cfg).await;
-        (display, r)
-    }));
+        (display, r, preset_start.elapsed())
+    });
 }
 
 /// Compact ETA string for the per-preset progress line:
