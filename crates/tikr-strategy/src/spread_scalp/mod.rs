@@ -6,6 +6,7 @@
 //! increases the reducing-side order size.
 
 pub mod book_state;
+pub mod resting_orders;
 
 use tikr_core::{
     Decimal, MarketEvent, Price, QuoteKind, Side, Size, Snapshot, TimeInForce, Timestamp,
@@ -14,6 +15,7 @@ use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
 use book_state::{Top, quote_size, size_at_least_min_notional};
+use resting_orders::RestingOrders;
 
 /// Configuration for [`SpreadScalp`].
 #[derive(Debug, Clone)]
@@ -55,6 +57,10 @@ pub struct SpreadScalp {
     /// `reject_cooldown_ms`, matching the SG pattern.
     last_reject_bid_ts: Option<Timestamp>,
     last_reject_ask_ts: Option<Timestamp>,
+    /// Strategy-owned view of resting orders. Stage 3 introduces this
+    /// as the authoritative quote book; Stage 4 will retire
+    /// `last_bid`/`last_ask`/`quotes_live` in favour of it.
+    resting: RestingOrders,
 }
 
 impl SpreadScalp {
@@ -171,6 +177,10 @@ impl SpreadScalp {
         self.last_ask = Some(ask);
         self.last_requote_ts = Some(ts);
         self.quotes_live = true;
+        // CancelAll wipes both sides on the venue → also wipe our
+        // tracker so it doesn't claim phantom resting orders into the
+        // next cycle.
+        self.resting.drop_all();
         let mut actions = vec![Action::CancelAll];
         let mid = (bid.0 + ask.0) / Decimal::from(2);
         let position_value = ctx.position.size.0.abs() * mid;
@@ -220,10 +230,18 @@ impl SpreadScalp {
         let want_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Ask, ts);
         if want_bid {
-            actions.push(self.make_quote(ctx, Side::Bid, bid, size_mult.0));
+            let action = self.make_quote(ctx, Side::Bid, bid, size_mult.0);
+            if let Action::Quote(intent) = &action {
+                self.resting.record_place(intent);
+            }
+            actions.push(action);
         }
         if want_ask {
-            actions.push(self.make_quote(ctx, Side::Ask, ask, size_mult.1));
+            let action = self.make_quote(ctx, Side::Ask, ask, size_mult.1);
+            if let Action::Quote(intent) = &action {
+                self.resting.record_place(intent);
+            }
+            actions.push(action);
         }
         actions
     }
@@ -250,6 +268,7 @@ impl SpreadScalp {
         self.last_requote_ts = None;
         if self.quotes_live {
             self.quotes_live = false;
+            self.resting.drop_all();
             vec![Action::CancelAll]
         } else {
             Vec::new()
@@ -269,6 +288,7 @@ impl Strategy for SpreadScalp {
             quotes_live: false,
             last_reject_bid_ts: None,
             last_reject_ask_ts: None,
+            resting: RestingOrders::new(),
         }
     }
 
@@ -277,6 +297,11 @@ impl Strategy for SpreadScalp {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        // Pull venue truth into the tracker so in-flight quotes get
+        // their ids stamped + ghosts (silently cancelled / expired)
+        // drop out of our view. Cheap — `ctx.open_quotes` is a slice,
+        // reconcile is O(N).
+        self.resting.reconcile(ctx.open_quotes);
         let (snapshot, ts) = match event {
             MarketEvent::BookUpdate { snapshot } => (snapshot, snapshot.ts),
             MarketEvent::Heartbeat { ts } => (ctx.latest_book, *ts),
@@ -284,8 +309,10 @@ impl Strategy for SpreadScalp {
             MarketEvent::Fill(fill) => {
                 let ts = ctx.now;
                 // Fill = inventory just moved; whatever rejection state
-                // was tracked for the filled side is stale.
+                // was tracked for the filled side is stale. The tracked
+                // resting quote on the filled side is also gone now.
                 self.clear_reject(fill.side);
+                self.resting.drop_side(fill.side);
                 let Some((bid, ask)) = self.compute_targets(ctx.latest_book) else {
                     return self.cancel_if_live(ts);
                 };
@@ -323,7 +350,7 @@ impl Strategy for SpreadScalp {
                     Side::Ask => allow_ask,
                 };
                 if allow_filled_side {
-                    actions.push(self.make_quote(
+                    let action = self.make_quote(
                         ctx,
                         fill_side,
                         if fill_side == Side::Bid { bid } else { ask },
@@ -332,7 +359,11 @@ impl Strategy for SpreadScalp {
                         } else {
                             size_mult.1
                         },
-                    ));
+                    );
+                    if let Action::Quote(intent) = &action {
+                        self.resting.record_place(intent);
+                    }
+                    actions.push(action);
                 }
 
                 // Opp-side top-up — only if cap allows growing that side.
@@ -363,14 +394,21 @@ impl Strategy for SpreadScalp {
                             extra
                         };
                         if extra > Decimal::ZERO {
-                            actions.push(Action::Quote(QuoteIntent {
+                            let intent = QuoteIntent {
                                 symbol: ctx.symbol.clone(),
                                 side: opp_side,
                                 price: opp_price,
                                 size: Size(extra),
                                 tif: TimeInForce::PostOnly,
                                 kind: QuoteKind::Point,
-                            }));
+                            };
+                            // Opp-side top-up adds to whatever's already
+                            // tracked at that side. We overwrite the
+                            // entry with the latest intent — Stage 4's
+                            // multi-quote support will replace this
+                            // with proper additive bookkeeping.
+                            self.resting.record_place(&intent);
+                            actions.push(Action::Quote(intent));
                         }
                     }
                 }
