@@ -592,6 +592,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 notional_per_order: notional,
                 levels_per_side: args.lg_levels,
                 inner_bps: args.lg_bps,
+                max_position_usdt: Decimal::ZERO,
+                take_profit_bps: 0,
+                stop_loss_bps: 0,
             });
             run_with_resume(
                 venue,
@@ -681,6 +684,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auto_skew: !args.sg_no_auto_skew,
                 step_size: venue.step_size(&symbol).unwrap_or(Decimal::ONE),
                 min_notional: venue.min_notional(&symbol).unwrap_or(Decimal::ZERO),
+                regime_window_secs: 0,
+                regime_trend_threshold_bps: 10,
+                regime_efficiency_threshold: Decimal::ZERO,
+                max_position_usdt: Decimal::ZERO,
+                take_profit_bps: 0,
+                stop_loss_bps: 0,
             });
             run_with_resume(
                 venue,

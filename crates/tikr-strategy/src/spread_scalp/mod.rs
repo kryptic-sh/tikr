@@ -9,7 +9,11 @@ pub mod adverse_tracker;
 pub mod book_state;
 pub mod policy;
 pub mod resting_orders;
-pub mod risk;
+
+/// Risk policy lives at the crate root so SG/LG share the same TP/SL
+/// + bps-of-notional evaluation as SS. Re-exported here so existing
+/// `spread_scalp::risk::*` paths continue to compile.
+pub use crate::risk;
 
 use tikr_core::{
     Decimal, MarketEvent, Price, QuoteKind, Side, Size, Snapshot, TimeInForce, Timestamp,

@@ -32,8 +32,20 @@ pub fn to_spec(
 ) -> Result<BotSpec> {
     let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
-        "static-grid" | "sg" => build_sg(cfg, &symbol, venue, default_notional)?,
-        "layered-grid" | "lg" => build_lg(cfg, &symbol, venue, default_notional)?,
+        "static-grid" | "sg" => build_sg(
+            cfg,
+            &symbol,
+            venue,
+            default_notional,
+            max_position_usdt_default,
+        )?,
+        "layered-grid" | "lg" => build_lg(
+            cfg,
+            &symbol,
+            venue,
+            default_notional,
+            max_position_usdt_default,
+        )?,
         "ladder-reentry" | "lr" => build_ladder_reentry(cfg, &symbol, venue, default_notional)?,
         "simple-gap" | "sgap" => build_simple_gap(cfg, &symbol, venue, default_notional)?,
         "micro-mean-reversion" | "mmr" => {
@@ -124,6 +136,7 @@ fn build_sg(
     symbol: &Symbol,
     venue: &BinanceClient,
     default_notional: Decimal,
+    max_position_usdt_default: Decimal,
 ) -> Result<StrategyChoice> {
     let sg = cfg.sg.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -146,6 +159,16 @@ fn build_sg(
         scale_min: sg.scale_min,
         scale_max: sg.scale_max,
         auto_skew: sg.auto_skew,
+        regime_window_secs: sg.regime_window_secs,
+        regime_trend_threshold_bps: sg.regime_trend_threshold_bps,
+        regime_efficiency_threshold: sg.regime_efficiency_threshold,
+        max_position_usdt: if sg.max_position_usdt > Decimal::ZERO {
+            sg.max_position_usdt
+        } else {
+            max_position_usdt_default
+        },
+        take_profit_bps: sg.take_profit_bps,
+        stop_loss_bps: sg.stop_loss_bps,
     }))
 }
 
@@ -154,6 +177,7 @@ fn build_lg(
     symbol: &Symbol,
     venue: &BinanceClient,
     default_notional: Decimal,
+    max_position_usdt_default: Decimal,
 ) -> Result<StrategyChoice> {
     let lg: &LgParams = cfg.lg.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -166,6 +190,13 @@ fn build_lg(
         notional_per_order: notional,
         levels_per_side: lg.levels,
         inner_bps: lg.bps,
+        max_position_usdt: if lg.max_position_usdt > Decimal::ZERO {
+            lg.max_position_usdt
+        } else {
+            max_position_usdt_default
+        },
+        take_profit_bps: lg.take_profit_bps,
+        stop_loss_bps: lg.stop_loss_bps,
     }))
 }
 

@@ -126,6 +126,67 @@ struct Args {
     #[arg(long, default_value = "4.0")]
     sg_scale_max_list: String,
 
+    /// StaticGrid: enable inventory-driven auto-skew (weak side joins
+    /// best touch; strong side widens by `(1 + |ratio|)`). Default
+    /// true — pass `--sg-auto-skew=false` to A/B test symmetric
+    /// quoting.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    sg_auto_skew: bool,
+
+    /// StaticGrid: regime-tracker window in seconds. `0` disables
+    /// regime gating — `auto_skew` then applies unconditionally
+    /// (legacy behaviour). Non-zero suppresses skew during chop
+    /// regimes (|drift_bps| <= threshold over window) and engages
+    /// it during trending ones.
+    #[arg(long, default_value_t = 0u64)]
+    sg_regime_window_secs: u64,
+
+    /// StaticGrid: drift threshold (bps) above which the regime
+    /// classifier flags "trending". Default 10 bps over the chosen
+    /// window. Only meaningful when `sg_regime_window_secs > 0`.
+    #[arg(long, default_value_t = 10u32)]
+    sg_regime_trend_threshold_bps: u32,
+
+    /// StaticGrid: directional-efficiency threshold for regime
+    /// classification (Kaufman's efficiency ratio). Range [0, 1] —
+    /// `0` disables (falls back to `sg_regime_trend_threshold_bps`).
+    /// Sensible: `0.3` (30% of total path was directional). Self-
+    /// scales per symbol (no per-symbol bps tuning needed).
+    #[arg(long, default_value = "0")]
+    sg_regime_efficiency_threshold: String,
+
+    /// StaticGrid: hard inventory cap in USDT notional. When
+    /// `|position × mid| >= cap`, the add-side quote (Bid for longs,
+    /// Ask for shorts) is suppressed so existing rest-orders can drain
+    /// the position. `0` (default) disables.
+    #[arg(long, default_value = "0")]
+    sg_max_pos_usdt: String,
+
+    /// StaticGrid: take-profit threshold in bps of position notional.
+    /// `0` (default) disables. Same bps-of-notional shape as SS.
+    #[arg(long, default_value_t = 0u32)]
+    sg_take_profit_bps: u32,
+
+    /// StaticGrid: stop-loss threshold in bps of position notional.
+    /// `0` (default) disables. Pairs with `sg_take_profit_bps`.
+    #[arg(long, default_value_t = 0u32)]
+    sg_stop_loss_bps: u32,
+
+    /// LayeredGrid: hard inventory cap in USDT notional. `0`
+    /// (default) disables. Same shape as `sg_max_pos_usdt`.
+    #[arg(long, default_value = "0")]
+    lg_max_pos_usdt: String,
+
+    /// LayeredGrid: take-profit threshold in bps of position notional.
+    /// `0` (default) disables.
+    #[arg(long, default_value_t = 0u32)]
+    lg_take_profit_bps: u32,
+
+    /// LayeredGrid: stop-loss threshold in bps of position notional.
+    /// `0` (default) disables.
+    #[arg(long, default_value_t = 0u32)]
+    lg_stop_loss_bps: u32,
+
     /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
@@ -173,6 +234,13 @@ struct Args {
     /// it uses the legacy absolute USDT path via take_profit_usdt).
     #[arg(long, default_value_t = 0u32)]
     spread_scalp_take_profit_bps: u32,
+
+    /// SpreadScalp / SpreadScalpOld: absolute-USDT take-profit
+    /// threshold (mirrors OLD's `take_profit_usdt`). `0` disables.
+    /// When set with `spread_scalp_take_profit_bps == 0`, NEW falls
+    /// back to this same threshold via the legacy USDT path.
+    #[arg(long, default_value = "0")]
+    spread_scalp_take_profit_usdt: String,
     /// SpreadScalp: stop-loss threshold in bps of position notional.
     /// `0` disables. NEW only (OLD has no SL path at all).
     #[arg(long, default_value_t = 0u32)]
@@ -301,7 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let size_per_quote = Size(Decimal::from_str(&args.size)?);
     let tick = Decimal::from_str(&args.tick_size)?;
-    let step = if args.step_size.trim().is_empty() {
+    let lot_step = if args.step_size.trim().is_empty() {
         tick
     } else {
         Decimal::from_str(args.step_size.trim())?
@@ -357,6 +425,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let micro_mean_reversion_notional = Decimal::from_str(&args.micro_mean_reversion_notional)?;
     let spread_scalp_notional = Decimal::from_str(&args.spread_scalp_notional)?;
     let spread_scalp_max_pos = Decimal::from_str(&args.spread_scalp_max_pos_usdt)?;
+    let spread_scalp_tp_usdt = Decimal::from_str(&args.spread_scalp_take_profit_usdt)?;
+    let sg_regime_eff_threshold = Decimal::from_str(&args.sg_regime_efficiency_threshold)?;
+    let sg_max_pos = Decimal::from_str(&args.sg_max_pos_usdt)?;
+    let lg_max_pos = Decimal::from_str(&args.lg_max_pos_usdt)?;
     let spread_scalp_adverse_threshold =
         Decimal::from_str(&args.spread_scalp_adverse_threshold_bps)?;
 
@@ -660,6 +732,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         notional_per_order: Decimal::from(100),
                         levels_per_side: levels,
                         inner_bps: bps,
+                        max_position_usdt: lg_max_pos,
+                        take_profit_bps: args.lg_take_profit_bps,
+                        stop_loss_bps: args.lg_stop_loss_bps,
                     }),
                     fees,
                     skim_cfg,
@@ -757,12 +832,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     SpreadScalp::new(SpreadScalpConfig {
                         notional_per_order: spread_scalp_notional,
                         tick_size: tick,
-                        step_size: step,
+                        step_size: lot_step,
                         min_notional: Decimal::ZERO,
                         min_spread_bps,
                         requote_interval_ms: 1000,
                         max_position_usdt: spread_scalp_max_pos,
-                        take_profit_usdt: Decimal::ZERO,
+                        take_profit_usdt: spread_scalp_tp_usdt,
                         reject_cooldown_ms: args.spread_scalp_reject_cooldown_ms,
                         price_tolerance_ticks: 1,
                         take_profit_bps: args.spread_scalp_take_profit_bps,
@@ -801,12 +876,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // the user-supplied bps TP into a rough abs USDT
                         // value (tp_bps × cap × 1e-4) so OLD has SOMETHING
                         // closing positions on the cap-hit scenario.
-                        step_size: step,
+                        step_size: lot_step,
                         min_notional: Decimal::ZERO,
                         min_spread_bps,
                         requote_interval_ms: 1000,
                         max_position_usdt: spread_scalp_max_pos,
-                        take_profit_usdt: if args.spread_scalp_take_profit_bps > 0
+                        take_profit_usdt: if spread_scalp_tp_usdt > Decimal::ZERO {
+                            spread_scalp_tp_usdt
+                        } else if args.spread_scalp_take_profit_bps > 0
                             && spread_scalp_max_pos > Decimal::ZERO
                         {
                             // bps × cap / 10_000 ≈ absolute USDT threshold
@@ -861,13 +938,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             levels_per_side: levels,
                                             inner_bps: inner,
                                             step_bps: step,
-                                            step_size: Decimal::from(1),
+                                            step_size: lot_step,
                                             min_notional: Decimal::ZERO,
                                             target_fills_per_min: fpm_target,
                                             fillrate_window_secs: fpm_window,
                                             scale_min: sc_min,
                                             scale_max: sc_max,
-                                            auto_skew: true,
+                                            auto_skew: args.sg_auto_skew,
+                                            regime_window_secs: args.sg_regime_window_secs,
+                                            regime_trend_threshold_bps: args
+                                                .sg_regime_trend_threshold_bps,
+                                            regime_efficiency_threshold: sg_regime_eff_threshold,
+                                            max_position_usdt: sg_max_pos,
+                                            take_profit_bps: args.sg_take_profit_bps,
+                                            stop_loss_bps: args.sg_stop_loss_bps,
                                         }),
                                         fees,
                                         skim_cfg,

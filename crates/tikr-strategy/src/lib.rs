@@ -36,6 +36,7 @@ pub mod ladder_reentry;
 pub mod layered_grid;
 pub mod micro_mean_reversion;
 pub mod micro_price;
+pub mod risk;
 pub mod simple_gap;
 pub mod spread_scalp;
 pub mod spread_scalp_old;

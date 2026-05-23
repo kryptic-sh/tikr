@@ -68,6 +68,9 @@ fn layered_grid_config() -> LayeredGridConfig {
         notional_per_order: Decimal::from(100), // $100 → ~1 BTC qty at price 100
         levels_per_side: 1,
         inner_bps: 50, // 0.5% → bid≈99.5 at mid=100
+        max_position_usdt: Decimal::ZERO,
+        take_profit_bps: 0,
+        stop_loss_bps: 0,
     }
 }
 

@@ -73,6 +73,9 @@ fn layered_grid_config() -> LayeredGridConfig {
         notional_per_order: Decimal::from(25),
         levels_per_side: 1,
         inner_bps: 6,
+        max_position_usdt: Decimal::ZERO,
+        take_profit_bps: 0,
+        stop_loss_bps: 0,
     }
 }
 

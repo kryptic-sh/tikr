@@ -224,6 +224,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notional_per_order: Decimal::from(25),
         levels_per_side: 1,
         inner_bps: 6,
+        max_position_usdt: Decimal::ZERO,
+        take_profit_bps: 0,
+        stop_loss_bps: 0,
     });
 
     let fill_sim = FillSim::new(FillSimConfig {

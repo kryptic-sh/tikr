@@ -51,7 +51,22 @@
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::{QuoteId, QuoteIntent};
 
+use crate::risk::{self, RiskConfig, RiskDecision};
 use crate::{Action, Strategy, StrategyContext};
+
+/// True iff posting on `side` would deepen inventory past `cap`.
+/// `cap == 0` disables the gate. Mirrors the SG helper — kept inline
+/// here to keep both strategies independent.
+#[inline]
+fn add_side_capped(pos_usdt: Decimal, cap: Decimal, side: Side) -> bool {
+    if cap <= Decimal::ZERO {
+        return false;
+    }
+    match side {
+        Side::Bid => pos_usdt >= cap,
+        Side::Ask => pos_usdt <= -cap,
+    }
+}
 
 /// Configuration for [`LayeredGrid`].
 #[derive(Debug, Clone)]
@@ -67,6 +82,19 @@ pub struct LayeredGridConfig {
     ///
     /// Each round-trip captures `inner_bps` minus `2 × maker_bps` in fees.
     pub inner_bps: u32,
+    /// Hard inventory cap in USDT notional. Add-side cold-start
+    /// quotes + per-fill extensions are suppressed when
+    /// `|position × mid| >= cap`; the closing TP placement is always
+    /// allowed (so an over-capped bot can scratch back to flat).
+    /// `0` (default) disables the cap.
+    pub max_position_usdt: Decimal,
+    /// Take-profit threshold in bps of position notional. On breach
+    /// the bot CancelAll + IOC-flattens at the opposing touch.
+    /// `0` (default) disables. Same bps-of-notional shape as SS/SG.
+    pub take_profit_bps: u32,
+    /// Stop-loss threshold in bps of position notional. `0` (default)
+    /// disables.
+    pub stop_loss_bps: u32,
 }
 
 /// Layered-grid strategy state.
@@ -82,17 +110,53 @@ pub struct LayeredGrid {
 }
 
 impl LayeredGrid {
+    /// Snapshot the risk policy from the current config. Stateless —
+    /// rebuilt each tick so a hot-reloaded config takes effect.
+    fn risk_cfg(&self) -> RiskConfig {
+        RiskConfig {
+            take_profit_bps: self.config.take_profit_bps,
+            stop_loss_bps: self.config.stop_loss_bps,
+            take_profit_usdt_legacy: Decimal::ZERO,
+        }
+    }
+
+    /// Evaluate the risk gate; on breach return CancelAll + IOC close
+    /// at the opposing touch. None when both thresholds disabled or
+    /// position is flat. Callers short-circuit normal logic on Some.
+    fn try_risk_close(
+        &self,
+        ctx: &StrategyContext<'_>,
+        mid: Price,
+        best_bid: Price,
+        best_ask: Price,
+    ) -> Option<Vec<Action>> {
+        if self.config.take_profit_bps == 0 && self.config.stop_loss_bps == 0 {
+            return None;
+        }
+        match risk::evaluate(ctx.position, mid, self.risk_cfg()) {
+            RiskDecision::Hold => None,
+            RiskDecision::Close { side, qty, .. } => Some(vec![
+                Action::CancelAll,
+                risk::build_close(ctx.symbol, side, qty, best_bid, best_ask),
+            ]),
+        }
+    }
+
     fn place_initial(
         &mut self,
         symbol: &Symbol,
         mid: Price,
         open_quotes: &[(QuoteId, QuoteIntent)],
+        pos_usdt: Decimal,
     ) -> Vec<Action> {
         let mut actions: Vec<Action> =
             Vec::with_capacity(self.config.levels_per_side as usize * 2 + open_quotes.len());
         self.orders.clear();
 
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
+        let cap = self.config.max_position_usdt;
+        let bid_capped = add_side_capped(pos_usdt, cap, Side::Bid);
+        let ask_capped = add_side_capped(pos_usdt, cap, Side::Ask);
         // Place the new ladder FIRST so the venue sees fresh resting orders
         // before any cancels — avoids the naked-book gap. Level k (0-indexed)
         // sits at `(k+1) × inner_bps` from mid — uniform `inner_bps` spacing.
@@ -103,10 +167,14 @@ impl LayeredGrid {
             let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
             let sell_price = Price(mid.0 * (Decimal::ONE + bp_dec));
 
-            actions.push(self.make_quote(symbol, Side::Bid, buy_price));
-            actions.push(self.make_quote(symbol, Side::Ask, sell_price));
-            self.orders.push((Side::Bid, buy_price));
-            self.orders.push((Side::Ask, sell_price));
+            if !bid_capped {
+                actions.push(self.make_quote(symbol, Side::Bid, buy_price));
+                self.orders.push((Side::Bid, buy_price));
+            }
+            if !ask_capped {
+                actions.push(self.make_quote(symbol, Side::Ask, sell_price));
+                self.orders.push((Side::Ask, sell_price));
+            }
         }
         // Then cancel any prior open quotes by id. On cold start the
         // runner-supplied list is empty, so no cancels emit.
@@ -135,6 +203,7 @@ impl LayeredGrid {
         fill_side: Side,
         fill_price: Price,
         open_quotes: &[(QuoteId, QuoteIntent)],
+        pos_usdt: Decimal,
     ) -> Vec<Action> {
         // 1. Drop the filled order from the mirror (exact match preferred,
         //    closest same-side match as fallback when fill_price is a touch
@@ -216,7 +285,13 @@ impl LayeredGrid {
             Side::Bid => Price(anchor * (Decimal::ONE - inner_dec)),
             Side::Ask => Price(anchor * (Decimal::ONE + inner_dec)),
         };
-        self.orders.push((fill_side, extension_price));
+        // Cap gate: TP (opposite-side reducer) always allowed so an
+        // over-capped bot can drain inventory. Extension (same-side
+        // adder) is suppressed when inventory would deepen past cap.
+        let extend = !add_side_capped(pos_usdt, self.config.max_position_usdt, fill_side);
+        if extend {
+            self.orders.push((fill_side, extension_price));
+        }
 
         let mut actions: Vec<Action> = Vec::with_capacity(3);
 
@@ -224,7 +299,9 @@ impl LayeredGrid {
         //    sees the new resting orders before any cancels arrive — no
         //    naked-book gap (mirrors NaiveGrid fix).
         actions.push(self.make_quote(symbol, opp_side, tp_price));
-        actions.push(self.make_quote(symbol, fill_side, extension_price));
+        if extend {
+            actions.push(self.make_quote(symbol, fill_side, extension_price));
+        }
 
         // 6. Drop the outermost opposite by id (preserves queue priority
         //    on surviving orders). Fall back to CancelAll only when the
@@ -268,24 +345,38 @@ impl Strategy for LayeredGrid {
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
         match event {
-            MarketEvent::BookUpdate { snapshot } if !self.placed => {
+            MarketEvent::BookUpdate { snapshot } => {
                 let bid = snapshot.bids.first().map(|l| l.price.0);
                 let ask = snapshot.asks.first().map(|l| l.price.0);
                 let (Some(b), Some(a)) = (bid, ask) else {
                     return Vec::new();
                 };
                 let mid = Price((b + a) / Decimal::from(2));
-                self.place_initial(ctx.symbol, mid, ctx.open_quotes)
+                let best_bid = Price(b);
+                let best_ask = Price(a);
+                let pos_usdt = ctx.position.size.0 * mid.0;
+                // Risk gate: check on every book update so an adverse
+                // spike between fills still trips TP/SL. Runs even
+                // pre-placement — if the bot resumed from a snapshot
+                // already in breach we want to flatten immediately.
+                if let Some(close) = self.try_risk_close(ctx, mid, best_bid, best_ask) {
+                    return close;
+                }
+                if !self.placed {
+                    self.place_initial(ctx.symbol, mid, ctx.open_quotes, pos_usdt)
+                } else {
+                    Vec::new()
+                }
             }
             MarketEvent::Fill(f) if f.symbol_matches(ctx.symbol) && f.is_full => {
                 // Belt-and-suspenders: the runner already gates `is_full`,
                 // but guard here too so a future caller (test, alt runner)
                 // can't accidentally feed a partial fill — which would
                 // cause `on_fill` to cancel the still-resting remainder.
-                self.on_fill(ctx.symbol, f.side, f.price, ctx.open_quotes)
+                let pos_usdt = ctx.position.size.0 * f.price.0;
+                self.on_fill(ctx.symbol, f.side, f.price, ctx.open_quotes, pos_usdt)
             }
-            // After cold-start, BookUpdate / Trade / Heartbeat don't change
-            // grid state. The strategy is purely fill-driven.
+            // Trade / Heartbeat don't change grid state.
             _ => Vec::new(),
         }
     }
@@ -318,15 +409,25 @@ impl Strategy for LayeredGrid {
 
         let mut actions = vec![Action::CancelAll];
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
+        // Recovery respects the inventory cap too — skip the side that
+        // would deepen position, refill only the closing side.
+        let pos_usdt = ctx.position.size.0 * mid.0;
+        let cap = self.config.max_position_usdt;
+        let bid_capped = add_side_capped(pos_usdt, cap, Side::Bid);
+        let ask_capped = add_side_capped(pos_usdt, cap, Side::Ask);
         for k in 0..self.config.levels_per_side {
             let bps = self.config.inner_bps * (k + 1);
             let bp_dec = bps_to_decimal(bps);
             let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
             let sell_price = Price(mid.0 * (Decimal::ONE + bp_dec));
-            actions.push(self.make_quote(ctx.symbol, Side::Bid, buy_price));
-            actions.push(self.make_quote(ctx.symbol, Side::Ask, sell_price));
-            self.orders.push((Side::Bid, buy_price));
-            self.orders.push((Side::Ask, sell_price));
+            if !bid_capped {
+                actions.push(self.make_quote(ctx.symbol, Side::Bid, buy_price));
+                self.orders.push((Side::Bid, buy_price));
+            }
+            if !ask_capped {
+                actions.push(self.make_quote(ctx.symbol, Side::Ask, sell_price));
+                self.orders.push((Side::Ask, sell_price));
+            }
         }
         self.placed = true;
         actions
@@ -405,6 +506,9 @@ mod tests {
             notional_per_order: Decimal::from(100),
             levels_per_side: 3,
             inner_bps: 6,
+            max_position_usdt: Decimal::ZERO,
+            take_profit_bps: 0,
+            stop_loss_bps: 0,
         }
     }
 

@@ -163,6 +163,39 @@ pub struct SgParams {
     /// `false` = symmetric ladder regardless of position.
     #[serde(default = "sg_default_auto_skew")]
     pub auto_skew: bool,
+    /// Regime-tracker window (seconds). `0` disables regime gating;
+    /// `auto_skew` then applies unconditionally. Non-zero
+    /// suppresses skew during chop regimes and engages it during
+    /// trending ones — auto-tunes the "skew helps for trending
+    /// pairs, hurts for choppy pairs" tradeoff. Sensible default:
+    /// `300` (5 minutes).
+    #[serde(default)]
+    pub regime_window_secs: u64,
+    /// Drift threshold (bps) above which the regime classifier
+    /// flags "trending". Default `10` bps over the chosen window.
+    /// Only meaningful when `regime_window_secs > 0`.
+    #[serde(default = "sg_default_regime_trend_threshold")]
+    pub regime_trend_threshold_bps: u32,
+    /// Directional-efficiency threshold for regime classification
+    /// (Kaufman's efficiency ratio). Range `[0, 1]` — `0` (default)
+    /// falls back to `regime_trend_threshold_bps`. Sensible value:
+    /// `"0.3"`. Self-scales per symbol — preferred over the bps path.
+    #[serde(default)]
+    pub regime_efficiency_threshold: Decimal,
+    /// Hard inventory cap in USDT notional. `0` (default) falls back
+    /// to the account-level `max_position_usdt`. Add-side quotes are
+    /// suppressed when `|position × mid| >= cap` so existing
+    /// rest-orders can drain inventory.
+    #[serde(default)]
+    pub max_position_usdt: Decimal,
+    /// Take-profit threshold in bps of position notional. `0`
+    /// (default) disables. Same shape as the SpreadScalp knob.
+    #[serde(default)]
+    pub take_profit_bps: u32,
+    /// Stop-loss threshold in bps of position notional. `0` (default)
+    /// disables.
+    #[serde(default)]
+    pub stop_loss_bps: u32,
 }
 
 fn sg_default_levels() -> u32 {
@@ -186,6 +219,9 @@ fn sg_default_scale_max() -> Decimal {
 fn sg_default_auto_skew() -> bool {
     true
 }
+fn sg_default_regime_trend_threshold() -> u32 {
+    10
+}
 
 /// LayeredGrid configuration.
 #[allow(dead_code)]
@@ -200,6 +236,18 @@ pub struct LgParams {
     /// Spacing in bps.
     #[serde(default = "lg_default_bps")]
     pub bps: u32,
+    /// Hard inventory cap in USDT notional. `0` (default) falls back
+    /// to the account-level `max_position_usdt`.
+    #[serde(default)]
+    pub max_position_usdt: Decimal,
+    /// Take-profit threshold in bps of position notional. `0`
+    /// (default) disables.
+    #[serde(default)]
+    pub take_profit_bps: u32,
+    /// Stop-loss threshold in bps of position notional. `0` (default)
+    /// disables.
+    #[serde(default)]
+    pub stop_loss_bps: u32,
 }
 
 fn lg_default_levels() -> u32 {
