@@ -1,0 +1,42 @@
+[package]
+name = "tikr-bybit"
+description = "Bybit V5 (linear perps) venue adapter for the tikr market-making engine"
+keywords = ["trading", "bybit", "market-making", "crypto"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[dependencies]
+tikr-core = "0.1"
+tikr-venue = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+rustls = { version = "0.23", features = ["ring"] }
+dotenvy = "0.15"
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
