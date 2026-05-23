@@ -16,6 +16,14 @@ fn sign(d: Decimal) -> Decimal {
     }
 }
 
+/// Cap stored-state precision to 8dp so subsequent multiplications stay
+/// inside rust_decimal's 96-bit mantissa. Without this, WACC division
+/// produces a 28dp avg_entry whose next price-multiply overflows on
+/// small-tick assets (DOGE/HYPER) under runaway TP/SL loops. Venue tick
+/// is at most 8dp in practice, so 8dp is lossless for any real price.
+/// fill_sim already uses the same 8dp ceiling.
+const STATE_DP: u32 = 8;
+
 /// Running position + P&L state for one symbol. WACC cost basis.
 pub struct PositionTracker {
     symbol: Symbol,
@@ -84,21 +92,25 @@ impl PositionTracker {
 
     /// Apply `fill` to the running state. WACC math, fees accumulated separately.
     pub fn apply(&mut self, fill: &Fill) {
-        let delta = side_delta(fill.side, fill.size);
+        // Bound input precision so downstream products stay inside
+        // rust_decimal's 96-bit mantissa. Venue tick + lot precision
+        // are well under STATE_DP — no information lost.
+        let delta = side_delta(fill.side, fill.size).round_dp(STATE_DP);
 
         // Always accrue fees, regardless of which state-update case fires.
         // `fee_quote` is signed: positive = paid, negative = rebate.
-        self.fees_paid = Notional(self.fees_paid.0 + fill.fee_quote.0);
+        self.fees_paid =
+            Notional((self.fees_paid.0 + fill.fee_quote.0.round_dp(STATE_DP)).round_dp(STATE_DP));
 
         // Defensive: a zero-size fill shouldn't happen but if it does, no state update.
         if delta == Decimal::ZERO {
             return;
         }
 
-        let cur = self.size.0;
-        let entry = self.avg_entry.0;
-        let fp = fill.price.0;
-        let new_size = cur + delta;
+        let cur = self.size.0.round_dp(STATE_DP);
+        let entry = self.avg_entry.0.round_dp(STATE_DP);
+        let fp = fill.price.0.round_dp(STATE_DP);
+        let new_size = (cur + delta).round_dp(STATE_DP);
 
         if cur == Decimal::ZERO {
             // Case A: opening from flat.
@@ -112,7 +124,8 @@ impl PositionTracker {
 
         if cur_sign == delta_sign {
             // Case B: same-direction add — WACC the entry price.
-            let new_entry = (cur.abs() * entry + delta.abs() * fp) / new_size.abs();
+            let new_entry =
+                ((cur.abs() * entry + delta.abs() * fp) / new_size.abs()).round_dp(STATE_DP);
             self.size = SignedSize(new_size);
             self.avg_entry = Price(new_entry);
             return;
@@ -124,8 +137,8 @@ impl PositionTracker {
         if new_size == Decimal::ZERO || new_sign == cur_sign {
             // Case C: reducing within the same side (or down to flat).
             let closed = delta.abs();
-            let realized_delta = closed * (fp - entry) * cur_sign;
-            self.realized_pnl = Notional(self.realized_pnl.0 + realized_delta);
+            let realized_delta = (closed * (fp - entry) * cur_sign).round_dp(STATE_DP);
+            self.realized_pnl = Notional((self.realized_pnl.0 + realized_delta).round_dp(STATE_DP));
             self.size = SignedSize(new_size);
             if new_size == Decimal::ZERO {
                 self.avg_entry = Price(Decimal::ZERO);
@@ -134,8 +147,8 @@ impl PositionTracker {
         } else {
             // Case D: flipping past zero. Close existing fully, then open leftover.
             let closed = cur.abs();
-            let realized_delta = closed * (fp - entry) * cur_sign;
-            self.realized_pnl = Notional(self.realized_pnl.0 + realized_delta);
+            let realized_delta = (closed * (fp - entry) * cur_sign).round_dp(STATE_DP);
+            self.realized_pnl = Notional((self.realized_pnl.0 + realized_delta).round_dp(STATE_DP));
             self.size = SignedSize(new_size);
             self.avg_entry = Price(fp);
         }
@@ -153,7 +166,7 @@ impl PositionTracker {
 
     /// Aggregate report at the given mark price.
     pub fn report(&self, last_mid: Price) -> PnLReport {
-        let unrealized = (last_mid.0 - self.avg_entry.0) * self.size.0;
+        let unrealized = ((last_mid.0 - self.avg_entry.0) * self.size.0).round_dp(STATE_DP);
         let net = self.realized_pnl.0 + unrealized - self.fees_paid.0 + self.funding_accrued.0;
         PnLReport {
             realized: self.realized_pnl,
@@ -327,10 +340,15 @@ mod tests {
         t.apply(&fill(&sym, Side::Bid, 120, 1, 1));
         t.apply(&fill(&sym, Side::Ask, 130, 2, 1));
 
-        let expected_avg =
-            (Decimal::from(2) * Decimal::from(100) + Decimal::from(120)) / Decimal::from(3);
-        let expected_realized = Decimal::from(2) * (Decimal::from(130) - expected_avg);
-        let expected_unrealized = (Decimal::from(125) - expected_avg) * Decimal::from(1);
+        // Match `STATE_DP`-rounded math: avg_entry persists at 8dp so the
+        // hand-computed expectations downstream must round at each step too.
+        let expected_avg = ((Decimal::from(2) * Decimal::from(100) + Decimal::from(120))
+            / Decimal::from(3))
+        .round_dp(8);
+        let expected_realized =
+            (Decimal::from(2) * (Decimal::from(130) - expected_avg)).round_dp(8);
+        let expected_unrealized =
+            ((Decimal::from(125) - expected_avg) * Decimal::from(1)).round_dp(8);
         let expected_net = expected_realized + expected_unrealized - Decimal::from(3);
 
         let snap = t.snapshot();

@@ -77,10 +77,12 @@ pub fn evaluate(position: &Position, mid: Price, cfg: RiskConfig) -> RiskDecisio
     let pos_abs = position.size.0.abs();
     // Signed bps of mid drift from entry, viewed from a LONG position.
     // Short position negates the sign so the same threshold semantics
-    // apply.
+    // apply. `.round_dp(8)` keeps intermediate scale bounded so
+    // small-tick assets (DOGE/HYPER) don't overflow rust_decimal's
+    // 96-bit mantissa on the divide-then-multiply.
     let drift = mid.0 - position.avg_entry.0;
     let signed_drift = if long { drift } else { -drift };
-    let drift_bps = signed_drift / position.avg_entry.0 * Decimal::from(10_000);
+    let drift_bps = (signed_drift / position.avg_entry.0 * Decimal::from(10_000)).round_dp(8);
     // Take-profit (positive drift = profit).
     if cfg.take_profit_bps > 0 {
         let tp_bps = Decimal::from(cfg.take_profit_bps);
@@ -93,7 +95,7 @@ pub fn evaluate(position: &Position, mid: Price, cfg: RiskConfig) -> RiskDecisio
         }
     } else if cfg.take_profit_usdt_legacy > Decimal::ZERO {
         // Legacy path: PnL in absolute USDT. profit = signed_drift × qty.
-        let unrealized = signed_drift * pos_abs;
+        let unrealized = (signed_drift * pos_abs).round_dp(8);
         if unrealized >= cfg.take_profit_usdt_legacy {
             return RiskDecision::Close {
                 side: if long { Side::Ask } else { Side::Bid },
