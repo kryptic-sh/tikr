@@ -35,8 +35,20 @@ use uuid::Uuid;
 
 /// Max consecutive venue rejections per side before switching to single-sided quoting.
 /// When one side hits this threshold, that side is skipped in subsequent quote rounds
-/// until a full requote cycle resets the counters.
+/// until either (a) a fill on this symbol arrives, (b) a `CancelAll` action
+/// is dispatched, or (c) `SIDE_FAILS_RESET_AFTER` elapses since the most
+/// recent rejection. The time-based recovery exists because the original
+/// reset triggers don't fire when the position is capped + the close-side
+/// itself is what's blocked — without it, a brief burst of `-5022` cross
+/// rejections during a fast move can strand the position for hours.
 const MAX_FAILS_PER_SIDE: u32 = 3;
+
+/// Time after which a side-lockout auto-recovers even without a fill or
+/// `CancelAll`. Picked to be long enough that a continuing burst of
+/// rejections still produces back-pressure (each new rejection re-stamps
+/// the timestamp), but short enough that a transient venue hiccup doesn't
+/// strand a position.
+const SIDE_FAILS_RESET_AFTER: Duration = Duration::from_secs(10);
 
 /// Runtime configuration for [`run`].
 #[derive(Debug, Clone)]
@@ -455,6 +467,12 @@ where
     // MAX_FAILS_PER_SIDE times consecutively, that side is skipped until the
     // next CancelAll (full requote cycle) resets the counters.
     let mut side_fails: HashMap<String, (u32, u32)> = HashMap::new();
+    // Most-recent rejection timestamp per symbol. Drives the
+    // `SIDE_FAILS_RESET_AFTER` time-based auto-recovery so a brief
+    // burst of `-5022` cross rejections during a fast move doesn't
+    // strand a position when the natural reset triggers
+    // (fill + CancelAll) don't fire.
+    let mut side_fails_last: HashMap<String, Instant> = HashMap::new();
     let started = Instant::now();
     // Decouple in-memory `snapshot_tap` updates from event-count disk
     // writes so the dashboard sidebar refreshes every ~250ms regardless
@@ -714,6 +732,21 @@ where
                     while i < filtered.len() {
                         if matches!(filtered[i], tikr_strategy::Action::Quote(_)) {
                             let mut run_intents: Vec<QuoteIntent> = Vec::new();
+                            // Time-based lockout auto-recovery: if the
+                            // last rejection was long enough ago, treat
+                            // the side as healthy again. Stops a brief
+                            // burst of `-5022` cross rejections from
+                            // permanently locking a side when the
+                            // natural reset triggers (fill, CancelAll)
+                            // can't fire (e.g. cap-pinned position with
+                            // close-side itself blocked).
+                            let key = symbol.base.0.to_string();
+                            if let Some(last) = side_fails_last.get(&key)
+                                && last.elapsed() >= SIDE_FAILS_RESET_AFTER
+                            {
+                                side_fails.remove(&key);
+                                side_fails_last.remove(&key);
+                            }
                             while i < filtered.len() {
                                 if let tikr_strategy::Action::Quote(intent) = &filtered[i] {
                                     let state = side_fails
@@ -768,6 +801,8 @@ where
                                             Side::Bid => state.0 += 1,
                                             Side::Ask => state.1 += 1,
                                         }
+                                        side_fails_last
+                                            .insert(symbol.base.0.to_string(), Instant::now());
                                     }
                                 }
                             }
@@ -1094,6 +1129,16 @@ where
                     &symbol,
                 )
                 .await;
+                // A fill is proof the venue is reachable + responsive on
+                // both sides. Clear any accumulated per-side failure
+                // counter so a prior burst of `-5022` (PostOnly cross)
+                // rejections doesn't permanently block the close-side
+                // quote from re-placing — the bug that stranded a
+                // carried-over short for 59m on 2026-05-24 because the
+                // close-side BID had hit `MAX_FAILS_PER_SIDE` and
+                // `side_fails` only auto-reset on `CancelAll` (which
+                // SS's close-side path never emits).
+                side_fails.remove(symbol.base.0.as_ref());
                 last_fill = Some(fill_clone.clone());
                 if let Some(ref tap) = config.snapshot_tap {
                     let mut report = finalize(
