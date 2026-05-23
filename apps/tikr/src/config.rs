@@ -132,6 +132,9 @@ pub struct BotConfig {
     /// LiqFade params (only honored when `strategy = "liq-fade"`).
     #[serde(default)]
     pub liq_fade: Option<LiqFadeParams>,
+    /// Hydra params (only honored when `strategy = "hydra"`).
+    #[serde(default)]
+    pub hydra: Option<HydraParams>,
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus
@@ -201,6 +204,68 @@ fn liq_default_position_timeout_secs() -> u32 {
 }
 fn liq_default_window_secs() -> u32 {
     180
+}
+
+/// Hydra configuration — knobs match `HydraConfig` 1:1.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct HydraParams {
+    /// Fiat notional per straddle leg + per add.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Distance from mid each straddle leg posts, in bps.
+    #[serde(default = "hydra_default_entry_offset_bps")]
+    pub entry_offset_bps: u32,
+    /// Pyramid step in bps — favorable-drift band that triggers an add.
+    #[serde(default = "hydra_default_pyramid_step_bps")]
+    pub pyramid_step_bps: u32,
+    /// Max pyramid adds. `0` disables the pyramid arm.
+    #[serde(default = "hydra_default_pyramid_max_adds")]
+    pub pyramid_max_adds: u32,
+    /// DCA step in bps — adverse-drift band that triggers an add.
+    #[serde(default = "hydra_default_dca_step_bps")]
+    pub dca_step_bps: u32,
+    /// Max DCA adds. `0` disables the DCA arm.
+    #[serde(default = "hydra_default_dca_max_adds")]
+    pub dca_max_adds: u32,
+    /// Take-profit in bps from rolling `avg_entry`.
+    #[serde(default = "hydra_default_tp_bps_from_avg")]
+    pub tp_bps_from_avg: u32,
+    /// Stop-loss in bps from FIRST-fill price (anchored, not rolling avg).
+    #[serde(default = "hydra_default_sl_bps_from_first")]
+    pub sl_bps_from_first: u32,
+    /// Hard inventory cap in USDT notional. `0` falls back to the
+    /// account-level cap.
+    #[serde(default)]
+    pub max_position_usdt: Decimal,
+    /// Min elapsed time between adds (ms).
+    #[serde(default = "hydra_default_add_cooldown_ms")]
+    pub add_cooldown_ms: u64,
+}
+
+fn hydra_default_entry_offset_bps() -> u32 {
+    100
+}
+fn hydra_default_pyramid_step_bps() -> u32 {
+    50
+}
+fn hydra_default_pyramid_max_adds() -> u32 {
+    2
+}
+fn hydra_default_dca_step_bps() -> u32 {
+    60
+}
+fn hydra_default_dca_max_adds() -> u32 {
+    1
+}
+fn hydra_default_tp_bps_from_avg() -> u32 {
+    30
+}
+fn hydra_default_sl_bps_from_first() -> u32 {
+    60
+}
+fn hydra_default_add_cooldown_ms() -> u64 {
+    1_000
 }
 
 /// StaticGrid configuration.

@@ -10,7 +10,7 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
-    LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MicroMeanReversionConfig,
+    HydraConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MicroMeanReversionConfig,
     SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
 };
 use tokio::sync::watch;
@@ -65,9 +65,16 @@ pub fn to_spec(
             default_notional,
             max_position_usdt_default,
         )?,
+        "hydra" | "hd" | "hy" => build_hydra(
+            cfg,
+            &symbol,
+            venue,
+            default_notional,
+            max_position_usdt_default,
+        )?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra)"
             ));
         }
     };
@@ -144,6 +151,11 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
             .unwrap_or(None)),
         "liq-fade" | "lf" => Ok(cfg
             .liq_fade
+            .as_ref()
+            .map(|p| p.notional)
+            .unwrap_or(None)),
+        "hydra" | "hd" | "hy" => Ok(cfg
+            .hydra
             .as_ref()
             .map(|p| p.notional)
             .unwrap_or(None)),
@@ -387,6 +399,44 @@ fn build_liq_fade(
         entry_timeout_secs: lf.entry_timeout_secs,
         position_timeout_secs: lf.position_timeout_secs,
         stop_loss_bps: lf.stop_loss_bps,
+    }))
+}
+
+fn build_hydra(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+    max_position_usdt_default: Decimal,
+) -> Result<StrategyChoice> {
+    let hd = cfg.hydra.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=hydra but [bot.hydra] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(hd.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::ONE);
+    let step_size = venue.step_size(symbol).unwrap_or(tick_size);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::Hydra(HydraConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        entry_offset_bps: hd.entry_offset_bps,
+        pyramid_step_bps: hd.pyramid_step_bps,
+        pyramid_max_adds: hd.pyramid_max_adds,
+        dca_step_bps: hd.dca_step_bps,
+        dca_max_adds: hd.dca_max_adds,
+        tp_bps_from_avg: hd.tp_bps_from_avg,
+        sl_bps_from_first: hd.sl_bps_from_first,
+        max_position_usdt: if hd.max_position_usdt > Decimal::ZERO {
+            hd.max_position_usdt
+        } else {
+            max_position_usdt_default
+        },
+        add_cooldown_ms: hd.add_cooldown_ms,
     }))
 }
 

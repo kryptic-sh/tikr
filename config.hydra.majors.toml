@@ -1,0 +1,148 @@
+# Hydra on the major-cap pairs (BTC, ETH, BNB, SOL, DOGE).
+#
+# Run with:
+#   tikr --config ./config.hydra.majors.toml
+#
+# ─── Strategy summary ──────────────────────────────────────────────────────
+# Hydra plants a passive PostOnly Bid+Ask straddle at `entry_offset_bps`
+# from mid. First leg to fill locks direction; the other leg is cancelled.
+# Held position:
+#   - TP via passive close-side limit at `avg_entry × (1 ± tp_bps_from_avg)`
+#     — refreshed when avg shifts after pyramid / DCA adds. Maker fee.
+#   - SL via IOC at touch when mid drifts `sl_bps_from_first` adverse from
+#     the ORIGINAL first-fill price (never the rolling avg — DCA can't drag
+#     the trigger out indefinitely). Taker fee on the loser.
+#   - Pyramid adds (IOC at touch) on favorable drift bands; DCA adds on
+#     adverse drift bands. Both capped at `max_position_usdt`.
+#
+# ─── Per-symbol entry_offset tuning ────────────────────────────────────────
+# 72h backtest (2026-05-23 recording) winners with the maker-exit v1:
+#   BTC eo=100, BNB/ETH/SOL eo=150, DOGE eo=100.
+# Wider straddle filters chop better on the lower-vol majors; DOGE pays at
+# the tighter eo because its book moves enough that a 100-bps bracket
+# still fills regularly. BTC's optimum was eo=100 in the v1 sweep — the
+# extra fees from the wider eo=150 didn't pay back on BTC's thinner moves.
+#
+# ─── Fees ──────────────────────────────────────────────────────────────────
+# Binance Futures USD-M tier 0: 2 bps maker / 5 bps taker. With maker-exit
+# v1, a TP round-trip = 2 + 2 = 4 bps. An SL round-trip = 2 + 5 = 7 bps.
+# tp=30 / sl=60 → win pays 26 bps, loss costs 67 bps → break-even win
+# rate 72%. v1 backtest cleared this on all 5 majors.
+#
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+env = "futures-testnet"
+state_dir = "./state"
+
+# 5 bots × 0.4% margin per bot = 2% of margin balance deployed.
+order_balance_pct = "2"
+
+# key_file = "./keys/binance-testnet.txt"
+
+
+# ─── BTCUSDT ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BTCUSDT"
+strategy = "hydra"
+
+[bot.hydra]
+notional = 120
+entry_offset_bps = 100
+pyramid_step_bps = 50
+pyramid_max_adds = 2
+dca_step_bps = 60
+dca_max_adds = 1
+tp_bps_from_avg = 30
+sl_bps_from_first = 60
+max_position_usdt = 500
+add_cooldown_ms = 1000
+
+
+# ─── ETHUSDT ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ETHUSDT"
+strategy = "hydra"
+
+[bot.hydra]
+notional = 120
+entry_offset_bps = 150
+pyramid_step_bps = 50
+pyramid_max_adds = 2
+dca_step_bps = 60
+dca_max_adds = 1
+tp_bps_from_avg = 30
+sl_bps_from_first = 60
+max_position_usdt = 500
+add_cooldown_ms = 1000
+
+
+# ─── BNBUSDT ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BNBUSDT"
+strategy = "hydra"
+
+[bot.hydra]
+notional = 120
+entry_offset_bps = 150
+pyramid_step_bps = 50
+pyramid_max_adds = 2
+dca_step_bps = 60
+dca_max_adds = 1
+tp_bps_from_avg = 30
+sl_bps_from_first = 60
+max_position_usdt = 500
+add_cooldown_ms = 1000
+
+
+# ─── SOLUSDT ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "SOLUSDT"
+strategy = "hydra"
+
+[bot.hydra]
+notional = 120
+entry_offset_bps = 150
+pyramid_step_bps = 50
+pyramid_max_adds = 2
+dca_step_bps = 60
+dca_max_adds = 1
+tp_bps_from_avg = 30
+sl_bps_from_first = 60
+max_position_usdt = 500
+add_cooldown_ms = 1000
+
+
+# ─── DOGEUSDT ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "hydra"
+
+[bot.hydra]
+notional = 120
+entry_offset_bps = 100
+pyramid_step_bps = 50
+pyramid_max_adds = 2
+dca_step_bps = 60
+dca_max_adds = 1
+tp_bps_from_avg = 30
+sl_bps_from_first = 60
+max_position_usdt = 500
+add_cooldown_ms = 1000
+
+
+# ─── Defaults reference (commented) ────────────────────────────────────────
+# Every Hydra knob with its default value, for experimentation. The
+# blocks above set what's worth setting; this lists what you could also
+# tune.
+#
+# [bot.hydra]
+# notional               # required (per straddle leg + per add, USDT)
+# entry_offset_bps = 100 # straddle distance from mid
+# pyramid_step_bps = 50  # favorable-drift band → pyramid add
+# pyramid_max_adds = 2   # 0 disables pyramid arm
+# dca_step_bps     = 60  # adverse-drift band → DCA add
+# dca_max_adds     = 1   # 0 disables DCA arm
+# tp_bps_from_avg  = 30  # TP target offset from rolling avg_entry
+# sl_bps_from_first= 60  # SL offset from ORIGINAL first-fill price
+# max_position_usdt= 0   # 0 falls back to account-level cap
+# add_cooldown_ms  = 1000# min elapsed between adds

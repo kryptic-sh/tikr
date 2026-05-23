@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, LadderReentry,
-    LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, Hydra, HydraConfig,
+    LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
     MicroMeanReversion, MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp,
     SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
 };
@@ -53,6 +53,8 @@ pub enum StrategyChoice {
     SpreadScalp(SpreadScalpConfig),
     /// [`LiqFade`] — liquidation-cascade mean-revert stat-arb.
     LiqFade(LiqFadeConfig),
+    /// [`Hydra`] — straddle-bracket entry + pyramid/DCA + maker TP / IOC SL.
+    Hydra(HydraConfig),
 }
 
 impl StrategyChoice {
@@ -69,6 +71,7 @@ impl StrategyChoice {
             Self::MicroMeanReversion(_) => "micro-mean-reversion",
             Self::SpreadScalp(_) => "spread-scalp",
             Self::LiqFade(_) => "liq-fade",
+            Self::Hydra(_) => "hydra",
         }
     }
 }
@@ -335,6 +338,23 @@ where
                         None,
                         external_fills,
                         external_liqs,
+                    )
+                    .await
+                }
+                StrategyChoice::Hydra(cfg) => {
+                    let strategy = Hydra::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
                     )
                     .await
                 }
