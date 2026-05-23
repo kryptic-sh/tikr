@@ -97,6 +97,7 @@ pub fn to_spec(
         // `--clear`-off startup. build.rs leaves it None — the spec is
         // constructed before supervisor knows whether to seed.
         seed_position: None,
+        equity_csv_path: None,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

@@ -479,6 +479,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notional_rx: None,
         liq_window_secs: 0,
         seed_position: None,
+        equity_csv_path: None,
     };
 
     info!(strategy = ?args.strategy, "strategy selected");

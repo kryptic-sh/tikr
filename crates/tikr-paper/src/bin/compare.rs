@@ -96,6 +96,16 @@ struct Args {
     #[arg(long, default_value = "")]
     baseline: String,
 
+    /// Directory where per-preset equity-curve CSVs are written. One
+    /// file per preset (`<dir>/<sanitized_preset_name>.csv`) with
+    /// header `ts_ns,sim_secs,fills,pos_size,realized,unrealized,fees,funding,net`.
+    /// Rows are appended at each snapshot tick (defaults to every event
+    /// — see `RunnerConfig::snapshot_every_n_events`). Empty (default)
+    /// disables the export. Basket mode (`--data-root`) suffixes the
+    /// symbol so per-symbol files don't collide.
+    #[arg(long, default_value = "")]
+    equity_csv_dir: String,
+
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
     size: String,
@@ -736,6 +746,13 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // Clear data_root so the inner call doesn't recurse.
         sub.data_root = String::new();
         sub.symbols_filter = String::new();
+        // Per-symbol equity CSV subdir so basket runs don't collide.
+        if !sub.equity_csv_dir.is_empty() {
+            sub.equity_csv_dir = std::path::Path::new(&sub.equity_csv_dir)
+                .join(sym)
+                .to_string_lossy()
+                .to_string();
+        }
         match run_sweep_collect(sub).await {
             Ok(results) => per_symbol.push((sym.clone(), results)),
             Err(e) => {
@@ -946,6 +963,25 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
     }
     let mut skipped_presets: Vec<String> = Vec::new();
 
+    // Equity-curve CSV root resolution. Create the dir up front so the
+    // per-preset opens don't all race the mkdir. Empty arg → disabled.
+    let equity_csv_dir: Option<PathBuf> = if args.equity_csv_dir.is_empty() {
+        None
+    } else {
+        let p = PathBuf::from(&args.equity_csv_dir);
+        if let Err(e) = std::fs::create_dir_all(&p) {
+            eprintln!(
+                "WARN: equity_csv_dir create failed: {} ({}); curve export disabled",
+                p.display(),
+                e
+            );
+            None
+        } else {
+            info!(dir = %p.display(), "equity curve CSV export enabled");
+            Some(p)
+        }
+    };
+
     // Build all preset handles up front; each runs as a tokio task. The
     // multi-thread runtime fans them across cores. State dirs are unique
     // per preset (derived from the preset name) so concurrent snapshot /
@@ -1014,6 +1050,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
     }
     if included("glft", &allow) {
@@ -1034,6 +1071,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
     }
     if included("top-of-book", &allow) {
@@ -1055,6 +1093,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
 
         spawn_preset(
@@ -1075,6 +1114,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
 
         spawn_preset(
@@ -1095,6 +1135,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
 
         spawn_preset(
@@ -1115,6 +1156,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
 
         for max_imb in [3u32, 5, 7, 10, 20] {
@@ -1137,6 +1179,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                 skim_cfg,
                 funding_cfg,
                 sim_cfg_template.clone(),
+                equity_csv_dir.clone(),
             );
         }
 
@@ -1158,6 +1201,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
 
         spawn_preset(
@@ -1178,6 +1222,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
 
         spawn_preset(
@@ -1198,6 +1243,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
     }
 
@@ -1224,6 +1270,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                 skim_cfg,
                 funding_cfg,
                 sim_cfg_template.clone(),
+                equity_csv_dir.clone(),
             );
         }
 
@@ -1245,6 +1292,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
     }
 
@@ -1278,6 +1326,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                     skim_cfg,
                     funding_cfg,
                     sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
                 );
             }
         }
@@ -1301,6 +1350,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             skim_cfg,
             funding_cfg,
             sim_cfg_template.clone(),
+            equity_csv_dir.clone(),
         );
     }
 
@@ -1323,6 +1373,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                 skim_cfg,
                 funding_cfg,
                 sim_cfg_template.clone(),
+                equity_csv_dir.clone(),
             );
         }
     }
@@ -1351,6 +1402,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                         skim_cfg,
                         funding_cfg,
                         sim_cfg_template.clone(),
+                        equity_csv_dir.clone(),
                     );
                 }
             }
@@ -1404,6 +1456,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                     skim_cfg,
                     funding_cfg,
                     sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
                 );
             }
             if included("spread-scalp-old", &allow) {
@@ -1446,6 +1499,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                     skim_cfg,
                     funding_cfg,
                     sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
                 );
             }
         }
@@ -1517,6 +1571,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                                         skim_cfg,
                                         funding_cfg,
                                         sim_cfg_template.clone(),
+                                        equity_csv_dir.clone(),
                                     );
                                 }
                             }
@@ -1571,6 +1626,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                             skim_cfg,
                             funding_cfg,
                             sim_cfg_template.clone(),
+                            equity_csv_dir.clone(),
                         );
                     }
                 }
@@ -1616,6 +1672,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             sim_cfg_template.clone(),
             liq_events.clone(),
             args.liq_window_secs,
+            equity_csv_dir.clone(),
         );
     }
 
@@ -1763,13 +1820,17 @@ async fn run_one<S: Strategy>(
     skim: Option<SkimConfig>,
     funding: Option<FundingConfig>,
     sim_cfg: FillSimConfig,
+    equity_csv_path: Option<PathBuf>,
 ) -> PaperReport {
     let replay = ParquetReplay::from_shared(shared_data);
     let venue = BacktestVenue::new(replay);
     let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
     let runner_config = RunnerConfig {
         state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
-        snapshot_every_n_events: 0,
+        // Equity-curve export needs snapshot ticks; default `0` (no
+        // ticks) → no rows. Force a modest cadence when CSV requested
+        // so the curve has resolution without spamming dashboards.
+        snapshot_every_n_events: if equity_csv_path.is_some() { 1000 } else { 0 },
         skim,
         funding,
         snapshot_tap: None,
@@ -1777,6 +1838,7 @@ async fn run_one<S: Strategy>(
         notional_rx: None,
         liq_window_secs: 0,
             seed_position: None,
+            equity_csv_path,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -1822,6 +1884,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
     sim_cfg: FillSimConfig,
     liq_events: Vec<tikr_core::LiqEvent>,
     liq_window_secs: u32,
+    equity_csv_dir: Option<PathBuf>,
 ) {
     let sd = Arc::clone(shared_data);
     let sym = symbol.clone();
@@ -1830,6 +1893,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
+    let equity_csv_path = equity_csv_dir.map(|d| d.join(format!("{state_id}.csv")));
     handles.spawn(async move {
         let _permit = acquire_sweep_permit().await;
         let preset_start = std::time::Instant::now();
@@ -1847,7 +1911,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
         let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
         let runner_config = RunnerConfig {
             state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
-            snapshot_every_n_events: 0,
+            snapshot_every_n_events: if equity_csv_path.is_some() { 1000 } else { 0 },
             skim,
             funding,
             snapshot_tap: None,
@@ -1855,6 +1919,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             notional_rx: None,
             liq_window_secs,
             seed_position: None,
+            equity_csv_path,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");
@@ -1911,6 +1976,7 @@ fn spawn_preset<S: Strategy + Send + 'static>(
     skim: Option<SkimConfig>,
     funding: Option<FundingConfig>,
     sim_cfg: FillSimConfig,
+    equity_csv_dir: Option<PathBuf>,
 ) {
     let sd = Arc::clone(shared_data);
     let sym = symbol.clone();
@@ -1919,10 +1985,14 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
+    let equity_csv_path = equity_csv_dir.map(|d| d.join(format!("{state_id}.csv")));
     handles.spawn(async move {
         let _permit = acquire_sweep_permit().await;
         let preset_start = std::time::Instant::now();
-        let r = run_one(sd, sym, state_id, strategy, fees, skim, funding, sim_cfg).await;
+        let r = run_one(
+            sd, sym, state_id, strategy, fees, skim, funding, sim_cfg, equity_csv_path,
+        )
+        .await;
         (display, r, preset_start.elapsed())
     });
 }

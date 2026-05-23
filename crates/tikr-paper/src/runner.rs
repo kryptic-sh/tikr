@@ -87,6 +87,12 @@ pub struct RunnerConfig {
     /// strategy + cap + risk gates all reason against the wrong state.
     /// `None` (default) = fresh-flat start.
     pub seed_position: Option<Position>,
+    /// Optional CSV file to append an equity-curve row to on every
+    /// snapshot tick. Format: `ts_ns,sim_secs,fills,pos_size,realized,unrealized,fees,funding,net`.
+    /// File is created + header-written on the first tick; subsequent
+    /// ticks append. `None` (default) disables the curve export. Used by
+    /// `compare` to dump per-preset PnL timelines for drawdown analysis.
+    pub equity_csv_path: Option<PathBuf>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -128,6 +134,7 @@ impl Default for RunnerConfig {
             notional_rx: None,
             liq_window_secs: 0,
             seed_position: None,
+            equity_csv_path: None,
         }
     }
 }
@@ -466,6 +473,13 @@ where
     let mut notional_rx = config.notional_rx;
     let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
+
+    // Equity-curve CSV writer. Lazy-opened on the first snapshot tick
+    // (header gets written then). `None` when the feature is disabled or
+    // the path fails to open — open failure is logged but does not abort
+    // the run, since the CSV is purely an introspection aid.
+    let mut equity_csv_writer: Option<std::io::BufWriter<std::fs::File>> = None;
+    let equity_csv_path = config.equity_csv_path.clone();
 
     info!(
         symbol = %symbol.base.0,
@@ -1003,6 +1017,47 @@ where
                     {
                         *guard = Some(report.clone());
                         last_tap_publish = Instant::now();
+                    }
+                    // Equity-curve CSV append. Open + header on first
+                    // tick; bounded buffered writer so we don't fsync on
+                    // every snapshot. Errors are warned but never fatal.
+                    if let Some(ref path) = equity_csv_path {
+                        if equity_csv_writer.is_none() {
+                            match std::fs::File::create(path) {
+                                Ok(f) => {
+                                    let mut w = std::io::BufWriter::new(f);
+                                    use std::io::Write;
+                                    let _ = writeln!(
+                                        w,
+                                        "ts_ns,sim_secs,fills,pos_size,realized,unrealized,fees,funding,net"
+                                    );
+                                    equity_csv_writer = Some(w);
+                                }
+                                Err(e) => warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "equity csv open failed; curve disabled for this run"
+                                ),
+                            }
+                        }
+                        if let Some(w) = equity_csv_writer.as_mut() {
+                            use std::io::Write;
+                            let ts_ns = last_event_ts.map(|t| t.0).unwrap_or(0);
+                            let pos_size = tracker.snapshot().size.0;
+                            let _ = writeln!(
+                                w,
+                                "{},{},{},{},{},{},{},{},{}",
+                                ts_ns,
+                                report.sim_duration_secs,
+                                report.fills_emitted,
+                                pos_size,
+                                report.realized.0,
+                                report.unrealized.0,
+                                report.fees.0,
+                                report.funding.0,
+                                report.net.0,
+                            );
+                        }
                     }
                 }
             }
@@ -1838,6 +1893,7 @@ mod tests {
             notional_rx: None,
             liq_window_secs: 0,
             seed_position: None,
+            equity_csv_path: None,
         }
     }
 
@@ -2182,6 +2238,7 @@ mod tests {
             notional_rx: None,
             liq_window_secs: 0,
             seed_position: None,
+            equity_csv_path: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2269,6 +2326,7 @@ mod tests {
             notional_rx: None,
             liq_window_secs: 0,
             seed_position: None,
+            equity_csv_path: None,
         };
         let (_tx, rx) = watch::channel(false);
 
