@@ -168,6 +168,7 @@ mod tests {
             recent_fills: &[],
             latest_book: snapshot,
             open_quotes: &[],
+            recent_liqs: &[],
         }
     }
 

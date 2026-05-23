@@ -423,6 +423,7 @@ where
                         recent_fills: &[],
                         latest_book: &current_book,
                         open_quotes: &open_quotes,
+            recent_liqs: &[],
                     };
                     let actions = strategy.on_notional_updated(&ctx, next_notional);
                     if !actions.is_empty() {
@@ -491,6 +492,7 @@ where
                     recent_fills: &[],
                     latest_book: &current_book,
                     open_quotes: &open_quotes,
+            recent_liqs: &[],
                 };
 
                 let actions = strategy.on_event(&ctx, &event);
@@ -718,6 +720,7 @@ where
                             recent_fills: std::slice::from_ref(&fill_clone),
                             latest_book: &current_book,
                             open_quotes: &post_fill_quotes,
+            recent_liqs: &[],
                         };
                         let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
                         dispatch_post_fill_actions(
@@ -759,6 +762,7 @@ where
                                 recent_fills: &[],
                                 latest_book: &current_book,
                                 open_quotes: &rec_quotes,
+            recent_liqs: &[],
                             };
                             let recovery_actions =
                                 strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
@@ -961,6 +965,7 @@ where
                     recent_fills: std::slice::from_ref(&fill_clone),
                     latest_book: &current_book,
                     open_quotes: &post_fill_quotes,
+            recent_liqs: &[],
                 };
                 let fill_actions = strategy.on_event(&fill_ctx, &fill_event);
                 dispatch_post_fill_actions(
@@ -1100,6 +1105,7 @@ where
         recent_fills: &[],
         latest_book: &current_book,
         open_quotes: &shutdown_quotes,
+        recent_liqs: &[],
     };
     let shutdown_actions = strategy.on_shutdown(&ctx);
     for action in shutdown_actions {
@@ -1270,6 +1276,7 @@ async fn dispatch_post_fill_actions<V, S>(
                 recent_fills: &[],
                 latest_book: &fresh_book,
                 open_quotes: &recovery_quotes,
+                recent_liqs: &[],
             };
             let recovery_actions = strategy.on_quote_rejected(&rec_ctx, &rej_intent, &rej_reason);
             for action in recovery_actions {

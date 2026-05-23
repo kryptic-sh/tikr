@@ -207,6 +207,7 @@ mod tests {
             recent_fills: &[],
             latest_book: book,
             open_quotes: &[],
+            recent_liqs: &[],
         }
     }
 

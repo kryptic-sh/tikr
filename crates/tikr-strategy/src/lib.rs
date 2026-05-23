@@ -34,6 +34,7 @@ pub mod glft;
 pub mod kline_scalp;
 pub mod ladder_reentry;
 pub mod layered_grid;
+pub mod liq_fade;
 pub mod micro_mean_reversion;
 pub mod micro_price;
 pub mod risk;
@@ -49,6 +50,7 @@ pub use glft::{Glft, GlftConfig};
 pub use kline_scalp::{KlineScalp, KlineScalpConfig};
 pub use ladder_reentry::{LadderReentry, LadderReentryConfig};
 pub use layered_grid::{LayeredGrid, LayeredGridConfig};
+pub use liq_fade::{LiqFade, LiqFadeConfig};
 pub use micro_mean_reversion::{MicroMeanReversion, MicroMeanReversionConfig};
 pub use micro_price::{MicroPrice, MicroPriceConfig};
 pub use simple_gap::{SimpleGap, SimpleGapConfig};
@@ -59,7 +61,7 @@ pub use top_of_book::{TopOfBook, TopOfBookConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
 
 use tikr_core::{
-    Decimal, Fill, MarketEvent, Position, Price, QuoteKind, Side, Size, Snapshot, Symbol,
+    Decimal, Fill, LiqEvent, MarketEvent, Position, Price, QuoteKind, Side, Size, Snapshot, Symbol,
     TimeInForce, Timestamp,
 };
 use tikr_venue::{QuoteId, QuoteIntent};
@@ -82,6 +84,12 @@ pub struct StrategyContext<'a> {
     pub latest_book: &'a Snapshot,
     /// All open quotes: (id, original intent) pairs.
     pub open_quotes: &'a [(QuoteId, QuoteIntent)],
+    /// Rolling window of recent forced-liquidation events. Runner-
+    /// maintained — strategies that don't care about liqs leave it
+    /// empty (default `&[]`). `LiqFade` consumes these to arm + time
+    /// the cascade-fade trade. Sorted oldest-first; window length is
+    /// a runner-side knob.
+    pub recent_liqs: &'a [LiqEvent],
 }
 
 // ---------------------------------------------------------------------------

@@ -401,6 +401,37 @@ pub struct Fill {
 }
 
 // ---------------------------------------------------------------------------
+// LiqEvent
+// ---------------------------------------------------------------------------
+
+/// A single forced-liquidation event from the venue's liquidation stream.
+///
+/// Binance USD-M Futures broadcasts these on `!forceOrder@arr`; the recorder
+/// (`record_liquidations`) writes them to parquet with one row per event.
+/// Strategies that care about liquidation cascades (e.g. `LiqFade`) consume
+/// these via `StrategyContext::recent_liqs` — a rolling window maintained
+/// by the runner.
+///
+/// `side` is from the **liquidated trader's** perspective: a liquidated
+/// long is forced to sell (Side::Ask), a liquidated short to buy
+/// (Side::Bid). `notional = qty × price`, pre-computed by the recorder
+/// so consumers don't repeat the multiply.
+#[derive(Debug, Clone, Copy)]
+pub struct LiqEvent {
+    /// Event timestamp from the venue, nanoseconds since UNIX epoch.
+    pub ts: Timestamp,
+    /// Side of the forced order on the book (the side the liquidated
+    /// trader's hedge crosses to).
+    pub side: Side,
+    /// Liquidated quantity in base units.
+    pub qty: Size,
+    /// Fill price of the forced order.
+    pub price: Price,
+    /// Pre-computed notional in quote currency (`qty × price`).
+    pub notional: Notional,
+}
+
+// ---------------------------------------------------------------------------
 // Position
 // ---------------------------------------------------------------------------
 

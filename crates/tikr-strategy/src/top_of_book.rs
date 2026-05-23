@@ -337,6 +337,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg(2)); // improve only when spread > 2 ticks
         let actions = tob.on_event(
@@ -370,6 +371,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg(1)); // improve when spread > 1 tick
         let actions = tob.on_event(
@@ -401,6 +403,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg(2));
         let _ = tob.on_event(
@@ -427,6 +430,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg(2));
         let _ = tob.on_event(
@@ -455,6 +459,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         // Improve when spread > 1 → bid=101, ask=109 base. After -3 skew:
         // bid=98, ask=106.
@@ -487,6 +492,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         // base bid=101, ask=109. +3 skew → bid=104, ask=112.
         let mut tob = TopOfBook::new(cfg_skew(1, 3, Decimal::from(1)));
@@ -519,6 +525,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         // base join 100/102, skew -100 → bid=0, ask=2. Clamp: ask <= 100
         // (best_bid) → ask = 101 (best_bid + tick).
@@ -555,6 +562,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         // Should match cfg(1) — no skew applied at zero position.
         let mut tob = TopOfBook::new(cfg_skew(1, 3, Decimal::from(1)));
@@ -591,6 +599,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         // tick = 1, base improve: bid=101, ask=199. Skew = -13.
         let mut tob = TopOfBook::new(cfg_skew(1, 20, Decimal::from(3)));
@@ -625,6 +634,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg_imbalance(1, 10));
         let actions = tob.on_event(
@@ -660,6 +670,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg_imbalance(1, 10));
         let actions = tob.on_event(
@@ -693,6 +704,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg_imbalance(1, 10));
         let actions = tob.on_event(
@@ -729,6 +741,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &b,
             open_quotes: &[],
+            recent_liqs: &[],
         };
         let mut tob = TopOfBook::new(cfg(2));
         let actions = tob.on_event(

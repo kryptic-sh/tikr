@@ -520,6 +520,7 @@ mod tests {
             recent_fills: &[],
             latest_book: snap,
             open_quotes: &[],
+            recent_liqs: &[],
         }
     }
 
@@ -607,6 +608,7 @@ mod tests {
             recent_fills: &[],
             latest_book: &snap,
             open_quotes: &open_quotes,
+            recent_liqs: &[],
         };
 
         let mid = Decimal::new(10005, 1);

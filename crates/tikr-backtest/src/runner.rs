@@ -58,6 +58,7 @@ where
             recent_fills: &[],
             latest_book: &current_book,
             open_quotes: &[],
+            recent_liqs: &[],
         };
 
         let actions = strategy.on_event(&ctx, &event);
