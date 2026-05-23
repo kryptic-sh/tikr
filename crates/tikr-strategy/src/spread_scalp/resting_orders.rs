@@ -32,7 +32,12 @@ pub struct Resting {
     pub side: Side,
     /// Quoted price.
     pub price: Price,
-    /// Quoted size (after lot-step rounding / min-notional bump).
+    /// Current resting size on the venue. Set to the original intent
+    /// size on `record_place`, then refreshed by `reconcile` from
+    /// `ctx.open_quotes` so partial fills (which leave a shrunken
+    /// resting order on the venue) shrink this field too. The next
+    /// `policy::diff` then sees `r.size < target_size` and fires a
+    /// Replace to top the side back up.
     pub size: Size,
 }
 
@@ -97,10 +102,15 @@ impl RestingOrders {
         let venue_sides: std::collections::HashSet<Side> =
             ctx_open.iter().map(|(_, q)| q.side).collect();
         self.by_side.retain(|s, _| venue_sides.contains(s));
-        // Update id field from venue truth.
+        // Refresh `id` and `size` from venue truth. `ctx.open_quotes`
+        // exposes `size_remaining` (NOT the original intent size — see
+        // `FillSim::live_quotes_for` which stamps `size: q.size_remaining`).
+        // Partial fills shrink `r.size` here so the next `policy::diff`
+        // sees the gap vs the strategy's target and fires a Replace.
         for (id, q) in ctx_open {
             if let Some(r) = self.by_side.get_mut(&q.side) {
                 r.id = Some(*id);
+                r.size = q.size;
             }
         }
     }
@@ -179,5 +189,21 @@ mod tests {
         assert!(ro.current_for(Side::Bid).is_some());
         assert!(ro.current_for(Side::Ask).is_none());
         assert_eq!(ro.current_for(Side::Bid).unwrap().id, Some(id));
+    }
+
+    /// Partial fill: venue reports the resting order with shrunken
+    /// size. Reconcile must copy the new size into the tracker so the
+    /// next policy::diff sees the gap and fires a Replace.
+    #[test]
+    fn reconcile_refreshes_size_for_partial_fills() {
+        let mut ro = RestingOrders::new();
+        ro.record_place(&intent(Side::Bid, 100, 5));
+        let id = QuoteId::new();
+        // Half-filled: venue now holds 2 of the original 5.
+        let venue_view = vec![(id, intent(Side::Bid, 100, 2))];
+        ro.reconcile(&venue_view);
+        let r = ro.current_for(Side::Bid).expect("bid still tracked");
+        assert_eq!(r.size, Size(Decimal::from(2)));
+        assert_eq!(r.id, Some(id));
     }
 }
