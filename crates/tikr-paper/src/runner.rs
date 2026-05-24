@@ -579,6 +579,33 @@ where
     recon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     recon_tick.tick().await;
 
+    // Initial reconciliation: when the supervisor respawns this bot
+    // (TUI restart, code reload, etc.) the venue may already hold
+    // resting orders from the prior incarnation. FillSim starts empty,
+    // so without this seed the strategy has no idea those orders exist
+    // — it places duplicates, fails to cancel, and reasoning about
+    // `open_quotes` is wrong for the first 30 s until the periodic tick
+    // fires. Mirrors the position seed (supervisor.rs:235) but on the
+    // open-orders dimension.
+    if live_mode {
+        match venue.open_orders(&symbol).await {
+            Ok(orders) => {
+                let (removed, added) = fill_sim.reconcile_quotes_for(&symbol, &orders);
+                if added > 0 || removed > 0 {
+                    info!(
+                        venue_open = orders.len(),
+                        added,
+                        removed,
+                        "initial reconciliation: seeded FillSim from venue.open_orders"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = ?e, "initial reconciliation: venue.open_orders failed (strategy starts with empty open_quotes view)");
+            }
+        }
+    }
+
     loop {
         // Poll the external fill receiver when in live mode. We use an async
         // block that resolves to `Option<Fill>` so the select! can be unified.
