@@ -842,14 +842,17 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Cross-symbol summary: best (highest-NET) preset per symbol +
     // total basket NET. Skipped when only one symbol contributed
     // results (the per-symbol table already shows the same info).
-    print_basket_summary(&per_symbol);
+    print_basket_summary(&per_symbol, args.sim_max_position_notional);
     Ok(())
 }
 
 /// Per-symbol best preset + basket NET sum. Empty result vectors
 /// (symbol whose sweep failed) contribute zero to the basket but show
 /// `—` in the per-symbol cells so the operator sees the gap.
-fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
+fn print_basket_summary(
+    per_symbol: &[(String, Vec<(String, PaperReport)>)],
+    per_bot_cap: f64,
+) {
     let non_empty = per_symbol.iter().filter(|(_, r)| !r.is_empty()).count();
     if non_empty < 2 {
         return;
@@ -867,12 +870,20 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(per_symbol.len() + 1);
     let mut total_net = 0.0;
     let mut total_volume = 0.0;
-    // Basket capital ≈ sum of per-symbol peaks. Each bot reserves its
-    // own cap independently from the operator's wallet, so the wallet
-    // must support all bots' peaks summed. That's the denominator the
-    // operator actually cares about when judging ROI on capital
-    // deployed.
     let mut sum_peak = 0.0;
+    // ROI uses the operator's allocated capital per bot, NOT the peak
+    // observed in the run. Allocation is what the wallet reserves; the
+    // peak is just the high-water mark of how much of that allocation
+    // got used. A bot that earns $5 on a $500 allocation has 1% ROI
+    // regardless of whether it actually deployed all $500 or only $300
+    // — the operator still tied up $500 of margin to run it. When
+    // `per_bot_cap == 0` (operator passed no `--sim-max-position-notional`)
+    // we fall back to peak so the cell still renders something useful.
+    let cap_denom = if per_bot_cap > 0.0 {
+        per_bot_cap
+    } else {
+        0.0
+    };
     for (sym, results) in per_symbol {
         if let Some((name, report)) = results.iter().max_by(|(_, a), (_, b)| {
             decimal_to_f64(&a.net.0)
@@ -883,8 +894,9 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
             let volume = decimal_to_f64(&report.buy_volume_usdt.0)
                 + decimal_to_f64(&report.sell_volume_usdt.0);
             let peak = decimal_to_f64(&report.peak_position_usdt.0);
-            let roi = if peak > 0.0 {
-                format!("{:.3}", net / peak * 100.0)
+            let denom = if cap_denom > 0.0 { cap_denom } else { peak };
+            let roi = if denom > 0.0 {
+                format!("{:.3}", net / denom * 100.0)
             } else {
                 "—".to_string()
             };
@@ -912,12 +924,18 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
             ]);
         }
     }
-    // Total ROI = total_net / sum_peak. Denominator is the upper-bound
-    // capital the operator's wallet had to support (each bot reserves
-    // its own peak independently). This is the apples-to-apples figure
-    // for comparing strategies under the same per-bot cap.
-    let total_roi = if sum_peak > 0.0 {
-        format!("{:.3}", total_net / sum_peak * 100.0)
+    // Total ROI = total_net / (per_bot_cap × num_bots). Denominator is
+    // the operator's wallet allocation — what they tied up to run the
+    // basket, regardless of how much each bot actually deployed at peak.
+    // Falls back to sum_peak when no explicit cap was set (matches
+    // per-symbol fallback above).
+    let total_capital = if cap_denom > 0.0 {
+        cap_denom * per_symbol.len() as f64
+    } else {
+        sum_peak
+    };
+    let total_roi = if total_capital > 0.0 {
+        format!("{:.3}", total_net / total_capital * 100.0)
     } else {
         "—".to_string()
     };
@@ -932,7 +950,19 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
     ]);
     let headers = ["symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset"];
     render_mysql_table(&headers, &rows);
-    println!("(TOTAL row: volume + peak_pos summed across symbols; ROI% = NET / sum(peak))");
+    let roi_note = if cap_denom > 0.0 {
+        format!(
+            "ROI% = NET / allocated_capital  (per_bot_cap=${:.0}, basket={}×${:.0}=${:.0})",
+            cap_denom,
+            per_symbol.len(),
+            cap_denom,
+            total_capital,
+        )
+    } else {
+        "ROI% = NET / peak_pos (no --sim-max-position-notional set; falling back to peak)"
+            .to_string()
+    };
+    println!("(TOTAL row: volume + peak_pos summed; {roi_note})");
 }
 
 async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
