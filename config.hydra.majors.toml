@@ -44,15 +44,20 @@
 env = "futures-testnet"
 state_dir = "./state"
 
-# 5 bots × 0.4% margin per bot = 2% of margin balance deployed per leg.
-# At wallet=$25k that's $100/leg per bot (the sweep sweet spot).
-order_balance_pct = "2"
+# 5 bots × 0.3% margin per bot = 1.5% of margin balance deployed per leg.
+# At wallet=$25k that's $75/leg per bot.
+#
+# notional:max_position ratio = 1.5:10 = 15%. 2026-05-25 retune sweep
+# confirmed 15% is the safe plateau (ROI 0.466%). 25% was a marginal
+# peak (ROI 0.491%) but on a knife-edge cap-arithmetic boundary —
+# real-market price/fee jitter degrades that to single-pyramid behaviour
+# fast. 15% leaves room for 2-3 pyramid adds with margin to spare.
+order_balance_pct = "1.5"
 
 # 5 bots × 2% per bot = 10% of margin balance allowed at peak position.
 # Drives `max_position_usdt` for any bot that doesn't set it explicitly:
 #   per_bot_max_pos = wallet × margin_multiplier × max_position_pct / 100 / bots
-# At wallet=$25k, 5 bots → $500/bot peak — the sweep's max_pos = 5× notional
-# ratio. Scales linearly with wallet.
+# At wallet=$25k, 5 bots → $500/bot peak. Scales linearly with wallet.
 max_position_pct = "10"
 
 # key_file = "./keys/binance-testnet.txt"

@@ -157,7 +157,8 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
             .map(|p| p.notional)
             .unwrap_or(None)),
         "liq-fade" | "lf" => Ok(cfg.liq_fade.as_ref().map(|p| p.notional).unwrap_or(None)),
-        "hydra" | "hd" | "hy" => Ok(cfg.hydra.as_ref().map(|p| p.notional).unwrap_or(None)),
+        // Hydra: notional is wallet-derived only — no per-bot override.
+        "hydra" | "hd" | "hy" => Ok(None),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -429,7 +430,7 @@ fn build_hydra(
     let hd = cfg.hydra.as_ref().ok_or_else(|| {
         anyhow::anyhow!("bot {} strategy=hydra but [bot.hydra] missing", cfg.symbol)
     })?;
-    let notional = autobump_notional(hd.notional.unwrap_or(default_notional), symbol, venue)?;
+    let notional = autobump_notional(default_notional, symbol, venue)?;
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::ONE);
     let step_size = venue.step_size(symbol).unwrap_or(tick_size);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);

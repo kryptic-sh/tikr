@@ -221,9 +221,6 @@ fn liq_default_window_secs() -> u32 {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct HydraParams {
-    /// Fiat notional per straddle leg + per add.
-    #[serde(default)]
-    pub notional: Option<Decimal>,
     /// Distance from mid each straddle leg posts, in bps.
     #[serde(default = "hydra_default_entry_offset_bps")]
     pub entry_offset_bps: u32,
