@@ -591,10 +591,9 @@ fn parse_strategies(s: &str) -> Option<std::collections::HashSet<String>> {
 /// behaviour means a CLI flag still overrides the TOML default — the
 /// TOML is for sweep templates, CLI for one-off tweaks.
 fn toml_to_args(path: &std::path::Path) -> Result<Vec<String>, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    let value: toml::Value = toml::from_str(&raw)
-        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let table = value
         .as_table()
         .ok_or_else(|| format!("{}: top-level must be a TOML table", path.display()))?;
@@ -707,7 +706,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         argv.remove(idx);
         let toml_args = toml_to_args(std::path::Path::new(&path))?;
         if !toml_args.is_empty() {
-            info!(path, count = toml_args.len(), "loaded sweep config from TOML");
+            info!(
+                path,
+                count = toml_args.len(),
+                "loaded sweep config from TOML"
+            );
         }
         // Insert TOML-derived args after argv[0] (the binary name) so
         // they're earlier in clap's sequence than any explicit CLI
@@ -788,12 +791,7 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut per_symbol: Vec<(String, Vec<(String, PaperReport)>)> = Vec::new();
     for (i, (sym, dir)) in symbols.iter().enumerate() {
-        let body = format!(
-            "[{}/{}] {sym}  ({})",
-            i + 1,
-            symbols.len(),
-            dir.display()
-        );
+        let body = format!("[{}/{}] {sym}  ({})", i + 1, symbols.len(), dir.display());
         // Banner sized to the content so the right edge always aligns.
         let bar_len = body.chars().count() + 4;
         let bar: String = "═".repeat(bar_len);
@@ -861,14 +859,11 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
     let mut total_volume = 0.0;
     let mut max_peak = 0.0;
     for (sym, results) in per_symbol {
-        if let Some((name, report)) = results
-            .iter()
-            .max_by(|(_, a), (_, b)| {
-                decimal_to_f64(&a.net.0)
-                    .partial_cmp(&decimal_to_f64(&b.net.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        {
+        if let Some((name, report)) = results.iter().max_by(|(_, a), (_, b)| {
+            decimal_to_f64(&a.net.0)
+                .partial_cmp(&decimal_to_f64(&b.net.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             let net = decimal_to_f64(&report.net.0);
             let volume = decimal_to_f64(&report.buy_volume_usdt.0)
                 + decimal_to_f64(&report.sell_volume_usdt.0);
@@ -912,7 +907,9 @@ async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 /// Body of `run_sweep`, but returns the sorted/filtered results so
 /// basket mode can aggregate across symbols. Single-symbol path stays
 /// at `run_sweep` for the void return + side-effect printing.
-async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box<dyn std::error::Error>> {
+async fn run_sweep_collect(
+    args: Args,
+) -> Result<Vec<(String, PaperReport)>, Box<dyn std::error::Error>> {
     let (base_str, quote_str) = split_symbol(&args.symbol);
     let symbol = Symbol {
         base: Asset::new(base_str),
@@ -1094,30 +1091,29 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
     // Load liq parquet once if a dir is provided + LiqFade is requested.
     // The Vec is cloned into a fresh mpsc channel per preset so each LiqFade
     // sweep gets its own pre-loaded receiver.
-    let liq_events: Vec<tikr_core::LiqEvent> = if !args.liq_data_dir.is_empty()
-        && included("liq-fade", &allow)
-    {
-        let dir = std::path::Path::new(&args.liq_data_dir);
-        match tikr_backtest::liq_replay::LiqEventStream::load(dir, &args.symbol) {
-            Ok(s) => {
-                info!(
-                    liq_events = s.len(),
-                    dir = %dir.display(),
-                    "loaded liq parquet for LiqFade"
-                );
-                s.into_events()
+    let liq_events: Vec<tikr_core::LiqEvent> =
+        if !args.liq_data_dir.is_empty() && included("liq-fade", &allow) {
+            let dir = std::path::Path::new(&args.liq_data_dir);
+            match tikr_backtest::liq_replay::LiqEventStream::load(dir, &args.symbol) {
+                Ok(s) => {
+                    info!(
+                        liq_events = s.len(),
+                        dir = %dir.display(),
+                        "loaded liq parquet for LiqFade"
+                    );
+                    s.into_events()
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: failed to load liq dir {}: {e}; LiqFade preset will see no liqs",
+                        dir.display()
+                    );
+                    Vec::new()
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "WARN: failed to load liq dir {}: {e}; LiqFade preset will see no liqs",
-                    dir.display()
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
+        } else {
+            Vec::new()
+        };
 
     if included("avellaneda-stoikov", &allow) {
         spawn_preset(
@@ -1501,11 +1497,8 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
         let spread_scalp_spread_sweep = parse_decimal_list(&args.spread_scalp_min_spread_bps_list)?;
         for &min_spread_bps in &spread_scalp_spread_sweep {
             // Pre-skip: gate above max observed spread → 0-fill guaranteed.
-            if max_observed_spread_bps > Decimal::ZERO
-                && min_spread_bps > max_observed_spread_bps
-            {
-                skipped_presets
-                    .push(format!("SpreadScalp(*) spread>={min_spread_bps}bps"));
+            if max_observed_spread_bps > Decimal::ZERO && min_spread_bps > max_observed_spread_bps {
+                skipped_presets.push(format!("SpreadScalp(*) spread>={min_spread_bps}bps"));
                 continue;
             }
             if included("spread-scalp", &allow) {
@@ -1620,9 +1613,7 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
                                     // are inert). Keeps the column narrow on
                                     // the common case where only inner/step/
                                     // levels vary.
-                                    let mut label = format!(
-                                        "SG in={inner} st={step} lv={levels}"
-                                    );
+                                    let mut label = format!("SG in={inner} st={step} lv={levels}");
                                     if fpm_target > Decimal::ZERO {
                                         use std::fmt::Write;
                                         let _ = write!(
@@ -1682,9 +1673,8 @@ async fn run_sweep_collect(args: Args) -> Result<Vec<(String, PaperReport)>, Box
             for &inner in &hawk_inner {
                 for &step in &hawk_step {
                     for &min_spread in &hawk_min_spread {
-                        let label = format!(
-                            "Hawk lv={levels} in={inner} st={step} ms={min_spread}"
-                        );
+                        let label =
+                            format!("Hawk lv={levels} in={inner} st={step} ms={min_spread}");
                         if max_observed_spread_bps > Decimal::ZERO
                             && min_spread > max_observed_spread_bps
                         {
@@ -1979,8 +1969,8 @@ async fn run_one<S: Strategy>(
         live_tap: None,
         notional_rx: None,
         liq_window_secs: 0,
-            seed_position: None,
-            equity_csv_path,
+        seed_position: None,
+        equity_csv_path,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -2103,7 +2093,12 @@ static SWEEP_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 /// `Option<OwnedSemaphorePermit>` falls out of scope.
 async fn acquire_sweep_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
     match SWEEP_LIMITER.get() {
-        Some(sem) => Some(sem.clone().acquire_owned().await.expect("sweep limiter closed")),
+        Some(sem) => Some(
+            sem.clone()
+                .acquire_owned()
+                .await
+                .expect("sweep limiter closed"),
+        ),
         None => None,
     }
 }
@@ -2132,7 +2127,15 @@ fn spawn_preset<S: Strategy + Send + 'static>(
         let _permit = acquire_sweep_permit().await;
         let preset_start = std::time::Instant::now();
         let r = run_one(
-            sd, sym, state_id, strategy, fees, skim, funding, sim_cfg, equity_csv_path,
+            sd,
+            sym,
+            state_id,
+            strategy,
+            fees,
+            skim,
+            funding,
+            sim_cfg,
+            equity_csv_path,
         )
         .await;
         (display, r, preset_start.elapsed())
@@ -2181,8 +2184,7 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
         } else {
             0.0
         };
-        let volume = decimal_to_f64(&r.buy_volume_usdt.0)
-            + decimal_to_f64(&r.sell_volume_usdt.0);
+        let volume = decimal_to_f64(&r.buy_volume_usdt.0) + decimal_to_f64(&r.sell_volume_usdt.0);
         let peak = decimal_to_f64(&r.peak_position_usdt.0);
         let roi = if peak > 0.0 { net / peak * 100.0 } else { 0.0 };
         // CSV escape: wrap preset name in quotes if it contains a comma.
@@ -2204,8 +2206,12 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
 fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!("### {symbol}");
     println!();
-    println!("| preset | fills | fills/min | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |");
-    println!("|--------|------:|----------:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|");
+    println!(
+        "| preset | fills | fills/min | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |"
+    );
+    println!(
+        "|--------|------:|----------:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|"
+    );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
         let fpm = if sim_min > 0.0 {
@@ -2222,8 +2228,7 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
         } else {
             0.0
         };
-        let volume = decimal_to_f64(&r.buy_volume_usdt.0)
-            + decimal_to_f64(&r.sell_volume_usdt.0);
+        let volume = decimal_to_f64(&r.buy_volume_usdt.0) + decimal_to_f64(&r.sell_volume_usdt.0);
         let peak = decimal_to_f64(&r.peak_position_usdt.0);
         let roi = if peak > 0.0 {
             format!("{:.3}", net / peak * 100.0)
@@ -2386,8 +2391,8 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             } else {
                 0.0
             };
-            let volume = decimal_to_f64(&r.buy_volume_usdt.0)
-                + decimal_to_f64(&r.sell_volume_usdt.0);
+            let volume =
+                decimal_to_f64(&r.buy_volume_usdt.0) + decimal_to_f64(&r.sell_volume_usdt.0);
             let peak = decimal_to_f64(&r.peak_position_usdt.0);
             // ROI% = NET / peak_position × 100 — return on the largest
             // capital deployed at any moment. `—` when peak is zero

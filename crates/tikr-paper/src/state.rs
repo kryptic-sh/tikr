@@ -38,6 +38,9 @@ mod tests {
             final_perp_balance: Notional(Decimal::ZERO),
             final_base_value: Notional(Decimal::ZERO),
             base_asset: String::new(),
+            buy_volume_usdt: Notional(Decimal::ZERO),
+            sell_volume_usdt: Notional(Decimal::ZERO),
+            peak_position_usdt: Notional(Decimal::ZERO),
         }
     }
 

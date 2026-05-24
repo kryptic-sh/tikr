@@ -215,7 +215,8 @@ impl Hawk {
         let bp_unit = Decimal::from(10_000);
         let bid_capped = self.add_side_capped(pos_usdt, Side::Bid);
         let ask_capped = self.add_side_capped(pos_usdt, Side::Ask);
-        let mut out: Vec<(Price, Action)> = Vec::with_capacity(self.config.levels_per_side as usize * 2);
+        let mut out: Vec<(Price, Action)> =
+            Vec::with_capacity(self.config.levels_per_side as usize * 2);
         for k in 0..self.config.levels_per_side {
             let offset_bps = Decimal::from(self.config.inner_bps + self.config.step_bps * k);
             if !bid_capped {
@@ -480,7 +481,12 @@ mod tests {
         // 1 bps spread on 100_000 mid → below 5 bps gate.
         let snap = snap(99_995, 100_005, 1_000_000_000);
         let c = ctx(&s, &p, &snap);
-        let actions = h.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = h.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::CancelAll));
     }
@@ -493,7 +499,12 @@ mod tests {
         // 10 bps spread on 100_000 mid → above 5 bps gate.
         let snap = snap(99_950, 100_050, 1_000_000_000);
         let c = ctx(&s, &p, &snap);
-        let actions = h.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = h.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         // CancelAll + 2 levels × 2 sides = 5 actions.
         assert_eq!(actions.len(), 5);
         assert!(matches!(actions[0], Action::CancelAll));
@@ -522,7 +533,12 @@ mod tests {
         // 2 bps spread (below 5 bps gate) but market hasn't moved.
         let snap = snap(99_990, 100_010, 1_000_000_000);
         let c = ctx(&s, &p, &snap);
-        let actions = h.on_event(&c, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = h.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         // CancelAll + one close-side Ask quote.
         assert_eq!(actions.len(), 2);
         assert!(matches!(actions[0], Action::CancelAll));
@@ -551,7 +567,12 @@ mod tests {
         // Hot spread = 10 bps.
         let snap = snap(99_950, 100_050, 1_000_000_000);
         let cx = ctx(&s, &p, &snap);
-        let actions = h.on_event(&cx, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = h.on_event(
+            &cx,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         // Long + capped → Bid side suppressed. Only Ask levels + CancelAll.
         let quote_sides: Vec<Side> = actions
             .iter()

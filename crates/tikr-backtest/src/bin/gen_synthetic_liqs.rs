@@ -82,7 +82,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (start_ns, end_ns) = scan_ts_range(&args.book_dir)?;
     let span = end_ns.saturating_sub(start_ns);
-    let price = if args.price > 0.0 { args.price } else { 100_000.0 };
+    let price = if args.price > 0.0 {
+        args.price
+    } else {
+        100_000.0
+    };
     let qty = args.event_notional_usdt / price;
     let burst_count = args.burst_count.max(1);
 
@@ -100,8 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.offset_pct
         } else {
             args.offset_pct
-                + (args.offset_end_pct - args.offset_pct) * (b as f64)
-                    / ((burst_count - 1) as f64)
+                + (args.offset_end_pct - args.offset_pct) * (b as f64) / ((burst_count - 1) as f64)
         };
         let burst_start = start_ns + ((span as f64 * pct) as u64);
         let burst_side = if args.alternate_sides && b % 2 == 1 {

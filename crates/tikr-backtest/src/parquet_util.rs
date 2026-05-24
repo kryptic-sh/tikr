@@ -49,7 +49,9 @@ mod tests {
 
     #[test]
     fn missing_file_is_not_complete() {
-        assert!(!is_complete_parquet(Path::new("/tmp/nonexistent-parquet.parquet")));
+        assert!(!is_complete_parquet(Path::new(
+            "/tmp/nonexistent-parquet.parquet"
+        )));
     }
 
     #[test]

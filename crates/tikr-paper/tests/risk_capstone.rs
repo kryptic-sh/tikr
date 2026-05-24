@@ -371,8 +371,8 @@ async fn risk_resume_alerting_capstone() {
         live_tap: None,
         notional_rx: None,
         liq_window_secs: 0,
-            seed_position: None,
-            equity_csv_path: None,
+        seed_position: None,
+        equity_csv_path: None,
     };
     let (_tx1, rx1) = watch::channel(false);
 

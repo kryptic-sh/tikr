@@ -36,10 +36,7 @@ pub enum GridDetectError {
 /// parquet data. Symbol matching is case-insensitive on the raw ticker
 /// (e.g. `"BTCUSDT"`). When the symbol is in the hardcoded table, no
 /// parquet is read.
-pub fn detect_grid(
-    data_dir: &Path,
-    symbol: &str,
-) -> Result<(Decimal, Decimal), GridDetectError> {
+pub fn detect_grid(data_dir: &Path, symbol: &str) -> Result<(Decimal, Decimal), GridDetectError> {
     if let Some((tick, step)) = static_lookup(symbol) {
         return Ok((tick, step));
     }
@@ -99,10 +96,7 @@ fn sniff_from_parquet(data_dir: &Path) -> Result<(Decimal, Decimal), GridDetectE
         }
     }
     let book = book_path.ok_or_else(|| {
-        GridDetectError::NoData(format!(
-            "no book_*.parquet in {}",
-            data_dir.display()
-        ))
+        GridDetectError::NoData(format!("no book_*.parquet in {}", data_dir.display()))
     })?;
     let tick = sniff_min_gap(&book, "price")?;
     let step = match trade_path {
@@ -156,7 +150,8 @@ fn sniff_min_gap(path: &Path, column: &str) -> Result<Decimal, GridDetectError> 
             min_gap = Some(gap);
         }
     }
-    min_gap.ok_or_else(|| GridDetectError::NoData(format!("no positive gaps in {}", path.display())))
+    min_gap
+        .ok_or_else(|| GridDetectError::NoData(format!("no positive gaps in {}", path.display())))
 }
 
 #[cfg(test)]

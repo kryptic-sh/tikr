@@ -180,12 +180,7 @@ impl Hydra {
 
     /// Build the PostOnly straddle: Bid below mid, Ask above mid, both
     /// at `entry_offset_bps` from mid.
-    fn build_straddle(
-        &self,
-        symbol: &Symbol,
-        best_bid: Price,
-        best_ask: Price,
-    ) -> Vec<Action> {
+    fn build_straddle(&self, symbol: &Symbol, best_bid: Price, best_ask: Price) -> Vec<Action> {
         let mid = Self::mid(best_bid, best_ask);
         let offset = Decimal::from(self.config.entry_offset_bps) / Decimal::from(10_000);
         let bid_raw = mid * (Decimal::ONE - offset);
@@ -332,16 +327,14 @@ impl Strategy for Hydra {
                     let side_long = pos_size > Decimal::ZERO;
                     let first_entry = ctx.position.avg_entry.0;
                     let mut actions = vec![Action::CancelAll];
-                    let tp_price_placed = if let Some((intent, price)) =
-                        self.build_tp_intent(
-                            ctx.symbol,
-                            side_long,
-                            ctx.position.size.0,
-                            first_entry,
-                            best_bid,
-                            best_ask,
-                        )
-                    {
+                    let tp_price_placed = if let Some((intent, price)) = self.build_tp_intent(
+                        ctx.symbol,
+                        side_long,
+                        ctx.position.size.0,
+                        first_entry,
+                        best_bid,
+                        best_ask,
+                    ) {
                         actions.push(intent);
                         Some(price)
                     } else {
@@ -452,8 +445,7 @@ impl Strategy for Hydra {
 
                 // Cooldown gate for adds.
                 let cooldown_ns = self.config.add_cooldown_ms.saturating_mul(1_000_000);
-                let cooldown_passed =
-                    ctx.now.0.saturating_sub(last_add_ts_ns) >= cooldown_ns;
+                let cooldown_passed = ctx.now.0.saturating_sub(last_add_ts_ns) >= cooldown_ns;
 
                 let pyramid_step = Decimal::from(self.config.pyramid_step_bps);
                 let dca_step = Decimal::from(self.config.dca_step_bps);
@@ -484,31 +476,18 @@ impl Strategy for Hydra {
 
                 if cooldown_passed && favorable_target > pyramid_bands_placed {
                     if let Some(intent) = self.maybe_add(
-                        ctx,
-                        side_long,
-                        mid,
-                        best_bid,
-                        best_ask,
-                        /*is_pyramid=*/ true,
+                        ctx, side_long, mid, best_bid, best_ask, /*is_pyramid=*/ true,
                     ) {
                         actions.push(intent);
                         new_pyramid = favorable_target;
                         new_last_add_ts = ctx.now.0;
                     }
                 }
-                if cooldown_passed
-                    && adverse_target > dca_bands_placed
-                    && actions.is_empty()
-                {
+                if cooldown_passed && adverse_target > dca_bands_placed && actions.is_empty() {
                     // Only one add per event so cap math + cooldown
                     // don't get tangled across two concurrent fires.
                     if let Some(intent) = self.maybe_add(
-                        ctx,
-                        side_long,
-                        mid,
-                        best_bid,
-                        best_ask,
-                        /*is_pyramid=*/ false,
+                        ctx, side_long, mid, best_bid, best_ask, /*is_pyramid=*/ false,
                     ) {
                         actions.push(intent);
                         new_dca = adverse_target;
@@ -818,7 +797,12 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s = snap(99_990, 100_010, 1_000_000_000);
         let ctx = flat_ctx(&s_sym, &s, 1_000_000_000);
-        let actions = h.on_event(&ctx, &MarketEvent::BookUpdate { snapshot: s.clone() });
+        let actions = h.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
         // CancelAll + 2 quotes (Bid + Ask) expected.
         assert!(matches!(actions[0], Action::CancelAll));
         let quotes: Vec<_> = actions
@@ -844,8 +828,18 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s = snap(99_990, 100_010, 1);
         let ctx = flat_ctx(&s_sym, &s, 1);
-        let _ = h.on_event(&ctx, &MarketEvent::BookUpdate { snapshot: s.clone() });
-        let actions = h.on_event(&ctx, &MarketEvent::BookUpdate { snapshot: s.clone() });
+        let _ = h.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let actions = h.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
         // No-op until we transition out of Idle/straddle_placed.
         assert!(actions.is_empty());
     }
@@ -856,7 +850,12 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s = snap(99_990, 100_010, 1);
         let ctx = flat_ctx(&s_sym, &s, 1);
-        let _ = h.on_event(&ctx, &MarketEvent::BookUpdate { snapshot: s.clone() });
+        let _ = h.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
         // Simulate Bid fill: ctx.position now reflects a long.
         let ctx2 = long_ctx(
             &s_sym,
@@ -888,7 +887,12 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s0 = snap(99_990, 100_010, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         // Long fill at 99990.
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s0, pos_size, Decimal::from(99_990), 2);
@@ -897,7 +901,12 @@ mod tests {
         // mid = 99990 × 1.0025 ≈ 100240.
         let s2 = snap(100_235, 100_245, 3);
         let ctx2 = long_ctx(&s_sym, &s2, pos_size, Decimal::from(99_990), 3);
-        let actions = h.on_event(&ctx2, &MarketEvent::BookUpdate { snapshot: s2.clone() });
+        let actions = h.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: s2.clone(),
+            },
+        );
         // Should emit one IOC Bid (taker add at touch).
         let quotes: Vec<_> = actions
             .iter()
@@ -917,14 +926,24 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s0 = snap(99_990, 100_010, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s0, pos_size, Decimal::from(99_990), 2);
         let _ = h.on_event(&ctx1, &MarketEvent::Heartbeat { ts: Timestamp(2) });
         // Market drops 30 bps (> dca_step_bps=25): mid ≈ 99690.
         let s2 = snap(99_685, 99_695, 3);
         let ctx2 = long_ctx(&s_sym, &s2, pos_size, Decimal::from(99_990), 3);
-        let actions = h.on_event(&ctx2, &MarketEvent::BookUpdate { snapshot: s2.clone() });
+        let actions = h.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: s2.clone(),
+            },
+        );
         let quotes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
@@ -949,12 +968,22 @@ mod tests {
         let mut h = Hydra::new(cfg);
         let s0 = snap(100_000, 100_001, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         // First long fill at 100000.
         let s1 = snap(99_950, 99_955, 2);
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s1, pos_size, Decimal::from(100_000), 2);
-        let _ = h.on_event(&ctx1, &MarketEvent::BookUpdate { snapshot: s1.clone() });
+        let _ = h.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: s1.clone(),
+            },
+        );
         // Big drop: mid 99500 → 50 bps from 100000 first.
         let s2 = snap(99_495, 99_505, 3);
         // After hypothetical DCA, avg might be 99750 — pretend so.
@@ -965,7 +994,12 @@ mod tests {
             Decimal::from(99_750),
             3,
         );
-        let actions = h.on_event(&ctx2, &MarketEvent::BookUpdate { snapshot: s2.clone() });
+        let actions = h.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: s2.clone(),
+            },
+        );
         // SL should fire because drift_from_first_bps ≈ -50.
         let quotes: Vec<_> = actions
             .iter()
@@ -989,10 +1023,20 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s0 = snap(100_000, 100_001, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s0, pos_size, Decimal::from(100_000), 2);
-        let actions = h.on_event(&ctx1, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let actions = h.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         // Expect [CancelAll, Quote(Ask PostOnly @ 100_000 × 1.0030)].
         assert!(actions.iter().any(|a| matches!(a, Action::CancelAll)));
         let quotes: Vec<_> = actions
@@ -1025,10 +1069,20 @@ mod tests {
         let mut h = Hydra::new(c);
         let s0 = snap(100_000, 100_001, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s0, pos_size, Decimal::from(100_000), 2);
-        let _ = h.on_event(&ctx1, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         // Pretend an add has landed: avg_entry slid to 99_500,
         // size doubled.
         let s2 = snap(99_490, 99_500, 3);
@@ -1039,7 +1093,12 @@ mod tests {
             Decimal::from(99_500),
             3,
         );
-        let actions = h.on_event(&ctx2, &MarketEvent::BookUpdate { snapshot: s2.clone() });
+        let actions = h.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: s2.clone(),
+            },
+        );
         let quotes: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1065,13 +1124,23 @@ mod tests {
         let mut h = Hydra::new(c);
         let s0 = snap(99_990, 100_010, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s0, pos_size, Decimal::from(99_990), 2);
         let _ = h.on_event(&ctx1, &MarketEvent::Heartbeat { ts: Timestamp(2) });
         let s2 = snap(100_235, 100_245, 3);
         let ctx2 = long_ctx(&s_sym, &s2, pos_size, Decimal::from(99_990), 3);
-        let actions = h.on_event(&ctx2, &MarketEvent::BookUpdate { snapshot: s2.clone() });
+        let actions = h.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: s2.clone(),
+            },
+        );
         // Cap blocks the add → no Quote actions emitted.
         let quotes: usize = actions
             .iter()
@@ -1086,7 +1155,12 @@ mod tests {
         let mut h = Hydra::new(cfg());
         let s0 = snap(99_990, 100_010, 1);
         let ctx0 = flat_ctx(&s_sym, &s0, 1);
-        let _ = h.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: s0.clone() });
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
         let pos_size = Decimal::from_str_exact("0.001").unwrap();
         let ctx1 = long_ctx(&s_sym, &s0, pos_size, Decimal::from(99_990), 2);
         let _ = h.on_event(&ctx1, &MarketEvent::Heartbeat { ts: Timestamp(2) });
