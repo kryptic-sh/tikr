@@ -482,6 +482,28 @@ impl Strategy for LiqFade {
         }
         Vec::new()
     }
+
+    fn on_notional_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        notional_per_order: Decimal,
+    ) -> Vec<Action> {
+        if notional_per_order > Decimal::ZERO {
+            self.config.notional_per_entry = notional_per_order;
+        }
+        Vec::new()
+    }
+
+    fn on_max_position_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        max_position_usdt: Decimal,
+    ) -> Vec<Action> {
+        if max_position_usdt > Decimal::ZERO {
+            self.config.max_position_usdt = max_position_usdt;
+        }
+        Vec::new()
+    }
 }
 
 impl LiqFade {

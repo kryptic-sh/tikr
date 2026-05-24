@@ -490,6 +490,17 @@ impl Strategy for LayeredGrid {
         }
         Vec::new()
     }
+
+    fn on_max_position_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        max_position_usdt: Decimal,
+    ) -> Vec<Action> {
+        if max_position_usdt > Decimal::ZERO {
+            self.config.max_position_usdt = max_position_usdt;
+        }
+        Vec::new()
+    }
 }
 
 /// Helper: does the [`tikr_core::Fill`] belong to our symbol? FillSim

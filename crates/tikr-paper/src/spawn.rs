@@ -385,6 +385,7 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
+        max_position_rx: None,
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: None,

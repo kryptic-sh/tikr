@@ -116,6 +116,8 @@ fn resolve_config_path(cli: Option<&std::path::Path>) -> anyhow::Result<PathBuf>
 struct AccountPollerConfig {
     shared_state: SharedBotState,
     notional_tx: watch::Sender<Decimal>,
+    max_position_tx: watch::Sender<Decimal>,
+    max_position_pct: Decimal,
     env: tikr_binance::BinanceEnv,
     api_key: String,
     key_material: Arc<tikr_binance::BinanceKeyMaterial>,
@@ -173,6 +175,13 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                             / bot_count;
                     if notional != *cfg.notional_tx.borrow() {
                         let _ = cfg.notional_tx.send(notional);
+                    }
+                    let max_position =
+                        balance.wallet_balance * cfg.margin_multiplier * cfg.max_position_pct
+                            / Decimal::from(100)
+                            / bot_count;
+                    if max_position != *cfg.max_position_tx.borrow() {
+                        let _ = cfg.max_position_tx.send(max_position);
                     }
                     for symbol in &symbols {
                         tracing::info!(
@@ -343,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
     // Global shutdown channel — TUI flips it on `q`; supervisors observe.
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
     let (notional_tx, notional_rx) = watch::channel(Decimal::ZERO);
+    let (max_position_tx, max_position_rx) = watch::channel(Decimal::ZERO);
 
     let total_slots = cfg
         .scalp_rotation
@@ -360,6 +370,8 @@ async fn main() -> anyhow::Result<()> {
     spawn_account_balance_poller(AccountPollerConfig {
         shared_state: shared_state.clone(),
         notional_tx,
+        max_position_tx,
+        max_position_pct: cfg.account.max_position_pct,
         env,
         api_key: api_key.clone(),
         key_material: key_material.clone(),
@@ -385,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
                 margin_multiplier: cfg.account.margin_multiplier,
                 max_position_pct: cfg.account.max_position_pct,
                 notional_rx: notional_rx.clone(),
+                max_position_rx: max_position_rx.clone(),
             },
             shared_state.clone(),
             global_shutdown_rx.clone(),
@@ -403,6 +416,7 @@ async fn main() -> anyhow::Result<()> {
                 margin_multiplier: cfg.account.margin_multiplier,
                 max_position_pct: cfg.account.max_position_pct,
                 notional_rx: notional_rx.clone(),
+                max_position_rx: max_position_rx.clone(),
             },
             shared_state.clone(),
             global_shutdown_rx.clone(),
@@ -422,6 +436,7 @@ async fn main() -> anyhow::Result<()> {
                 max_position_pct: cfg.account.max_position_pct,
                 bot_count: cfg.bots.len(),
                 notional_rx: notional_rx.clone(),
+                max_position_rx: max_position_rx.clone(),
                 clear_on_start: args.clear,
             };
             let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());

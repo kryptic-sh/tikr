@@ -34,6 +34,8 @@ pub struct RotationAccountCtx {
     pub max_position_pct: Decimal,
     /// Account-derived notional updates.
     pub notional_rx: watch::Receiver<Decimal>,
+    /// Account-derived per-bot position cap updates.
+    pub max_position_rx: watch::Receiver<Decimal>,
 }
 
 struct ActiveSet {
@@ -242,6 +244,7 @@ fn spawn_one_bot(
             max_position_pct: account.max_position_pct,
             bot_count: slots,
             notional_rx: account.notional_rx.clone(),
+            max_position_rx: account.max_position_rx.clone(),
             // Rotation always starts a fresh symbol — leftover state
             // from a different bot in this slot would be stale.
             clear_on_start: true,

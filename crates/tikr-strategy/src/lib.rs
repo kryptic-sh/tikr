@@ -195,6 +195,19 @@ pub trait Strategy: Send {
     ) -> Vec<Action> {
         Vec::new()
     }
+
+    /// Called when the runner receives a new account-derived per-bot position
+    /// cap. Strategies that gate adds against `max_position_usdt` should
+    /// update their config. Default impl is a no-op for strategies without
+    /// a cap concept. Fires alongside [`Self::on_notional_updated`] so order
+    /// size and cap track each other in lockstep as the wallet grows.
+    fn on_max_position_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        _max_position_usdt: Decimal,
+    ) -> Vec<Action> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------

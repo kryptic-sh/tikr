@@ -46,6 +46,11 @@ pub struct SupervisorCtx {
     pub bot_count: usize,
     /// Live per-bot notional updates from the account balance poller.
     pub notional_rx: watch::Receiver<Decimal>,
+    /// Live per-bot position-cap updates from the account balance poller.
+    /// Recomputed every 5s alongside `notional_rx` so the strategy's
+    /// `max_position_usdt` tracks compounded wallet growth, not just
+    /// per-order size.
+    pub max_position_rx: watch::Receiver<Decimal>,
     /// When `true`, the supervisor cancels all resting orders + flattens
     /// any open position for this symbol on each spawn cycle, giving
     /// the bot a clean slate. When `false` (default for `tikr` CLI),
@@ -214,6 +219,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         &ctx.base_state_dir,
         default_notional,
         Some(ctx.notional_rx.clone()),
+        Some(ctx.max_position_rx.clone()),
         max_pos_default,
     )?;
 

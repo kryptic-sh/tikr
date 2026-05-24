@@ -28,6 +28,7 @@ pub fn to_spec(
     base_state_dir: &std::path::Path,
     default_notional: Decimal,
     notional_rx: Option<watch::Receiver<Decimal>>,
+    max_position_rx: Option<watch::Receiver<Decimal>>,
     max_position_usdt_default: Decimal,
 ) -> Result<BotSpec> {
     let uses_default_notional = strategy_notional(cfg)?.is_none();
@@ -93,6 +94,16 @@ pub fn to_spec(
         } else {
             None
         },
+        // Cap rescaling tracks the same default-vs-explicit semantics
+        // as notional: when the bot defines its own `max_position_usdt`
+        // in TOML the live channel is suppressed (operator intent
+        // wins). When the bot inherits the account-level default, the
+        // strategy receives live updates as wallet grows.
+        max_position_rx: if strategy_max_position(cfg)?.is_none() {
+            max_position_rx
+        } else {
+            None
+        },
         // LiqFade is the only consumer; other strategies leave the
         // buffer empty regardless of this value.
         liq_window_secs: cfg.liq_fade.as_ref().map(|p| p.window_secs).unwrap_or(0),
@@ -149,6 +160,24 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "hydra" | "hd" | "hy" => Ok(cfg.hydra.as_ref().map(|p| p.notional).unwrap_or(None)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
+}
+
+/// Returns `Some(cap)` when the bot's TOML explicitly sets a per-bot
+/// `max_position_usdt > 0`, else `None`. Used by `to_spec` to decide
+/// whether to subscribe the runner to live-cap updates from the
+/// account poller.
+fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
+    let cap = match cfg.strategy.as_str() {
+        "static-grid" | "sg" => cfg.sg.as_ref().map(|p| p.max_position_usdt),
+        "layered-grid" | "lg" => cfg.lg.as_ref().map(|p| p.max_position_usdt),
+        "spread-scalp" | "ss" => cfg.spread_scalp.as_ref().map(|p| p.max_position_usdt),
+        "liq-fade" | "lf" => cfg.liq_fade.as_ref().map(|p| p.max_position_usdt),
+        "hydra" | "hd" | "hy" => cfg.hydra.as_ref().map(|p| p.max_position_usdt),
+        // Strategies without a cap concept: never override.
+        "ladder-reentry" | "lr" | "simple-gap" | "sgap" | "micro-mean-reversion" | "mmr" => None,
+        other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
+    };
+    Ok(cap.filter(|v| *v > Decimal::ZERO))
 }
 
 fn per_bot_state_dir(base: &std::path::Path, symbol: &str) -> PathBuf {

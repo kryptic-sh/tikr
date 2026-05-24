@@ -84,6 +84,11 @@ pub struct RunnerConfig {
     /// Optional live per-order notional updates derived from account wallet
     /// balance. Strategies decide how to refresh resting orders.
     pub notional_rx: Option<watch::Receiver<Decimal>>,
+    /// Optional live per-bot position-cap updates derived from the same
+    /// wallet poll as `notional_rx`. Strategies that gate adds against
+    /// `max_position_usdt` update their config via `on_max_position_updated`.
+    /// `None` (default) = static cap (set once at spawn).
+    pub max_position_rx: Option<watch::Receiver<Decimal>>,
     /// Rolling-window length (seconds) for `StrategyContext::recent_liqs`.
     /// `0` (default) disables the liq window — the slice exposed to
     /// strategies is always empty even when `external_liqs` is set.
@@ -144,6 +149,7 @@ impl Default for RunnerConfig {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            max_position_rx: None,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
@@ -494,6 +500,7 @@ where
     // continuously, then advance.
     let funding_cfg = config.funding;
     let mut notional_rx = config.notional_rx;
+    let mut max_position_rx = config.max_position_rx;
     let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
@@ -601,6 +608,46 @@ where
                     let actions = strategy.on_notional_updated(&ctx, next_notional);
                     if !actions.is_empty() {
                         info!(notional_per_order = %next_notional, "order notional updated");
+                        dispatch_post_fill_actions(
+                            actions,
+                            &venue,
+                            &mut fill_sim,
+                            &mut strategy,
+                            &symbol,
+                            last_event_ts.unwrap_or(Timestamp(0)),
+                            &pos,
+                            &current_book,
+                            live_mode,
+                            &mut side_fails,
+                        ).await;
+                    }
+                }
+            }
+            changed = async {
+                match max_position_rx.as_mut() {
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed
+                    && let Some(rx) = max_position_rx.as_ref()
+                {
+                    let next_max_pos = *rx.borrow();
+                    let pos = tracker.snapshot();
+                    let open_quotes = fill_sim.live_quotes_for(&symbol);
+                    let liqs = liq_window.observe(last_event_ts.unwrap_or(Timestamp(0)).0);
+                    let ctx = StrategyContext {
+                        symbol: &symbol,
+                        now: last_event_ts.unwrap_or(Timestamp(0)),
+                        position: &pos,
+                        recent_fills: &[],
+                        latest_book: &current_book,
+                        open_quotes: &open_quotes,
+                        recent_liqs: liqs,
+                    };
+                    let actions = strategy.on_max_position_updated(&ctx, next_max_pos);
+                    if !actions.is_empty() {
+                        info!(max_position_usdt = %next_max_pos, "position cap updated");
                         dispatch_post_fill_actions(
                             actions,
                             &venue,
@@ -1989,6 +2036,7 @@ mod tests {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            max_position_rx: None,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
@@ -2340,6 +2388,7 @@ mod tests {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            max_position_rx: None,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
@@ -2428,6 +2477,7 @@ mod tests {
             snapshot_tap: None,
             live_tap: None,
             notional_rx: None,
+            max_position_rx: None,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
