@@ -948,9 +948,22 @@ where
                 // (mirrors the live-mode recovery loop in
                 // dispatch_post_fill_actions). Resulting actions queue
                 // through fill_sim and apply on the NEXT event.
+                //
+                // Bounded by MAX_RECOVERY_ROUNDS to match live mode
+                // (dispatch_post_fill_actions:1514). Without the cap,
+                // strategies whose `on_quote_rejected` re-emits a full
+                // ladder (LG/SG) can blow up exponentially when the
+                // position cap rejects every grid level — each rejection
+                // spawns N new placements which all reject again.
                 if !live_mode {
-                    let rejections = fill_sim.drain_rejections();
-                    if !rejections.is_empty() {
+                    const MAX_RECOVERY_ROUNDS: usize = 5;
+                    let mut round = 0;
+                    loop {
+                        let rejections = fill_sim.drain_rejections();
+                        if rejections.is_empty() || round >= MAX_RECOVERY_ROUNDS {
+                            break;
+                        }
+                        round += 1;
                         let rec_pos = tracker.snapshot();
                         for (rej_intent, rej_reason) in rejections {
                             let rec_quotes = fill_sim.live_quotes_for(&symbol);
@@ -2102,6 +2115,9 @@ mod tests {
             final_perp_balance: Notional(Decimal::ZERO),
             final_base_value: Notional(Decimal::ZERO),
             base_asset: String::new(),
+            buy_volume_usdt: Notional(Decimal::ZERO),
+            sell_volume_usdt: Notional(Decimal::ZERO),
+            peak_position_usdt: Notional(Decimal::ZERO),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -2149,6 +2165,9 @@ mod tests {
             final_perp_balance: Notional(Decimal::ZERO),
             final_base_value: Notional(Decimal::ZERO),
             base_asset: String::new(),
+            buy_volume_usdt: Notional(Decimal::ZERO),
+            sell_volume_usdt: Notional(Decimal::ZERO),
+            peak_position_usdt: Notional(Decimal::ZERO),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);

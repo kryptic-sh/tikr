@@ -401,15 +401,22 @@ impl FillSim {
             return None;
         }
         // Synthetic Binance `-2019` (margin insufficient). At place-time,
-        // if applying this intent *as a fill* would push |position| past
-        // the configured cap, reject. Cheap approximation of the live
-        // pre-trade margin check.
+        // the venue reserves margin for the WORST-CASE fill scenario
+        // across all currently-resting orders on this symbol plus the
+        // new intent. Margin reserved at place time stays reserved
+        // until the order fills or is cancelled, so the cap must
+        // account for the additive worst-case across all open orders
+        // — not just the new intent in isolation. Without this, layered
+        // grid strategies (LG/SG) place dozens of resting orders that
+        // individually pass the cap but collectively breach it on real
+        // venues.
+        //
+        // Worst-case direction-wise:
+        //   - all bids fill, no asks fill → position grows long by
+        //     Σ(bid notionals). Long must not breach cap.
+        //   - all asks fill, no bids fill → position grows short by
+        //     Σ(ask notionals). Short must not breach cap.
         if let Some(cap) = self.cfg.max_position_notional_usdt {
-            let pos = self
-                .position_notional
-                .get(&intent.symbol)
-                .copied()
-                .unwrap_or(Decimal::ZERO);
             // Scale-bounded: the position_notional accumulator path
             // re-rounds to 8 dp, but `intent.price × intent.size` can
             // independently produce a high-scale value (DOGE
@@ -417,13 +424,36 @@ impl FillSim {
             // operands BEFORE the addition so neither the inner
             // multiplication nor the sum exceeds rust_decimal's
             // 96-bit mantissa.
-            let delta = (intent.price.0 * intent.size.0).round_dp(8);
-            let pos = pos.round_dp(8);
-            let projected = match intent.side {
-                Side::Bid => pos + delta,
-                Side::Ask => pos - delta,
-            };
-            if projected.abs() > cap {
+            let pos = self
+                .position_notional
+                .get(&intent.symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(8);
+            let intent_delta = (intent.price.0 * intent.size.0).round_dp(8);
+            // Sum currently-resting notionals on the same symbol, split
+            // by side. New intent's notional is added to its own side.
+            let mut resting_bids = Decimal::ZERO;
+            let mut resting_asks = Decimal::ZERO;
+            for q in &self.live_quotes {
+                if q.symbol != intent.symbol {
+                    continue;
+                }
+                let n = (q.price.0 * q.size_remaining.0).round_dp(8);
+                match q.side {
+                    Side::Bid => resting_bids = (resting_bids + n).round_dp(8),
+                    Side::Ask => resting_asks = (resting_asks + n).round_dp(8),
+                }
+            }
+            match intent.side {
+                Side::Bid => resting_bids = (resting_bids + intent_delta).round_dp(8),
+                Side::Ask => resting_asks = (resting_asks + intent_delta).round_dp(8),
+            }
+            // Worst-case long: all bids fill → pos + resting_bids.
+            // Worst-case short: all asks fill → pos − resting_asks.
+            let worst_long = pos + resting_bids;
+            let worst_short = pos - resting_asks;
+            if worst_long > cap || worst_short < -cap {
                 self.pending_rejections.push((
                     intent.clone(),
                     "margin insufficient (paper -2019)".to_string(),
