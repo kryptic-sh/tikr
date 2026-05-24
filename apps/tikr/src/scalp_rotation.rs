@@ -29,6 +29,9 @@ pub struct RotationAccountCtx {
     pub order_balance_pct: Decimal,
     /// Margin multiplier for notional sizing.
     pub margin_multiplier: Decimal,
+    /// Account margin percent for per-bot peak-position cap (used by
+    /// strategies that don't set their own `max_position_usdt`).
+    pub max_position_pct: Decimal,
     /// Account-derived notional updates.
     pub notional_rx: watch::Receiver<Decimal>,
 }
@@ -236,6 +239,7 @@ fn spawn_one_bot(
             base_state_dir: account.base_state_dir.clone(),
             order_balance_pct: account.order_balance_pct,
             margin_multiplier: account.margin_multiplier,
+            max_position_pct: account.max_position_pct,
             bot_count: slots,
             notional_rx: account.notional_rx.clone(),
             // Rotation always starts a fresh symbol — leftover state

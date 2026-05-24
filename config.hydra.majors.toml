@@ -44,8 +44,16 @@
 env = "futures-testnet"
 state_dir = "./state"
 
-# 5 bots × 0.4% margin per bot = 2% of margin balance deployed.
+# 5 bots × 0.4% margin per bot = 2% of margin balance deployed per leg.
+# At wallet=$25k that's $100/leg per bot (the sweep sweet spot).
 order_balance_pct = "2"
+
+# 5 bots × 2% per bot = 10% of margin balance allowed at peak position.
+# Drives `max_position_usdt` for any bot that doesn't set it explicitly:
+#   per_bot_max_pos = wallet × margin_multiplier × max_position_pct / 100 / bots
+# At wallet=$25k, 5 bots → $500/bot peak — the sweep's max_pos = 5× notional
+# ratio. Scales linearly with wallet.
+max_position_pct = "10"
 
 # key_file = "./keys/binance-testnet.txt"
 
@@ -56,15 +64,13 @@ symbol = "BTCUSDT"
 strategy = "hydra"
 
 [bot.hydra]
-notional = 120
 entry_offset_bps = 100
 pyramid_step_bps = 50
-pyramid_max_adds = 2
+pyramid_max_adds = 3
 dca_step_bps = 60
 dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
-max_position_usdt = 500
 add_cooldown_ms = 1000
 pyramid_size_mult = "1.5"
 dca_size_mult = "0.5"
@@ -76,15 +82,13 @@ symbol = "ETHUSDT"
 strategy = "hydra"
 
 [bot.hydra]
-notional = 120
 entry_offset_bps = 50
 pyramid_step_bps = 50
-pyramid_max_adds = 2
+pyramid_max_adds = 3
 dca_step_bps = 60
 dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
-max_position_usdt = 500
 add_cooldown_ms = 1000
 pyramid_size_mult = "1.5"
 dca_size_mult = "0.5"
@@ -96,15 +100,13 @@ symbol = "BNBUSDT"
 strategy = "hydra"
 
 [bot.hydra]
-notional = 120
 entry_offset_bps = 50
 pyramid_step_bps = 50
-pyramid_max_adds = 2
+pyramid_max_adds = 3
 dca_step_bps = 60
 dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
-max_position_usdt = 500
 add_cooldown_ms = 1000
 pyramid_size_mult = "1.5"
 dca_size_mult = "0.5"
@@ -116,15 +118,13 @@ symbol = "SOLUSDT"
 strategy = "hydra"
 
 [bot.hydra]
-notional = 120
 entry_offset_bps = 50
 pyramid_step_bps = 50
-pyramid_max_adds = 2
+pyramid_max_adds = 3
 dca_step_bps = 60
 dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
-max_position_usdt = 500
 add_cooldown_ms = 1000
 pyramid_size_mult = "1.5"
 dca_size_mult = "0.5"
@@ -136,15 +136,13 @@ symbol = "DOGEUSDT"
 strategy = "hydra"
 
 [bot.hydra]
-notional = 120
 entry_offset_bps = 50
 pyramid_step_bps = 50
-pyramid_max_adds = 2
+pyramid_max_adds = 3
 dca_step_bps = 60
 dca_max_adds = 0
 tp_bps_from_avg = 30
 sl_bps_from_first = 35
-max_position_usdt = 500
 add_cooldown_ms = 1000
 pyramid_size_mult = "1.5"
 dca_size_mult = "0.5"

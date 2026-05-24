@@ -95,11 +95,7 @@ pub fn to_spec(
         },
         // LiqFade is the only consumer; other strategies leave the
         // buffer empty regardless of this value.
-        liq_window_secs: cfg
-            .liq_fade
-            .as_ref()
-            .map(|p| p.window_secs)
-            .unwrap_or(0),
+        liq_window_secs: cfg.liq_fade.as_ref().map(|p| p.window_secs).unwrap_or(0),
         // Supervisor fills this in from venue.position_risk on
         // `--clear`-off startup. build.rs leaves it None — the spec is
         // constructed before supervisor knows whether to seed.
@@ -149,16 +145,8 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
             .as_ref()
             .map(|p| p.notional)
             .unwrap_or(None)),
-        "liq-fade" | "lf" => Ok(cfg
-            .liq_fade
-            .as_ref()
-            .map(|p| p.notional)
-            .unwrap_or(None)),
-        "hydra" | "hd" | "hy" => Ok(cfg
-            .hydra
-            .as_ref()
-            .map(|p| p.notional)
-            .unwrap_or(None)),
+        "liq-fade" | "lf" => Ok(cfg.liq_fade.as_ref().map(|p| p.notional).unwrap_or(None)),
+        "hydra" | "hd" | "hy" => Ok(cfg.hydra.as_ref().map(|p| p.notional).unwrap_or(None)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -410,10 +398,7 @@ fn build_hydra(
     max_position_usdt_default: Decimal,
 ) -> Result<StrategyChoice> {
     let hd = cfg.hydra.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "bot {} strategy=hydra but [bot.hydra] missing",
-            cfg.symbol
-        )
+        anyhow::anyhow!("bot {} strategy=hydra but [bot.hydra] missing", cfg.symbol)
     })?;
     let notional = autobump_notional(hd.notional.unwrap_or(default_notional), symbol, venue)?;
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::ONE);

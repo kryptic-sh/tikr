@@ -38,6 +38,10 @@ pub struct SupervisorCtx {
     pub order_balance_pct: Decimal,
     /// Multiplier applied to wallet balance before sizing, typically leverage.
     pub margin_multiplier: Decimal,
+    /// Account margin percent for the per-bot peak-position cap (split by
+    /// `bot_count`). Drives `max_position_usdt` defaults handed to
+    /// strategies that don't set their own cap in TOML.
+    pub max_position_pct: Decimal,
     /// Number of configured bots sharing the account allocation.
     pub bot_count: usize,
     /// Live per-bot notional updates from the account balance poller.
@@ -195,8 +199,14 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     .await?;
 
     let default_notional = default_order_notional(&venue_for_run, ctx).await?;
-    let max_pos_default =
-        default_notional * Decimal::from(100) / ctx.order_balance_pct * Decimal::new(8, 1);
+    // Derive max_pos from the same wallet × mult source as default_notional:
+    //   max_pos = wallet × mult × max_position_pct / 100 / bot_count
+    //          = default_notional × (max_position_pct / order_balance_pct)
+    let max_pos_default = if ctx.order_balance_pct > Decimal::ZERO {
+        default_notional * ctx.max_position_pct / ctx.order_balance_pct
+    } else {
+        Decimal::ZERO
+    };
     let mut spec = to_spec(
         &ctx.cfg,
         symbol.clone(),

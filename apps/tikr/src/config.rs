@@ -87,6 +87,13 @@ pub struct AccountConfig {
     /// Multiplier applied to wallet balance before order sizing, typically leverage.
     #[serde(default = "default_margin_multiplier")]
     pub margin_multiplier: Decimal,
+    /// Percent of account margin balance used as the per-bot peak position
+    /// cap, split evenly by bot count. Per-bot max position USDT =
+    /// `wallet × margin_multiplier × max_position_pct / 100 / bot_count`.
+    /// Default `80` preserves legacy behavior (effectively 80% of wallet
+    /// divided across bots).
+    #[serde(default = "default_max_position_pct")]
+    pub max_position_pct: Decimal,
 }
 
 fn default_state_dir() -> PathBuf {
@@ -99,6 +106,10 @@ fn default_order_balance_pct() -> Decimal {
 
 fn default_margin_multiplier() -> Decimal {
     Decimal::ONE
+}
+
+fn default_max_position_pct() -> Decimal {
+    Decimal::from(80)
 }
 
 /// Per-bot configuration.
@@ -678,6 +689,7 @@ mod tests {
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(cfg.account.order_balance_pct, Decimal::new(2, 1));
         assert_eq!(cfg.account.margin_multiplier, Decimal::ONE);
+        assert_eq!(cfg.account.max_position_pct, Decimal::from(80));
         assert_eq!(sg.notional, None);
         assert_eq!(sg.levels, 3);
         assert_eq!(sg.inner_bps, 3);
