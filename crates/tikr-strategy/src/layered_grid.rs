@@ -68,6 +68,40 @@ fn add_side_capped(pos_usdt: Decimal, cap: Decimal, side: Side) -> bool {
     }
 }
 
+/// Remaining notional that can be placed on each side before the
+/// venue's worst-case margin check (FillSim's place-time -2019
+/// equivalent) binds. Models Binance: each resting order reserves its
+/// notional even before fill, so a long position + resting bids both
+/// consume the long-side budget. Returned values are `(bid_room,
+/// ask_room)` — clamp to zero if cap already breached.
+///
+/// `cap == 0` returns `(Decimal::MAX, Decimal::MAX)` (gate disabled).
+#[inline]
+fn side_room(
+    pos_usdt: Decimal,
+    open_quotes: &[(QuoteId, QuoteIntent)],
+    cap: Decimal,
+) -> (Decimal, Decimal) {
+    if cap <= Decimal::ZERO {
+        return (Decimal::MAX, Decimal::MAX);
+    }
+    let mut resting_bids = Decimal::ZERO;
+    let mut resting_asks = Decimal::ZERO;
+    for (_, q) in open_quotes {
+        let n = q.price.0 * q.size.0;
+        match q.side {
+            Side::Bid => resting_bids += n,
+            Side::Ask => resting_asks += n,
+        }
+    }
+    // FillSim semantics:
+    //   worst_long  = pos + resting_bids  ≤ cap → bid_room = cap − pos − resting_bids
+    //   worst_short = pos − resting_asks  ≥ −cap → ask_room = cap + pos − resting_asks
+    let bid_room = (cap - pos_usdt - resting_bids).max(Decimal::ZERO);
+    let ask_room = (cap + pos_usdt - resting_asks).max(Decimal::ZERO);
+    (bid_room, ask_room)
+}
+
 /// Configuration for [`LayeredGrid`].
 #[derive(Debug, Clone)]
 pub struct LayeredGridConfig {
@@ -155,8 +189,15 @@ impl LayeredGrid {
 
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
         let cap = self.config.max_position_usdt;
-        let bid_capped = add_side_capped(pos_usdt, cap, Side::Bid);
-        let ask_capped = add_side_capped(pos_usdt, cap, Side::Ask);
+        // Adaptive level placement: track remaining margin room per side
+        // and stop placing levels on a side once the next one would
+        // breach the cap. Without this, the strategy keeps blasting
+        // orders the venue would reject — burning API quota for zero
+        // progress and (in backtests) triggering paper-mode recovery
+        // storms. Each level's notional ≈ `notional_per_order` because
+        // size = notional / price → price × size = notional.
+        let (mut bid_room, mut ask_room) = side_room(pos_usdt, open_quotes, cap);
+        let level_notional = self.config.notional_per_order;
         // Place the new ladder FIRST so the venue sees fresh resting orders
         // before any cancels — avoids the naked-book gap. Level k (0-indexed)
         // sits at `(k+1) × inner_bps` from mid — uniform `inner_bps` spacing.
@@ -167,13 +208,15 @@ impl LayeredGrid {
             let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
             let sell_price = Price(mid.0 * (Decimal::ONE + bp_dec));
 
-            if !bid_capped {
+            if bid_room >= level_notional {
                 actions.push(self.make_quote(symbol, Side::Bid, buy_price));
                 self.orders.push((Side::Bid, buy_price));
+                bid_room -= level_notional;
             }
-            if !ask_capped {
+            if ask_room >= level_notional {
                 actions.push(self.make_quote(symbol, Side::Ask, sell_price));
                 self.orders.push((Side::Ask, sell_price));
+                ask_room -= level_notional;
             }
         }
         // Then cancel any prior open quotes by id. On cold start the
@@ -409,24 +452,28 @@ impl Strategy for LayeredGrid {
 
         let mut actions = vec![Action::CancelAll];
         let bps_to_decimal = |b: u32| Decimal::from(b) / Decimal::from(10_000);
-        // Recovery respects the inventory cap too — skip the side that
-        // would deepen position, refill only the closing side.
+        // Recovery respects the inventory cap too — adaptive level
+        // placement stops when the next level would breach the cap.
+        // CancelAll fires before the new placements so resting orders
+        // are gone — pass an empty open_quotes slice to `side_room`.
         let pos_usdt = ctx.position.size.0 * mid.0;
         let cap = self.config.max_position_usdt;
-        let bid_capped = add_side_capped(pos_usdt, cap, Side::Bid);
-        let ask_capped = add_side_capped(pos_usdt, cap, Side::Ask);
+        let (mut bid_room, mut ask_room) = side_room(pos_usdt, &[], cap);
+        let level_notional = self.config.notional_per_order;
         for k in 0..self.config.levels_per_side {
             let bps = self.config.inner_bps * (k + 1);
             let bp_dec = bps_to_decimal(bps);
             let buy_price = Price(mid.0 * (Decimal::ONE - bp_dec));
             let sell_price = Price(mid.0 * (Decimal::ONE + bp_dec));
-            if !bid_capped {
+            if bid_room >= level_notional {
                 actions.push(self.make_quote(ctx.symbol, Side::Bid, buy_price));
                 self.orders.push((Side::Bid, buy_price));
+                bid_room -= level_notional;
             }
-            if !ask_capped {
+            if ask_room >= level_notional {
                 actions.push(self.make_quote(ctx.symbol, Side::Ask, sell_price));
                 self.orders.push((Side::Ask, sell_price));
+                ask_room -= level_notional;
             }
         }
         self.placed = true;
