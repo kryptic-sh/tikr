@@ -966,6 +966,15 @@ where
                         round += 1;
                         let rec_pos = tracker.snapshot();
                         for (rej_intent, rej_reason) in rejections {
+                            // Skip recovery for margin-insufficient rejections.
+                            // The cap is binding until position decays via TP/SL
+                            // or external fills — re-emitting the same intent
+                            // (or worse, the whole grid via LG's
+                            // `on_quote_rejected`) will just bounce again,
+                            // burning CPU for zero progress.
+                            if rej_reason.starts_with("margin insufficient") {
+                                continue;
+                            }
                             let rec_quotes = fill_sim.live_quotes_for(&symbol);
                             let liqs = liq_window.observe(ts.0);
                             let rec_ctx = StrategyContext {
