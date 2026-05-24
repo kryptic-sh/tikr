@@ -153,24 +153,30 @@ struct Args {
     #[arg(long, default_value_t = 1.0_f64)]
     skim_ratio: f64,
 
-    /// LayeredGrid sweep: comma-separated `bps` values (single spacing param).
-    #[arg(long, default_value = "2,4,6,8,10")]
+    /// LayeredGrid sweep: comma-separated `bps` values (single spacing
+    /// param). Default `4` is the prior-sweep winner on 2026-05-24 72h
+    /// frozen-snapshot data; expand the list for per-strategy retuning.
+    #[arg(long, default_value = "4")]
     lg_bps_list: String,
 
-    /// LayeredGrid sweep: comma-separated `levels` values.
-    #[arg(long, default_value = "1,2,3,4,5")]
+    /// LayeredGrid sweep: comma-separated `levels` values. Default `2`
+    /// (prior-sweep winner — see `lg_bps_list`).
+    #[arg(long, default_value = "2")]
     lg_levels_list: String,
 
-    /// StaticGrid sweep: comma-separated `inner_bps` values.
-    #[arg(long, default_value = "3,6,10")]
+    /// StaticGrid sweep: comma-separated `inner_bps` values. Default `6`
+    /// (prior-sweep winner — expand for retuning).
+    #[arg(long, default_value = "6")]
     sg_inner_bps_list: String,
 
-    /// StaticGrid sweep: comma-separated `step_bps` values.
-    #[arg(long, default_value = "3,6")]
+    /// StaticGrid sweep: comma-separated `step_bps` values. Default `3`
+    /// (prior-sweep winner — expand for retuning).
+    #[arg(long, default_value = "3")]
     sg_step_bps_list: String,
 
     /// StaticGrid sweep: comma-separated `levels_per_side` values.
-    #[arg(long, default_value = "3,5")]
+    /// Default `3` (prior-sweep winner — expand for retuning).
+    #[arg(long, default_value = "3")]
     sg_levels_list: String,
 
     /// StaticGrid sweep: comma-separated `target_fills_per_min` values
@@ -357,19 +363,24 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     hawk_stop_loss_bps: u32,
 
-    /// Hydra: fiat notional per straddle leg / per add.
-    #[arg(long, default_value = "100")]
-    hydra_notional: String,
+    /// Hydra: per-order notional as percent of `hydra_max_pos_usdt`.
+    /// Default `15` is the 2026-05-25 retune sweet spot (notional=75 /
+    /// cap=500). Strategies are now wallet-scaled in live mode; this
+    /// flag exists for backtests so the ratio between order size and
+    /// cap stays explicit instead of being a raw USDT number that
+    /// doesn't generalise across wallet sizes.
+    #[arg(long, default_value = "15")]
+    hydra_notional_pct: String,
 
     /// Hydra: comma-separated `entry_offset_bps` sweep — straddle
     /// distance from mid. Wider = bigger-move filter; tighter = more
     /// chop fills.
-    #[arg(long, default_value = "10,20,30")]
+    #[arg(long, default_value = "50")]
     hydra_entry_offset_bps_list: String,
 
     /// Hydra: comma-separated `pyramid_step_bps` sweep — favorable-
     /// drift band that triggers a pyramid add.
-    #[arg(long, default_value = "15,25")]
+    #[arg(long, default_value = "50")]
     hydra_pyramid_step_bps_list: String,
 
     /// Hydra: max pyramid adds. `0` disables the pyramid arm.
@@ -378,7 +389,7 @@ struct Args {
 
     /// Hydra: comma-separated `dca_step_bps` sweep — adverse-drift
     /// band that triggers a DCA add.
-    #[arg(long, default_value = "20,30")]
+    #[arg(long, default_value = "60")]
     hydra_dca_step_bps_list: String,
 
     /// Hydra: max DCA adds. `0` disables the DCA arm.
@@ -457,7 +468,7 @@ struct Args {
     spread_scalp_notional: String,
 
     /// SpreadScalp sweep: comma-separated min spread in bps.
-    #[arg(long, default_value = "5,7,10")]
+    #[arg(long, default_value = "7")]
     spread_scalp_min_spread_bps_list: String,
 
     /// SpreadScalp / SpreadScalpOld: position cap in USDT notional.
@@ -850,14 +861,18 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
     println!("╔{bar}╗");
     println!("║  {body}  ║");
     println!("╚{bar}╝");
-    println!(
-        "{:<10} {:>11} {:>9} {:>10} {:>9} {:>7} {:<40}",
-        "symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset"
-    );
-    println!("{}", "-".repeat(105));
+    // Build rows for render_mysql_table — first column left-aligned
+    // (symbol), rest right-aligned numeric. TOTAL row goes through the
+    // same renderer so column widths stay consistent.
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(per_symbol.len() + 1);
     let mut total_net = 0.0;
     let mut total_volume = 0.0;
-    let mut max_peak = 0.0;
+    // Basket capital ≈ sum of per-symbol peaks. Each bot reserves its
+    // own cap independently from the operator's wallet, so the wallet
+    // must support all bots' peaks summed. That's the denominator the
+    // operator actually cares about when judging ROI on capital
+    // deployed.
+    let mut sum_peak = 0.0;
     for (sym, results) in per_symbol {
         if let Some((name, report)) = results.iter().max_by(|(_, a), (_, b)| {
             decimal_to_f64(&a.net.0)
@@ -875,28 +890,49 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)]) {
             };
             total_net += net;
             total_volume += volume;
-            if peak > max_peak {
-                max_peak = peak;
-            }
-            println!(
-                "{:<10} {:>11.4} {:>9} {:>10.0} {:>9.0} {:>7} {:<40}",
-                sym, net, report.fills_emitted, volume, peak, roi, name
-            );
+            sum_peak += peak;
+            rows.push(vec![
+                sym.clone(),
+                format!("{:.4}", net),
+                report.fills_emitted.to_string(),
+                format!("{:.0}", volume),
+                format!("{:.0}", peak),
+                roi,
+                name.clone(),
+            ]);
         } else {
-            println!(
-                "{:<10} {:>11} {:>9} {:>10} {:>9} {:>7} {:<40}",
-                sym, "—", "—", "—", "—", "—", "(no results)"
-            );
+            rows.push(vec![
+                sym.clone(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "(no results)".to_string(),
+            ]);
         }
     }
-    println!("{}", "-".repeat(105));
-    // Total NET + summed volume. Peak shown as max-across-symbols
-    // (caps are per-symbol; summing implies all peaked simultaneously
-    // which would be misleading for capital-deployed reasoning).
-    println!(
-        "{:<10} {:>11.4} {:>9} {:>10.0} {:>9.0} {:>7} {:<40}",
-        "TOTAL", total_net, "", total_volume, max_peak, "(peak=max,vol=sum)", ""
-    );
+    // Total ROI = total_net / sum_peak. Denominator is the upper-bound
+    // capital the operator's wallet had to support (each bot reserves
+    // its own peak independently). This is the apples-to-apples figure
+    // for comparing strategies under the same per-bot cap.
+    let total_roi = if sum_peak > 0.0 {
+        format!("{:.3}", total_net / sum_peak * 100.0)
+    } else {
+        "—".to_string()
+    };
+    rows.push(vec![
+        "TOTAL".to_string(),
+        format!("{:.4}", total_net),
+        String::new(),
+        format!("{:.0}", total_volume),
+        format!("{:.0}", sum_peak),
+        total_roi,
+        String::new(),
+    ]);
+    let headers = ["symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset"];
+    render_mysql_table(&headers, &rows);
+    println!("(TOTAL row: volume + peak_pos summed across symbols; ROI% = NET / sum(peak))");
 }
 
 async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -1714,8 +1750,12 @@ async fn run_sweep_collect(
 
     // Hydra — straddle-bracket entry + pyramid/DCA adds + bracketed exit.
     if included("hydra", &allow) {
-        let hydra_notional = Decimal::from_str(&args.hydra_notional)?;
         let hydra_max_pos = Decimal::from_str(&args.hydra_max_pos_usdt)?;
+        // Notional derives from cap × pct — keeps the ratio explicit
+        // so retuning the sweep stays scale-invariant (matches live
+        // mode where both notional and cap auto-rescale with wallet).
+        let hydra_notional_pct = Decimal::from_str(&args.hydra_notional_pct)?;
+        let hydra_notional = hydra_max_pos * hydra_notional_pct / Decimal::from(100);
         let hydra_entry = parse_u32_list(&args.hydra_entry_offset_bps_list)?;
         let hydra_pyr = parse_u32_list(&args.hydra_pyramid_step_bps_list)?;
         let hydra_dca = parse_u32_list(&args.hydra_dca_step_bps_list)?;
