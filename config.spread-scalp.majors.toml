@@ -24,13 +24,17 @@
 # ─── Active knobs ──────────────────────────────────────────────────────────
 # Each [bot.spread_scalp] block sets:
 #   notional, min_spread_bps, requote_interval_ms,
-#   max_position_usdt, reject_cooldown_ms, price_tolerance_ticks
+#   max_position_usdt, reject_cooldown_ms, price_tolerance_ticks,
+#   adverse_stop_after_secs, adverse_stop_drift_bps
 #
-# TP/SL and adverse-tracker fields are intentionally NOT set — the
-# 2026-05-22 ETH/DOGE live A/B showed both flipped sign-negative
-# (IOC-on-loss closer eats taker fee; adverse-tracker cut fills
-# without improving NET). Defaults reference at the bottom lists every
-# available knob if you want to re-enable for experimentation.
+# TP/SL and adverse-tracker (entry-side widen) fields stay OFF — the
+# 2026-05-22 ETH/DOGE live A/B showed both flipped sign-negative.
+#
+# Adverse-drift HARD STOP (new 2026-05-25) is ON at 120s / 30bps —
+# DOGE backtest 33h sweep showed +93% banked profit vs unstopped
+# baseline. Distinct from the cancelled-out IOC-on-loss closer: this
+# fires only after a long hold + meaningful drift, so winners aren't
+# touched. Defaults reference at the bottom lists every available knob.
 
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
@@ -64,6 +68,8 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
 
 
 # ─── ETHUSDT ───────────────────────────────────────────────────────────────
@@ -79,6 +85,8 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
 
 
 # ─── BNBUSDT ───────────────────────────────────────────────────────────────
@@ -94,6 +102,8 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
 
 
 # ─── SOLUSDT ───────────────────────────────────────────────────────────────
@@ -109,6 +119,8 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
 
 
 # ─── DOGEUSDT ──────────────────────────────────────────────────────────────
@@ -130,6 +142,8 @@ requote_interval_ms = 1000
 max_position_usdt = 200
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
 
 
 # ─── Defaults reference ───────────────────────────────────────────────────

@@ -383,6 +383,12 @@ fn build_spread_scalp(
             tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled()
         },
         close_side_always_quotes: spread_scalp.close_side_always_quotes,
+        close_decay_after_secs_1: spread_scalp.close_decay_after_secs_1,
+        close_decay_factor_1: spread_scalp.close_decay_factor_1,
+        close_decay_after_secs_2: spread_scalp.close_decay_after_secs_2,
+        close_decay_factor_2: spread_scalp.close_decay_factor_2,
+        adverse_stop_after_secs: spread_scalp.adverse_stop_after_secs,
+        adverse_stop_drift_bps: spread_scalp.adverse_stop_drift_bps,
     }))
 }
 

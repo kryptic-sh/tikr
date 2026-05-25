@@ -84,6 +84,30 @@ pub struct SpreadScalpConfig {
     /// BOTH sides cancel when targets unavailable — useful for backtest
     /// A/B but not recommended for live trading.
     pub close_side_always_quotes: bool,
+    /// Time-decay step 1 (seconds). After this many seconds holding the
+    /// current cycle's position, multiply the close-target distance by
+    /// `close_decay_factor_1` (e.g. 0.7) to ratchet the TP closer.
+    /// Captures partial wins when reversion stalls. `0` disables.
+    pub close_decay_after_secs_1: u64,
+    /// Multiplier applied after `close_decay_after_secs_1`. Sensible
+    /// range 0.3-0.9. `1.0` is a no-op (no decay).
+    pub close_decay_factor_1: Decimal,
+    /// Time-decay step 2 (seconds). After this many seconds, multiply
+    /// by `close_decay_factor_2` (tighter than step 1). `0` disables.
+    pub close_decay_after_secs_2: u64,
+    /// Multiplier applied after `close_decay_after_secs_2`. Typically
+    /// smaller than `close_decay_factor_1` (e.g. 0.5).
+    pub close_decay_factor_2: Decimal,
+    /// Adverse-drift hard stop: after `adverse_stop_after_secs` of
+    /// holding, if mid has drifted >= `adverse_stop_drift_bps` against
+    /// the position direction (long → mid below avg_entry), IOC close
+    /// at opposing touch. Caps the bad-tail when reversion never comes.
+    /// `0` disables.
+    pub adverse_stop_after_secs: u64,
+    /// Bps drift threshold from `avg_entry` that triggers the adverse
+    /// stop (only after `adverse_stop_after_secs` elapsed). `0`
+    /// disables even when the time gate is set.
+    pub adverse_stop_drift_bps: u32,
 }
 
 /// Spread scalping strategy state.
@@ -105,6 +129,14 @@ pub struct SpreadScalp {
     /// Adverse-selection tracker (Stage 6). Disabled when
     /// `config.adverse.snapshot_window_ms == 0`.
     adverse: AdverseTracker,
+    /// Timestamp of the first fill of the current inventory cycle.
+    /// Set when position transitions zero → non-zero; cleared when it
+    /// returns to zero. Drives time-decay close target + adverse stop.
+    cycle_start_ts: Option<Timestamp>,
+    /// Cached signed position size at the previous event. Used to
+    /// detect zero ↔ non-zero transitions for cycle_start_ts tracking
+    /// without needing a separate Fill-hook path.
+    prev_pos_size: Decimal,
 }
 
 impl SpreadScalp {
@@ -394,11 +426,40 @@ impl SpreadScalp {
             return None;
         }
         let tick = self.config.tick_size;
-        let bp = self.config.min_spread_bps / Decimal::from(10_000);
+        // Time-decay close target: ratchet bp distance down after
+        // configured hold thresholds. 0-step config = no decay (factor
+        // = 1.0). Decay step 2 supersedes step 1 once its threshold
+        // is reached.
+        let decay_factor = self
+            .cycle_start_ts
+            .map(|cycle_ts| {
+                let held_ns = ts.0.saturating_sub(cycle_ts.0);
+                let secs_1 = self.config.close_decay_after_secs_1;
+                let secs_2 = self.config.close_decay_after_secs_2;
+                let f1 = self.config.close_decay_factor_1;
+                let f2 = self.config.close_decay_factor_2;
+                if secs_2 > 0
+                    && held_ns >= secs_2.saturating_mul(1_000_000_000)
+                    && f2 > Decimal::ZERO
+                {
+                    f2
+                } else if secs_1 > 0
+                    && held_ns >= secs_1.saturating_mul(1_000_000_000)
+                    && f1 > Decimal::ZERO
+                {
+                    f1
+                } else {
+                    Decimal::ONE
+                }
+            })
+            .unwrap_or(Decimal::ONE);
+        let bp = self.config.min_spread_bps * decay_factor / Decimal::from(10_000);
         // Profit-target price relative to entry. The min_spread_bps
         // value already encodes the operator's intended round-trip
         // capture, so re-using it here keeps "what we were trying to
         // earn" consistent with "what we hold out for on the exit".
+        // After decay, the target ratchets closer so partial wins
+        // bank when reversion stalls (vs holding out forever).
         let target_from_entry = match close_side {
             Side::Ask => Price(entry * (Decimal::ONE + bp)),
             Side::Bid => Price(entry * (Decimal::ONE - bp)),
@@ -488,6 +549,8 @@ impl Strategy for SpreadScalp {
             last_reject_ask_ts: None,
             resting: RestingOrders::new(),
             adverse,
+            cycle_start_ts: None,
+            prev_pos_size: Decimal::ZERO,
         }
     }
 
@@ -518,6 +581,79 @@ impl Strategy for SpreadScalp {
         // fraction.
         if let MarketEvent::Fill(fill) = event {
             self.adverse.record_fill(fill.ts, fill.side, fill.price);
+        }
+
+        // Cycle tracking: detect zero ↔ non-zero transitions to anchor
+        // the time-decay close target + adverse stop. Set when entering
+        // a new cycle (Flat → Holding), cleared on close (Holding → Flat).
+        let pos_size = ctx.position.size.0;
+        if self.prev_pos_size == Decimal::ZERO && pos_size != Decimal::ZERO {
+            self.cycle_start_ts = Some(ctx.now);
+        } else if self.prev_pos_size != Decimal::ZERO && pos_size == Decimal::ZERO {
+            self.cycle_start_ts = None;
+        }
+        self.prev_pos_size = pos_size;
+
+        // Adverse-drift hard stop. Fires before normal flow when:
+        //  - configured (both bps + secs > 0)
+        //  - position non-zero
+        //  - cycle held >= adverse_stop_after_secs
+        //  - mid drifted >= adverse_stop_drift_bps against position direction
+        // Returns an IOC at the opposing touch. Bounds the bad-tail when
+        // reversion never comes.
+        if self.config.adverse_stop_drift_bps > 0
+            && self.config.adverse_stop_after_secs > 0
+            && pos_size != Decimal::ZERO
+            && let Some(cycle_ts) = self.cycle_start_ts
+            && let Some(top) = Top::from_snapshot(ctx.latest_book)
+        {
+            let held_ns = ctx.now.0.saturating_sub(cycle_ts.0);
+            let stop_ns = self
+                .config
+                .adverse_stop_after_secs
+                .saturating_mul(1_000_000_000);
+            if held_ns >= stop_ns {
+                let mid = top.mid().0;
+                let avg = ctx.position.avg_entry.0;
+                if avg > Decimal::ZERO {
+                    let drift_bps = if pos_size > Decimal::ZERO {
+                        // Long: adverse = mid below avg.
+                        (avg - mid) / avg * Decimal::from(10_000)
+                    } else {
+                        // Short: adverse = mid above avg.
+                        (mid - avg) / avg * Decimal::from(10_000)
+                    };
+                    let threshold = Decimal::from(self.config.adverse_stop_drift_bps);
+                    if drift_bps >= threshold {
+                        let close_side = if pos_size > Decimal::ZERO {
+                            Side::Ask
+                        } else {
+                            Side::Bid
+                        };
+                        let touch = match close_side {
+                            Side::Bid => top.ask,
+                            Side::Ask => top.bid,
+                        };
+                        let qty = pos_size.abs();
+                        let stop_qty = quote_size(qty, touch, Decimal::ONE, self.config.step_size);
+                        if stop_qty > Decimal::ZERO {
+                            self.cycle_start_ts = None;
+                            let mut actions: Vec<Action> = Vec::with_capacity(3);
+                            actions.extend(self.drop_tracked_side(Side::Bid));
+                            actions.extend(self.drop_tracked_side(Side::Ask));
+                            actions.push(Action::Quote(tikr_venue::QuoteIntent {
+                                symbol: ctx.symbol.clone(),
+                                side: close_side,
+                                price: touch,
+                                size: Size(stop_qty),
+                                tif: TimeInForce::IOC,
+                                kind: QuoteKind::Point,
+                            }));
+                            return actions;
+                        }
+                    }
+                }
+            }
         }
 
         // Stage 5 risk gate: TP/SL checked every event, before any
@@ -856,6 +992,12 @@ mod tests {
             // don't regress. Tests that need the new behaviour can opt
             // in by mutating this field on the config.
             close_side_always_quotes: false,
+            close_decay_after_secs_1: 0,
+            close_decay_factor_1: Decimal::ONE,
+            close_decay_after_secs_2: 0,
+            close_decay_factor_2: Decimal::ONE,
+            adverse_stop_after_secs: 0,
+            adverse_stop_drift_bps: 0,
         })
     }
 

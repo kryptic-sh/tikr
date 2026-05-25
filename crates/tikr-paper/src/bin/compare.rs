@@ -279,6 +279,42 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     spread_scalp_close_side_always_quotes: bool,
 
+    /// SpreadScalp time-decay step 1: after this many seconds holding
+    /// a position, multiply the close-target distance by
+    /// `--spread-scalp-close-decay-factor-1` to ratchet TP closer.
+    /// `0` (default) disables — no decay, behaviour unchanged.
+    #[arg(long, default_value_t = 0u64)]
+    spread_scalp_close_decay_after_secs_1: u64,
+
+    /// SpreadScalp time-decay multiplier applied after secs_1.
+    /// `1.0` (default) = no-op. Sensible: 0.5-0.8.
+    #[arg(long, default_value = "1.0")]
+    spread_scalp_close_decay_factor_1: String,
+
+    /// SpreadScalp time-decay step 2: stronger decay after a longer
+    /// hold. Supersedes step 1 once reached. `0` (default) disables.
+    #[arg(long, default_value_t = 0u64)]
+    spread_scalp_close_decay_after_secs_2: u64,
+
+    /// SpreadScalp time-decay multiplier applied after secs_2.
+    /// `1.0` (default) = no-op. Typically tighter than factor_1.
+    #[arg(long, default_value = "1.0")]
+    spread_scalp_close_decay_factor_2: String,
+
+    /// SpreadScalp adverse-drift stop: after this many seconds holding,
+    /// if mid drifts >= `--spread-scalp-adverse-stop-drift-bps` against
+    /// position direction, IOC close at touch. Default `120s` from the
+    /// 2026-05-25 sweep winner (+93% banked profit on DOGE/$700/33h).
+    /// Set `0` to disable.
+    #[arg(long, default_value_t = 120u64)]
+    spread_scalp_adverse_stop_after_secs: u64,
+
+    /// SpreadScalp adverse-stop drift threshold (bps). Default `30` from
+    /// the 2026-05-25 sweep winner. Set `0` to disable even when the
+    /// time gate is set.
+    #[arg(long, default_value_t = 30u32)]
+    spread_scalp_adverse_stop_drift_bps: u32,
+
     /// LiqFade: directory holding `record_liquidations`-style parquet
     /// shards (per-day `YYYY-MM-DD/all_symbols.parquet`). Empty (default)
     /// disables LiqFade — the preset is skipped even when included in
@@ -1701,6 +1737,16 @@ async fn run_sweep_collect(
                             tikr_strategy::spread_scalp::adverse_tracker::AdverseConfig::disabled()
                         },
                         close_side_always_quotes: args.spread_scalp_close_side_always_quotes,
+                        close_decay_after_secs_1: args.spread_scalp_close_decay_after_secs_1,
+                        close_decay_factor_1: Decimal::from_str(
+                            &args.spread_scalp_close_decay_factor_1,
+                        )?,
+                        close_decay_after_secs_2: args.spread_scalp_close_decay_after_secs_2,
+                        close_decay_factor_2: Decimal::from_str(
+                            &args.spread_scalp_close_decay_factor_2,
+                        )?,
+                        adverse_stop_after_secs: args.spread_scalp_adverse_stop_after_secs,
+                        adverse_stop_drift_bps: args.spread_scalp_adverse_stop_drift_bps,
                     }),
                     fees,
                     skim_cfg,

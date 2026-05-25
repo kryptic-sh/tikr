@@ -583,6 +583,31 @@ pub struct SpreadScalpParams {
     /// BOTH sides cancel when targets are unavailable.
     #[serde(default = "spread_scalp_default_close_side_always_quotes")]
     pub close_side_always_quotes: bool,
+    /// Time-decay close-target step 1: after this many seconds holding
+    /// a position, multiply the close target by `close_decay_factor_1`
+    /// to ratchet TP closer. `0` (default) disables.
+    #[serde(default)]
+    pub close_decay_after_secs_1: u64,
+    /// Multiplier applied after step 1. `1.0` (default) = no-op.
+    #[serde(default = "spread_scalp_default_decay_factor")]
+    pub close_decay_factor_1: Decimal,
+    /// Time-decay step 2: stronger decay after a longer hold.
+    /// Supersedes step 1 once reached. `0` (default) disables.
+    #[serde(default)]
+    pub close_decay_after_secs_2: u64,
+    /// Multiplier applied after step 2. `1.0` (default) = no-op.
+    #[serde(default = "spread_scalp_default_decay_factor")]
+    pub close_decay_factor_2: Decimal,
+    /// Adverse-drift hard stop: after N seconds holding, if mid drift
+    /// is at least `adverse_stop_drift_bps` against position, IOC close
+    /// at touch. Default `120s` from the 2026-05-25 sweep winner
+    /// (+93% banked profit on DOGE/$700/33h). Set `0` to disable.
+    #[serde(default = "spread_scalp_default_adverse_stop_after_secs")]
+    pub adverse_stop_after_secs: u64,
+    /// Bps drift threshold for the adverse stop. Default `30` from the
+    /// 2026-05-25 sweep winner. Set `0` to disable.
+    #[serde(default = "spread_scalp_default_adverse_stop_drift_bps")]
+    pub adverse_stop_drift_bps: u32,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
@@ -608,6 +633,15 @@ fn spread_scalp_default_close_side_always_quotes() -> bool {
 }
 fn spread_scalp_default_adverse_max_widen_bps() -> u32 {
     10
+}
+fn spread_scalp_default_decay_factor() -> Decimal {
+    Decimal::ONE
+}
+fn spread_scalp_default_adverse_stop_after_secs() -> u64 {
+    120
+}
+fn spread_scalp_default_adverse_stop_drift_bps() -> u32 {
+    30
 }
 
 /// Parse a TOML config file.

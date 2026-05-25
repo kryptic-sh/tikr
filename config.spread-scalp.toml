@@ -33,9 +33,23 @@ min_spread_bps = 12
 requote_interval_ms = 1000
 take_profit_usdt = 1.0     # lock in small profits early
 
+# Adverse-drift hard stop (2026-05-25 sweep winner on DOGE 33h):
+# if position held >adverse_stop_after_secs AND mid drifts
+# >=adverse_stop_drift_bps against direction, IOC close at touch.
+# Caps the bad-tail when reversion never comes. Lifted banked profit
+# 4.20 → 8.10 (+93%) vs unstopped baseline.
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
 
 # Defaults:
 # notional = 25                 # fiat $ per order; auto-bumps to min_notional × 1.2
 # tick_size = "0.0001"          # optional; auto-detected from Binance exchangeInfo
 # min_spread_bps = 5            # minimum market spread in bps required to quote
 # requote_interval_ms = 1000    # fixed requote interval in ms
+# adverse_stop_after_secs = 120 # held > N secs + drift adverse triggers IOC stop
+# adverse_stop_drift_bps = 30   # 0 to disable
+# close_decay_after_secs_1 = 0  # time-decay close-target (off — sweep showed -77% banked)
+# close_decay_factor_1 = 1.0
+# close_decay_after_secs_2 = 0
+# close_decay_factor_2 = 1.0
