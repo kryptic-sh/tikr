@@ -1760,7 +1760,6 @@ async fn apply_fill(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn finalize(
     tracker: &PositionTracker,
     last_mid: Price,

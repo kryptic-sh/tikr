@@ -174,8 +174,8 @@ impl BookState {
             .map(|(p, s)| (*p, *s))
             .collect();
         match taker_side {
-            Side::Bid => levels.sort_by(|a, b| a.0.cmp(&b.0)),
-            Side::Ask => levels.sort_by(|a, b| b.0.cmp(&a.0)),
+            Side::Bid => levels.sort_by_key(|(p, _)| *p),
+            Side::Ask => levels.sort_by_key(|(p, _)| std::cmp::Reverse(*p)),
         }
         let mut consumed = Vec::new();
         let mut remaining = size;

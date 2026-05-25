@@ -784,10 +784,10 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if !known_quote {
             continue;
         }
-        if let Some(ref a) = allow {
-            if !a.contains(&upper) {
-                continue;
-            }
+        if let Some(ref a) = allow
+            && !a.contains(&upper)
+        {
+            continue;
         }
         symbols.push((upper, path));
     }
@@ -1108,7 +1108,6 @@ async fn run_sweep_collect(
     // has no completed snapshots (heartbeat-only fixtures).
     let (median_spread_bps, max_observed_spread_bps) = shared_data
         .book_spread_stats_bps()
-        .map(|(m, x)| (m, x))
         .unwrap_or((Decimal::ZERO, Decimal::ZERO));
     if max_observed_spread_bps > Decimal::ZERO {
         info!(
@@ -2074,7 +2073,6 @@ async fn run_one<S: Strategy>(
     report
 }
 
-#[allow(clippy::too_many_arguments)]
 /// LiqFade preset spawn — pre-loads the liq channel with all events
 /// from `liq_events` before invoking `run_with_resume`. Distinct fn so
 /// the (now bigger) run wrapper doesn't touch the existing
@@ -2180,6 +2178,7 @@ async fn acquire_sweep_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_preset<S: Strategy + Send + 'static>(
     handles: &mut JoinSet<(String, PaperReport, std::time::Duration)>,
     shared_data: &Arc<LoadedReplayData>,

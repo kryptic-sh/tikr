@@ -474,14 +474,15 @@ impl Strategy for Hydra {
                 let mut new_last_add_ts = last_add_ts_ns;
                 let mut new_tp_price = last_tp_price;
 
-                if cooldown_passed && favorable_target > pyramid_bands_placed {
-                    if let Some(intent) = self.maybe_add(
+                if cooldown_passed
+                    && favorable_target > pyramid_bands_placed
+                    && let Some(intent) = self.maybe_add(
                         ctx, side_long, mid, best_bid, best_ask, /*is_pyramid=*/ true,
-                    ) {
-                        actions.push(intent);
-                        new_pyramid = favorable_target;
-                        new_last_add_ts = ctx.now.0;
-                    }
+                    )
+                {
+                    actions.push(intent);
+                    new_pyramid = favorable_target;
+                    new_last_add_ts = ctx.now.0;
                 }
                 if cooldown_passed && adverse_target > dca_bands_placed && actions.is_empty() {
                     // Only one add per event so cap math + cooldown
@@ -511,19 +512,19 @@ impl Strategy for Hydra {
                             diff > self.config.tick_size
                         }
                     };
-                    if needs_refresh {
-                        if let Some((intent, placed_price)) = self.build_tp_intent(
+                    if needs_refresh
+                        && let Some((intent, placed_price)) = self.build_tp_intent(
                             ctx.symbol,
                             side_long,
                             ctx.position.size.0,
                             avg_entry,
                             best_bid,
                             best_ask,
-                        ) {
-                            actions.push(Action::CancelAll);
-                            actions.push(intent);
-                            new_tp_price = Some(placed_price);
-                        }
+                        )
+                    {
+                        actions.push(Action::CancelAll);
+                        actions.push(intent);
+                        new_tp_price = Some(placed_price);
                     }
                 }
 

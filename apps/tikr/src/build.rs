@@ -21,6 +21,7 @@ use crate::config::{BotConfig, LgParams};
 ///
 /// `venue` is consulted for symbol min-notional so per-bot notional is
 /// auto-bumped to `min_notional × 1.2` if the operator set it too low.
+#[allow(clippy::too_many_arguments)]
 pub fn to_spec(
     cfg: &BotConfig,
     symbol: Symbol,

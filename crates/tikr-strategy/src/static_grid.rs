@@ -136,9 +136,9 @@ impl RegimeTracker {
     ///
     /// Self-scaling per symbol — DOGE's 10-bps spread-flicker and
     /// BTC's 1-bps tick-noise both produce low efficiency unless the
-    /// drift is genuinely directional. Replaces the brittle `|drift|
-    /// > N bps` heuristic. Returns `None` when fewer than 2 samples
-    /// or total movement is zero.
+    /// drift is genuinely directional. Replaces the brittle
+    /// `|drift| > N bps` heuristic. Returns `None` when fewer than 2
+    /// samples or total movement is zero.
     fn efficiency(&self) -> Option<Decimal> {
         if self.samples.len() < 2 {
             return None;

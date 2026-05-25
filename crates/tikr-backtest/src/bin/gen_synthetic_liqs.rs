@@ -176,14 +176,14 @@ fn scan_ts_range(dir: &Path) -> Result<(u64, u64), Box<dyn std::error::Error>> {
             continue;
         }
         let df = ParquetReader::new(std::fs::File::open(&path)?).finish()?;
-        if let Ok(col) = df.column("ts_ns") {
-            if let Ok(arr) = col.u64() {
-                if let Some(lo) = arr.min() {
-                    min_ts = Some(min_ts.map(|c| c.min(lo)).unwrap_or(lo));
-                }
-                if let Some(hi) = arr.max() {
-                    max_ts = Some(max_ts.map(|c| c.max(hi)).unwrap_or(hi));
-                }
+        if let Ok(col) = df.column("ts_ns")
+            && let Ok(arr) = col.u64()
+        {
+            if let Some(lo) = arr.min() {
+                min_ts = Some(min_ts.map(|c| c.min(lo)).unwrap_or(lo));
+            }
+            if let Some(hi) = arr.max() {
+                max_ts = Some(max_ts.map(|c| c.max(hi)).unwrap_or(hi));
             }
         }
     }

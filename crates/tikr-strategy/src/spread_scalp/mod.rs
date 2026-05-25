@@ -11,7 +11,7 @@ pub mod policy;
 pub mod resting_orders;
 
 /// Risk policy lives at the crate root so SG/LG share the same TP/SL
-/// + bps-of-notional evaluation as SS. Re-exported here so existing
+/// and bps-of-notional evaluation as SS. Re-exported here so existing
 /// `spread_scalp::risk::*` paths continue to compile.
 pub use crate::risk;
 
