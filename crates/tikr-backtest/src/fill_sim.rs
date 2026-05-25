@@ -136,6 +136,71 @@ impl BookState {
             }
         }
     }
+
+    /// Walk the book for an IOC taker, consuming liquidity level by level
+    /// from the touch outward. Returns the consumed levels (`(price,
+    /// qty)`) so the caller can decrement aggregates AND compute the
+    /// weighted-average fill price + total filled size.
+    ///
+    /// `taker_side` is the SIDE OF THE INTENT (Bid or Ask). The side of
+    /// the book that gets consumed is the opposite.
+    ///
+    /// `limit_price` caps how far the walk goes: Bid IOC won't pay above
+    /// it, Ask IOC won't sell below. For IOC at touch (intent.price ==
+    /// touch), this typically allows full traversal until size exhausted
+    /// or book runs out — but a strategy that places IOC with a tighter
+    /// limit price stops earlier (partial fill, rest cancelled).
+    ///
+    /// Returns empty Vec when the touch doesn't cross the limit (no
+    /// fill) or the book side is empty.
+    fn walk_book_ioc(
+        &self,
+        taker_side: Side,
+        size: Decimal,
+        limit_price: Price,
+    ) -> Vec<(Price, Decimal)> {
+        let book_side_map = match taker_side {
+            Side::Bid => &self.asks,
+            Side::Ask => &self.bids,
+        };
+        if book_side_map.is_empty() || size <= Decimal::ZERO {
+            return Vec::new();
+        }
+        // Sort levels in the direction the IOC walks. Bid walks asks
+        // cheapest first (ascending). Ask walks bids highest first
+        // (descending).
+        let mut levels: Vec<(Decimal, Decimal)> = book_side_map
+            .iter()
+            .map(|(p, s)| (*p, *s))
+            .collect();
+        match taker_side {
+            Side::Bid => levels.sort_by(|a, b| a.0.cmp(&b.0)),
+            Side::Ask => levels.sort_by(|a, b| b.0.cmp(&a.0)),
+        }
+        let mut consumed = Vec::new();
+        let mut remaining = size;
+        for (level_price, level_size) in levels {
+            if remaining <= Decimal::ZERO {
+                break;
+            }
+            // Honor the IOC's limit price — stop walking when next
+            // level would breach. Bid can't pay above limit, Ask can't
+            // sell below.
+            let breaches = match taker_side {
+                Side::Bid => level_price > limit_price.0,
+                Side::Ask => level_price < limit_price.0,
+            };
+            if breaches {
+                break;
+            }
+            let take = remaining.min(level_size);
+            if take > Decimal::ZERO {
+                consumed.push((Price(level_price), take));
+                remaining -= take;
+            }
+        }
+        consumed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,63 +532,64 @@ impl FillSim {
         // cancel). Partial-fill modeling for IOC is a future refinement.
         if matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK) {
             let st = self.book_state.entry(intent.symbol.clone()).or_default();
-            let touch = match intent.side {
-                Side::Bid => st.best_ask(),
-                Side::Ask => st.best_bid(),
-            };
-            let touch_price = touch?;
-            let crosses = match intent.side {
-                Side::Bid => intent.price.0 >= touch_price.0,
-                Side::Ask => intent.price.0 <= touch_price.0,
-            };
-            if !crosses {
+            // Walk the book: IOC consumes liquidity level by level from
+            // the touch outward. Average fill price worsens as we eat
+            // deeper into the order book — the realistic taker
+            // experience that's invisible when modelling fills as
+            // "single-price at touch". On thin books or large IOCs the
+            // PnL impact is significant (Hydra SL exits, pyramid adds in
+            // fast moves both go through this path).
+            let consumed = st.walk_book_ioc(intent.side, intent.size.0, intent.price);
+            if consumed.is_empty() {
                 return None;
             }
-            let fill_size = intent.size.0;
-            // Taker fee — round each operand to bound scale; on DOGE
-            // (price scale 5+) the mul chain can produce a scale-9+
-            // intermediate that, when summed with the existing
-            // accumulator, overflows rust_decimal's 96-bit mantissa.
-            let fee_amount = (touch_price.0.round_dp(8)
-                * fill_size.round_dp(8)
+            let total_qty: Decimal = consumed.iter().map(|(_, q)| *q).sum();
+            // Weighted-average price = Σ(p × q) / Σq. Round at each
+            // multiplication to bound Decimal scale (same scale-overflow
+            // story as the original at-touch fill below).
+            let notional: Decimal = consumed
+                .iter()
+                .map(|(p, q)| (p.0 * *q).round_dp(8))
+                .sum();
+            let avg_price = (notional / total_qty).round_dp(8);
+            let fee_amount = (notional
                 * Decimal::from(self.cfg.fees.taker_bps)
                 / Decimal::from(10_000))
             .round_dp(8);
-            // Decrement the touched side's aggregate so subsequent cancel
-            // attribution doesn't see the consumed liquidity as a cancel.
+            // Decrement each consumed level so subsequent fills (and the
+            // next BookUpdate's cancel-attribution) see correct
+            // remaining depth.
             let touched_side = match intent.side {
                 Side::Bid => Side::Ask,
                 Side::Ask => Side::Bid,
             };
-            st.decrement_level(touched_side, touch_price, fill_size);
-            // Bound Decimal scale on every accumulation. Each
-            // `delta = price × size` can grow the running scale by 4-8
-            // digits; on long sessions with many fills the cumulative
-            // scale exceeds rust_decimal's 28-digit cap and triggers
-            // an `Addition overflowed` panic. Re-rounding to 8 dp keeps
-            // the value bounded without losing meaningful precision —
-            // USDT exposures don't need sub-satoshi resolution.
-            let delta = (touch_price.0 * fill_size).round_dp(8);
+            for (lvl_price, lvl_qty) in &consumed {
+                st.decrement_level(touched_side, *lvl_price, *lvl_qty);
+            }
+            // Position notional uses the same Σ(p×q) we just computed —
+            // it's the actual cash flow of the trade, not the touch
+            // approximation.
             let entry = self
                 .position_notional
                 .entry(intent.symbol.clone())
                 .or_insert(Decimal::ZERO);
             match intent.side {
-                Side::Bid => *entry = (*entry + delta).round_dp(8),
-                Side::Ask => *entry = (*entry - delta).round_dp(8),
+                Side::Bid => *entry = (*entry + notional).round_dp(8),
+                Side::Ask => *entry = (*entry - notional).round_dp(8),
             }
             return Some(Fill {
                 quote_id: QuoteId::new(),
-                price: touch_price,
-                size: Size(fill_size),
+                price: Price(avg_price),
+                size: Size(total_qty),
                 fee_asset: intent.symbol.quote.clone(),
                 fee_amount,
                 fee_quote: Notional(fee_amount),
                 side: intent.side,
                 ts,
-                // IOC taker fills the full intent in one shot (model
-                // simplification: no partial IOC).
-                is_full: true,
+                // IOC may now PARTIALLY fill if the book runs out of
+                // depth (or the limit price is breached) before the
+                // intent size is consumed. `is_full = (consumed == intent.size)`.
+                is_full: total_qty >= intent.size.0,
             });
         }
         // Snapshot queue position at our price level when placed. We're
