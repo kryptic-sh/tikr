@@ -58,6 +58,9 @@ async fn paper_runner_against_testnet_5min() {
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: None,
+        initial_balance: Decimal::ZERO,
+        order_balance_pct: Decimal::ZERO,
+        max_position_pct: Decimal::ZERO,
     };
 
     let (tx, rx) = watch::channel(false);

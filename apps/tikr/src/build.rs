@@ -113,6 +113,9 @@ pub fn to_spec(
         // constructed before supervisor knows whether to seed.
         seed_position: None,
         equity_csv_path: None,
+        initial_balance: Decimal::ZERO,
+        order_balance_pct: Decimal::ZERO,
+        max_position_pct: Decimal::ZERO,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

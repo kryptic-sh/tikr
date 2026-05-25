@@ -169,10 +169,8 @@ impl BookState {
         // Sort levels in the direction the IOC walks. Bid walks asks
         // cheapest first (ascending). Ask walks bids highest first
         // (descending).
-        let mut levels: Vec<(Decimal, Decimal)> = book_side_map
-            .iter()
-            .map(|(p, s)| (*p, *s))
-            .collect();
+        let mut levels: Vec<(Decimal, Decimal)> =
+            book_side_map.iter().map(|(p, s)| (*p, *s)).collect();
         match taker_side {
             Side::Bid => levels.sort_by_key(|(p, _)| *p),
             Side::Ask => levels.sort_by_key(|(p, _)| std::cmp::Reverse(*p)),
@@ -547,13 +545,9 @@ impl FillSim {
             // Weighted-average price = Σ(p × q) / Σq. Round at each
             // multiplication to bound Decimal scale (same scale-overflow
             // story as the original at-touch fill below).
-            let notional: Decimal = consumed
-                .iter()
-                .map(|(p, q)| (p.0 * *q).round_dp(8))
-                .sum();
+            let notional: Decimal = consumed.iter().map(|(p, q)| (p.0 * *q).round_dp(8)).sum();
             let avg_price = (notional / total_qty).round_dp(8);
-            let fee_amount = (notional
-                * Decimal::from(self.cfg.fees.taker_bps)
+            let fee_amount = (notional * Decimal::from(self.cfg.fees.taker_bps)
                 / Decimal::from(10_000))
             .round_dp(8);
             // Decrement each consumed level so subsequent fills (and the

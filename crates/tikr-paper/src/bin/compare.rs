@@ -30,6 +30,18 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::info;
 
+/// Backtest balance-compounding config: `(initial_balance, order_balance_pct,
+/// max_position_pct)`. Set once in `main` from CLI args; read by every spawn
+/// helper. Default = all zeros → compounding disabled, static notional path.
+static BALANCE_COMPOUNDING: OnceLock<(Decimal, Decimal, Decimal)> = OnceLock::new();
+
+fn balance_compounding() -> (Decimal, Decimal, Decimal) {
+    BALANCE_COMPOUNDING
+        .get()
+        .copied()
+        .unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "compare",
@@ -598,6 +610,29 @@ struct Args {
     #[arg(long, default_value_t = 0.0_f64)]
     sim_max_position_notional: f64,
 
+    /// Backtest balance compounding: initial wallet balance in USDT.
+    /// `0` (default) disables compounding — per-order notional and
+    /// per-bot cap stay static at the strategy-spec defaults. When set
+    /// `> 0` together with `--sim-order-balance-pct > 0`, the runner
+    /// tracks `balance = initial + realized − fees` per fill and pushes
+    /// updated notional/cap to the strategy via the existing
+    /// `on_notional_updated` / `on_max_position_updated` hooks.
+    #[arg(long, default_value = "0")]
+    sim_initial_balance: String,
+
+    /// Backtest compounding: percent of running balance allocated per
+    /// order (0-100). Mirrors the live account poller in
+    /// `apps/tikr/src/main.rs`. `0` = disabled even when initial
+    /// balance is set.
+    #[arg(long, default_value = "0")]
+    sim_order_balance_pct: String,
+
+    /// Backtest compounding: percent of running balance used as the
+    /// per-bot position cap (0-100). `0` keeps the static cap
+    /// (`--sim-max-position-notional`).
+    #[arg(long, default_value = "0")]
+    sim_max_position_pct: String,
+
     /// FillSim: silent-cancel rate per minute per live quote (simulates
     /// venue cancel/expire events the WS misses; runner reconciliation
     /// eventually purges them). `0.0` = disabled.
@@ -797,6 +832,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         argv.splice(1..1, toml_args);
     }
     let args = Args::parse_from(argv);
+
+    // Lock the balance-compounding config before any spawn fires.
+    let initial = Decimal::from_str(&args.sim_initial_balance)?;
+    let order_pct = Decimal::from_str(&args.sim_order_balance_pct)?;
+    let max_pct = Decimal::from_str(&args.sim_max_position_pct)?;
+    let _ = BALANCE_COMPOUNDING.set((initial, order_pct, max_pct));
 
     if !args.data_root.is_empty() {
         return run_basket(args).await;
@@ -2159,6 +2200,9 @@ async fn run_one<S: Strategy>(
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path,
+        initial_balance: balance_compounding().0,
+        order_balance_pct: balance_compounding().1,
+        max_position_pct: balance_compounding().2,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -2240,6 +2284,9 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             liq_window_secs,
             seed_position: None,
             equity_csv_path,
+            initial_balance: balance_compounding().0,
+            order_balance_pct: balance_compounding().1,
+            max_position_pct: balance_compounding().2,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");

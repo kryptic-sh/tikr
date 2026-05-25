@@ -154,6 +154,16 @@ impl PositionTracker {
         }
     }
 
+    /// Realized P&L accumulator (gross, before fees).
+    pub fn realized(&self) -> Notional {
+        self.realized_pnl
+    }
+
+    /// Total fees paid (positive) or rebated (negative).
+    pub fn fees(&self) -> Notional {
+        self.fees_paid
+    }
+
     /// Current position snapshot (immutable view).
     pub fn snapshot(&self) -> Position {
         Position {

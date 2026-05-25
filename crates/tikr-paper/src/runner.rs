@@ -110,6 +110,24 @@ pub struct RunnerConfig {
     /// ticks append. `None` (default) disables the curve export. Used by
     /// `compare` to dump per-preset PnL timelines for drawdown analysis.
     pub equity_csv_path: Option<PathBuf>,
+    /// Initial wallet balance for backtest compounding (USDT). When
+    /// `> 0` AND `order_balance_pct > 0`, the runner overrides any
+    /// caller-supplied `notional_rx`/`max_position_rx` with internal
+    /// watch channels driven by running balance =
+    /// `initial_balance + realized - fees`. Each fill recomputes
+    /// notional = `balance × order_balance_pct / 100` and max-pos =
+    /// `balance × max_position_pct / 100`, sending updates that fire
+    /// `Strategy::on_notional_updated` / `on_max_position_updated`.
+    /// `0` (default) disables — sizing stays static from spawn.
+    pub initial_balance: Decimal,
+    /// Percent of running balance allocated per order (0-100). Drives
+    /// notional updates when `initial_balance > 0`. Mirrors the live
+    /// account poller's formula in `apps/tikr/src/main.rs`.
+    pub order_balance_pct: Decimal,
+    /// Percent of running balance used as the per-bot position cap
+    /// (0-100). Drives max_position_usdt updates when
+    /// `initial_balance > 0`.
+    pub max_position_pct: Decimal,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -153,6 +171,9 @@ impl Default for RunnerConfig {
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
+            initial_balance: Decimal::ZERO,
+            order_balance_pct: Decimal::ZERO,
+            max_position_pct: Decimal::ZERO,
         }
     }
 }
@@ -501,6 +522,29 @@ where
     let funding_cfg = config.funding;
     let mut notional_rx = config.notional_rx;
     let mut max_position_rx = config.max_position_rx;
+    // Balance-compounding channels (backtest mode). When enabled,
+    // overrides any caller-supplied notional/max_position channels.
+    let compounding_enabled =
+        config.initial_balance > Decimal::ZERO && config.order_balance_pct > Decimal::ZERO;
+    let initial_balance = config.initial_balance;
+    let order_balance_pct = config.order_balance_pct;
+    let max_position_pct = config.max_position_pct;
+    let (balance_notional_tx, balance_maxpos_tx) = if compounding_enabled {
+        let init_notional = initial_balance * order_balance_pct / Decimal::from(100);
+        let init_maxpos = initial_balance * max_position_pct / Decimal::from(100);
+        let (ntx, nrx) = watch::channel(init_notional);
+        notional_rx = Some(nrx);
+        let mtx_opt = if max_position_pct > Decimal::ZERO {
+            let (mtx, mrx) = watch::channel(init_maxpos);
+            max_position_rx = Some(mrx);
+            Some(mtx)
+        } else {
+            None
+        };
+        (Some(ntx), mtx_opt)
+    } else {
+        (None, None)
+    };
     let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
@@ -579,29 +623,38 @@ where
     recon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     recon_tick.tick().await;
 
-    // Initial reconciliation: when the supervisor respawns this bot
-    // (TUI restart, code reload, etc.) the venue may already hold
-    // resting orders from the prior incarnation. FillSim starts empty,
-    // so without this seed the strategy has no idea those orders exist
-    // — it places duplicates, fails to cancel, and reasoning about
-    // `open_quotes` is wrong for the first 30 s until the periodic tick
-    // fires. Mirrors the position seed (supervisor.rs:235) but on the
-    // open-orders dimension.
+    // Initial reconciliation: on startup, cancel ANY existing orders on
+    // this symbol. The bot can't have created them in this incarnation,
+    // so they're stale from a prior run (crash, supervisor respawn, code
+    // reload) — at prices that no longer match the strategy's current
+    // state. Better to wipe + let the strategy place fresh quotes than
+    // adopt orphan orders the strategy didn't intend.
+    //
+    // Skipped in paper mode (FillSim is authoritative; nothing to clean).
     if live_mode {
         match venue.open_orders(&symbol).await {
-            Ok(orders) => {
-                let (removed, added) = fill_sim.reconcile_quotes_for(&symbol, &orders);
-                if added > 0 || removed > 0 {
-                    info!(
-                        venue_open = orders.len(),
-                        added,
-                        removed,
-                        "initial reconciliation: seeded FillSim from venue.open_orders"
-                    );
+            Ok(orders) if !orders.is_empty() => {
+                info!(
+                    venue_open = orders.len(),
+                    "initial reconciliation: cancelling {} pre-existing order(s) on {} — bot did not create them",
+                    orders.len(),
+                    symbol.base.0
+                );
+                match venue.cancel_all(&symbol).await {
+                    Ok(()) => {
+                        info!("initial reconciliation: cancel_all OK — clean slate")
+                    }
+                    Err(e) => warn!(
+                        error = ?e,
+                        "initial reconciliation: cancel_all failed — strategy may collide with stale orders"
+                    ),
                 }
             }
+            Ok(_) => {
+                // No pre-existing orders — nothing to clean.
+            }
             Err(e) => {
-                warn!(error = ?e, "initial reconciliation: venue.open_orders failed (strategy starts with empty open_quotes view)");
+                warn!(error = ?e, "initial reconciliation: venue.open_orders failed (cannot check for stale orders)");
             }
         }
     }
@@ -957,6 +1010,32 @@ where
                             &symbol,
                         )
                         .await;
+                        // Balance-compounding: republish notional + max-pos
+                        // derived from running balance = initial + realized - fees.
+                        if compounding_enabled {
+                            let balance = initial_balance + tracker.realized().0 - tracker.fees().0;
+                            let new_notional = (balance * order_balance_pct / Decimal::from(100))
+                                .max(Decimal::ZERO);
+                            if let Some(tx) = balance_notional_tx.as_ref() {
+                                let cur = *tx.borrow();
+                                if (new_notional - cur).abs()
+                                    > Decimal::from_str_exact("0.01").unwrap()
+                                {
+                                    let _ = tx.send(new_notional);
+                                }
+                            }
+                            if let Some(mtx) = balance_maxpos_tx.as_ref() {
+                                let new_maxpos =
+                                    (balance * max_position_pct / Decimal::from(100))
+                                        .max(Decimal::ZERO);
+                                let cur = *mtx.borrow();
+                                if (new_maxpos - cur).abs()
+                                    > Decimal::from_str_exact("0.01").unwrap()
+                                {
+                                    let _ = mtx.send(new_maxpos);
+                                }
+                            }
+                        }
                         last_fill = Some(fill_clone.clone());
                         publish_live(
                             &config.live_tap,
@@ -2066,6 +2145,9 @@ mod tests {
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
+            initial_balance: Decimal::ZERO,
+            order_balance_pct: Decimal::ZERO,
+            max_position_pct: Decimal::ZERO,
         }
     }
 
@@ -2418,6 +2500,9 @@ mod tests {
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
+            initial_balance: Decimal::ZERO,
+            order_balance_pct: Decimal::ZERO,
+            max_position_pct: Decimal::ZERO,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2507,6 +2592,9 @@ mod tests {
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
+            initial_balance: Decimal::ZERO,
+            order_balance_pct: Decimal::ZERO,
+            max_position_pct: Decimal::ZERO,
         };
         let (_tx, rx) = watch::channel(false);
 

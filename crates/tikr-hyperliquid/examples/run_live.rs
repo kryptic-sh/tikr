@@ -233,6 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: None,
+        initial_balance: Decimal::ZERO,
+        order_balance_pct: Decimal::ZERO,
+        max_position_pct: Decimal::ZERO,
     };
 
     let report = run_with_resume(

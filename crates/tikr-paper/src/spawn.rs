@@ -389,5 +389,8 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: None,
+        initial_balance: tikr_core::Decimal::ZERO,
+        order_balance_pct: tikr_core::Decimal::ZERO,
+        max_position_pct: tikr_core::Decimal::ZERO,
     }
 }
