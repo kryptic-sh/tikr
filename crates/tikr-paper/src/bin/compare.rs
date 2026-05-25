@@ -440,6 +440,68 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     hydra_dca_size_mult: String,
 
+    /// Ratchet: per-order notional as percent of `ratchet_max_pos_usdt`
+    /// (mirrors hydra_notional_pct — keeps the ratio explicit).
+    #[arg(long, default_value = "15")]
+    ratchet_notional_pct: String,
+
+    /// Ratchet: comma-separated `tp_bps` sweep — bps offset from the
+    /// last-fill price for the opposite-side ratchet order.
+    #[arg(long, default_value = "30")]
+    ratchet_tp_bps_list: String,
+
+    /// Ratchet: bps offset from mid for the cold-start straddle (used
+    /// until the first fill establishes a last-buy / last-sell anchor).
+    #[arg(long, default_value_t = 50u32)]
+    ratchet_initial_offset_bps: u32,
+
+    /// Ratchet: comma-separated `sl_bps_from_first` sweep — stop-loss
+    /// offset from the first entry of a `Holding` cycle. Only fires
+    /// while inventory is non-zero.
+    #[arg(long, default_value = "75")]
+    ratchet_sl_bps_list: String,
+
+    /// Ratchet: trend-filter window in seconds. `0` disables the
+    /// filter (orders always placed on both sides).
+    #[arg(long, default_value_t = 300u32)]
+    ratchet_trend_window_secs: u32,
+
+    /// Ratchet: trend-filter threshold in bps. Suppresses the BUY
+    /// side when mid has risen this much over the window (don't catch
+    /// falling knives on a rip-up); mirror for ASK on rip-down.
+    #[arg(long, default_value_t = 30u32)]
+    ratchet_trend_filter_bps: u32,
+
+    /// Ratchet: min elapsed time between order placements (ms).
+    #[arg(long, default_value_t = 500u64)]
+    ratchet_refresh_cooldown_ms: u64,
+
+    /// Ratchet: hard inventory cap in USDT notional (per bot).
+    #[arg(long, default_value = "500")]
+    ratchet_max_pos_usdt: String,
+
+    /// Ratchet pyramid: bps step between adds beyond the first entry.
+    /// Each add is placed `pyramid_step_bps` past the previous add
+    /// price. `0` disables (only first entry is placed).
+    #[arg(long, default_value_t = 0u32)]
+    ratchet_pyramid_step_bps: u32,
+
+    /// Ratchet pyramid: maximum adds beyond the first entry. `0`
+    /// disables the pyramid path (Ratchet stays single-entry).
+    #[arg(long, default_value_t = 0u32)]
+    ratchet_pyramid_max_adds: u32,
+
+    /// Ratchet pyramid: size multiplier per add. Add n uses
+    /// `notional × pyramid_size_mult^n`. `1.0` flat, `<1.0` decay,
+    /// `>1.0` martingale (risky).
+    #[arg(long, default_value = "1.0")]
+    ratchet_pyramid_size_mult: String,
+
+    /// Ratchet: TP bps from `avg_entry` while `Phase::Holding`.
+    /// `0` falls back to `tp_bps_list` value (from first entry).
+    #[arg(long, default_value_t = 0u32)]
+    ratchet_tp_bps_from_avg: u32,
+
     /// SimpleGap sweep: comma-separated fixed gaps from mid, in bps.
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
@@ -580,6 +642,7 @@ fn parse_strategies(s: &str) -> Option<std::collections::HashSet<String>> {
             "lf" => "liq-fade".to_string(),
             "hk" => "hawk".to_string(),
             "hd" | "hy" => "hydra".to_string(),
+            "rt" => "ratchet".to_string(),
             _ => t,
         })
         .collect();
@@ -854,10 +917,7 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 /// Per-symbol best preset + basket NET sum. Empty result vectors
 /// (symbol whose sweep failed) contribute zero to the basket but show
 /// `—` in the per-symbol cells so the operator sees the gap.
-fn print_basket_summary(
-    per_symbol: &[(String, Vec<(String, PaperReport)>)],
-    per_bot_cap: f64,
-) {
+fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per_bot_cap: f64) {
     let non_empty = per_symbol.iter().filter(|(_, r)| !r.is_empty()).count();
     if non_empty < 2 {
         return;
@@ -884,11 +944,7 @@ fn print_basket_summary(
     // — the operator still tied up $500 of margin to run it. When
     // `per_bot_cap == 0` (operator passed no `--sim-max-position-notional`)
     // we fall back to peak so the cell still renders something useful.
-    let cap_denom = if per_bot_cap > 0.0 {
-        per_bot_cap
-    } else {
-        0.0
-    };
+    let cap_denom = if per_bot_cap > 0.0 { per_bot_cap } else { 0.0 };
     for (sym, results) in per_symbol {
         if let Some((name, report)) = results.iter().max_by(|(_, a), (_, b)| {
             decimal_to_f64(&a.net.0)
@@ -953,7 +1009,9 @@ fn print_basket_summary(
         total_roi,
         String::new(),
     ]);
-    let headers = ["symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset"];
+    let headers = [
+        "symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset",
+    ];
     render_mysql_table(&headers, &rows);
     let roi_note = if cap_denom > 0.0 {
         format!(
@@ -1836,6 +1894,61 @@ async fn run_sweep_collect(
                         equity_csv_dir.clone(),
                     );
                 }
+            }
+        }
+    }
+
+    // Ratchet — price-ratchet mean reversion. Places opposite-side
+    // limit at last_fill ± tp_bps after each fill. Sweeps tp_bps and
+    // sl_bps; other knobs single-valued via flags.
+    if included("ratchet", &allow) {
+        let r_max_pos = Decimal::from_str(&args.ratchet_max_pos_usdt)?;
+        let r_notional_pct = Decimal::from_str(&args.ratchet_notional_pct)?;
+        let r_notional = r_max_pos * r_notional_pct / Decimal::from(100);
+        let r_tp_list = parse_u32_list(&args.ratchet_tp_bps_list)?;
+        let r_sl_list = parse_u32_list(&args.ratchet_sl_bps_list)?;
+        let r_pyr_mult = Decimal::from_str(&args.ratchet_pyramid_size_mult)?;
+        for &tp_bps in &r_tp_list {
+            for &sl_bps in &r_sl_list {
+                let label = format!(
+                    "Ratchet tp={tp_bps} sl={sl_bps} init={} trend={}s/{}bps cool={}ms pyr={}/{}@{}bps tpAvg={}",
+                    args.ratchet_initial_offset_bps,
+                    args.ratchet_trend_window_secs,
+                    args.ratchet_trend_filter_bps,
+                    args.ratchet_refresh_cooldown_ms,
+                    args.ratchet_pyramid_max_adds,
+                    r_pyr_mult,
+                    args.ratchet_pyramid_step_bps,
+                    args.ratchet_tp_bps_from_avg,
+                );
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    tikr_strategy::Ratchet::new(tikr_strategy::RatchetConfig {
+                        tick_size: tick,
+                        step_size: lot_step,
+                        min_notional: Decimal::ZERO,
+                        notional_per_order: r_notional,
+                        tp_bps,
+                        initial_offset_bps: args.ratchet_initial_offset_bps,
+                        max_position_usdt: r_max_pos,
+                        sl_bps_from_first: sl_bps,
+                        trend_window_secs: args.ratchet_trend_window_secs,
+                        trend_filter_bps: args.ratchet_trend_filter_bps,
+                        refresh_cooldown_ms: args.ratchet_refresh_cooldown_ms,
+                        pyramid_step_bps: args.ratchet_pyramid_step_bps,
+                        pyramid_max_adds: args.ratchet_pyramid_max_adds,
+                        pyramid_size_mult: r_pyr_mult,
+                        tp_bps_from_avg: args.ratchet_tp_bps_from_avg,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
             }
         }
     }
