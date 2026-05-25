@@ -375,6 +375,11 @@ struct Args {
     /// Hydra: comma-separated `entry_offset_bps` sweep — straddle
     /// distance from mid. Wider = bigger-move filter; tighter = more
     /// chop fills.
+    /// Default `50` is the 2026-05-25 uniform-eo sweep winner ($13.94
+    /// basket NET on 13.6h frozen-snapshot). Bimodal — local peaks at
+    /// 10 and 50; valleys at 30 and 75. Expand the list for per-symbol
+    /// retuning (compare picks the best per symbol from a multi-value
+    /// list).
     #[arg(long, default_value = "50")]
     hydra_entry_offset_bps_list: String,
 

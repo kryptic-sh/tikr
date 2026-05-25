@@ -80,7 +80,7 @@ dca_max_adds = 0
 tp_bps_from_avg = 50
 sl_bps_from_first = 75
 add_cooldown_ms = 1000
-pyramid_size_mult = "0.5"
+pyramid_size_mult = "0.75"
 dca_size_mult = "0.5"
 
 
@@ -98,7 +98,7 @@ dca_max_adds = 0
 tp_bps_from_avg = 50
 sl_bps_from_first = 75
 add_cooldown_ms = 1000
-pyramid_size_mult = "0.5"
+pyramid_size_mult = "0.75"
 dca_size_mult = "0.5"
 
 
@@ -116,7 +116,7 @@ dca_max_adds = 0
 tp_bps_from_avg = 50
 sl_bps_from_first = 75
 add_cooldown_ms = 1000
-pyramid_size_mult = "0.5"
+pyramid_size_mult = "0.75"
 dca_size_mult = "0.5"
 
 
@@ -134,7 +134,7 @@ dca_max_adds = 0
 tp_bps_from_avg = 50
 sl_bps_from_first = 75
 add_cooldown_ms = 1000
-pyramid_size_mult = "0.5"
+pyramid_size_mult = "0.75"
 dca_size_mult = "0.5"
 
 
@@ -144,7 +144,7 @@ symbol = "DOGEUSDT"
 strategy = "hydra"
 
 [bot.hydra]
-entry_offset_bps = 100
+entry_offset_bps = 50
 pyramid_step_bps = 150
 pyramid_max_adds = 3
 dca_step_bps = 60
@@ -152,7 +152,7 @@ dca_max_adds = 0
 tp_bps_from_avg = 50
 sl_bps_from_first = 75
 add_cooldown_ms = 1000
-pyramid_size_mult = "0.5"
+pyramid_size_mult = "0.75"
 dca_size_mult = "0.5"
 
 
