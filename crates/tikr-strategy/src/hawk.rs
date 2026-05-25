@@ -431,7 +431,6 @@ mod tests {
     use tikr_core::{
         Asset, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp, VenueId,
     };
-    use tikr_venue::QuoteId;
 
     fn sym() -> Symbol {
         Symbol {

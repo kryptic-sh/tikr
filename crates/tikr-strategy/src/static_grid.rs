@@ -1044,7 +1044,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn regime_disabled_acts_as_legacy_always_trending() {
         let r = RegimeTracker::new(0);
         // window == 0 → tracker disabled; always reports trending.
@@ -1124,6 +1123,7 @@ mod tests {
         assert!(!r.is_trending_efficiency(Decimal::from_str("0.3").unwrap(), false));
     }
 
+    #[test]
     fn scaler_disabled_returns_one() {
         let g = StaticGrid::new(cfg("0", 60, "1", "4"));
         assert_eq!(g.adaptive_scale(), Decimal::ONE);
