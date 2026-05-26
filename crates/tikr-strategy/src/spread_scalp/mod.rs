@@ -1047,16 +1047,19 @@ impl Strategy for SpreadScalp {
         &mut self,
         ctx: &StrategyContext<'_>,
         intent: &tikr_venue::QuoteIntent,
-        _reason: &str,
+        reason: &str,
     ) -> Vec<Action> {
-        // Stamp the cooldown on the side that just bounced so the next
-        // rebuild attempt within `reject_cooldown_ms` skips this side
-        // (see SG `last_refill_*_ts` for the parent pattern). Without
-        // this, fast moves can produce a -5022 → rebuild → -5022 hot
-        // loop because every rejection nukes the price cache and
-        // re-emits both sides.
+        // Post-only races on offset=0 (-5022 "would not be maker") are
+        // not real errors — the book just moved a tick while our place
+        // was in flight. Re-emit IMMEDIATELY at the fresh touch without
+        // stamping side cooldown. Other rejection classes (insufficient
+        // margin, lot/tick filter) get the cooldown so we don't hammer
+        // a known-bad config.
         let ts = ctx.now;
-        self.mark_reject(intent.side, ts);
+        let is_post_only_race = reason.contains("-5022") || reason.contains("Post Only");
+        if !is_post_only_race {
+            self.mark_reject(intent.side, ts);
+        }
         self.last_bid = None;
         self.last_ask = None;
         self.last_requote_ts = None;

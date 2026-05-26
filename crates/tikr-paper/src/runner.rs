@@ -965,13 +965,21 @@ where
                                         fill_sim.enqueue_place_with_id(intent, ts, qid);
                                     }
                                     Err(e) => {
+                                        let msg = format!("{e:?}");
+                                        let is_post_only_race = msg.contains("-5022")
+                                            || msg.contains("Post Only");
                                         warn!(error = ?e, "live: venue.quote failed");
-                                        match intent.side {
-                                            Side::Bid => state.0 += 1,
-                                            Side::Ask => state.1 += 1,
+                                        // Post-only races are market jitter, not a
+                                        // strategy/config bug — don't burn the
+                                        // side_fails budget on them.
+                                        if !is_post_only_race {
+                                            match intent.side {
+                                                Side::Bid => state.0 += 1,
+                                                Side::Ask => state.1 += 1,
+                                            }
+                                            side_fails_last
+                                                .insert(symbol.base.0.to_string(), Instant::now());
                                         }
-                                        side_fails_last
-                                            .insert(symbol.base.0.to_string(), Instant::now());
                                     }
                                 }
                             }
@@ -1767,12 +1775,16 @@ async fn dispatch_post_fill_actions<V, S>(
                         fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
                     }
                     Err(e) => {
+                        let msg = format!("{e:?}");
+                        let is_post_only_race = msg.contains("-5022") || msg.contains("Post Only");
                         warn!(error = ?e, "live: venue.quote failed (post-fill)");
-                        match intent.side {
-                            Side::Bid => state.0 += 1,
-                            Side::Ask => state.1 += 1,
+                        if !is_post_only_race {
+                            match intent.side {
+                                Side::Bid => state.0 += 1,
+                                Side::Ask => state.1 += 1,
+                            }
                         }
-                        rejected_intents.push((intent.clone(), format!("{e:?}")));
+                        rejected_intents.push((intent.clone(), msg));
                     }
                 }
             }
@@ -1801,7 +1813,11 @@ async fn dispatch_post_fill_actions<V, S>(
     // re-anchors on current book mid and emits a fresh pair. We iterate
     // until no Quote actions remain rejected or `MAX_RECOVERY_ROUNDS` is
     // hit (defensive cap against an infinite reject loop in a fast move).
-    const MAX_RECOVERY_ROUNDS: usize = 5;
+    // Raised from 5 to 20 — at offset=0 on a 1-tick-spread book, the
+    // post-only race against book moves is the dominant rejection mode
+    // and the bot needs to chase the touch through 10+ price ticks
+    // before giving up. Each round refetches the book.
+    const MAX_RECOVERY_ROUNDS: usize = 20;
     let mut round = 0;
     while !rejected_intents.is_empty() && round < MAX_RECOVERY_ROUNDS {
         round += 1;
@@ -1875,12 +1891,17 @@ async fn dispatch_post_fill_actions<V, S>(
                                 fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
                             }
                             Err(e) => {
+                                let msg = format!("{e:?}");
+                                let is_post_only_race =
+                                    msg.contains("-5022") || msg.contains("Post Only");
                                 warn!(error = ?e, round, "live: venue.quote failed (recovery)");
-                                match intent.side {
-                                    Side::Bid => state.0 += 1,
-                                    Side::Ask => state.1 += 1,
+                                if !is_post_only_race {
+                                    match intent.side {
+                                        Side::Bid => state.0 += 1,
+                                        Side::Ask => state.1 += 1,
+                                    }
                                 }
-                                rejected_intents.push((intent.clone(), format!("{e:?}")));
+                                rejected_intents.push((intent.clone(), msg));
                             }
                         }
                     }

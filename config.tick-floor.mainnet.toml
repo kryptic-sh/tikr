@@ -89,7 +89,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -112,7 +112,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -149,7 +149,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -166,7 +166,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -183,7 +183,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -200,7 +200,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -217,7 +217,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -234,7 +234,7 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # AT touches (join queue)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 500
 reject_cooldown_ms = 500
