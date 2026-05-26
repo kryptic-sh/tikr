@@ -128,6 +128,14 @@ pub struct RunnerConfig {
     /// (0-100). Drives max_position_usdt updates when
     /// `initial_balance > 0`.
     pub max_position_pct: Decimal,
+    /// Venue-side minimum order notional (USDT). When `> 0`, the live
+    /// dispatch path drops any `Action::Quote` whose `size × price`
+    /// falls below this floor BEFORE calling `venue.quote()`. Defense
+    /// against strategy emit paths that don't bump dust qty to meet
+    /// the exchange filter (close-side pinned to residual position,
+    /// risk module TP/SL on a near-empty position, etc.). `0` (default)
+    /// disables the guard.
+    pub min_notional: Decimal,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -174,6 +182,7 @@ impl Default for RunnerConfig {
             initial_balance: Decimal::ZERO,
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
         }
     }
 }
@@ -699,6 +708,7 @@ where
                             &current_book,
                             live_mode,
                             &mut side_fails,
+                            config.min_notional,
                         ).await;
                     }
                 }
@@ -739,6 +749,7 @@ where
                             &current_book,
                             live_mode,
                             &mut side_fails,
+                            config.min_notional,
                         ).await;
                     }
                 }
@@ -898,7 +909,23 @@ where
                                         Side::Bid => state.0 >= MAX_FAILS_PER_SIDE,
                                         Side::Ask => state.1 >= MAX_FAILS_PER_SIDE,
                                     };
-                                    if !skip {
+                                    // Sub-min-notional guard — drop dust emits
+                                    // before the venue rejects them. Catches
+                                    // residual close-side qty, TP/SL on
+                                    // near-empty positions, etc.
+                                    let below_min = config.min_notional > Decimal::ZERO
+                                        && intent.size.0 * intent.price.0
+                                            < config.min_notional;
+                                    if below_min {
+                                        debug!(
+                                            side = ?intent.side,
+                                            qty = %intent.size.0,
+                                            price = %intent.price.0,
+                                            notional = %(intent.size.0 * intent.price.0),
+                                            min = %config.min_notional,
+                                            "live: dropping sub-min-notional quote"
+                                        );
+                                    } else if !skip {
                                         run_intents.push(intent.clone());
                                     } else {
                                         debug!(
@@ -1086,6 +1113,7 @@ where
                             &current_book,
                             false,
                             &mut side_fails,
+                            config.min_notional,
                         )
                         .await;
                     }
@@ -1412,6 +1440,7 @@ where
                     &current_book,
                     true,
                     &mut side_fails,
+                    config.min_notional,
                 )
                 .await;
                 // Publish AFTER local mirror has dropped the filled order and
@@ -1682,6 +1711,7 @@ async fn dispatch_post_fill_actions<V, S>(
     current_book: &tikr_core::Snapshot,
     live_mode: bool,
     side_fails: &mut HashMap<String, (u32, u32)>,
+    min_notional: Decimal,
 ) where
     V: Venue,
     S: Strategy,
@@ -1710,6 +1740,17 @@ async fn dispatch_post_fill_actions<V, S>(
                     warn!(
                         side = ?intent.side, bid_fails = state.0, ask_fails = state.1,
                         "live: skipping post-fill quote — side exceeded max failures"
+                    );
+                    continue;
+                }
+                if min_notional > Decimal::ZERO && intent.size.0 * intent.price.0 < min_notional {
+                    debug!(
+                        side = ?intent.side,
+                        qty = %intent.size.0,
+                        price = %intent.price.0,
+                        notional = %(intent.size.0 * intent.price.0),
+                        min = %min_notional,
+                        "live: dropping sub-min-notional quote (post-fill)"
                     );
                     continue;
                 }
@@ -1804,6 +1845,20 @@ async fn dispatch_post_fill_actions<V, S>(
                             warn!(
                                 side = ?intent.side, bid_fails = state.0, ask_fails = state.1, round,
                                 "live: skipping recovery quote — side exceeded max failures"
+                            );
+                            continue;
+                        }
+                        if min_notional > Decimal::ZERO
+                            && intent.size.0 * intent.price.0 < min_notional
+                        {
+                            debug!(
+                                side = ?intent.side,
+                                qty = %intent.size.0,
+                                price = %intent.price.0,
+                                notional = %(intent.size.0 * intent.price.0),
+                                min = %min_notional,
+                                round,
+                                "live: dropping sub-min-notional quote (recovery)"
                             );
                             continue;
                         }
@@ -2222,6 +2277,7 @@ mod tests {
             initial_balance: Decimal::ZERO,
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
         }
     }
 
@@ -2577,6 +2633,7 @@ mod tests {
             initial_balance: Decimal::ZERO,
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2669,6 +2726,7 @@ mod tests {
             initial_balance: Decimal::ZERO,
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
         };
         let (_tx, rx) = watch::channel(false);
 

@@ -377,6 +377,7 @@ async fn risk_resume_alerting_capstone() {
         initial_balance: Decimal::ZERO,
         order_balance_pct: Decimal::ZERO,
         max_position_pct: Decimal::ZERO,
+        min_notional: Decimal::ZERO,
     };
     let (_tx1, rx1) = watch::channel(false);
 

@@ -392,5 +392,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         initial_balance: tikr_core::Decimal::ZERO,
         order_balance_pct: tikr_core::Decimal::ZERO,
         max_position_pct: tikr_core::Decimal::ZERO,
+        min_notional: tikr_core::Decimal::ZERO,
     }
 }

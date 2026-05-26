@@ -257,6 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_balance: Decimal::ZERO,
         order_balance_pct: Decimal::ZERO,
         max_position_pct: Decimal::ZERO,
+        min_notional: Decimal::ZERO,
     };
 
     let report = run_with_resume(

@@ -87,8 +87,8 @@ strategy = "spread-scalp"
 min_spread_bps = 0
 quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 close_side_always_quotes = true
 

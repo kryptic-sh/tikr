@@ -2266,6 +2266,7 @@ async fn run_one<S: Strategy>(
         initial_balance: balance_compounding().0,
         order_balance_pct: balance_compounding().1,
         max_position_pct: balance_compounding().2,
+        min_notional: Decimal::ZERO,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -2350,6 +2351,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             initial_balance: balance_compounding().0,
             order_balance_pct: balance_compounding().1,
             max_position_pct: balance_compounding().2,
+            min_notional: Decimal::ZERO,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");

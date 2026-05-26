@@ -186,8 +186,14 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     // restart cycle doesn't churn the open position.
     if ctx.clear_on_start {
         info!("startup reset (cancel + flatten) — --clear was set");
-        let reset_venue =
-            venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol, ctx.leverage).await?;
+        let reset_venue = venue::build_venue(
+            ctx.env,
+            &ctx.api_key,
+            &ctx.key_material,
+            &symbol,
+            ctx.leverage,
+        )
+        .await?;
         reset_symbol_state(&reset_venue, &symbol).await;
         drop(reset_venue);
     } else {
@@ -195,8 +201,14 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     }
 
     info!("building venue for runner");
-    let venue_for_run =
-        venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol, ctx.leverage).await?;
+    let venue_for_run = venue::build_venue(
+        ctx.env,
+        &ctx.api_key,
+        &ctx.key_material,
+        &symbol,
+        ctx.leverage,
+    )
+    .await?;
 
     info!("subscribing user data stream");
     let (us_shutdown_tx, us_shutdown_rx) = watch::channel(false);

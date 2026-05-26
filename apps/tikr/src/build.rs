@@ -116,6 +116,10 @@ pub fn to_spec(
         initial_balance: Decimal::ZERO,
         order_balance_pct: Decimal::ZERO,
         max_position_pct: Decimal::ZERO,
+        // Same lookup as the strategy-side min_notional plumbing
+        // above. Runner uses it as a defense-in-depth guard against
+        // dust emits (close-side pinned to residual qty, etc.).
+        min_notional: venue.min_notional(&symbol).unwrap_or(Decimal::ZERO),
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.
