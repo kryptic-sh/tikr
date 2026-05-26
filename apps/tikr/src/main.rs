@@ -457,14 +457,16 @@ async fn main() -> anyhow::Result<()> {
             .map(|r| r.slots)
             .unwrap_or(0);
 
-    // Margin asset: when touch_refill_auto is enabled with a non-USDT
-    // quote, that's the wallet asset (USDC perps settle in USDC).
+    // Margin asset priority:
+    // 1. touch_refill_auto.quote_asset (when auto-rotation enabled)
+    // 2. account.asset (explicit override for fixed-bot configs)
+    // 3. "USDT" (default)
     let wallet_asset = cfg
         .touch_refill_auto
         .as_ref()
         .filter(|c| c.enabled)
         .map(|c| c.quote_asset.clone())
-        .unwrap_or_else(|| "USDT".to_string());
+        .unwrap_or_else(|| cfg.account.asset.clone());
     spawn_account_balance_poller(AccountPollerConfig {
         shared_state: shared_state.clone(),
         notional_tx,

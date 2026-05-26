@@ -1,0 +1,109 @@
+# ─── SpreadScalp on USDC majors — MAINNET ──────────────────────────────────
+#
+# 4 fixed bots on BTCUSDC/ETHUSDC/BNBUSDC/DOGEUSDC. SS strategy
+# captures spread between best bid + ask, takes profit on the
+# opposite-side maker close.
+#
+# Why min_spread_bps = 0?
+#   Binance USDC futures = 0 maker fee (promo). No fee floor to
+#   clear — any captured spread is pure profit. Quote on every
+#   tick of spread, however thin.
+#   Verify current rate: binance.com/en/fee/futureFee
+#
+# Caveats:
+#   - Adverse selection still applies. 0-fee doesn't fix bad fills.
+#   - Min_spread=0 means the bot quotes even on 1-bps books; on
+#     majors USDC books are very tight, fill rate may be low.
+#   - Fixed bot list — no rotation. Each symbol gets its own
+#     persistent state under state/<symbol>/.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/spread-scalp-usdc"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+# ─── BTCUSDC ───────────────────────────────────────────────────────────────
+#
+# Tick = 0.10 on ~$60k price = ~0.017 bps. Tightest of the bunch.
+# Notional 120 ≈ 0.002 BTC at this price.
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional = 120
+min_spread_bps = 0
+requote_interval_ms = 500
+max_position_usdt = 200
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
+
+# ─── ETHUSDC ───────────────────────────────────────────────────────────────
+#
+# Tick = 0.01 on ~$2k price = ~0.05 bps.
+
+[[bot]]
+symbol = "ETHUSDC"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional = 120
+min_spread_bps = 0
+requote_interval_ms = 500
+max_position_usdt = 200
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
+
+# ─── BNBUSDC ───────────────────────────────────────────────────────────────
+#
+# Tick = 0.01 on ~$650 price = ~0.15 bps.
+
+[[bot]]
+symbol = "BNBUSDC"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional = 120
+min_spread_bps = 0
+requote_interval_ms = 500
+max_position_usdt = 200
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
+
+# ─── DOGEUSDC ──────────────────────────────────────────────────────────────
+#
+# Tick = 0.00001 on ~$0.20 price = ~0.5 bps. Widest tick of the basket.
+# Smaller notional because DOGE is volatile per-bp.
+
+[[bot]]
+symbol = "DOGEUSDC"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+notional = 60
+min_spread_bps = 0
+requote_interval_ms = 500
+max_position_usdt = 100
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30

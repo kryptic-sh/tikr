@@ -122,6 +122,12 @@ pub struct AccountConfig {
     /// untouched.
     #[serde(default = "default_leverage")]
     pub leverage: u32,
+    /// Margin asset for the wallet balance poller + TUI display.
+    /// `"USDT"` (default) for USDT-M perps, `"USDC"` for USDC-M.
+    /// When `touch_refill_auto.quote_asset` is set, that takes
+    /// precedence; this field covers the fixed-bot-list case.
+    #[serde(default = "default_account_asset")]
+    pub asset: String,
 }
 
 fn default_state_dir() -> PathBuf {
@@ -140,6 +146,9 @@ fn default_bnb_refill_enabled() -> bool {
 
 fn default_order_balance_pct() -> Decimal {
     Decimal::new(2, 1)
+}
+fn default_account_asset() -> String {
+    "USDT".to_string()
 }
 
 fn default_leverage() -> u32 {
