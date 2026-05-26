@@ -275,21 +275,32 @@ impl Strategy for TouchRefill {
             }
         }
 
-        // Rule 2: on FULL fill, place opposite-side close at
-        // fill_price ± 1 tick. Partial fills (is_full=false) skip
-        // the close — there's still residual size on the same side
-        // that'll catch the rest of the flow; we don't want to
-        // pre-place a close for a position that's still being built.
+        // Rule 2: on FULL fill, place opposite-side close at a
+        // distance that satisfies min_self_spread_bps. Partial fills
+        // (is_full=false) skip the close — there's still residual
+        // size on the same side that'll catch the rest of the flow;
+        // we don't want to pre-place a close for a position that's
+        // still being built.
+        //
+        // Close distance = max(1 tick, ceil(min_self_spread × fill_price
+        //   / 10000 / tick) × tick). Always ≥ 1 tick; bumped to whatever
+        // satisfies min_self_spread_bps on tight-tick markets.
         if let MarketEvent::Fill(fill) = event
             && fill.is_full
         {
             let tick = self.config.tick_size;
-            if tick > Decimal::ZERO {
+            if tick > Decimal::ZERO && fill.price.0 > Decimal::ZERO {
+                let spread_required = fill.price.0 * Decimal::from(self.config.min_self_spread_bps)
+                    / Decimal::from(10_000);
+                let close_distance = if spread_required > tick {
+                    // Round up to nearest tick.
+                    (spread_required / tick).ceil() * tick
+                } else {
+                    tick
+                };
                 let (close_side, close_price) = match fill.side {
-                    // Filled BID = long → close with SELL at fill+1tick.
-                    Side::Bid => (Side::Ask, Price(fill.price.0 + tick)),
-                    // Filled ASK = short → close with BUY at fill-1tick.
-                    Side::Ask => (Side::Bid, Price(fill.price.0 - tick)),
+                    Side::Bid => (Side::Ask, Price(fill.price.0 + close_distance)),
+                    Side::Ask => (Side::Bid, Price(fill.price.0 - close_distance)),
                 };
                 if close_price.0 > Decimal::ZERO
                     && !self.already_have_order(ctx, close_side, close_price)
@@ -531,6 +542,49 @@ mod tests {
             .collect();
         assert_eq!(asks.len(), 1, "no close emit on partial fill: {asks:?}");
         assert_eq!(asks[0], Decimal::new(20, 4));
+    }
+
+    #[test]
+    fn full_fill_close_honors_min_self_spread_on_tight_tick() {
+        // Setup: price ~ 0.1 (so 10bps of price = 1e-4 = 1 tick), but
+        // pretend tick is smaller so 1 tick alone wouldn't satisfy
+        // min_self_spread_bps. Use price=0.100, tick=0.00001 → 1 tick
+        // = 1 bps. min_self_spread_bps = 10 → required = 0.0001 = 10
+        // ticks. Close ASK at fill+10 ticks, not fill+1 tick.
+        let mut c = TouchRefillConfig {
+            notional_per_order: Decimal::from(10),
+            tick_size: Decimal::new(1, 5), // 0.00001
+            step_size: Decimal::ONE,
+            min_notional: Decimal::from(5),
+            grid_levels: 1,
+            min_self_spread_bps: 10,
+        };
+        c.tick_size = Decimal::new(1, 5);
+        let mut s = TouchRefill::new(c);
+        let symbol = sym();
+        let p = pos();
+        let snap = book(Decimal::new(99999, 6), Decimal::new(100001, 6)); // 0.099999 / 0.100001
+        let fill = mk_fill(Side::Bid, Decimal::new(99999, 6), true);
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
+        // The close-on-fill ASK should sit at fill + close_distance where
+        // close_distance >= 10 ticks (to satisfy 10 bps). Several ASKs
+        // may be emitted (rule 1 top-of-grid + rule 2 close); assert at
+        // least one is far enough out.
+        let fill_p = Decimal::new(99999, 6);
+        let min_distance = Decimal::new(1, 4); // 0.0001 = 10 ticks
+        let has_close = actions.iter().any(|a| match a {
+            Action::Quote(q) if q.side == Side::Ask => q.price.0 - fill_p >= min_distance,
+            _ => false,
+        });
+        assert!(
+            has_close,
+            "close ASK should sit ≥ 10 ticks from fill; got: {:?}",
+            actions.iter().filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            }).collect::<Vec<_>>()
+        );
     }
 
     #[test]
