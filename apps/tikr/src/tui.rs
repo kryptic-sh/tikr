@@ -937,21 +937,30 @@ fn draw_account(
             )),
         ]));
         if let Some(start) = start_balance {
-            // Base api_net = USDT wallet delta. When BNB-fee mode is
-            // on, also add the BNB-value delta — fees come out of BNB
-            // balance (separate from USDT wallet) so true account-wide
-            // PnL is the sum of both deltas.
+            // Base api_net = USDT wallet delta (already realized — the
+            // exchange settled fees + realized PnL into wallet_balance).
+            // When BNB-fee mode is on, also add the BNB-value delta —
+            // fees come out of BNB balance (separate from USDT wallet)
+            // so true realized account-wide PnL is the sum of both.
             let usdt_delta = api.wallet_balance - start;
             let bnb_delta = match (bnb, bnb_start_value_usdt) {
                 (Some(b), Some(start_val)) if b.enabled => b.balance * b.price_usdt - start_val,
                 _ => Decimal::ZERO,
             };
-            let api_net = usdt_delta + bnb_delta;
+            let api_real_net = usdt_delta + bnb_delta;
+            let api_mtm_net = api_real_net + api.cross_unrealized_pnl;
             lines.push(Line::from(vec![
-                Span::styled("api net  ", Style::default().fg(Color::White)),
+                Span::styled("api real ", Style::default().fg(Color::White)),
                 Span::styled(
-                    format!("{:>+10.2}", dec_to_f64(api_net)),
-                    pnl_style(api_net),
+                    format!("{:>+10.2}", dec_to_f64(api_real_net)),
+                    pnl_style(api_real_net),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("api mtm  ", Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:>+10.2}", dec_to_f64(api_mtm_net)),
+                    pnl_style(api_mtm_net),
                 ),
             ]));
         }
