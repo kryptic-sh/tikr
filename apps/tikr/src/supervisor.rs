@@ -197,7 +197,24 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         reset_symbol_state(&reset_venue, &symbol).await;
         drop(reset_venue);
     } else {
-        info!("resuming live state — pass --clear to flatten + cancel-all at startup");
+        // Always cancel pre-existing open orders even when resuming —
+        // the strategy boots with an empty resting tracker and would
+        // otherwise leave orphans on the venue forever (no Cancel ever
+        // issued for orders it doesn't know about). Position is left
+        // intact; only resting orders are wiped.
+        info!("resuming live state — cancel-all orphan orders, position preserved");
+        let cancel_venue = venue::build_venue(
+            ctx.env,
+            &ctx.api_key,
+            &ctx.key_material,
+            &symbol,
+            ctx.leverage,
+        )
+        .await?;
+        if let Err(e) = cancel_venue.cancel_all(&symbol).await {
+            warn!(error = ?e, "startup cancel_all failed (continuing)");
+        }
+        drop(cancel_venue);
     }
 
     info!("building venue for runner");

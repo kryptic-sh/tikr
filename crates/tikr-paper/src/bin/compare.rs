@@ -1764,6 +1764,7 @@ async fn run_sweep_collect(
                         adverse_stop_drift_bps: args.spread_scalp_adverse_stop_drift_bps,
                         quote_offset_ticks: args.spread_scalp_quote_offset_ticks,
                         close_target_ticks: args.spread_scalp_close_target_ticks,
+                        strict_touch_quotes: false,
                     }),
                     fees,
                     skim_cfg,

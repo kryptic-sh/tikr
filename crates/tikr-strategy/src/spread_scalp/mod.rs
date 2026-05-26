@@ -145,6 +145,15 @@ pub struct SpreadScalpConfig {
     /// Has no effect in legacy SS mode (`quote_offset_ticks = -1`):
     /// that path still uses `min_spread_bps` via `try_keep_close_side`.
     pub close_target_ticks: u32,
+    /// When `true`, **bypasses the close-side avg-anchored pin** so the
+    /// close-side quote always sits at touch (same as the entry side).
+    /// Removes the "1-tick gap above touch_ask when holding long" symptom
+    /// when avg_entry has drifted above the current touch. Tradeoff: the
+    /// close quote can now realize a per-cycle loss if the touch is below
+    /// avg + close_target × tick — the strategy gives up the avg-anchored
+    /// floor in exchange for always being at the front of the book.
+    /// Default `false` preserves the protective pin behavior.
+    pub strict_touch_quotes: bool,
 }
 
 /// Spread scalping strategy state.
@@ -474,6 +483,12 @@ impl SpreadScalp {
         bid: Price,
         ask: Price,
     ) -> (Price, Price) {
+        // strict_touch_quotes bypass: caller wants close-side to sit at
+        // touch (entry-side parity) even when that means closing at a
+        // loss relative to avg_entry. Skip the pin entirely.
+        if self.config.strict_touch_quotes {
+            return (bid, ask);
+        }
         if self.config.quote_offset_ticks < 0 {
             return (bid, ask);
         }
@@ -1186,6 +1201,7 @@ mod tests {
             adverse_stop_drift_bps: 0,
             quote_offset_ticks: -1,
             close_target_ticks: 0,
+            strict_touch_quotes: false,
         })
     }
 

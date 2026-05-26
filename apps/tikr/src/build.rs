@@ -395,6 +395,7 @@ fn build_spread_scalp(
         adverse_stop_drift_bps: spread_scalp.adverse_stop_drift_bps,
         quote_offset_ticks: spread_scalp.quote_offset_ticks,
         close_target_ticks: spread_scalp.close_target_ticks,
+        strict_touch_quotes: spread_scalp.strict_touch_quotes,
     }))
 }
 

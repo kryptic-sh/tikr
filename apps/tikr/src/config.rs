@@ -657,6 +657,11 @@ pub struct SpreadScalpParams {
     /// min(target, touch) for short-close. Pure tick math, no bps.
     #[serde(default)]
     pub close_target_ticks: u32,
+    /// Bypass the close-side avg-anchored pin so both sides quote at
+    /// touch always. Trade: gives up the "never close at loss" floor
+    /// in exchange for staying at front of book. Default `false`.
+    #[serde(default)]
+    pub strict_touch_quotes: bool,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
