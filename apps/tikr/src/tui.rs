@@ -15,8 +15,11 @@ use crossterm::{ExecutableCommand, event};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Padding, Paragraph, Wrap,
+};
 use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
 use tokio::sync::watch;
@@ -55,6 +58,7 @@ enum NormalAction {
     LogPageDown,
     LogTop,
     LogBottom,
+    ToggleChart,
 }
 
 /// Either the chord-bound `Normal` mode, or one of the inline modal
@@ -92,6 +96,8 @@ struct UiState {
     /// captured so chord actions can compute "page up / page down" in
     /// proportion to what the user actually sees.
     last_log_visible: usize,
+    /// Show the price chart in the top 1/3 of the log area. Default true.
+    show_chart: bool,
     /// Last drawn log line count for the active tab — captured so the
     /// scroll handlers can compute a valid anchor when transitioning
     /// from Follow → Anchored without waiting for a render.
@@ -139,6 +145,7 @@ impl UiState {
             last_log_rect: None,
             last_tab_ranges: Vec::new(),
             last_log_visible: 0,
+            show_chart: true,
             last_log_total: 0,
             last_bot_rect: None,
             last_account_rect: None,
@@ -321,6 +328,8 @@ fn build_keymap() -> hjkl_keymap::Keymap<NormalAction, AppMode> {
     km.add(m, ":", NormalAction::EnterEx, "ex command").unwrap();
     km.add(m, "H", NormalAction::TabPrev, "prev tab").unwrap();
     km.add(m, "L", NormalAction::TabNext, "next tab").unwrap();
+    km.add(m, "c", NormalAction::ToggleChart, "toggle chart")
+        .unwrap();
     km.add(m, "gg", NormalAction::LogTop, "log top").unwrap();
     km.add(m, "G", NormalAction::LogBottom, "log bottom")
         .unwrap();
@@ -399,6 +408,7 @@ fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mu
         }
         NormalAction::LogPageUp => scroll_log(ui, -10),
         NormalAction::LogPageDown => scroll_log(ui, 10),
+        NormalAction::ToggleChart => ui.show_chart = !ui.show_chart,
         NormalAction::LogTop => ui.log_view = LogView::Anchored(0),
         NormalAction::LogBottom => ui.log_view = LogView::Follow,
         _ => {}
@@ -879,7 +889,23 @@ fn draw_body(
         .split(area);
 
     draw_bot_detail(f, cols[0], views.get(active), ui);
-    draw_logs(f, cols[1], views.get(active), log_lines, ui);
+    // Split the middle column: top 1/3 chart (if enabled), bottom 2/3 logs.
+    let active_view = views.get(active);
+    if ui.show_chart && cols[1].height >= 9 {
+        let middle = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+            .split(cols[1]);
+        draw_chart(
+            f,
+            middle[0],
+            active_view,
+            active_view.and_then(|v| v.history.as_ref()),
+        );
+        draw_logs(f, middle[1], active_view, log_lines, ui);
+    } else {
+        draw_logs(f, cols[1], active_view, log_lines, ui);
+    }
     draw_account(
         f,
         cols[2],
@@ -1225,6 +1251,128 @@ fn draw_account(
         )
         .scroll((scroll, 0));
     f.render_widget(p, area);
+}
+
+fn draw_chart(
+    f: &mut Frame<'_>,
+    area: Rect,
+    active: Option<&BotViewSnapshot>,
+    history: Option<&crate::state::PriceHistory>,
+) {
+    let title = match active {
+        Some(v) => format!(" {} price ", v.symbol),
+        None => " price ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .padding(Padding::horizontal(1));
+
+    let Some(hist) = history else {
+        f.render_widget(block, area);
+        return;
+    };
+    if hist.samples.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "no price samples yet",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(block);
+        f.render_widget(p, area);
+        return;
+    }
+
+    // X-axis: use sample index as x (sequence). Skip wall-clock for now —
+    // 1-sample/sec means index ≈ seconds-ago when reversed.
+    let line_pts: Vec<(f64, f64)> = hist
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(i, (_, p))| (i as f64, dec_to_f64(*p)))
+        .collect();
+
+    let last_ts = hist.samples.last().map(|(t, _)| *t).unwrap_or(0);
+    let first_ts = hist.samples.first().map(|(t, _)| *t).unwrap_or(0);
+    let span_ms = last_ts.saturating_sub(first_ts).max(1);
+    // Map fill timestamps to x indices in the samples timeline.
+    let map_x = |fill_ts: u64| -> f64 {
+        if last_ts <= first_ts {
+            0.0
+        } else {
+            let frac = fill_ts.saturating_sub(first_ts) as f64 / span_ms as f64;
+            frac * (hist.samples.len() as f64 - 1.0)
+        }
+    };
+    let buy_pts: Vec<(f64, f64)> = hist
+        .fills
+        .iter()
+        .filter(|(_, _, is_buy)| *is_buy)
+        .map(|(ts, p, _)| (map_x(*ts), dec_to_f64(*p)))
+        .collect();
+    let sell_pts: Vec<(f64, f64)> = hist
+        .fills
+        .iter()
+        .filter(|(_, _, is_buy)| !is_buy)
+        .map(|(ts, p, _)| (map_x(*ts), dec_to_f64(*p)))
+        .collect();
+
+    // Y-axis bounds: min/max over samples + fills with 1% padding.
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (_, y) in line_pts.iter().chain(buy_pts.iter()).chain(sell_pts.iter()) {
+        if *y < lo {
+            lo = *y;
+        }
+        if *y > hi {
+            hi = *y;
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() || lo == hi {
+        lo -= 1.0;
+        hi += 1.0;
+    }
+    let pad = (hi - lo) * 0.02;
+    let y_lo = lo - pad;
+    let y_hi = hi + pad;
+    let x_hi = (hist.samples.len() as f64 - 1.0).max(1.0);
+
+    let datasets = vec![
+        Dataset::default()
+            .name("bid")
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&line_pts),
+        Dataset::default()
+            .name("buy")
+            .marker(Marker::Dot)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(Color::Green))
+            .data(&buy_pts),
+        Dataset::default()
+            .name("sell")
+            .marker(Marker::Dot)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(Color::Red))
+            .data(&sell_pts),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([0.0, x_hi]),
+        )
+        .y_axis(
+            Axis::default()
+                .style(Style::default().fg(Color::DarkGray))
+                .bounds([y_lo, y_hi])
+                .labels(vec![
+                    Line::from(format!("{y_lo:.4}")),
+                    Line::from(format!("{y_hi:.4}")),
+                ]),
+        );
+    f.render_widget(chart, area);
 }
 
 fn draw_logs(

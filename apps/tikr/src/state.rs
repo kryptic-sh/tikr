@@ -114,10 +114,56 @@ pub struct BnbState {
     pub fetched_at_ms: u64,
 }
 
+/// Per-symbol rolling price + fill-marker history for the TUI chart.
+/// Capped ring buffer — drops oldest when at capacity.
+#[derive(Debug, Clone, Default)]
+pub struct PriceHistory {
+    /// `(ts_ms, price)` samples, oldest first.
+    pub samples: Vec<(u64, Decimal)>,
+    /// `(ts_ms, price, is_buy)` fill markers, oldest first.
+    pub fills: Vec<(u64, Decimal, bool)>,
+    /// Last sample timestamp — used to downsample to 1/sec.
+    pub last_sample_ms: u64,
+}
+
+impl PriceHistory {
+    /// Max samples retained (≈1 sample/sec * 30 min = 1800).
+    pub const MAX_SAMPLES: usize = 1800;
+    /// Max fill markers retained.
+    pub const MAX_FILLS: usize = 500;
+
+    /// Push a price sample IF >= 1s since last. Trims to MAX_SAMPLES.
+    pub fn push_sample(&mut self, ts_ms: u64, price: Decimal) {
+        if price <= Decimal::ZERO {
+            return;
+        }
+        if ts_ms.saturating_sub(self.last_sample_ms) < 1000 && self.last_sample_ms != 0 {
+            return;
+        }
+        self.samples.push((ts_ms, price));
+        self.last_sample_ms = ts_ms;
+        if self.samples.len() > Self::MAX_SAMPLES {
+            let drop = self.samples.len() - Self::MAX_SAMPLES;
+            self.samples.drain(0..drop);
+        }
+    }
+
+    /// Push a fill marker. Trims to MAX_FILLS.
+    pub fn push_fill(&mut self, ts_ms: u64, price: Decimal, is_buy: bool) {
+        self.fills.push((ts_ms, price, is_buy));
+        if self.fills.len() > Self::MAX_FILLS {
+            let drop = self.fills.len() - Self::MAX_FILLS;
+            self.fills.drain(0..drop);
+        }
+    }
+}
+
 /// Shared state keyed by symbol. Wrap in `Arc` for cross-task sharing.
 #[derive(Clone)]
 pub struct SharedBotState {
     inner: Arc<Mutex<HashMap<String, BotView>>>,
+    /// Per-symbol price + fill history for the TUI chart.
+    history: Arc<RwLock<HashMap<String, PriceHistory>>>,
     /// Ordered list of symbols — the TUI's tab order. Kept in sync with
     /// the order bots were inserted.
     order: Arc<Mutex<Vec<String>>>,
@@ -145,6 +191,7 @@ impl SharedBotState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            history: Arc::new(RwLock::new(HashMap::new())),
             order: Arc::new(Mutex::new(Vec::new())),
             api_account: Arc::new(RwLock::new(None)),
             start_balance: Arc::new(RwLock::new(None)),
@@ -265,10 +312,12 @@ impl SharedBotState {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
+        let hist = self.history.read().ok();
         order
             .into_iter()
             .filter_map(|sym| {
                 let v = map.get(&sym)?;
+                let history = hist.as_ref().and_then(|h| h.get(&sym).cloned());
                 Some(BotViewSnapshot {
                     symbol: v.symbol.clone(),
                     label: v.label.clone(),
@@ -277,6 +326,7 @@ impl SharedBotState {
                     snapshot: v.snapshot.read().ok().and_then(|g| g.clone()),
                     live: v.live.read().ok().and_then(|g| g.clone()),
                     api_position: v.api_position.read().ok().and_then(|g| g.clone()),
+                    history,
                 })
             })
             .collect()
@@ -298,6 +348,31 @@ impl SharedBotState {
             *pos = Some(snapshot);
         }
     }
+
+    /// Append a price sample for `symbol` (downsampled to 1/sec by
+    /// PriceHistory::push_sample).
+    pub fn push_price_sample(&self, symbol: &str, ts_ms: u64, price: Decimal) {
+        if let Ok(mut g) = self.history.write() {
+            g.entry(symbol.to_string())
+                .or_default()
+                .push_sample(ts_ms, price);
+        }
+    }
+
+    /// Append a fill marker for `symbol`.
+    pub fn push_fill_marker(&self, symbol: &str, ts_ms: u64, price: Decimal, is_buy: bool) {
+        if let Ok(mut g) = self.history.write() {
+            g.entry(symbol.to_string())
+                .or_default()
+                .push_fill(ts_ms, price, is_buy);
+        }
+    }
+
+    /// Clone the current price history for `symbol` for read-only render.
+    #[allow(dead_code)]
+    pub fn price_history(&self, symbol: &str) -> Option<PriceHistory> {
+        self.history.read().ok()?.get(symbol).cloned()
+    }
 }
 
 /// Cloneable point-in-time view for the renderer.
@@ -318,6 +393,8 @@ pub struct BotViewSnapshot {
     pub live: Option<LiveSnapshot>,
     /// Latest Binance REST positionRisk snapshot, if any.
     pub api_position: Option<ApiPositionSnapshot>,
+    /// Rolling price + fill history for the chart panel.
+    pub history: Option<PriceHistory>,
 }
 
 /// Account-wide aggregate computed from all bot views.

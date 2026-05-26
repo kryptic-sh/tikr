@@ -94,6 +94,7 @@ pub fn spawn_bagboy(
         let mut total_spent_usdt = Decimal::ZERO;
         let mut total_base_acquired = Decimal::ZERO;
         let mut last_seen_base = Decimal::ZERO;
+        let mut last_known_bid = Decimal::ZERO;
         if let Ok(b) = client.balance(&base_asset).await {
             last_seen_base = b.free + b.locked;
             info!(
@@ -134,6 +135,20 @@ pub fn spawn_bagboy(
                     total_base = %total_base_acquired,
                     "bagboy: fill detected"
                 );
+                // Record fill on LiveSnapshot so the watcher task picks
+                // it up. Approximate price = last known bid.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                if let Ok(mut g) = live.write()
+                    && let Some(s) = g.as_mut()
+                {
+                    s.last_fill_ts = Some(now_ms * 1_000_000); // ns
+                    s.last_fill_side = Some(tikr_core::Side::Bid);
+                    s.last_fill_price = last_known_bid;
+                    s.last_fill_size = delta;
+                }
                 last_seen_base = cur_base;
             }
 
@@ -175,6 +190,7 @@ pub fn spawn_bagboy(
                 );
                 continue;
             }
+            last_known_bid = book.bid_price;
 
             // 4. USDT balance gate — skip placements if we can't afford
             //    even one min-notional order. Avoids -2010 / insufficient

@@ -138,6 +138,60 @@ struct AccountPollerConfig {
     bnb_price_tx: watch::Sender<Decimal>,
 }
 
+/// Spawn a 1-Hz watcher that reads each bot's LiveSnapshot and pushes
+/// `last_bid` as a price-history sample + any new fills as markers.
+/// Single source for the TUI price-chart panel — works across tide,
+/// SS, bagboy, etc. without touching the runner.
+fn spawn_price_history_watcher(state: SharedBotState, mut shutdown: watch::Receiver<bool>) {
+    tokio::spawn(async move {
+        use std::collections::HashMap;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Per-symbol last_fill_ts seen, so we only push new fills.
+        let mut last_fill_ts: HashMap<String, u64> = HashMap::new();
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = shutdown.changed() => if *shutdown.borrow() { return; }
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            for view in state.views() {
+                // Sample best_bid (fallback to last_mid).
+                let (bid, fill_ts, fill_side, fill_price) = match view.live.as_ref() {
+                    Some(s) => (
+                        if s.last_bid > Decimal::ZERO {
+                            s.last_bid
+                        } else {
+                            s.last_mid
+                        },
+                        s.last_fill_ts,
+                        s.last_fill_side,
+                        s.last_fill_price,
+                    ),
+                    None => (Decimal::ZERO, None, None, Decimal::ZERO),
+                };
+                if bid > Decimal::ZERO {
+                    state.push_price_sample(&view.symbol, now_ms, bid);
+                }
+                // Detect new fill via last_fill_ts delta.
+                if let (Some(ts_ns), Some(side)) = (fill_ts, fill_side)
+                    && fill_price > Decimal::ZERO
+                {
+                    let prev = last_fill_ts.get(&view.symbol).copied().unwrap_or(0);
+                    if ts_ns > prev {
+                        let is_buy = matches!(side, tikr_core::Side::Bid);
+                        state.push_fill_marker(&view.symbol, ts_ns / 1_000_000, fill_price, is_buy);
+                        last_fill_ts.insert(view.symbol.clone(), ts_ns);
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
@@ -487,6 +541,9 @@ async fn main() -> anyhow::Result<()> {
     });
     // Silence unused-rx warning until user_stream parser wires it up.
     let _bnb_price_rx_for_parser = bnb_price_rx.clone();
+
+    // Price-history watcher — drives the TUI chart panel.
+    spawn_price_history_watcher(shared_state.clone(), global_shutdown_rx.clone());
 
     // BNB-balance monitor — warns when balance drops below threshold.
     // No-ops when bnb_refill_enabled=false in TOML OR when the account
