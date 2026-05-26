@@ -16,7 +16,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
 use tokio::sync::watch;
@@ -848,9 +848,9 @@ fn draw_body(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(31), // left: bot detail
+            Constraint::Length(34), // left: bot detail
             Constraint::Min(40),    // middle: logs
-            Constraint::Length(31), // right: account
+            Constraint::Length(34), // right: account
         ])
         .split(area);
 
@@ -1135,15 +1135,20 @@ fn draw_account(
     }
 
     let total = lines.len() as u16;
-    // Visible content rows = inner area height (minus 2 border rows).
-    let visible = area.height.saturating_sub(2);
+    // Visible rows = area.height − 2 borders − 2 padding (top+bot).
+    let visible = area.height.saturating_sub(4);
     ui.last_account_total = total;
     ui.last_account_visible = visible;
     ui.last_account_rect = Some(area);
     let scroll = UiState::clamp_scroll(ui.account_scroll, total, visible);
     ui.account_scroll = scroll;
     let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" account "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::uniform(1))
+                .title(" account "),
+        )
         .scroll((scroll, 0));
     f.render_widget(p, area);
 }
@@ -1308,8 +1313,12 @@ fn draw_bot_detail(
 ) {
     ui.last_bot_rect = Some(area);
     let Some(v) = active else {
-        let p =
-            Paragraph::new("no bot").block(Block::default().borders(Borders::ALL).title(" bot "));
+        let p = Paragraph::new("no bot").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::uniform(1))
+                .title(" bot "),
+        );
         f.render_widget(p, area);
         return;
     };
@@ -1592,13 +1601,18 @@ fn draw_bot_detail(
     }
 
     let total = lines.len() as u16;
-    let visible = area.height.saturating_sub(2);
+    let visible = area.height.saturating_sub(4);
     ui.last_bot_total = total;
     ui.last_bot_visible = visible;
     let scroll = UiState::clamp_scroll(ui.bot_scroll, total, visible);
     ui.bot_scroll = scroll;
     let p = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" bot "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .padding(Padding::uniform(1))
+                .title(" bot "),
+        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
@@ -1646,9 +1660,10 @@ fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {
     d.to_f64().unwrap_or(0.0)
 }
 
-/// Side panel inner width (panel width - 2 border chars). Both left
-/// and right side panels are 31 wide → 29 chars inside.
-const SIDE_PANEL_INNER: usize = 29;
+/// Side panel content width = panel width (34) − 2 borders − 2 padding
+/// (1 char each side). Vertical layout uses the matching `area.height
+/// − 4` for the visible row count.
+const SIDE_PANEL_INNER: usize = 30;
 
 /// Build a label/value row that left-aligns the label and
 /// right-aligns the value to fill `SIDE_PANEL_INNER`. Inserts a
