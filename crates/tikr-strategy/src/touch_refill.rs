@@ -359,29 +359,21 @@ impl Strategy for TouchRefill {
         }
 
         // Rule 2: on FULL fill, place opposite-side close at a
-        // distance that satisfies min_self_spread_bps. Partial fills
+        // distance defined by close_profit_bps. Partial fills
         // (is_full=false) skip the close — there's still residual
-        // size on the same side that'll catch the rest of the flow;
-        // we don't want to pre-place a close for a position that's
-        // still being built.
+        // size on the same side that'll catch the rest of the flow.
         //
-        // Close distance = max(1 tick, ceil(min_self_spread × fill_price
-        //   / 10000 / tick) × tick). Always ≥ 1 tick; bumped to whatever
-        // satisfies min_self_spread_bps on tight-tick markets.
+        // When close_profit_bps = 0, Rule 2 is DISABLED entirely —
+        // grid-only mode. Filled orders are not re-paired with a
+        // close target; position drains only via grid maintenance on
+        // the opposite side.
         if let MarketEvent::Fill(fill) = event
             && fill.is_full
+            && self.config.close_profit_bps > 0
         {
             let tick = self.config.tick_size;
             if tick > Decimal::ZERO && fill.price.0 > Decimal::ZERO {
-                // close_profit_bps overrides min_self_spread_bps when set.
-                // Otherwise the close distance falls back to the
-                // self-spread requirement (whatever keeps the grid tops
-                // apart). Either way, always ≥ 1 tick.
-                let close_bps = if self.config.close_profit_bps > 0 {
-                    self.config.close_profit_bps
-                } else {
-                    self.config.min_self_spread_bps
-                };
+                let close_bps = self.config.close_profit_bps;
                 let target_distance =
                     fill.price.0 * Decimal::from(close_bps) / Decimal::from(10_000);
                 let close_distance = if target_distance > tick {

@@ -1646,6 +1646,22 @@ fn draw_bot_detail(
             format!("{}", lv.buy_fills),
             format!("{}", lv.sell_fills),
         ));
+        // Effective per-order notional after venue min_notional auto-bump.
+        // Derived from the most recent fill (price × size) — that IS the
+        // actual order size the bot placed. Falls back to "—" before any
+        // fill has happened in this session.
+        let order_usdt = lv.last_fill_price * lv.last_fill_size;
+        let order_str = if order_usdt > Decimal::ZERO {
+            format!("{:>.2}", dec_to_f64(order_usdt))
+        } else {
+            "—".to_string()
+        };
+        lines.push(kv_line(
+            "order $",
+            order_str,
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::White),
+        ));
         if let Some(side) = lv.last_fill_side {
             let (tag, col) = match side {
                 tikr_core::Side::Bid => ("BUY ", Color::Green),

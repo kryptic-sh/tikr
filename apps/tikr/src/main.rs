@@ -268,8 +268,7 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     // max_position_pct is per-bot, NOT split across bots.
                     // 100 = each bot can hold up to 100% of wallet notional.
                     // Total risk capped by Binance margin engine + leverage.
-                    let max_position =
-                        total_balance * cfg.max_position_pct / Decimal::from(100);
+                    let max_position = total_balance * cfg.max_position_pct / Decimal::from(100);
                     if max_position != *cfg.max_position_tx.borrow() {
                         let _ = cfg.max_position_tx.send(max_position);
                     }
