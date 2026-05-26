@@ -1,0 +1,32 @@
+[account]
+env = "futures-mainnet"
+state_dir = "./state/sg-mainnet"
+order_balance_pct = "1"
+
+
+[[bot]]
+symbol = "PLAYUSDT"
+strategy = "static-grid"
+
+[bot.sg]
+levels = 2
+inner_bps = 8
+step_bps = 2
+auto_skew = true
+regime_window_secs = 300
+regime_efficiency_threshold = "0.3"
+
+
+# ─── Defaults reference ───────────────────────────────────────────────────
+# notional                       = (account.order_balance_pct split)
+# levels                         = 3      # orders/side
+# inner_bps                      = 3      # innermost offset from mid
+# step_bps                       = 3      # spacing between levels
+# target_fills_per_min           = 0      # adaptive scaler off
+# fillrate_window_secs           = 60
+# scale_min                      = "1.0"
+# scale_max                      = "4.0"
+# auto_skew                      = true
+# regime_window_secs             = 0      # 0 disables regime gating
+# regime_trend_threshold_bps     = 10     # used when efficiency_threshold == 0
+# regime_efficiency_threshold    = "0"    # Kaufman ratio gate, "0.3" recommended
