@@ -108,6 +108,43 @@ pub struct SpreadScalpConfig {
     /// stop (only after `adverse_stop_after_secs` elapsed). `0`
     /// disables even when the time gate is set.
     pub adverse_stop_drift_bps: u32,
+    /// Tick offset from touch for quote placement.
+    ///
+    /// - `-1` (default) — legacy SS: quote 1 tick INSIDE the touch
+    ///   (`bid = top.bid + 1 tick`, `ask = top.ask − 1 tick`). Captures
+    ///   dislocation cascades when book widens past `min_spread_bps`.
+    ///   Requires book spread ≥ 2 ticks (otherwise quotes would cross).
+    ///
+    /// - `0` — join the queue AT the touches (`bid = top.bid`,
+    ///   `ask = top.ask`). Works even on 1-tick-wide books. Sits at
+    ///   the back of the queue at each touch level.
+    ///
+    /// - `+1`, `+2`, … — quote N ticks OUTSIDE the touches
+    ///   (`bid = top.bid − N×tick`, `ask = top.ask + N×tick`). Tick-floor
+    ///   sitter mode: we own our own level, no queue competition. Each
+    ///   RT captures `(2N+1) × tick_bps` gross. Best fit for wide-tick
+    ///   symbols (WIF/ADA/SAGA/ESPORTS at 4-20bps per tick) where book
+    ///   spread is structurally 1 tick.
+    ///
+    /// When `>= 0`, the "would-cross" guard in compute_targets is a
+    /// no-op (we're at or outside touches, never inside).
+    pub quote_offset_ticks: i32,
+    /// Close-side target distance in TICKS from `avg_entry`, used only
+    /// when `quote_offset_ticks >= 0` (tick mode). Default `0` means
+    /// "auto" — derives `quote_offset_ticks + 1` so a (2N+1)-tick RT
+    /// is the natural exit symmetric to the entry placement.
+    ///
+    /// Tick mode close logic: place the closing quote at
+    ///   long  → ask @ max(avg_entry + N×tick, touch_based_ask)
+    ///   short → bid @ min(avg_entry − N×tick, touch_based_bid)
+    /// This guarantees we never close at a loss (the avg-anchored
+    /// floor) while still capturing the bonus when the market has
+    /// moved past target (the touch-based fallback). Pure tick math —
+    /// no bps involved.
+    ///
+    /// Has no effect in legacy SS mode (`quote_offset_ticks = -1`):
+    /// that path still uses `min_spread_bps` via `try_keep_close_side`.
+    pub close_target_ticks: u32,
 }
 
 /// Spread scalping strategy state.
@@ -154,11 +191,26 @@ impl SpreadScalp {
         if spread_bps < effective_min {
             return None;
         }
-        // Quote 1 tick inside the best level so PostOnly orders don't get
-        // rejected (-5022) when the market moves between snapshot and
-        // placement.
-        let bid = Price(top.bid.0 + tick);
-        let ask = Price(top.ask.0 - tick);
+        // Quote placement is parameterised by `quote_offset_ticks`:
+        //   -1 (default) — 1 tick INSIDE touches (legacy SS, captures
+        //       cascade widenings; requires book >= 2 ticks wide).
+        //    0           — AT touches (joins queue at top bid/ask).
+        //   +1, +2…      — N ticks OUTSIDE touches (tick-floor sitter:
+        //       owns its own level, captures (2N+1) ticks per RT).
+        //
+        // The would-cross guard below only fires when offset == -1 and
+        // book is at the 1-tick floor; for offset >= 0 the quotes are
+        // at or outside touches, never crossing.
+        let off = self.config.quote_offset_ticks;
+        let (bid, ask) = if off >= 0 {
+            let n = Decimal::from(off);
+            (Price(top.bid.0 - n * tick), Price(top.ask.0 + n * tick))
+        } else {
+            // off < 0 → inside touches by |off| ticks. Negate to get
+            // positive distance; for off=-1, inside by 1 tick.
+            let n = Decimal::from(-off);
+            (Price(top.bid.0 + n * tick), Price(top.ask.0 - n * tick))
+        };
         if bid.0 >= ask.0 {
             return None;
         }
@@ -306,6 +358,13 @@ impl SpreadScalp {
         ask: Price,
         ts: Timestamp,
     ) -> Vec<Action> {
+        // Tick mode close-side override. When in tick mode (offset >= 0)
+        // and holding inventory, the close-side quote from compute_targets
+        // is touch-anchored — it follows the market and can sit BELOW
+        // avg_entry (covering at a loss). Replace it with an avg-anchored
+        // target that takes max(avg+N_tick, touch) for long close,
+        // min(avg-N_tick, touch) for short close. Pure tick math.
+        let (bid, ask) = self.apply_tick_mode_close_target(ctx, bid, ask);
         let size_mult = self.inventory_size_multiplier(ctx);
         self.last_bid = Some(bid);
         self.last_ask = Some(ask);
@@ -342,6 +401,66 @@ impl SpreadScalp {
             actions.push(Action::NoOp);
         }
         actions
+    }
+
+    /// In tick mode (`quote_offset_ticks >= 0`) with non-zero inventory,
+    /// override the close-side quote price with an avg-anchored target
+    /// using pure tick math (no bps). Returns possibly-modified `(bid, ask)`.
+    ///
+    /// Long  → ask close: max(avg_entry + N×tick, touch_ask) — never
+    ///   close below profitable target; capture bonus if market is past.
+    /// Short → bid close: min(avg_entry − N×tick, touch_bid) — never
+    ///   cover above profitable target; capture bonus if market is past.
+    ///
+    /// N = `close_target_ticks` config, defaulting to `quote_offset_ticks + 1`
+    /// (so a 2N+1 tick RT is the natural exit symmetric to entry).
+    fn apply_tick_mode_close_target(
+        &self,
+        ctx: &StrategyContext<'_>,
+        bid: Price,
+        ask: Price,
+    ) -> (Price, Price) {
+        if self.config.quote_offset_ticks < 0 {
+            return (bid, ask);
+        }
+        let pos_size = ctx.position.size.0;
+        if pos_size == Decimal::ZERO {
+            return (bid, ask);
+        }
+        let avg = ctx.position.avg_entry.0;
+        if avg <= Decimal::ZERO {
+            return (bid, ask);
+        }
+        let n_ticks = if self.config.close_target_ticks > 0 {
+            self.config.close_target_ticks as i32
+        } else {
+            self.config.quote_offset_ticks + 1
+        };
+        let tick = self.config.tick_size;
+        let target_distance = Decimal::from(n_ticks) * tick;
+        if pos_size > Decimal::ZERO {
+            // Long: close is ASK. Target = avg + N*tick (above entry).
+            // Use max(target, touch-based ask) so we never sit below
+            // target but DO capture bonus when market is past.
+            let target_ask = Price(avg + target_distance);
+            let safe_ask = if target_ask.0 > ask.0 {
+                target_ask
+            } else {
+                ask
+            };
+            (bid, safe_ask)
+        } else {
+            // Short: close is BID. Target = avg - N*tick (below entry).
+            // Use min(target, touch-based bid) so we never sit above
+            // target but DO capture bonus when market is past.
+            let target_bid = Price(avg - target_distance);
+            let safe_bid = if target_bid.0 < bid.0 {
+                target_bid
+            } else {
+                bid
+            };
+            (safe_bid, ask)
+        }
     }
 
     fn inventory_size_multiplier(&self, ctx: &StrategyContext<'_>) -> (Decimal, Decimal) {
@@ -634,8 +753,18 @@ impl Strategy for SpreadScalp {
                             Side::Bid => top.ask,
                             Side::Ask => top.bid,
                         };
+                        // Lot-step-round the position size directly. DO NOT
+                        // call quote_size here — that helper divides by
+                        // price to convert NOTIONAL→qty; we already have
+                        // the qty (contracts) and just need it on the lot
+                        // grid for the venue to accept the IOC.
                         let qty = pos_size.abs();
-                        let stop_qty = quote_size(qty, touch, Decimal::ONE, self.config.step_size);
+                        let step = self.config.step_size;
+                        let stop_qty = if step > Decimal::ZERO {
+                            (qty / step).floor() * step
+                        } else {
+                            qty
+                        };
                         if stop_qty > Decimal::ZERO {
                             self.cycle_start_ts = None;
                             let mut actions: Vec<Action> = Vec::with_capacity(3);
@@ -998,6 +1127,8 @@ mod tests {
             close_decay_factor_2: Decimal::ONE,
             adverse_stop_after_secs: 0,
             adverse_stop_drift_bps: 0,
+            quote_offset_ticks: -1,
+            close_target_ticks: 0,
         })
     }
 

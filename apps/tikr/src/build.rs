@@ -389,6 +389,8 @@ fn build_spread_scalp(
         close_decay_factor_2: spread_scalp.close_decay_factor_2,
         adverse_stop_after_secs: spread_scalp.adverse_stop_after_secs,
         adverse_stop_drift_bps: spread_scalp.adverse_stop_drift_bps,
+        quote_offset_ticks: spread_scalp.quote_offset_ticks,
+        close_target_ticks: spread_scalp.close_target_ticks,
     }))
 }
 

@@ -315,6 +315,21 @@ struct Args {
     #[arg(long, default_value_t = 30u32)]
     spread_scalp_adverse_stop_drift_bps: u32,
 
+    /// SpreadScalp quote-placement offset in ticks (signed).
+    /// `-1` (default, legacy SS): 1 tick INSIDE touches, requires
+    /// book >= 2 ticks wide. `0`: AT touches, joins queue. `+1`, `+2`:
+    /// N ticks OUTSIDE touches (tick-floor sitter — owns its own level,
+    /// captures (2N+1) ticks per RT; best on wide-tick symbols).
+    #[arg(long, default_value_t = -1i32, allow_hyphen_values = true)]
+    spread_scalp_quote_offset_ticks: i32,
+
+    /// SpreadScalp tick-mode close target in ticks (used only when
+    /// `quote_offset_ticks >= 0`). Close-side quote sits at
+    /// `avg_entry ± N×tick` on the favorable side, taking the better
+    /// of (target, touch). `0` (default) = auto = `quote_offset_ticks+1`.
+    #[arg(long, default_value_t = 0u32)]
+    spread_scalp_close_target_ticks: u32,
+
     /// LiqFade: directory holding `record_liquidations`-style parquet
     /// shards (per-day `YYYY-MM-DD/all_symbols.parquet`). Empty (default)
     /// disables LiqFade — the preset is skipped even when included in
@@ -1747,6 +1762,8 @@ async fn run_sweep_collect(
                         )?,
                         adverse_stop_after_secs: args.spread_scalp_adverse_stop_after_secs,
                         adverse_stop_drift_bps: args.spread_scalp_adverse_stop_drift_bps,
+                        quote_offset_ticks: args.spread_scalp_quote_offset_ticks,
+                        close_target_ticks: args.spread_scalp_close_target_ticks,
                     }),
                     fees,
                     skim_cfg,

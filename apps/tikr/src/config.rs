@@ -608,6 +608,22 @@ pub struct SpreadScalpParams {
     /// 2026-05-25 sweep winner. Set `0` to disable.
     #[serde(default = "spread_scalp_default_adverse_stop_drift_bps")]
     pub adverse_stop_drift_bps: u32,
+    /// Tick offset from touch for quote placement (signed).
+    /// `-1` (default): 1 tick INSIDE — legacy SS, captures cascade
+    /// widenings (requires book >= 2 ticks wide).
+    /// `0`: AT touches, joins queue.
+    /// `+1`, `+2`, …: N ticks OUTSIDE — tick-floor sitter (owns its
+    /// own level, captures (2N+1) ticks per RT). Best on wide-tick
+    /// symbols where book sits at 1-tick floor.
+    #[serde(default = "spread_scalp_default_quote_offset_ticks")]
+    pub quote_offset_ticks: i32,
+    /// Tick-mode close target in ticks from `avg_entry`. Only used when
+    /// `quote_offset_ticks >= 0`. `0` (default) = auto =
+    /// `quote_offset_ticks + 1`. Close quote sits at avg±N×tick on the
+    /// favorable side, taking max(target, touch) for long-close /
+    /// min(target, touch) for short-close. Pure tick math, no bps.
+    #[serde(default)]
+    pub close_target_ticks: u32,
 }
 
 fn spread_scalp_default_min_spread_bps() -> Decimal {
@@ -642,6 +658,9 @@ fn spread_scalp_default_adverse_stop_after_secs() -> u64 {
 }
 fn spread_scalp_default_adverse_stop_drift_bps() -> u32 {
     30
+}
+fn spread_scalp_default_quote_offset_ticks() -> i32 {
+    -1
 }
 
 /// Parse a TOML config file.

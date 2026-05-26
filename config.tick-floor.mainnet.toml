@@ -1,0 +1,142 @@
+# ─── Tick-Floor Sitter on Binance Futures MAINNET ────────────────────────
+#
+# Live config testing the new SS `quote_offset_ticks` mode on 4
+# wide-tick mainnet perps where book sits at 1-tick spread. Each bot
+# posts N ticks OUTSIDE the touches (owns its own level, no queue
+# competition).
+#
+# Pure tick math — NO bps used for placement decisions:
+#   - Entry  side: `top.bid − N×tick` / `top.ask + N×tick`
+#   - Close  side: max(`avg_entry + M×tick`, touch) for long-close
+#                  min(`avg_entry − M×tick`, touch) for short-close
+#   - `close_target_ticks = 0` → auto = `quote_offset_ticks + 1`
+#     so a symmetric (2N+1)-tick RT is the natural exit
+#
+# Expected per-RT gross spread (N=offset, M=close_target):
+#   off=1, M=2 (auto):  3-tick RT capture
+#   off=2, M=3 (auto):  5-tick RT capture
+#   Minus 4bps maker fees = realized edge per RT
+#
+# Per-symbol math (gross − fees):
+#   ESPORTS  : 60 − 4 = 56 bps net per RT (offset=1, tick=19.84bps)
+#   WIF      : 25 − 4 = 21 bps net per RT (offset=2, tick=5.07bps)
+#   ADA      : 20 − 4 = 16 bps net per RT (offset=2, tick=4.05bps)
+#   NEAR     : 18 − 4 = 14 bps net per RT (offset=2, tick=3.62bps)
+#
+# Pre-flight checklist:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1 set in shell
+#   2. .env loaded with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Futures account activated, USDT >= $200 in Futures wallet
+#   4. Leverage 1x on all 4 symbols (default may be 20x — change in UI)
+#
+# Sizing per bot (auto-derived from wallet via account.* percentages):
+#   - order_balance_pct = 1.5%   per-order notional
+#   - max_position_pct  = 4%     per-bot cap
+#
+# At $200 wallet across 4 symbols: $3/order, $8 cap/bot = $32 total.
+# At $700 wallet:                  $10.50/order, $28 cap/bot = $112 total.
+# Adjust pct values if you want bigger exposure.
+#
+# Adverse stop = safety backstop. Time gate 120s. Drift threshold
+# sized per-symbol to ~3-4 ticks (= one fat market move against us).
+
+
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tick-floor"
+
+# Credentials: .env auto-loaded by dotenvy, OR shell env vars
+# TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET.
+
+order_balance_pct = "1.5"
+max_position_pct = "4"
+
+
+# ─── ESPORTSUSDT ──────────────────────────────────────────────────────────
+#
+# Tick = 19.84 bps of price (post-crash). 3-tick RT = ~60bps gross.
+# Adverse stop at 50bps = ~2.5 ticks → fires on any meaningful drift.
+# CAVEAT: token nuked -93% in 24h; adverse selection extreme right
+# now. Test with tiny notional first. May need to wait 24-48h for
+# vol to settle before stable edge.
+
+[[bot]]
+symbol = "ESPORTSUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0          # AT touches (join queue)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 1
+close_side_always_quotes = true
+
+# Adverse stop scaled to symbol tick.
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 50   # ~2.5 ticks at 20bps/tick
+
+
+# ─── WIFUSDT ──────────────────────────────────────────────────────────────
+#
+# Tick = 5.07 bps. 3-tick RT = ~15bps gross.
+# Adverse stop at 20bps = 4 ticks.
+
+[[bot]]
+symbol = "WIFUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1          # 2 ticks outside touch
+close_target_ticks = 2          # close at avg ± 3 ticks (5-tick RT)
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 3
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 20     # ~4 ticks at 5bps/tick
+
+
+# ─── ADAUSDT ──────────────────────────────────────────────────────────────
+#
+# Tick = 4.05 bps. 3-tick RT = ~12bps gross.
+# Adverse stop at 16bps = 4 ticks.
+
+[[bot]]
+symbol = "ADAUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1          # 2 ticks outside touch
+close_target_ticks = 2          # close at avg ± 3 ticks (5-tick RT)
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 3
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 16     # ~4 ticks at 4bps/tick
+
+
+# ─── NEARUSDT ─────────────────────────────────────────────────────────────
+#
+# Tick = 3.62 bps. 3-tick RT = ~11bps gross.
+# Adverse stop at 14bps = ~4 ticks.
+
+[[bot]]
+symbol = "NEARUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1          # 2 ticks outside touch
+close_target_ticks = 2          # close at avg ± 3 ticks (5-tick RT)
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 3
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 14     # ~4 ticks at 3.6bps/tick

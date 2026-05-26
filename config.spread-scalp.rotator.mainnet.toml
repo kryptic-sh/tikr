@@ -71,17 +71,17 @@ min_quote_volume = 100000000
 # 8bps trigger has natural cascade events to capture (per 2026-05-25
 # probe of mainnet alts).
 candidates = [
-    "DOGEUSDT",    # confirmed winner — 0.97bps tick, 279M vol
-    "NEARUSDT",    # 3.62bps tick, 777M vol, +14.7% / 20.9% range
-    "SUIUSDT",     # 0.95bps tick, 213M vol
-    "ONDOUSDT",    # 2.30bps tick, 177M vol
-    "NILUSDT",     # 1.14bps tick, 359M vol, high volatility
-    "INJUSDT",     # 1.74bps tick, 114M vol, +10% / 14% range
-    "WLDUSDT",     # 3.27bps tick, 133M vol
-    "1000SHIBUSDT", # 1.78bps tick, 26M vol (borderline)
-    "ADAUSDT",     # 4.08bps tick, 122M vol (wide tick)
-    "AVAXUSDT",    # 1.06bps tick, 92M vol
-    "LINKUSDT",    # 1.04bps tick, 82M vol
+    # "DOGEUSDT",    # confirmed winner — 0.97bps tick, 279M vol
+    # "NEARUSDT",    # 3.62bps tick, 777M vol, +14.7% / 20.9% range
+    # "SUIUSDT",     # 0.95bps tick, 213M vol
+    # "ONDOUSDT",    # 2.30bps tick, 177M vol
+    # "NILUSDT",     # 1.14bps tick, 359M vol, high volatility
+    # "INJUSDT",     # 1.74bps tick, 114M vol, +10% / 14% range
+    # "WLDUSDT",     # 3.27bps tick, 133M vol
+    # "1000SHIBUSDT", # 1.78bps tick, 26M vol (borderline)
+    # "ADAUSDT",     # 4.08bps tick, 122M vol (wide tick)
+    # "AVAXUSDT",    # 1.06bps tick, 92M vol
+    # "LINKUSDT",    # 1.04bps tick, 82M vol
 ]
 
 
