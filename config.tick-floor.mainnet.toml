@@ -157,3 +157,157 @@ price_tolerance_ticks = 2
 close_side_always_quotes = true
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 14     # ~4 ticks at 3.6bps/tick
+
+
+# ─── Additional wide-tick perps ───────────────────────────────────────────
+#
+# Picked from Binance Futures exchangeInfo + 24h volume snapshot
+# (2026-05-26). Same offset=1 / close_target=1 / price_tolerance=2
+# template; adverse_stop scaled to ~4 ticks per symbol. All have
+# >= $20M 24h quote volume for execution quality.
+#
+# Per-symbol tick width + adverse stop:
+#   XPL      : 11.14 bps tick → 45 bps drift = 4 ticks
+#   FIL      :  9.83 bps tick → 40 bps drift
+#   ARB      :  8.87 bps tick → 36 bps drift
+#   DOT      :  7.82 bps tick → 31 bps drift
+#   OP       :  7.52 bps tick → 30 bps drift
+#   ERA      :  7.20 bps tick → 29 bps drift
+#   ATOM     :  4.49 bps tick → 18 bps drift
+#   RENDER   :  4.21 bps tick → 17 bps drift
+
+
+# ─── XPLUSDT ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "XPLUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 45
+
+
+# ─── FILUSDT ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "FILUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 40
+
+
+# ─── ARBUSDT ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ARBUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 36
+
+
+# ─── DOTUSDT ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "DOTUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 31
+
+
+# ─── OPUSDT ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "OPUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
+
+# ─── ERAUSDT ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ERAUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 29
+
+
+# ─── ATOMUSDT ─────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ATOMUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 18
+
+
+# ─── RENDERUSDT ───────────────────────────────────────────────────────────
+[[bot]]
+symbol = "RENDERUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 1
+close_target_ticks = 1
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 2
+close_side_always_quotes = true
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 17
