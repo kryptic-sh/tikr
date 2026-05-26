@@ -269,6 +269,13 @@ pub struct TouchRefillAutoConfig {
     /// USDC, so you'll need USDC in your futures wallet to trade them.
     #[serde(default = "touch_refill_auto_default_quote_asset")]
     pub quote_asset: String,
+    /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
+    /// When non-empty, discovery STILL applies `min_tick_bps` +
+    /// `min_volume_usdt` filters but then restricts further to symbols
+    /// in this list. When empty (default), every qualifying symbol
+    /// passes — original auto behavior.
+    #[serde(default)]
+    pub symbols_allowlist: Vec<String>,
 }
 
 fn touch_refill_auto_default_min_tick_bps() -> Decimal {

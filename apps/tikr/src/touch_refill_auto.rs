@@ -107,9 +107,14 @@ pub fn spawn_touch_refill_auto_manager(
                 }
             };
 
+            let allowlist: HashSet<&str> =
+                cfg.symbols_allowlist.iter().map(|s| s.as_str()).collect();
             let mut qualifying: HashSet<String> = HashSet::new();
             for row in discovered {
                 if row.tick_bps >= cfg.min_tick_bps && row.quote_volume_24h >= cfg.min_volume_usdt {
+                    if !allowlist.is_empty() && !allowlist.contains(row.symbol.as_str()) {
+                        continue;
+                    }
                     qualifying.insert(row.symbol);
                 }
             }
