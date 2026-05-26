@@ -1282,37 +1282,31 @@ fn draw_chart(
         return;
     }
 
-    // X-axis: use sample index as x (sequence). Skip wall-clock for now —
-    // 1-sample/sec means index ≈ seconds-ago when reversed.
+    // Window the chart to the last 60 seconds.
+    const WINDOW_MS: u64 = 60_000;
+    let last_ts = hist.samples.last().map(|(t, _)| *t).unwrap_or(0);
+    let cutoff = last_ts.saturating_sub(WINDOW_MS);
     let line_pts: Vec<(f64, f64)> = hist
         .samples
         .iter()
-        .enumerate()
-        .map(|(i, (_, p))| (i as f64, dec_to_f64(*p)))
+        .filter(|(t, _)| *t >= cutoff)
+        .map(|(t, p)| {
+            // X = seconds-ago (negative left, 0 right) for intuitive read.
+            let x = -((last_ts.saturating_sub(*t)) as f64 / 1000.0);
+            (x, dec_to_f64(*p))
+        })
         .collect();
-
-    let last_ts = hist.samples.last().map(|(t, _)| *t).unwrap_or(0);
-    let first_ts = hist.samples.first().map(|(t, _)| *t).unwrap_or(0);
-    let span_ms = last_ts.saturating_sub(first_ts).max(1);
-    // Map fill timestamps to x indices in the samples timeline.
-    let map_x = |fill_ts: u64| -> f64 {
-        if last_ts <= first_ts {
-            0.0
-        } else {
-            let frac = fill_ts.saturating_sub(first_ts) as f64 / span_ms as f64;
-            frac * (hist.samples.len() as f64 - 1.0)
-        }
-    };
+    let map_x = |fill_ts: u64| -> f64 { -((last_ts.saturating_sub(fill_ts)) as f64 / 1000.0) };
     let buy_pts: Vec<(f64, f64)> = hist
         .fills
         .iter()
-        .filter(|(_, _, is_buy)| *is_buy)
+        .filter(|(t, _, is_buy)| *is_buy && *t >= cutoff)
         .map(|(ts, p, _)| (map_x(*ts), dec_to_f64(*p)))
         .collect();
     let sell_pts: Vec<(f64, f64)> = hist
         .fills
         .iter()
-        .filter(|(_, _, is_buy)| !is_buy)
+        .filter(|(t, _, is_buy)| !*is_buy && *t >= cutoff)
         .map(|(ts, p, _)| (map_x(*ts), dec_to_f64(*p)))
         .collect();
 
@@ -1333,7 +1327,10 @@ fn draw_chart(
     let pad = (hi - lo) * 0.02;
     let y_lo = lo - pad;
     let y_hi = hi + pad;
-    let x_hi = (hist.samples.len() as f64 - 1.0).max(1.0);
+    // X bounds: -60s to 0s. Always show the full minute window for
+    // consistent scale even when fewer samples exist.
+    let x_lo = -(WINDOW_MS as f64 / 1000.0);
+    let x_hi = 0.0_f64;
 
     let datasets = vec![
         Dataset::default()
@@ -1361,7 +1358,8 @@ fn draw_chart(
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, x_hi]),
+                .bounds([x_lo, x_hi])
+                .labels(vec![Line::from("-60s"), Line::from("now")]),
         )
         .y_axis(
             Axis::default()

@@ -443,9 +443,7 @@ impl Strategy for Tide {
             let bid_upper = top + step;
             let bid_floor_active = top - Decimal::from(levels.saturating_sub(1).max(1)) * step;
             for (id, q) in ctx.open_quotes {
-                if q.side == Side::Bid
-                    && (q.price.0 < bid_floor_active || q.price.0 > bid_upper)
-                {
+                if q.side == Side::Bid && (q.price.0 < bid_floor_active || q.price.0 > bid_upper) {
                     actions.push(Action::Cancel(*id));
                 }
             }
@@ -459,8 +457,7 @@ impl Strategy for Tide {
             let ask_ceiling_active = top + Decimal::from(levels.saturating_sub(1).max(1)) * step;
             let ask_lower = top - step;
             for (id, q) in ctx.open_quotes {
-                if q.side == Side::Ask
-                    && (q.price.0 > ask_ceiling_active || q.price.0 < ask_lower)
+                if q.side == Side::Ask && (q.price.0 > ask_ceiling_active || q.price.0 < ask_lower)
                 {
                     actions.push(Action::Cancel(*id));
                 }
