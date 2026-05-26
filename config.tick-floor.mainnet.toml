@@ -49,8 +49,25 @@ state_dir = "./state/tick-floor"
 # Credentials: .env auto-loaded by dotenvy, OR shell env vars
 # TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET.
 
-order_balance_pct = "1.5"
-max_position_pct = "4"
+order_balance_pct = "1"
+max_position_pct = "5"
+
+# ─── BNB-fee mode (auto-detected) ─────────────────────────────────────────
+#
+# tikr calls `GET /fapi/v1/feeBurn` at startup and adopts whatever your
+# Binance account toggle says — no manual setting here. When ON, tikr:
+#   - converts BNB commissions → USDT-equivalent for accurate tracker fees
+#   - displays BNB balance + USDT-value in the api-account sidebar
+#   - includes BNB-balance delta in the api-net PnL calculation
+#   - (optionally) auto-refills BNB when balance drops below threshold
+#
+# Refill defaults (safe starter values, override if needed):
+#   bnb_min_balance_usdt    = "1"      # refill trigger ($)
+#   bnb_target_balance_usdt = "50"     # buy enough to reach this ($)
+#   bnb_refill_enabled      = true     # auto-buy on spot + transfer
+#
+# When feeBurn is OFF on the Binance account, ALL BNB settings are
+# ignored: fees stay in USDT, no refill, no BNB row in TUI.
 
 
 # ─── ESPORTSUSDT ──────────────────────────────────────────────────────────
@@ -68,7 +85,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # AT touches (join queue)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 1000
 reject_cooldown_ms = 2000
 price_tolerance_ticks = 1
@@ -91,10 +108,10 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 1          # 2 ticks outside touch
-close_target_ticks = 2          # close at avg ± 3 ticks (5-tick RT)
+close_target_ticks = 1          # close at avg ± 3 ticks (5-tick RT)
 requote_interval_ms = 1000
 reject_cooldown_ms = 2000
-price_tolerance_ticks = 3
+price_tolerance_ticks = 1
 close_side_always_quotes = true
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 20     # ~4 ticks at 5bps/tick
@@ -112,10 +129,10 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 1          # 2 ticks outside touch
-close_target_ticks = 2          # close at avg ± 3 ticks (5-tick RT)
+close_target_ticks = 1          # close at avg ± 3 ticks (5-tick RT)
 requote_interval_ms = 1000
 reject_cooldown_ms = 2000
-price_tolerance_ticks = 3
+price_tolerance_ticks = 1
 close_side_always_quotes = true
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 16     # ~4 ticks at 4bps/tick
@@ -133,10 +150,10 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 1          # 2 ticks outside touch
-close_target_ticks = 2          # close at avg ± 3 ticks (5-tick RT)
+close_target_ticks = 1          # close at avg ± 3 ticks (5-tick RT)
 requote_interval_ms = 1000
 reject_cooldown_ms = 2000
-price_tolerance_ticks = 3
+price_tolerance_ticks = 1
 close_side_always_quotes = true
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 14     # ~4 ticks at 3.6bps/tick

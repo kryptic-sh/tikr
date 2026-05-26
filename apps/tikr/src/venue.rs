@@ -116,6 +116,7 @@ pub async fn subscribe_fills(
     key_material: Arc<BinanceKeyMaterial>,
     symbol: &Symbol,
     shutdown_rx: watch::Receiver<bool>,
+    bnb_price_rx: Option<watch::Receiver<tikr_core::Decimal>>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>> {
     let http = HttpClient::new();
     let sym_filter =
@@ -128,6 +129,7 @@ pub async fn subscribe_fills(
         MarketKind::Perp,
         sym_filter,
         Some(shutdown_rx),
+        bnb_price_rx,
     )
     .await
     .map_err(|e| anyhow::anyhow!("subscribe_user_data_stream: {e}"))

@@ -345,6 +345,7 @@ pub async fn subscribe_user_data_stream(
         kind,
         symbol_filter,
         None,
+        None,
     )
     .await
 }
@@ -361,6 +362,7 @@ pub async fn subscribe_user_data_stream(
 /// Pass `Some(rx)` to get cancellable behavior; pass `None` (or use the
 /// non-cancellable wrapper) for one-shot tools like `run_perp` that exit
 /// the process on shutdown.
+#[allow(clippy::too_many_arguments)]
 pub async fn subscribe_user_data_stream_cancellable(
     http: HttpClient,
     env: BinanceEnv,
@@ -369,10 +371,19 @@ pub async fn subscribe_user_data_stream_cancellable(
     kind: MarketKind,
     symbol_filter: String,
     shutdown_rx: Option<watch::Receiver<bool>>,
+    bnb_price_rx: Option<watch::Receiver<Decimal>>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     if env.is_futures() {
-        subscribe_futures_user_data_stream(http, env, api_key, kind, symbol_filter, shutdown_rx)
-            .await
+        subscribe_futures_user_data_stream(
+            http,
+            env,
+            api_key,
+            kind,
+            symbol_filter,
+            shutdown_rx,
+            bnb_price_rx,
+        )
+        .await
     } else {
         subscribe_spot_user_data_stream(
             env,
@@ -381,6 +392,7 @@ pub async fn subscribe_user_data_stream_cancellable(
             kind,
             symbol_filter,
             shutdown_rx,
+            bnb_price_rx,
         )
         .await
     }
@@ -397,6 +409,7 @@ async fn subscribe_spot_user_data_stream(
     kind: MarketKind,
     symbol_filter: String,
     shutdown_rx: Option<watch::Receiver<bool>>,
+    bnb_price_rx: Option<watch::Receiver<Decimal>>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     let stream = open_spot_user_data_ws(env, &api_key, &key_material).await?;
     let (tx, rx) = mpsc::unbounded_channel::<Fill>();
@@ -411,6 +424,7 @@ async fn subscribe_spot_user_data_stream(
             kind,
             symbol_filter,
             shutdown_rx,
+            bnb_price_rx,
         )
         .in_current_span(),
     );
@@ -428,6 +442,7 @@ async fn spot_user_data_pump(
     kind: MarketKind,
     symbol_filter: String,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
+    bnb_price_rx: Option<watch::Receiver<Decimal>>,
 ) {
     let reconnect_min_ms: u64 = 1_000;
     let reconnect_max_ms: u64 = 30_000;
@@ -498,7 +513,12 @@ async fn spot_user_data_pump(
                 // Parse: could be a response frame (id present) or an event frame.
                 // Event frames: {"subscriptionId": N, "event": {...}}
                 // Response frames: {"id": "...", "status": 200, "result": ...}
-                if let Some(fill) = parse_spot_ws_api_message(&txt, kind, &symbol_filter) {
+                let bnb_price = bnb_price_rx
+                    .as_ref()
+                    .map(|rx| *rx.borrow())
+                    .unwrap_or(Decimal::ZERO);
+                if let Some(fill) = parse_spot_ws_api_message(&txt, kind, &symbol_filter, bnb_price)
+                {
                     info!(
                         quote_id = ?fill.quote_id,
                         price = %fill.price.0,
@@ -575,6 +595,7 @@ async fn subscribe_futures_user_data_stream(
     kind: MarketKind,
     symbol_filter: String,
     shutdown_rx: Option<watch::Receiver<bool>>,
+    bnb_price_rx: Option<watch::Receiver<Decimal>>,
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     let listen_key = mint_listen_key(&http, env, &api_key).await?;
     let ws_url = format!("{}/{}", ws_base_url(env), listen_key);
@@ -655,6 +676,7 @@ async fn subscribe_futures_user_data_stream(
             shared_key,
             symbol_filter,
             shutdown_rx,
+            bnb_price_rx,
         )
         .in_current_span(),
     );
@@ -680,6 +702,7 @@ async fn user_data_pump(
     shared_key: Arc<Mutex<String>>,
     symbol_filter: String,
     mut shutdown_rx: Option<watch::Receiver<bool>>,
+    bnb_price_rx: Option<watch::Receiver<Decimal>>,
 ) {
     let reconnect_min_ms: u64 = 1_000;
     let reconnect_max_ms: u64 = 30_000;
@@ -756,7 +779,11 @@ async fn user_data_pump(
                         "userDataStream: alive (frame milestone)"
                     );
                 }
-                if let Some(fill) = parse_user_data_message(&txt, kind, &symbol_filter) {
+                let bnb_price = bnb_price_rx
+                    .as_ref()
+                    .map(|rx| *rx.borrow())
+                    .unwrap_or(Decimal::ZERO);
+                if let Some(fill) = parse_user_data_message(&txt, kind, &symbol_filter, bnb_price) {
                     info!(
                         quote_id = ?fill.quote_id,
                         price = %fill.price.0,
@@ -848,13 +875,18 @@ async fn reconnect_user_data(
 ///
 /// Spot WS-API wraps events as `{"subscriptionId": N, "event": {...}}`.
 /// Response frames (acks) have `"id"` + `"status"` and no `"event"` — ignored.
-pub fn parse_spot_ws_api_message(txt: &str, kind: MarketKind, symbol_filter: &str) -> Option<Fill> {
+pub fn parse_spot_ws_api_message(
+    txt: &str,
+    kind: MarketKind,
+    symbol_filter: &str,
+    bnb_price_usdt: Decimal,
+) -> Option<Fill> {
     let v: serde_json::Value = serde_json::from_str(txt).ok()?;
     // Only process event frames — ack frames have "id" field, not "event".
     let event = v.get("event")?;
     match kind {
-        MarketKind::Spot => parse_execution_report(event, symbol_filter),
-        MarketKind::Perp => parse_order_trade_update(event, symbol_filter),
+        MarketKind::Spot => parse_execution_report(event, symbol_filter, bnb_price_usdt),
+        MarketKind::Perp => parse_order_trade_update(event, symbol_filter, bnb_price_usdt),
     }
 }
 
@@ -865,13 +897,23 @@ pub fn parse_spot_ws_api_message(txt: &str, kind: MarketKind, symbol_filter: &st
 /// because Binance returns ONE listenKey per account so multi-process
 /// runs against the same account share an event stream.
 ///
+/// `bnb_price_usdt` is the current BNBUSDT mid; used to convert BNB
+/// commissions to USDT-equivalent when the user has BNB-pays-fees
+/// enabled (so the tracker sees consistent USDT-denominated fees).
+/// Pass `Decimal::ZERO` to disable conversion (commissions kept raw).
+///
 /// Spot (futures path): `executionReport` with `x=FILL` and `s=<symbol>`.
 /// Futures: `ORDER_TRADE_UPDATE` with `.o.X=FILLED` and `.o.s=<symbol>`.
-pub fn parse_user_data_message(txt: &str, kind: MarketKind, symbol_filter: &str) -> Option<Fill> {
+pub fn parse_user_data_message(
+    txt: &str,
+    kind: MarketKind,
+    symbol_filter: &str,
+    bnb_price_usdt: Decimal,
+) -> Option<Fill> {
     let v: serde_json::Value = serde_json::from_str(txt).ok()?;
     match kind {
-        MarketKind::Spot => parse_execution_report(&v, symbol_filter),
-        MarketKind::Perp => parse_order_trade_update(&v, symbol_filter),
+        MarketKind::Spot => parse_execution_report(&v, symbol_filter, bnb_price_usdt),
+        MarketKind::Perp => parse_order_trade_update(&v, symbol_filter, bnb_price_usdt),
     }
 }
 
@@ -921,7 +963,11 @@ pub struct ExecutionReport {
     pub transaction_time: u64,
 }
 
-fn parse_execution_report(v: &serde_json::Value, symbol_filter: &str) -> Option<Fill> {
+fn parse_execution_report(
+    v: &serde_json::Value,
+    symbol_filter: &str,
+    bnb_price_usdt: Decimal,
+) -> Option<Fill> {
     let event_type = v.get("e").and_then(serde_json::Value::as_str)?;
     if event_type != "executionReport" {
         return None;
@@ -968,13 +1014,19 @@ fn parse_execution_report(v: &serde_json::Value, symbol_filter: &str) -> Option<
     };
     let quote_id = QuoteId::from_uuid(Uuid::from_u128(order_id as u128));
 
+    let fee_quote_usdt = if commission_asset == "BNB" && bnb_price_usdt > Decimal::ZERO {
+        commission * bnb_price_usdt
+    } else {
+        commission
+    };
+
     Some(Fill {
         quote_id,
         price: Price(price),
         size: Size(qty),
         fee_asset: Asset::new(commission_asset),
         fee_amount: commission,
-        fee_quote: Notional(commission),
+        fee_quote: Notional(fee_quote_usdt),
         side,
         ts: Timestamp(ts_ms.saturating_mul(1_000_000)),
         is_full,
@@ -985,7 +1037,11 @@ fn parse_execution_report(v: &serde_json::Value, symbol_filter: &str) -> Option<
 // Futures: ORDER_TRADE_UPDATE
 // ---------------------------------------------------------------------------
 
-fn parse_order_trade_update(v: &serde_json::Value, symbol_filter: &str) -> Option<Fill> {
+fn parse_order_trade_update(
+    v: &serde_json::Value,
+    symbol_filter: &str,
+    bnb_price_usdt: Decimal,
+) -> Option<Fill> {
     let event_type = v.get("e").and_then(serde_json::Value::as_str)?;
     if event_type != "ORDER_TRADE_UPDATE" {
         return None;
@@ -1031,13 +1087,23 @@ fn parse_order_trade_update(v: &serde_json::Value, symbol_filter: &str) -> Optio
     let quote_id = QuoteId::from_uuid(Uuid::from_u128(order_id as u128));
     let is_full = status == "FILLED";
 
+    // BNB-paid commissions arrive in BNB units. Convert to USDT-equivalent
+    // so the tracker sees consistent USDT-denominated fees regardless of
+    // payment currency. `fee_amount` + `fee_asset` keep the raw values
+    // for audit; `fee_quote` is what the PnL math consumes.
+    let fee_quote_usdt = if commission_asset == "BNB" && bnb_price_usdt > Decimal::ZERO {
+        commission * bnb_price_usdt
+    } else {
+        commission
+    };
+
     Some(Fill {
         quote_id,
         price: Price(price),
         size: Size(qty),
         fee_asset: Asset::new(commission_asset),
         fee_amount: commission,
-        fee_quote: Notional(commission),
+        fee_quote: Notional(fee_quote_usdt),
         side,
         ts: Timestamp(ts_ms.saturating_mul(1_000_000)),
         is_full,
@@ -1139,8 +1205,13 @@ mod tests {
 
     #[test]
     fn parse_execution_report_to_fill_spot() {
-        let fill = parse_user_data_message(spot_fill_report(), MarketKind::Spot, "BTCUSDT")
-            .expect("should parse spot executionReport");
+        let fill = parse_user_data_message(
+            spot_fill_report(),
+            MarketKind::Spot,
+            "BTCUSDT",
+            Decimal::ZERO,
+        )
+        .expect("should parse spot executionReport");
 
         assert_eq!(fill.price.0, Decimal::from_str("30000.00").unwrap());
         assert_eq!(fill.size.0, Decimal::from_str("0.001").unwrap());
@@ -1153,8 +1224,13 @@ mod tests {
 
     #[test]
     fn parse_order_trade_update_to_fill_futures() {
-        let fill = parse_user_data_message(futures_fill_report(), MarketKind::Perp, "BTCUSDT")
-            .expect("should parse futures ORDER_TRADE_UPDATE");
+        let fill = parse_user_data_message(
+            futures_fill_report(),
+            MarketKind::Perp,
+            "BTCUSDT",
+            Decimal::ZERO,
+        )
+        .expect("should parse futures ORDER_TRADE_UPDATE");
 
         assert_eq!(fill.price.0, Decimal::from_str("31000.00").unwrap());
         assert_eq!(fill.size.0, Decimal::from_str("0.001").unwrap());
@@ -1174,7 +1250,7 @@ mod tests {
     fn non_fill_execution_report_ignored() {
         // "x": "NEW" should not produce a fill.
         let msg = r#"{"e":"executionReport","s":"BTCUSDT","x":"NEW","i":999,"S":"BUY","L":"0","l":"0","n":"0","T":0}"#;
-        let result = parse_user_data_message(msg, MarketKind::Spot, "BTCUSDT");
+        let result = parse_user_data_message(msg, MarketKind::Spot, "BTCUSDT", Decimal::ZERO);
         assert!(
             result.is_none(),
             "NEW execution type must not produce a fill"
@@ -1185,7 +1261,7 @@ mod tests {
     fn non_order_event_ignored() {
         // Spot balance update event should not produce a fill.
         let msg = r#"{"e":"outboundAccountPosition","E":1234567890}"#;
-        let result = parse_user_data_message(msg, MarketKind::Spot, "BTCUSDT");
+        let result = parse_user_data_message(msg, MarketKind::Spot, "BTCUSDT", Decimal::ZERO);
         assert!(result.is_none());
     }
 
@@ -1196,7 +1272,7 @@ mod tests {
         let mut msg = spot_fill_report().to_string();
         // Replace the symbol in the fixture.
         msg = msg.replace("\"s\": \"BTCUSDT\"", "\"s\": \"SOLUSDT\"");
-        let result = parse_user_data_message(&msg, MarketKind::Spot, "BTCUSDT");
+        let result = parse_user_data_message(&msg, MarketKind::Spot, "BTCUSDT", Decimal::ZERO);
         assert!(
             result.is_none(),
             "spot fill for SOLUSDT must not pass BTCUSDT filter"
@@ -1208,7 +1284,7 @@ mod tests {
     fn futures_fill_other_symbol_filtered_out() {
         let mut msg = futures_fill_report().to_string();
         msg = msg.replace("\"s\": \"BTCUSDT\"", "\"s\": \"ETHUSDT\"");
-        let result = parse_user_data_message(&msg, MarketKind::Perp, "BTCUSDT");
+        let result = parse_user_data_message(&msg, MarketKind::Perp, "BTCUSDT", Decimal::ZERO);
         assert!(
             result.is_none(),
             "futures fill for ETHUSDT must not pass BTCUSDT filter"
@@ -1309,7 +1385,7 @@ mod tests {
         });
         let txt = wrapped.to_string();
 
-        let fill = parse_spot_ws_api_message(&txt, MarketKind::Spot, "BTCUSDT")
+        let fill = parse_spot_ws_api_message(&txt, MarketKind::Spot, "BTCUSDT", Decimal::ZERO)
             .expect("spot WS-API wrapped executionReport must parse");
 
         assert_eq!(fill.price.0, Decimal::from_str("30000.00").unwrap());
@@ -1323,7 +1399,7 @@ mod tests {
     fn parse_spot_ws_api_ack_not_a_fill() {
         let ack =
             r#"{"id":"tikr-logon-1","status":200,"result":{"apiKey":"x","authorizedSince":1}}"#;
-        let result = parse_spot_ws_api_message(ack, MarketKind::Spot, "BTCUSDT");
+        let result = parse_spot_ws_api_message(ack, MarketKind::Spot, "BTCUSDT", Decimal::ZERO);
         assert!(
             result.is_none(),
             "ack frame with no 'event' key must not produce a fill"

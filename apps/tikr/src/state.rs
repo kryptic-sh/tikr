@@ -94,6 +94,26 @@ impl BotView {
     }
 }
 
+/// Account-wide BNB-fee mode snapshot. When `enabled = true`, every
+/// order's commission is debited in BNB from the futures wallet (with
+/// the 10% maker/taker discount). The user-stream parser uses
+/// `price_usdt` to convert BNB commissions → USDT-equivalent for the
+/// tracker, and the refill task watches `balance` against
+/// `min_balance_usdt` / `target_balance_usdt`.
+#[derive(Debug, Clone, Default)]
+pub struct BnbState {
+    /// Whether `/fapi/v1/feeBurn` returned `true` for this account.
+    /// When `false`, all BNB-aware logic is bypassed.
+    pub enabled: bool,
+    /// Most recent BNB free balance in the futures wallet (BNB units).
+    pub balance: Decimal,
+    /// Most recent BNBUSDT mid (USDT per BNB).
+    pub price_usdt: Decimal,
+    /// Local unix timestamp in ms when these values were fetched.
+    #[allow(dead_code)]
+    pub fetched_at_ms: u64,
+}
+
 /// Shared state keyed by symbol. Wrap in `Arc` for cross-task sharing.
 #[derive(Clone)]
 pub struct SharedBotState {
@@ -104,6 +124,14 @@ pub struct SharedBotState {
     api_account: Arc<RwLock<Option<ApiAccountSnapshot>>>,
     /// First wallet balance reading for API net calc.
     start_balance: Arc<RwLock<Option<Decimal>>>,
+    /// Account-wide BNB-fee state. Updated by the account-poll task.
+    /// Shared with the user-stream parser (fee conversion) and the
+    /// optional BNB auto-refill task.
+    bnb: Arc<RwLock<BnbState>>,
+    /// First BNB balance reading × first BNB price = USDT-equivalent
+    /// starting BNB value. Used for BNB-aware NET calculation
+    /// (subtract BNB-value delta from realized PnL → real banked).
+    bnb_start_value_usdt: Arc<RwLock<Option<Decimal>>>,
 }
 
 impl Default for SharedBotState {
@@ -120,7 +148,36 @@ impl SharedBotState {
             order: Arc::new(Mutex::new(Vec::new())),
             api_account: Arc::new(RwLock::new(None)),
             start_balance: Arc::new(RwLock::new(None)),
+            bnb: Arc::new(RwLock::new(BnbState::default())),
+            bnb_start_value_usdt: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Update the BNB state snapshot. Captures the starting BNB-value
+    /// on first call where `enabled = true` AND `balance × price > 0`,
+    /// so the BNB-aware NET row in the TUI can compute the delta.
+    pub fn set_bnb(&self, state: BnbState) {
+        if state.enabled
+            && state.balance > Decimal::ZERO
+            && state.price_usdt > Decimal::ZERO
+            && let Ok(mut start) = self.bnb_start_value_usdt.write()
+            && start.is_none()
+        {
+            *start = Some(state.balance * state.price_usdt);
+        }
+        if let Ok(mut g) = self.bnb.write() {
+            *g = state;
+        }
+    }
+
+    /// Read the latest BNB snapshot.
+    pub fn bnb_snapshot(&self) -> BnbState {
+        self.bnb.read().ok().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Starting BNB USDT-value (locked on first non-zero reading).
+    pub fn bnb_start_value_usdt(&self) -> Option<Decimal> {
+        self.bnb_start_value_usdt.read().ok().and_then(|g| *g)
     }
 
     /// Update account-wide API balance snapshot. Captures start balance on first call.

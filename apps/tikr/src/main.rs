@@ -126,6 +126,10 @@ struct AccountPollerConfig {
     order_balance_pct: Decimal,
     margin_multiplier: Decimal,
     shutdown: watch::Receiver<bool>,
+    /// Published price (USDT per BNB) for the user-stream parser to
+    /// convert BNB commissions → USDT-equivalent. Set to ZERO when
+    /// BNB-pays-fees is disabled on the account.
+    bnb_price_tx: watch::Sender<Decimal>,
 }
 
 fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
@@ -144,7 +148,74 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                 }
             }
         };
+
+        // BNB-fee autodetect: one-time at startup, cached for the
+        // remainder of the process. Cheap (1 REST call) but logs
+        // loudly so operators can see which mode they're in.
+        let bnb_fee_enabled = match tikr_binance::futs::get_fee_burn_status(
+            &http,
+            cfg.env.rest_base_url(),
+            &cfg.api_key,
+            &key_material,
+        )
+        .await
+        {
+            Ok(on) => {
+                tracing::info!(
+                    enabled = on,
+                    "feeBurn status: BNB-pays-fees {}",
+                    if on { "ENABLED" } else { "disabled" }
+                );
+                on
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "feeBurn check failed; assuming disabled");
+                false
+            }
+        };
+
         loop {
+            // BNB-aware accounting block — only fires when feeBurn is on.
+            // Fetches BNB futures-wallet balance + BNBUSDT mark, publishes
+            // to SharedState + price watch channel. The user-stream parser
+            // reads `bnb_price_tx` to convert commissions; the refill task
+            // reads SharedState to decide when to top up.
+            if bnb_fee_enabled {
+                let mut bnb_balance = Decimal::ZERO;
+                let mut bnb_price = Decimal::ZERO;
+                if let Ok(b) = tikr_binance::futs::get_balance(
+                    &http,
+                    cfg.env.rest_base_url(),
+                    &cfg.api_key,
+                    &key_material,
+                    "BNB",
+                )
+                .await
+                {
+                    bnb_balance = b.wallet_balance;
+                }
+                if let Ok(t) =
+                    tikr_binance::futs::get_book_ticker(&http, cfg.env.rest_base_url(), "BNBUSDT")
+                        .await
+                {
+                    bnb_price = (t.bid_price + t.ask_price) / Decimal::from(2);
+                }
+                cfg.shared_state.set_bnb(crate::state::BnbState {
+                    enabled: true,
+                    balance: bnb_balance,
+                    price_usdt: bnb_price,
+                    fetched_at_ms: current_time_ms(),
+                });
+                if bnb_price > Decimal::ZERO && bnb_price != *cfg.bnb_price_tx.borrow() {
+                    let _ = cfg.bnb_price_tx.send(bnb_price);
+                }
+                tracing::info!(
+                    bnb_balance = %bnb_balance,
+                    bnb_price = %bnb_price,
+                    bnb_usdt_value = %(bnb_balance * bnb_price),
+                    "bnb poll"
+                );
+            }
             match tikr_binance::futs::get_balance(
                 &http,
                 cfg.env.rest_base_url(),
@@ -353,6 +424,9 @@ async fn main() -> anyhow::Result<()> {
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
     let (notional_tx, notional_rx) = watch::channel(Decimal::ZERO);
     let (max_position_tx, max_position_rx) = watch::channel(Decimal::ZERO);
+    // Live BNBUSDT mid; account poller refreshes when feeBurn is on.
+    // Subscribers (user_stream parser, refill task) read latest via `borrow()`.
+    let (bnb_price_tx, bnb_price_rx) = watch::channel(Decimal::ZERO);
 
     let total_slots = cfg
         .scalp_rotation
@@ -380,7 +454,10 @@ async fn main() -> anyhow::Result<()> {
         order_balance_pct: cfg.account.order_balance_pct,
         margin_multiplier: cfg.account.margin_multiplier,
         shutdown: global_shutdown_rx.clone(),
+        bnb_price_tx,
     });
+    // Silence unused-rx warning until user_stream parser wires it up.
+    let _bnb_price_rx_for_parser = bnb_price_rx.clone();
 
     // Spawn supervisors. Each enabled rotation type gets its own manager.
     let mut supervisors = Vec::new();
@@ -398,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
                 max_position_pct: cfg.account.max_position_pct,
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                bnb_price_rx: bnb_price_rx.clone(),
             },
             shared_state.clone(),
             global_shutdown_rx.clone(),
@@ -417,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                 max_position_pct: cfg.account.max_position_pct,
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                bnb_price_rx: bnb_price_rx.clone(),
             },
             shared_state.clone(),
             global_shutdown_rx.clone(),
@@ -437,6 +516,7 @@ async fn main() -> anyhow::Result<()> {
                 bot_count: cfg.bots.len(),
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                bnb_price_rx: bnb_price_rx.clone(),
                 clear_on_start: args.clear,
             };
             let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());

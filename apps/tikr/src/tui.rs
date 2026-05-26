@@ -226,6 +226,8 @@ pub fn run(
                 let agg = AccountAggregate::compute(&views);
                 let api_account = state.api_account();
                 let start_balance = state.start_balance();
+                let bnb = state.bnb_snapshot();
+                let bnb_start_value = state.bnb_start_value_usdt();
                 terminal.draw(|f| {
                     draw(
                         f,
@@ -233,6 +235,8 @@ pub fn run(
                         &agg,
                         api_account.as_ref(),
                         start_balance,
+                        Some(&bnb),
+                        bnb_start_value,
                         &log_lines,
                         &mut ui,
                         &config_path,
@@ -543,6 +547,8 @@ fn draw(
     agg: &AccountAggregate,
     api_account: Option<&ApiAccountSnapshot>,
     start_balance: Option<Decimal>,
+    bnb: Option<&crate::state::BnbState>,
+    bnb_start_value_usdt: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
     config_path: &std::path::Path,
@@ -565,6 +571,8 @@ fn draw(
         agg,
         api_account,
         start_balance,
+        bnb,
+        bnb_start_value_usdt,
         log_lines,
         ui,
     );
@@ -770,6 +778,8 @@ fn draw_body(
     agg: &AccountAggregate,
     api_account: Option<&ApiAccountSnapshot>,
     start_balance: Option<Decimal>,
+    bnb: Option<&crate::state::BnbState>,
+    bnb_start_value_usdt: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
 ) {
@@ -784,9 +794,19 @@ fn draw_body(
 
     draw_bot_detail(f, cols[0], views.get(active));
     draw_logs(f, cols[1], views.get(active), log_lines, ui);
-    draw_account(f, cols[2], views, agg, api_account, start_balance);
+    draw_account(
+        f,
+        cols[2],
+        views,
+        agg,
+        api_account,
+        start_balance,
+        bnb,
+        bnb_start_value_usdt,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_account(
     f: &mut Frame<'_>,
     area: Rect,
@@ -794,6 +814,8 @@ fn draw_account(
     agg: &AccountAggregate,
     api_account: Option<&ApiAccountSnapshot>,
     start_balance: Option<Decimal>,
+    bnb: Option<&crate::state::BnbState>,
+    bnb_start_value_usdt: Option<Decimal>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
@@ -901,13 +923,49 @@ fn draw_account(
             )),
         ]));
         if let Some(start) = start_balance {
-            let api_net = api.wallet_balance - start;
+            // Base api_net = USDT wallet delta. When BNB-fee mode is
+            // on, also add the BNB-value delta — fees come out of BNB
+            // balance (separate from USDT wallet) so true account-wide
+            // PnL is the sum of both deltas.
+            let usdt_delta = api.wallet_balance - start;
+            let bnb_delta = match (bnb, bnb_start_value_usdt) {
+                (Some(b), Some(start_val)) if b.enabled => b.balance * b.price_usdt - start_val,
+                _ => Decimal::ZERO,
+            };
+            let api_net = usdt_delta + bnb_delta;
             lines.push(Line::from(vec![
                 Span::styled("api net  ", Style::default().fg(Color::White)),
                 Span::styled(
                     format!("{:>+10.2}", dec_to_f64(api_net)),
                     pnl_style(api_net),
                 ),
+            ]));
+        }
+        // BNB-fee mode panel — only render when feeBurn is enabled.
+        if let Some(bnb) = bnb
+            && bnb.enabled
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "bnb fees on",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ));
+            lines.push(Line::from(vec![
+                Span::styled("bnb bal  ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{:>10.6}", dec_to_f64(bnb.balance))),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("bnb $    ", Style::default().fg(Color::Gray)),
+                Span::raw(format!(
+                    "{:>10.2}",
+                    dec_to_f64(bnb.balance * bnb.price_usdt)
+                )),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("bnb px   ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{:>10.2}", dec_to_f64(bnb.price_usdt))),
             ]));
         }
     } else {

@@ -724,6 +724,45 @@ pub async fn get_balance(
     })
 }
 
+/// Get the BNB-pays-fees flag for the user's Futures account.
+///
+/// `GET /fapi/v1/feeBurn` — returns `{"feeBurn": true}` when the user
+/// has enabled "Use BNB to pay fees". When `true`, every order's
+/// commission is debited in BNB from the futures wallet (with the 10%
+/// maker/taker discount) instead of being deducted from the USDT
+/// margin balance. The strategy needs to know this so the fee accounting
+/// + auto-refill can engage.
+pub async fn get_fee_burn_status(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+) -> Result<bool, VenueError> {
+    let signed = append_auth_dispatch("", key_material);
+    let url = format!("{base_url}/fapi/v1/feeBurn?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let burn = body
+        .get("feeBurn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok(burn)
+}
+
 /// Per-symbol commission rate from Binance.
 #[derive(Debug, Clone, Copy)]
 pub struct CommissionRate {

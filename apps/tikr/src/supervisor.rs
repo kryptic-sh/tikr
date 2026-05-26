@@ -51,6 +51,12 @@ pub struct SupervisorCtx {
     /// `max_position_usdt` tracks compounded wallet growth, not just
     /// per-order size.
     pub max_position_rx: watch::Receiver<Decimal>,
+    /// Live BNBUSDT mid; user-stream parser uses this to convert BNB
+    /// commissions → USDT-equivalent fee_quote. When BNB-fee mode is
+    /// off (or autodetect fails), this stays at ZERO and the parser
+    /// keeps the raw commission. Always provided so the supervisor
+    /// doesn't need conditional plumbing.
+    pub bnb_price_rx: watch::Receiver<Decimal>,
     /// When `true`, the supervisor cancels all resting orders + flattens
     /// any open position for this symbol on each spawn cycle, giving
     /// the bot a clean slate. When `false` (default for `tikr` CLI),
@@ -200,6 +206,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         ctx.key_material.clone(),
         &symbol,
         us_shutdown_rx,
+        Some(ctx.bnb_price_rx.clone()),
     )
     .await?;
 
