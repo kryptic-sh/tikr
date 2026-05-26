@@ -1,0 +1,39 @@
+# ─── SpreadScalp BTCUSDC solo — MAINNET ────────────────────────────────────
+#
+# Single BTCUSDC bot. Same SS knobs as the 15-symbol USDC config,
+# scaled sizing for solo run:
+#   order_balance_pct  = 1   (1% of wallet per order)
+#   max_position_pct   = 50  (50% of wallet as inventory cap)
+#
+# On a $737 wallet:
+#   per-order notional ≈ $7.37 → auto-bumps to BTC step 0.001 = ~$76
+#   peak inventory cap ≈ $368
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/spread-scalp-btcusdc"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "50"
+leverage = 5
+
+
+# ─── BTCUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+close_target_ticks = 1
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
