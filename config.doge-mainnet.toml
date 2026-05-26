@@ -60,9 +60,9 @@ max_position_usdt = 30
 
 # Tuned entry trigger.
 min_spread_bps = 8
-requote_interval_ms = 1000
+requote_interval_ms = 500
 price_tolerance_ticks = 1
-reject_cooldown_ms = 2000
+reject_cooldown_ms = 500
 
 # Adverse-drift hard stop (2026-05-25 sweep winner):
 # If held >120s AND mid drifts >=30bps against direction → IOC close at

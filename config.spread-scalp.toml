@@ -30,7 +30,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 5
 min_spread_bps = 12
-requote_interval_ms = 1000
+requote_interval_ms = 500
 take_profit_usdt = 1.0     # lock in small profits early
 
 # Adverse-drift hard stop (2026-05-25 sweep winner on DOGE 33h):

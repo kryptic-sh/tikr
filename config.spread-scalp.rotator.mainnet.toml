@@ -100,8 +100,8 @@ strategy = "spread-scalp"
 # account.order_balance_pct + account.max_position_pct per refresh tick.
 
 min_spread_bps = 8
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 
 # Adverse-drift hard stop (2026-05-25 sweep winner).

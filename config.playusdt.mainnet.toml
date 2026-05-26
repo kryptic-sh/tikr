@@ -52,8 +52,8 @@ symbol = "WLDUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 8
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 30
@@ -63,8 +63,8 @@ symbol = "AVAXUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 8
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 30
@@ -74,8 +74,8 @@ symbol = "1000SHIBUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 8
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 30
@@ -85,8 +85,8 @@ symbol = "DOGEUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 8
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 30
@@ -96,8 +96,8 @@ symbol = "PLAYUSDT"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 8
-requote_interval_ms = 1000
-reject_cooldown_ms = 2000
+requote_interval_ms = 500
+reject_cooldown_ms = 500
 price_tolerance_ticks = 1
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 30
