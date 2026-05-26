@@ -127,18 +127,33 @@ impl TouchRefill {
     }
 
     /// Does the venue (per fill_sim) OR this cycle's pending set
-    /// already hold an order on `side` at exactly `price`?
-    fn already_have_order(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> bool {
+    /// already hold an order on `side` within `tolerance` of `price`?
+    ///
+    /// Exact-price matching breaks on tight-tick markets: prior
+    /// close-on-fill orders sit at arbitrary fill prices, and grid
+    /// emits at step boundaries. A fresh emit one tick off an
+    /// existing order would create a duplicate. With tolerance set
+    /// to `step / 2`, any existing order within half a step "covers"
+    /// the requested level and the emit is skipped.
+    fn already_have_order(
+        &self,
+        ctx: &StrategyContext<'_>,
+        side: Side,
+        price: Price,
+        tolerance: Decimal,
+    ) -> bool {
         let pending = match side {
             Side::Bid => &self.pending_bid_prices,
             Side::Ask => &self.pending_ask_prices,
         };
-        if pending.contains(&price.0) {
+        let lo = price.0 - tolerance;
+        let hi = price.0 + tolerance;
+        if pending.range(lo..=hi).next().is_some() {
             return true;
         }
         ctx.open_quotes
             .iter()
-            .any(|(_, q)| q.side == side && q.price.0 == price.0)
+            .any(|(_, q)| q.side == side && q.price.0 >= lo && q.price.0 <= hi)
     }
 
     fn emit(&mut self, symbol: &Symbol, side: Side, price: Price) -> Action {
@@ -278,9 +293,10 @@ impl Strategy for TouchRefill {
                     price = max_bid;
                 }
             }
+            let tolerance = step / Decimal::from(2);
             while price >= floor && price > Decimal::ZERO {
                 let p = Price(price);
-                if !self.already_have_order(ctx, Side::Bid, p) {
+                if !self.already_have_order(ctx, Side::Bid, p, tolerance) {
                     actions.push(self.emit(ctx.symbol, Side::Bid, p));
                 }
                 price -= step;
@@ -308,9 +324,10 @@ impl Strategy for TouchRefill {
                     price = min_ask;
                 }
             }
+            let tolerance = step / Decimal::from(2);
             while price <= ceiling {
                 let p = Price(price);
-                if !self.already_have_order(ctx, Side::Ask, p) {
+                if !self.already_have_order(ctx, Side::Ask, p, tolerance) {
                     actions.push(self.emit(ctx.symbol, Side::Ask, p));
                 }
                 price += step;
@@ -352,8 +369,12 @@ impl Strategy for TouchRefill {
                     Side::Bid => (Side::Ask, Price(fill.price.0 + close_distance)),
                     Side::Ask => (Side::Bid, Price(fill.price.0 - close_distance)),
                 };
+                // Close uses exact match (tolerance = 0) — each fill
+                // gets its own close target. Tolerating overlap here
+                // would skip legitimate close emits when grid orders
+                // happen to sit near the close price.
                 if close_price.0 > Decimal::ZERO
-                    && !self.already_have_order(ctx, close_side, close_price)
+                    && !self.already_have_order(ctx, close_side, close_price, Decimal::ZERO)
                 {
                     actions.push(self.emit(ctx.symbol, close_side, close_price));
                 }
