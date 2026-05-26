@@ -62,6 +62,7 @@ async fn paper_runner_against_testnet_5min() {
         order_balance_pct: Decimal::ZERO,
         max_position_pct: Decimal::ZERO,
         min_notional: Decimal::ZERO,
+        max_expected_open_orders: 2,
     };
 
     let (tx, rx) = watch::channel(false);

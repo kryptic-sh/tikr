@@ -378,6 +378,7 @@ async fn risk_resume_alerting_capstone() {
         order_balance_pct: Decimal::ZERO,
         max_position_pct: Decimal::ZERO,
         min_notional: Decimal::ZERO,
+        max_expected_open_orders: 2,
     };
     let (_tx1, rx1) = watch::channel(false);
 

@@ -121,6 +121,12 @@ pub fn to_spec(
         // above. Runner uses it as a defense-in-depth guard against
         // dust emits (close-side pinned to residual qty, etc.).
         min_notional: venue.min_notional(&symbol).unwrap_or(Decimal::ZERO),
+        // Per-strategy expected max open order count. SS / SG / etc.
+        // emit at most 2 (one per side); TouchRefill emits up to
+        // 2 × grid_levels. The runner's 30s orphan sweep uses this
+        // as a "wipe everything if exceeded" threshold; set to 0
+        // (disabled) when the strategy intentionally keeps many.
+        max_expected_open_orders: max_open_orders_for(cfg),
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.
@@ -200,6 +206,20 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
 
 fn per_bot_state_dir(base: &std::path::Path, symbol: &str) -> PathBuf {
     base.join(symbol.to_lowercase())
+}
+
+/// Strategy-specific expected max open-order count for the runner's
+/// 30s orphan sweep. `0` = sweep disabled (caller intentionally keeps
+/// many resting orders).
+fn max_open_orders_for(cfg: &BotConfig) -> usize {
+    match cfg.strategy.as_str() {
+        "touch-refill" | "tr" => 0,
+        // Grid-style strategies — let the strategy manage its own
+        // book without runner-level wipes.
+        "static-grid" | "sg" | "layered-grid" | "lg" => 0,
+        // Default: SS-style 1-per-side strategies emit at most 2.
+        _ => 2,
+    }
 }
 
 fn build_sg(

@@ -136,6 +136,14 @@ pub struct RunnerConfig {
     /// risk module TP/SL on a near-empty position, etc.). `0` (default)
     /// disables the guard.
     pub min_notional: Decimal,
+    /// Strategy's expected maximum open orders. The 30s reconcile
+    /// sweep nukes everything when `venue_open` exceeds this — an
+    /// orphan-accumulation safety net. SS quotes at most 1/side = 2.
+    /// Grid strategies like TouchRefill with N levels per side want
+    /// `2 * N` (or more if they keep deeper historical levels). `0`
+    /// (default) disables the sweep entirely — useful when the
+    /// strategy intentionally keeps a lot of resting orders.
+    pub max_expected_open_orders: usize,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -183,6 +191,7 @@ impl Default for RunnerConfig {
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
+            max_expected_open_orders: 2,
         }
     }
 }
@@ -1600,16 +1609,18 @@ where
                 match venue.open_orders(&symbol).await {
                     Ok(orders) => {
                         let venue_open = orders.len();
-                        // Orphan sweep: spread-scalp + tick-strategies quote
-                        // at most 1 per side = 2 total. Anything more is
-                        // an orphan accumulated through a race (cap fired
-                        // while in-flight, recovery loop placed without
-                        // cancel, etc.). Wipe + let strategy re-emit on
-                        // the next event.
-                        if venue_open > 2 {
+                        // Orphan sweep: when the strategy's expected max
+                        // open-order count is set and exceeded, wipe +
+                        // let strategy re-emit on next event. Disabled
+                        // (max=0) for grid strategies that deliberately
+                        // keep many resting orders.
+                        if config.max_expected_open_orders > 0
+                            && venue_open > config.max_expected_open_orders
+                        {
                             warn!(
                                 venue_open,
-                                "order reconciliation: > 2 open orders, cancelling all to wipe orphans"
+                                max_expected = config.max_expected_open_orders,
+                                "order reconciliation: open count > max_expected, cancelling all"
                             );
                             if let Err(e) = venue.cancel_all(&symbol).await {
                                 warn!(error = ?e, "orphan sweep: cancel_all failed");
@@ -2316,6 +2327,7 @@ mod tests {
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
+            max_expected_open_orders: 2,
         }
     }
 
@@ -2672,6 +2684,7 @@ mod tests {
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
+            max_expected_open_orders: 2,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2765,6 +2778,7 @@ mod tests {
             order_balance_pct: Decimal::ZERO,
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
+            max_expected_open_orders: 2,
         };
         let (_tx, rx) = watch::channel(false);
 
