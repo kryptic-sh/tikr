@@ -1,5 +1,5 @@
-# ─── Tick-Floor Sitter on Binance Futures MAINNET ────────────────────────
 #
+# ─── Tick-Floor Sitter on Binance Futures MAINNET ────────────────────────
 # Live config testing the new SS `quote_offset_ticks` mode on 4
 # wide-tick mainnet perps where book sits at 1-tick spread. Each bot
 # posts N ticks OUTSIDE the touches (owns its own level, no queue
@@ -19,7 +19,6 @@
 #
 # Active bots (filtered to tick >= 5 bps so 1-tick RT covers fees):
 #   ESPORTS  : 19.84 bps tick
-#   WIF      :  5.07 bps tick
 #   XPL      : 11.14 bps tick
 #   FIL      :  9.83 bps tick
 #   ARB      :  8.87 bps tick
@@ -90,7 +89,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
@@ -99,31 +98,6 @@ close_side_always_quotes = true
 # # Adverse stop scaled to symbol tick.
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 50   # ~2.5 ticks at 20bps/tick
-
-
-# ─── WIFUSDT ──────────────────────────────────────────────────────────────
-#
-# Tick = 5.07 bps. 3-tick RT = ~15bps gross.
-# Adverse stop at 20bps = 4 ticks.
-
-[[bot]]
-symbol = "WIFUSDT"
-strategy = "spread-scalp"
-
-[bot.spread_scalp]
-min_spread_bps = 0
-quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 5000
-reject_cooldown_ms = 250
-price_tolerance_ticks = 0
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 20     # ~4 ticks at 5bps/tick
-
-
-# ADAUSDT removed (4.05 bps tick — below 5bps floor)
-# NEARUSDT removed (3.62 bps tick)
 
 
 # ─── Additional wide-tick perps ───────────────────────────────────────────
@@ -150,7 +124,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
@@ -167,7 +141,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
@@ -184,7 +158,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
@@ -201,7 +175,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
@@ -218,7 +192,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
@@ -235,7 +209,7 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
 quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+close_target_ticks = 0          # close at avg ± 1 tick (1-tick RT min)
 requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 0
