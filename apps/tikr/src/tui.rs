@@ -1121,13 +1121,21 @@ fn draw_account(
     // purpose: this panel exists to show whether each bot is actually
     // turning over profitable round-trips, not how its current open
     // inventory is marked. Unrealized is captured at the global level.
-    for v in views {
-        let net = v
-            .snapshot
-            .as_ref()
-            .map_or(Decimal::ZERO, |r| r.realized.0 - r.fees.0);
+    // Sorted DESC by net so the biggest winners are at the top.
+    let mut rows: Vec<(&str, Decimal)> = views
+        .iter()
+        .map(|v| {
+            let net = v
+                .snapshot
+                .as_ref()
+                .map_or(Decimal::ZERO, |r| r.realized.0 - r.fees.0);
+            (v.symbol.as_str(), net)
+        })
+        .collect();
+    rows.sort_by_key(|(_, net)| std::cmp::Reverse(*net));
+    for (symbol, net) in rows {
         lines.push(kv_line(
-            format!("  {}", v.symbol),
+            format!("  {symbol}"),
             format!("{:>+.2}", dec_to_f64(net)),
             Style::default().fg(Color::White),
             pnl_style(net),
