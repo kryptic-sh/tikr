@@ -92,10 +92,11 @@ pub struct AccountConfig {
     /// configuration.
     #[serde(default = "default_order_balance_pct")]
     pub order_balance_pct: Decimal,
-    /// Percent of wallet balance used as the per-bot peak position
-    /// cap, split evenly by bot count. Per-bot max position USDT =
-    /// `wallet × max_position_pct / 100 / bot_count`.
-    /// Default `80` preserves legacy behavior.
+    /// Percent of wallet balance used as the PER-BOT peak position
+    /// cap. NOT split across bots — `100` means each bot can hold up
+    /// to 100% of wallet notional. Total risk is capped by Binance
+    /// margin engine + leverage, not by per-bot sum.
+    /// Default `80`.
     #[serde(default = "default_max_position_pct")]
     pub max_position_pct: Decimal,
     /// BNB-refill trigger in USDT-equivalent. When BNB-pays-fees is
