@@ -110,4 +110,4 @@ grid_levels = 3
 # the cost of slower fills.
 #
 # Example: fill at $100, close_profit_bps=30 → close at $100.30 (30 bps).
-# close_profit_bps = 30
+close_profit_bps = 30
