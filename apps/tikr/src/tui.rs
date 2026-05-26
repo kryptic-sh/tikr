@@ -110,6 +110,10 @@ struct UiState {
     last_account_total: u16,
     last_bot_visible: u16,
     last_account_visible: u16,
+    /// Per-symbol row positions in the account pane (absolute row,
+    /// symbol). Set at draw time so left-click handler can switch
+    /// `active_tab` to the bot for the clicked symbol.
+    per_symbol_rows: Vec<(u16, String)>,
     /// Current modal state.
     mode: ModeState,
     /// Keymap for chord dispatch in Normal mode.
@@ -144,6 +148,7 @@ impl UiState {
             last_account_total: 0,
             last_bot_visible: 0,
             last_account_visible: 0,
+            per_symbol_rows: Vec::new(),
             mode: ModeState::Normal,
             keymap,
             last_key_ts: None,
@@ -567,6 +572,18 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(idx) = ui.hit_tab(mev.column, mev.row)
                 && idx < views.len()
+            {
+                ui.active_tab = idx;
+                ui.log_view = LogView::Follow;
+            } else if ui.in_account_pane(mev.column, mev.row)
+                && let Some(sym) = ui.per_symbol_rows.iter().find_map(|(row, s)| {
+                    if *row == mev.row {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                && let Some(idx) = views.iter().position(|v| v.symbol == sym)
             {
                 ui.active_tab = idx;
                 ui.log_view = LogView::Follow;
@@ -1156,7 +1173,10 @@ fn draw_account(
         })
         .collect();
     rows.sort_by_key(|(_, net)| std::cmp::Reverse(*net));
+    // Record (line_idx, symbol) so click handler can map row → symbol.
+    let mut per_symbol_lines: Vec<(usize, String)> = Vec::new();
     for (symbol, net) in rows {
+        per_symbol_lines.push((lines.len(), symbol.to_string()));
         lines.push(kv_line(
             format!("  {symbol}"),
             format!("{:>+.2}", dec_to_f64(net)),
@@ -1173,6 +1193,22 @@ fn draw_account(
     ui.last_account_rect = Some(area);
     let scroll = UiState::clamp_scroll(ui.account_scroll, total, visible);
     ui.account_scroll = scroll;
+    // Convert line_idx → absolute screen row for click hit-test.
+    // Paragraph: area.y + 1 (top border) + 1 (top pad) + line_idx - scroll.
+    let body_top = area.y.saturating_add(2);
+    ui.per_symbol_rows = per_symbol_lines
+        .into_iter()
+        .filter_map(|(line_idx, sym)| {
+            let row = body_top.checked_add(line_idx as u16)?.checked_sub(scroll)?;
+            // Only include rows inside the visible body region.
+            let body_bot = area.y.saturating_add(area.height).saturating_sub(2);
+            if row >= body_top && row < body_bot {
+                Some((row, sym))
+            } else {
+                None
+            }
+        })
+        .collect();
     let p = Paragraph::new(lines)
         .block(
             Block::default()
