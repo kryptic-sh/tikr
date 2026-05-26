@@ -20,7 +20,7 @@
 [account]
 env = "futures-mainnet"
 state_dir = "./state/touch-refill-usdc-majors"
-order_balance_pct = "2"
+order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
