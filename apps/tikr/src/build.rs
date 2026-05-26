@@ -217,7 +217,11 @@ fn max_open_orders_for(cfg: &BotConfig) -> usize {
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
-        // Default: SS-style 1-per-side strategies emit at most 2.
+        // SS: 1 entry per side + 1 close-side after fills + transient
+        // overlap during requote = up to 5 in flight. Disable sweep
+        // entirely — SS does its own requote management.
+        "spread-scalp" | "ss" => 0,
+        // Default: 1-per-side strategies emit at most 2.
         _ => 2,
     }
 }
