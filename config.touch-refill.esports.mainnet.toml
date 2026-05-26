@@ -1,0 +1,38 @@
+# ─── TouchRefill on ESPORTSUSDT — MAINNET ───────────────────────────────
+#
+# Minimal at-touch market making: post BID at top.bid and ASK at top.ask,
+# both post-only. Re-quote when the book moves; refill on every fill.
+# No inventory cap, no adverse stop, no close-side avg pin.
+#
+# Economics on ESPORTS (tick ≈ 20 bps of price):
+#   gross RT capture ≈ 20 bps  (buy bid, sell ask)
+#   maker fees (BNB) ≈ 3.6 bps RT  (1.8 bps × 2 sides)
+#   net per RT       ≈ +16 bps
+#
+# Risk: adverse selection. When the bid fills, market is often
+# dropping (you got picked off). The strategy bag-holds in that
+# direction until a reversion. Treat this as a "spread > 2× fees"
+# bet, not a real MM strategy.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1 set in shell
+#   2. .env loaded with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Have $200+ in Futures wallet
+#   4. ESPORTS leverage set in Binance UI (config below sets 5x)
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/touch-refill-esports"
+
+# Per-order = wallet × 1% (single bot, no split).
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+[[bot]]
+symbol = "ESPORTSUSDT"
+strategy = "touch-refill"
+
+# No params required. Notional comes from account.order_balance_pct.
+# Step size + min notional pulled from venue exchangeInfo automatically.
+[bot.touch_refill]

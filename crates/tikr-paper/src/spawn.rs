@@ -16,6 +16,7 @@ use tikr_strategy::{
     LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
     MicroMeanReversion, MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp,
     SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    TouchRefill, TouchRefillConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -55,6 +56,8 @@ pub enum StrategyChoice {
     LiqFade(LiqFadeConfig),
     /// [`Hydra`] — straddle-bracket entry + pyramid/DCA + maker TP / IOC SL.
     Hydra(HydraConfig),
+    /// [`TouchRefill`] — minimal at-touch both-sided MM, refill on fill.
+    TouchRefill(TouchRefillConfig),
 }
 
 impl StrategyChoice {
@@ -72,6 +75,7 @@ impl StrategyChoice {
             Self::SpreadScalp(_) => "spread-scalp",
             Self::LiqFade(_) => "liq-fade",
             Self::Hydra(_) => "hydra",
+            Self::TouchRefill(_) => "touch-refill",
         }
     }
 }
@@ -343,6 +347,23 @@ where
                 }
                 StrategyChoice::Hydra(cfg) => {
                     let strategy = Hydra::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
+                    )
+                    .await
+                }
+                StrategyChoice::TouchRefill(cfg) => {
+                    let strategy = TouchRefill::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,

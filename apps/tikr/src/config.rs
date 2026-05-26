@@ -179,6 +179,20 @@ pub struct BotConfig {
     /// Hydra params (only honored when `strategy = "hydra"`).
     #[serde(default)]
     pub hydra: Option<HydraParams>,
+    /// TouchRefill params (only honored when `strategy = "touch-refill"`).
+    #[serde(default)]
+    pub touch_refill: Option<TouchRefillParams>,
+}
+
+/// TouchRefill — minimal at-touch MM. Only knob is per-order notional;
+/// step_size + min_notional come from the venue exchangeInfo cache.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TouchRefillParams {
+    /// Per-order notional in USDT. When omitted, the account-derived
+    /// default applies (`account.order_balance_pct × wallet / bots`).
+    #[serde(default)]
+    pub notional: Option<Decimal>,
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

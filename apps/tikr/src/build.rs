@@ -11,7 +11,7 @@ use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MicroMeanReversionConfig,
-    SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
+    SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, TouchRefillConfig,
 };
 use tokio::sync::watch;
 
@@ -74,9 +74,10 @@ pub fn to_spec(
             default_notional,
             max_position_usdt_default,
         )?,
+        "touch-refill" | "tr" => build_touch_refill(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, touch-refill)"
             ));
         }
     };
@@ -167,6 +168,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "liq-fade" | "lf" => Ok(cfg.liq_fade.as_ref().map(|p| p.notional).unwrap_or(None)),
         // Hydra: notional is wallet-derived only — no per-bot override.
         "hydra" | "hd" | "hy" => Ok(None),
+        "touch-refill" | "tr" => Ok(cfg.touch_refill.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -183,7 +185,14 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "liq-fade" | "lf" => cfg.liq_fade.as_ref().map(|p| p.max_position_usdt),
         "hydra" | "hd" | "hy" => cfg.hydra.as_ref().map(|p| p.max_position_usdt),
         // Strategies without a cap concept: never override.
-        "ladder-reentry" | "lr" | "simple-gap" | "sgap" | "micro-mean-reversion" | "mmr" => None,
+        "ladder-reentry"
+        | "lr"
+        | "simple-gap"
+        | "sgap"
+        | "micro-mean-reversion"
+        | "mmr"
+        | "touch-refill"
+        | "tr" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -305,6 +314,25 @@ fn build_simple_gap(
     Ok(StrategyChoice::SimpleGap(SimpleGapConfig {
         notional_per_order: notional,
         gap_bps: simple_gap.gap_bps,
+    }))
+}
+
+fn build_touch_refill(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    // touch_refill block is optional — strategy only needs notional,
+    // and that can come from the account-wide default.
+    let notional_override = cfg.touch_refill.as_ref().and_then(|p| p.notional);
+    let notional = autobump_notional(notional_override.unwrap_or(default_notional), symbol, venue)?;
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::TouchRefill(TouchRefillConfig {
+        notional_per_order: notional,
+        step_size,
+        min_notional,
     }))
 }
 
