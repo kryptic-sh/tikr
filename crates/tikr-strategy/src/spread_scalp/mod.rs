@@ -288,6 +288,46 @@ impl SpreadScalp {
         policy_apply(decision, intent)
     }
 
+    /// Close-side emit with a pinned `qty` (= position size to flatten).
+    /// Skips notional-derived sizing so price jitter within
+    /// `price_tolerance_ticks` no longer triggers Replace from a 1-lot
+    /// size recompute. `qty` must already be lot-step-compliant (venue
+    /// fill aggregation guarantees this).
+    fn diff_emit_close(
+        &mut self,
+        ctx: &StrategyContext<'_>,
+        side: Side,
+        price: Price,
+        qty: Decimal,
+    ) -> Vec<Action> {
+        // Skip if qty falls below min-notional (residual dust). Adverse
+        // stop or natural drift will mop up; emitting would just earn
+        // -2010 reject + cooldown churn.
+        if self.config.min_notional > Decimal::ZERO && qty * price.0 < self.config.min_notional {
+            return Vec::new();
+        }
+        let intent = QuoteIntent {
+            symbol: ctx.symbol.clone(),
+            side,
+            price,
+            size: Size(qty),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        };
+        let decision = policy_diff(
+            self.resting.current_for(side),
+            intent.price,
+            intent.size,
+            Decimal::from(self.config.price_tolerance_ticks),
+            self.config.tick_size,
+        );
+        if matches!(decision, DiffDecision::Unchanged) {
+            return Vec::new();
+        }
+        self.resting.record_place(&intent);
+        policy_apply(decision, intent)
+    }
+
     /// Emit a side-cancel for a tracked-but-no-longer-wanted side.
     /// Drops the tracker entry too.
     fn drop_tracked_side(&mut self, side: Side) -> Vec<Action> {
@@ -386,14 +426,28 @@ impl SpreadScalp {
             && !self.side_in_cooldown(Side::Bid, ts);
         let want_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Ask, ts);
+        // Close-side qty pin: when holding inventory, the side that
+        // reduces it (long→Ask, short→Bid) is sized to abs(position.size)
+        // rather than notional/price. Eliminates lot-step jitter from
+        // recomputed sizes when price moves within price_tolerance_ticks.
+        let close_side = Self::close_side_for(ctx.position.size.0);
+        let close_qty = ctx.position.size.0.abs();
         if want_bid {
-            actions.extend(self.diff_emit(ctx, Side::Bid, bid, size_mult.0));
+            if close_side == Some(Side::Bid) && close_qty > Decimal::ZERO {
+                actions.extend(self.diff_emit_close(ctx, Side::Bid, bid, close_qty));
+            } else {
+                actions.extend(self.diff_emit(ctx, Side::Bid, bid, size_mult.0));
+            }
         } else {
             // Side not wanted — drop the resting quote on it.
             actions.extend(self.drop_tracked_side(Side::Bid));
         }
         if want_ask {
-            actions.extend(self.diff_emit(ctx, Side::Ask, ask, size_mult.1));
+            if close_side == Some(Side::Ask) && close_qty > Decimal::ZERO {
+                actions.extend(self.diff_emit_close(ctx, Side::Ask, ask, close_qty));
+            } else {
+                actions.extend(self.diff_emit(ctx, Side::Ask, ask, size_mult.1));
+            }
         } else {
             actions.extend(self.drop_tracked_side(Side::Ask));
         }
@@ -1228,10 +1282,15 @@ mod tests {
     }
 
     #[test]
-    fn long_inventory_sizes_ask_larger() {
+    fn long_inventory_pins_ask_to_position_size() {
+        // Close-side (Ask for long) is now pinned to abs(position.size)
+        // rather than notional/price × multiplier. This prevents
+        // lot-step jitter from triggering Replace when price moves
+        // within `price_tolerance_ticks`.
         let symbol = sym();
         let snapshot = book(&symbol, 50, 60, 1);
-        let position = pos_with_size(&symbol, Decimal::new(5, 1));
+        let pos_size = Decimal::new(5, 1);
+        let position = pos_with_size(&symbol, pos_size);
         let mut strategy = strategy();
         let actions = strategy.on_event(
             &ctx(&symbol, &snapshot, &position),
@@ -1242,22 +1301,22 @@ mod tests {
         assert_eq!(actions.len(), 2);
         match (&actions[0], &actions[1]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert!(
-                    ask.size.0 > bid.size.0,
-                    "ask={} bid={}",
-                    ask.size.0,
-                    bid.size.0
-                );
+                assert_eq!(ask.size.0, pos_size.abs(), "ask pinned to position size");
+                // Bid (entry side) still notional-derived. Default
+                // strategy() has quote_offset_ticks=-1 → bid price =
+                // best_bid + 1 tick = 51, size = floor(100/51) = 1.
+                assert_eq!(bid.size.0, Decimal::ONE);
             }
             _ => panic!("expected quotes"),
         }
     }
 
     #[test]
-    fn short_inventory_sizes_bid_larger() {
+    fn short_inventory_pins_bid_to_position_size() {
         let symbol = sym();
         let snapshot = book(&symbol, 100, 110, 1);
-        let position = pos_with_size(&symbol, Decimal::new(-5, 1));
+        let pos_size = Decimal::new(-5, 1);
+        let position = pos_with_size(&symbol, pos_size);
         let mut strategy = strategy();
         let actions = strategy.on_event(
             &ctx(&symbol, &snapshot, &position),
@@ -1268,7 +1327,11 @@ mod tests {
         assert_eq!(actions.len(), 2);
         match (&actions[0], &actions[1]) {
             (Action::Quote(bid), Action::Quote(ask)) => {
-                assert!(bid.size.0 > ask.size.0);
+                assert_eq!(bid.size.0, pos_size.abs(), "bid pinned to position size");
+                // Ask (entry side) still notional-derived: 100/110 floor
+                // to step=1 = 0. min_notional is ZERO in tests so the
+                // zero-size emit is allowed.
+                assert_eq!(ask.size.0, Decimal::ZERO);
             }
             _ => panic!("expected quotes"),
         }
