@@ -184,8 +184,9 @@ pub struct BotConfig {
     pub touch_refill: Option<TouchRefillParams>,
 }
 
-/// TouchRefill — minimal at-touch MM. Only knob is per-order notional;
-/// step_size + min_notional come from the venue exchangeInfo cache.
+/// TouchRefill — minimal at-touch MM with optional N-tick grid depth.
+/// `step_size` / `tick_size` / `min_notional` come from venue
+/// exchangeInfo.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TouchRefillParams {
@@ -193,6 +194,17 @@ pub struct TouchRefillParams {
     /// default applies (`account.order_balance_pct × wallet / bots`).
     #[serde(default)]
     pub notional: Option<Decimal>,
+    /// Grid depth per side. `1` = single order at touch (classic),
+    /// `N > 1` places `N` orders per side spaced one tick apart
+    /// starting at touch. Default `1`. With N=12 the bot defends
+    /// against ~10-tick adverse price jumps. Inventory cap scales:
+    /// max per-side position = N × notional_per_order.
+    #[serde(default = "touch_refill_default_grid_levels")]
+    pub grid_levels: u32,
+}
+
+fn touch_refill_default_grid_levels() -> u32 {
+    1
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

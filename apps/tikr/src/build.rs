@@ -330,11 +330,17 @@ fn build_touch_refill(
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    let grid_levels = cfg
+        .touch_refill
+        .as_ref()
+        .map(|p| p.grid_levels)
+        .unwrap_or(1);
     Ok(StrategyChoice::TouchRefill(TouchRefillConfig {
         notional_per_order: notional,
         tick_size,
         step_size,
         min_notional,
+        grid_levels,
     }))
 }
 

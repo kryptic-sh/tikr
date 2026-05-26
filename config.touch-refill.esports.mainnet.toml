@@ -33,6 +33,12 @@ leverage = 5
 symbol = "ESPORTSUSDT"
 strategy = "touch-refill"
 
-# No params required. Notional comes from account.order_balance_pct.
-# Step size + min notional pulled from venue exchangeInfo automatically.
+# grid_levels = 12 → maintain a 12-tick deep grid per side. When the
+# book moves down, the bid grid extends down to follow (and vice versa
+# for asks moving up). Defends against ~10-tick price jumps that would
+# leave a single-level bot unfilled.
+#
+# Inventory cap scales: max per-side position ≈ 12 × notional. With
+# 1% wallet notional on $770 wallet = $7.70/order × 12 = $92 max per side.
 [bot.touch_refill]
+grid_levels = 12

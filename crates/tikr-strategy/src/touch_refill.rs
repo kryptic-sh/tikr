@@ -33,12 +33,21 @@ pub struct TouchRefillConfig {
     /// Notional USDT per order. Quantity = `notional / price`, floored
     /// to `step_size`, bumped to meet `min_notional`.
     pub notional_per_order: Decimal,
-    /// Venue tick size. Used for the close-on-fill +/- 1 tick offset.
+    /// Venue tick size. Used for the close-on-fill +/- 1 tick offset
+    /// and for grid level spacing.
     pub tick_size: Decimal,
     /// Venue lot step.
     pub step_size: Decimal,
     /// Venue min order notional.
     pub min_notional: Decimal,
+    /// Grid depth per side. `1` (default) = classic single-level
+    /// at-touch. `N > 1` places orders at `best_bid − i × tick` for
+    /// `i ∈ [0, N)` on the bid side, and `best_ask + i × tick` on the
+    /// ask side. Defends against price jumps that would otherwise leave
+    /// the bot unfilled and chasing — with N=12, a 10-tick jump still
+    /// leaves the bot with orders in the path. Inventory cap scales
+    /// linearly: max position = N × notional_per_order per side.
+    pub grid_levels: u32,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
@@ -51,6 +60,12 @@ pub struct TouchRefill {
     /// `on_event` call.
     pending_bid_prices: BTreeSet<Decimal>,
     pending_ask_prices: BTreeSet<Decimal>,
+    /// Historic deepest BID grid floor. When the book drops, the grid
+    /// extends down to follow it; when it rises, the floor stays put
+    /// (existing deep bids keep resting). `None` until the first event.
+    bid_grid_floor: Option<Decimal>,
+    /// Historic highest ASK grid ceiling — mirror of `bid_grid_floor`.
+    ask_grid_ceiling: Option<Decimal>,
 }
 
 impl TouchRefill {
@@ -121,6 +136,8 @@ impl Strategy for TouchRefill {
             config,
             pending_bid_prices: BTreeSet::new(),
             pending_ask_prices: BTreeSet::new(),
+            bid_grid_floor: None,
+            ask_grid_ceiling: None,
         }
     }
 
@@ -135,20 +152,86 @@ impl Strategy for TouchRefill {
 
         let mut actions: Vec<Action> = Vec::new();
 
-        // Rule 1: ensure ≥1 order at best on each side.
+        // Rule 1: maintain a grid that extends in both directions as the
+        // book moves. Each side's grid spans from the current touch
+        // outward by at least `grid_levels` ticks, AND keeps any deeper
+        // levels it has accumulated from past book moves.
+        //
+        // - BID floor: min(historic floor, current best_bid − (N−1)×tick).
+        //   When best_bid drops, the floor drops with it (extend down).
+        //   When best_bid rises, the floor stays put (existing deep bids
+        //   keep resting).
+        // - ASK ceiling: max(historic ceiling, current best_ask + (N−1)×tick).
+        //   Mirror behavior for the ask side.
+        //
+        // Then place at every tick from current touch out to the
+        // historic extreme. Existing orders are deduped via
+        // `already_have_order`. Never cancels — stale levels just
+        // sit in the book until they fill.
+        let levels = self.config.grid_levels.max(1);
+        let tick = self.config.tick_size;
+        let outward = Decimal::from(levels.saturating_sub(1)) * tick;
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
+
         if let Some(bp) = best_bid
             && bp.0 > Decimal::ZERO
-            && !self.already_have_order(ctx, Side::Bid, bp)
+            && tick > Decimal::ZERO
         {
-            actions.push(self.emit(ctx.symbol, Side::Bid, bp));
+            let target_floor = bp.0 - outward;
+            self.bid_grid_floor = Some(match self.bid_grid_floor {
+                Some(f) if f <= target_floor => f,
+                _ => target_floor,
+            });
+            let floor = self.bid_grid_floor.unwrap();
+            // Cross-guard: never emit a BID at or above best_ask
+            // (snapshot may be stale vs current venue book — post-only
+            // would reject with -5022). Cap starting price at best_ask − tick.
+            let mut price = bp.0;
+            if let Some(ap) = best_ask
+                && ap.0 > Decimal::ZERO
+            {
+                let max_bid = ap.0 - tick;
+                if price > max_bid {
+                    price = max_bid;
+                }
+            }
+            while price >= floor && price > Decimal::ZERO {
+                let p = Price(price);
+                if !self.already_have_order(ctx, Side::Bid, p) {
+                    actions.push(self.emit(ctx.symbol, Side::Bid, p));
+                }
+                price -= tick;
+            }
         }
+
         if let Some(ap) = best_ask
             && ap.0 > Decimal::ZERO
-            && !self.already_have_order(ctx, Side::Ask, ap)
+            && tick > Decimal::ZERO
         {
-            actions.push(self.emit(ctx.symbol, Side::Ask, ap));
+            let target_ceiling = ap.0 + outward;
+            self.ask_grid_ceiling = Some(match self.ask_grid_ceiling {
+                Some(c) if c >= target_ceiling => c,
+                _ => target_ceiling,
+            });
+            let ceiling = self.ask_grid_ceiling.unwrap();
+            // Cross-guard: never emit ASK at or below best_bid.
+            let mut price = ap.0;
+            if let Some(bp) = best_bid
+                && bp.0 > Decimal::ZERO
+            {
+                let min_ask = bp.0 + tick;
+                if price < min_ask {
+                    price = min_ask;
+                }
+            }
+            while price <= ceiling {
+                let p = Price(price);
+                if !self.already_have_order(ctx, Side::Ask, p) {
+                    actions.push(self.emit(ctx.symbol, Side::Ask, p));
+                }
+                price += tick;
+            }
         }
 
         // Rule 2: on FULL fill, place opposite-side close at
@@ -250,6 +333,7 @@ mod tests {
             tick_size: Decimal::new(1, 4), // 0.0001
             step_size: Decimal::ONE,
             min_notional: Decimal::from(5),
+            grid_levels: 1,
         }
     }
 
@@ -405,5 +489,104 @@ mod tests {
             .collect();
         assert_eq!(asks.len(), 1, "no close emit on partial fill: {asks:?}");
         assert_eq!(asks[0], Decimal::new(20, 4));
+    }
+
+    #[test]
+    fn grid_places_levels_outward_from_touch() {
+        let mut c = cfg();
+        c.grid_levels = 3;
+        let mut s = TouchRefill::new(c);
+        let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
+        let p = pos();
+        let symbol = sym();
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        // 3 BIDs at 0.0010, 0.0009, 0.0008 + 3 ASKs at 0.0011, 0.0012, 0.0013.
+        let bids: BTreeSet<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bids.len(), 3);
+        assert!(bids.contains(&Decimal::new(10, 4)));
+        assert!(bids.contains(&Decimal::new(9, 4)));
+        assert!(bids.contains(&Decimal::new(8, 4)));
+        let asks: BTreeSet<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asks.len(), 3);
+        assert!(asks.contains(&Decimal::new(11, 4)));
+        assert!(asks.contains(&Decimal::new(12, 4)));
+        assert!(asks.contains(&Decimal::new(13, 4)));
+    }
+
+    #[test]
+    fn grid_extends_down_when_best_bid_falls() {
+        let mut c = cfg();
+        c.grid_levels = 3;
+        let mut s = TouchRefill::new(c);
+        let symbol = sym();
+        let p = pos();
+
+        // Initial book: 0.0010 / 0.0011. Grid: BIDs at 10, 9, 8.
+        let snap1 = book(Decimal::new(10, 4), Decimal::new(11, 4));
+        let ctx1 = make_ctx(&symbol, &snap1, &p, &[]);
+        let _ = s.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+
+        // Book moves down: 0.0008 / 0.0009. New bid grid should cover
+        // 0.0008 (already there), 0.0007 (NEW — extension), 0.0006 (NEW).
+        // Existing 0.0010, 0.0009 stay (orphans we don't cancel).
+        let snap2 = book(Decimal::new(8, 4), Decimal::new(9, 4));
+        // Simulate open orders from first cycle (10, 9, 8 BIDs).
+        let open: Vec<(QuoteId, QuoteIntent)> = [10, 9, 8]
+            .iter()
+            .map(|p| {
+                (
+                    QuoteId::new(),
+                    QuoteIntent {
+                        symbol: symbol.clone(),
+                        side: Side::Bid,
+                        price: Price(Decimal::new(*p, 4)),
+                        size: Size(Decimal::ONE),
+                        tif: TimeInForce::PostOnly,
+                        kind: QuoteKind::Point,
+                    },
+                )
+            })
+            .collect();
+        let ctx2 = make_ctx(&symbol, &snap2, &p, &open);
+        let actions = s.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap2.clone(),
+            },
+        );
+        let new_bids: BTreeSet<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // 0.0008 was already open. 0.0007 + 0.0006 are new extensions.
+        assert_eq!(new_bids.len(), 2, "expect 2 new bid levels: {new_bids:?}");
+        assert!(new_bids.contains(&Decimal::new(7, 4)));
+        assert!(new_bids.contains(&Decimal::new(6, 4)));
     }
 }
