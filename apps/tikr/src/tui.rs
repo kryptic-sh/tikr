@@ -1031,14 +1031,15 @@ fn draw_account(
         "per symbol",
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     ));
+    // Per-symbol = realized − fees only. Unrealized is excluded on
+    // purpose: this panel exists to show whether each bot is actually
+    // turning over profitable round-trips, not how its current open
+    // inventory is marked. Unrealized is captured at the global level.
     for v in views {
-        let net = v.snapshot.as_ref().map_or(Decimal::ZERO, |r| {
-            if let Some(api) = &v.api_position {
-                r.realized.0 + api.unrealized_profit - r.fees.0 + r.funding.0
-            } else {
-                r.net.0
-            }
-        });
+        let net = v
+            .snapshot
+            .as_ref()
+            .map_or(Decimal::ZERO, |r| r.realized.0 - r.fees.0);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {:<10}", v.symbol),
