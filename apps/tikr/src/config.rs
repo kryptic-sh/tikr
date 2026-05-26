@@ -263,6 +263,12 @@ pub struct TouchRefillAutoConfig {
     /// `min_self_spread_bps`.
     #[serde(default)]
     pub close_profit_bps: u32,
+    /// Quote asset to filter discovery on. Typical values: `"USDT"`
+    /// (default) or `"USDC"`. Affects which set of USD-M perps the
+    /// rotation manager considers. Note: USDC perps are settled in
+    /// USDC, so you'll need USDC in your futures wallet to trade them.
+    #[serde(default = "touch_refill_auto_default_quote_asset")]
+    pub quote_asset: String,
 }
 
 fn touch_refill_auto_default_min_tick_bps() -> Decimal {
@@ -279,6 +285,9 @@ fn touch_refill_auto_default_min_self_spread_bps() -> u32 {
 }
 fn touch_refill_auto_default_grid_levels() -> u32 {
     12
+}
+fn touch_refill_auto_default_quote_asset() -> String {
+    "USDT".to_string()
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

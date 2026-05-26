@@ -67,6 +67,7 @@ pub fn spawn_touch_refill_auto_manager(
             min_tick_bps = %cfg.min_tick_bps,
             min_volume_usdt = %cfg.min_volume_usdt,
             recheck_interval_secs = recheck,
+            quote_asset = %cfg.quote_asset,
             "touch_refill_auto: starting discovery loop"
         );
 
@@ -95,6 +96,7 @@ pub fn spawn_touch_refill_auto_manager(
             let discovered = match tikr_binance::futs::list_perp_tick_info(
                 &http,
                 account.env.rest_base_url(),
+                &cfg.quote_asset,
             )
             .await
             {

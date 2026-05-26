@@ -414,15 +414,16 @@ pub struct PerpTickInfo {
     pub quote_volume_24h: tikr_core::Decimal,
 }
 
-/// Discover all USD-M PERPETUAL USDT-quoted symbols, joining
-/// exchangeInfo (tick filter) with the latest /ticker/price snapshot
-/// and 24h ticker volume. Returns one row per TRADING symbol.
+/// Discover all USD-M PERPETUAL symbols quoted in `quote_asset`,
+/// joining exchangeInfo (tick filter) with the latest /ticker/price
+/// snapshot and 24h ticker volume. Returns one row per TRADING symbol.
 ///
-/// Single REST call to exchangeInfo + one to ticker/price + one to
-/// ticker/24hr. Total ~3 requests. Caller decides the threshold.
+/// `quote_asset` is typically `"USDT"` or `"USDC"`. Single REST call
+/// to exchangeInfo + one to ticker/price + one to ticker/24hr.
 pub async fn list_perp_tick_info(
     http: &HttpClient,
     base_url: &str,
+    quote_asset: &str,
 ) -> Result<Vec<PerpTickInfo>, VenueError> {
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -465,7 +466,7 @@ pub async fn list_perp_tick_info(
     let mut out = Vec::new();
     for sym_raw in &info.symbols {
         let symbol = &sym_raw.symbol;
-        if sym_raw.quote_asset.as_deref() != Some("USDT") {
+        if sym_raw.quote_asset.as_deref() != Some(quote_asset) {
             continue;
         }
         if sym_raw.contract_type.as_deref() != Some("PERPETUAL") {

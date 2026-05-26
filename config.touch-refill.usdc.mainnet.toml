@@ -1,0 +1,65 @@
+# ─── TouchRefill Auto-rotation on USDC perps — MAINNET ─────────────────
+#
+# Same as the USDT auto config, but discovers + trades USDC-margined
+# perpetuals (BTCUSDC, ETHUSDC, BNBUSDC, SOLUSDC, etc.). USDC perps
+# use the same /fapi/v1/* endpoints as USDT-M — only the quote-asset
+# filter changes.
+#
+# Why USDC?
+#   - Binance runs a zero-maker-fee PROMOTION on USDC-margined perps
+#     (verify current rate at binance.com/en/fee/futureFee before use).
+#     0 bps maker → entire min_self_spread becomes net profit per RT.
+#   - vs USDT-M with BNB discount: 1.8 bps maker × 2 sides = 3.6 bps
+#     RT fee overhead.
+#
+# Caveats:
+#   1. USDC perp universe is MUCH smaller (~10 symbols vs ~200 USDT-M).
+#   2. Liquidity is thinner — wider real spreads, more adverse selection.
+#   3. Need USDC in your futures wallet (NOT USDT). Transfer first.
+#   4. Promo can be pulled — verify maker rate matches assumption below.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1   in shell
+#   2. .env loaded with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Binance Futures wallet (NOT USDT)
+#   4. Confirm current USDC maker fee at the link above
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/touch-refill-usdc"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+[touch_refill_auto]
+enabled = true
+
+# Discover USDC-margined perps only.
+quote_asset = "USDC"
+
+# Lower threshold than USDT config because USDC maker fees are 0 (promo).
+# Net edge per RT ≈ min_self_spread_bps - 0 = full spread.
+# 6 bps still leaves a comfortable margin even if the promo expires
+# and reverts to 1.8 bps maker (i.e. 3.6 bps RT).
+min_tick_bps = "6"
+
+# USDC perp volumes are much smaller. Drop the floor to surface what
+# little universe exists. Set higher if you want only the most-liquid
+# names (BTCUSDC + ETHUSDC + BNBUSDC).
+min_volume_usdt = "5000000"
+
+recheck_interval_secs = 60
+
+# With 0 maker fees, the spread requirement can be tighter — but
+# we still want a couple bps of edge for adverse-selection padding.
+# 8 bps gives ~5 bps net profit per RT at promo rates.
+min_self_spread_bps = 8
+
+# Smaller grid because thinner books mean less room to safely
+# accumulate inventory; 3 levels covers typical 1-3 tick book moves
+# without over-extending.
+grid_levels = 3
+
+# Profit target ≥ spread floor. 15 bps gives a nicer per-RT win when
+# fills do come through (less frequent on thin USDC books anyway).
+close_profit_bps = 15
