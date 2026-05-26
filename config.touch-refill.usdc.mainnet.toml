@@ -33,20 +33,21 @@ quote_asset = "USDC"
 # explicitly and min_self_spread_bps below synthesizes the required
 # spread regardless of natural book width.
 symbols_allowlist = [
-    "ETHUSDC",
-    "BNBUSDC",
-    "SOLUSDC",
-    "XRPUSDC",
-    "DOGEUSDC",
-    "ADAUSDC",
-    "AVAXUSDC",
-    "LINKUSDC",
-    "SUIUSDC",
-    "1000PEPEUSDC",
-    "1000SHIBUSDC",
-    "WIFUSDC",
-    "WLDUSDC",
-    "ARBUSDC",
+  "BTCUSDC",
+  "ETHUSDC",
+  "BNBUSDC",
+  "SOLUSDC",
+  "XRPUSDC",
+  "DOGEUSDC",
+  "ADAUSDC",
+  "AVAXUSDC",
+  "LINKUSDC",
+  "SUIUSDC",
+  "1000PEPEUSDC",
+  "1000SHIBUSDC",
+  "WIFUSDC",
+  "WLDUSDC",
+  "ARBUSDC",
 ]
 
 # Ignored when symbols_allowlist set, but kept for reference if
@@ -62,7 +63,7 @@ recheck_interval_secs = 60
 min_self_spread_bps = 20
 
 # Smaller grid — thinner USDC books mean less safe inventory accumulation.
-grid_levels = 2
+grid_levels = 3
 
 # Wider close target = more profit per RT. USDC books are slow,
 # fewer fills, so make each one count more.

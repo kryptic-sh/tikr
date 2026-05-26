@@ -545,11 +545,18 @@ fn drain_keymap_timeout(ui: &mut UiState, views: &[BotViewSnapshot]) {
 /// Returns `(original_index, score, match_positions)` sorted descending
 /// by score. Empty query returns all views with score 0.
 fn filter_views(views: &[BotViewSnapshot], query: &str) -> Vec<(usize, i64, Vec<usize>)> {
+    // hjkl_picker::score is case-sensitive; lowercase both sides so
+    // "eth" matches "ETHUSDC". Char positions returned are indices
+    // into the lowercased haystack, which line up 1:1 with the
+    // original since to_lowercase preserves char count for ASCII
+    // symbol names.
+    let needle = query.to_lowercase();
     let mut out: Vec<(usize, i64, Vec<usize>)> = views
         .iter()
         .enumerate()
         .filter_map(|(idx, v)| {
-            let (score, positions) = hjkl_picker::score(&v.symbol, query)?;
+            let haystack = v.symbol.to_lowercase();
+            let (score, positions) = hjkl_picker::score(&haystack, &needle)?;
             Some((idx, score, positions))
         })
         .collect();
