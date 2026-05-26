@@ -694,16 +694,20 @@ impl Venue for BinanceClient {
 
     /// Return the current position for a symbol.
     ///
-    /// v0: returns a zero position. A REST call to `/fapi/v2/positionRisk`
-    /// (futures) or account endpoint (spot) is a follow-up item.
+    /// Futures: REST call to `/fapi/v3/positionRisk` returns signed
+    /// position amount + avg entry price. Caller can rely on
+    /// `avg_entry` being populated when `size != 0` — critical for
+    /// the runner's position-drift safety net, which would otherwise
+    /// `force_reconcile` to `avg_entry = 0` and treat all subsequent
+    /// closing PnL as if entry were $0 (inflates realized hugely).
+    ///
+    /// Spot: returns flat (no position concept).
     async fn position(&self, symbol: &Symbol) -> Result<Position, VenueError> {
         use tikr_core::Notional;
-        // Spot: no native position concept — return flat. Futures: query
-        // /fapi/v2/positionRisk for the real signed amount.
         if self.env.is_futures() {
             let sym_str = binance_symbol(symbol);
             let base_url = self.env.rest_base_url();
-            let amount = crate::futs::get_position_amount(
+            let pr = crate::futs::get_position_risk(
                 &self.http,
                 base_url,
                 &self.api_key,
@@ -713,8 +717,8 @@ impl Venue for BinanceClient {
             .await?;
             return Ok(Position {
                 symbol: symbol.clone(),
-                size: SignedSize(amount),
-                avg_entry: Price(tikr_core::Decimal::ZERO),
+                size: SignedSize(pr.position_amount),
+                avg_entry: Price(pr.entry_price),
                 realized_pnl: Notional(tikr_core::Decimal::ZERO),
             });
         }

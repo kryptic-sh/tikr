@@ -1,0 +1,76 @@
+# ─── DOGE-only Spread-Scalp on Binance Futures MAINNET ────────────────────
+#
+# Starter config for live mainnet trading on DOGEUSDT. Sizing kept TINY
+# ($10 notional / $30 max position) — scale up only after 6-12h of clean
+# operation + realized > fees.
+#
+# Pre-flight checklist:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1 set in shell (safety interlock)
+#   2. Credentials provided via env vars OR uncomment key_file below
+#   3. DOGE leverage on Binance Futures set to 1x (default may be 20x)
+#   4. USDT balance in Futures wallet (>= $50 for headroom)
+#   5. No existing DOGE position/orders you care about — bot cancels
+#      pre-existing orders on startup (clean-slate policy)
+#
+# Tuned params (DOGE 48h backtest 2026-05-26):
+#   - min_spread_bps=8     : entry trigger; fires on real dislocations
+#   - adverse_stop=120s/30bps : caps bad-tail when reversion doesn't come
+#                              (+93% banked profit vs unstopped baseline)
+#
+# Expected behaviour:
+#   - First fill within 10-30 min depending on book activity
+#   - ~0.5 fills/min average; tight days may be 0.1 fills/min
+#   - Realized + fees should both grow steadily; banked = realized − fees
+#     stays positive on a healthy run
+#
+# Adjust knobs as confidence grows. Once verified, bump `notional` to
+# ~$50 → $100 → $200 over successive sessions.
+
+
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+env = "futures-mainnet"
+state_dir = "./state/doge-mainnet"
+
+# Credentials — pick ONE:
+#
+#   A) env vars (no key_file line needed):
+#      export TIKR_BINANCE_FUTURES_API_KEY=...
+#      export TIKR_BINANCE_FUTURES_API_SECRET=...
+#
+#   B) HMAC key file (uncomment + set path):
+# key_file = "/home/mxaddict/keys/binance-futures.txt"
+
+# Optional auto-sizing from wallet balance. Disabled here (notional set
+# explicitly per bot below) so the bot doesn't grow size as wallet
+# fluctuates during validation. Re-enable later.
+# order_balance_pct = "1.5"
+# max_position_pct = "5"
+
+
+# ─── DOGE SpreadScalp ──────────────────────────────────────────────────────
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+# TINY sizing for first session. Scale up after validation.
+notional = 10
+max_position_usdt = 30
+
+# Tuned entry trigger.
+min_spread_bps = 8
+requote_interval_ms = 1000
+price_tolerance_ticks = 1
+reject_cooldown_ms = 2000
+
+# Adverse-drift hard stop (2026-05-25 sweep winner):
+# If held >120s AND mid drifts >=30bps against direction → IOC close at
+# touch. Bounds the bad-tail when reversion never comes.
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
+# Close-side passive quote stays alive even when book spread tightens
+# below min_spread_bps. Drains position at maker fee on natural
+# reversion. (Default true; pinned here so it's visible.)
+# close_side_always_quotes = true

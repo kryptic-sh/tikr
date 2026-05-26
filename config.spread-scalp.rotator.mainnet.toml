@@ -1,0 +1,120 @@
+# ─── SpreadScalp Rotator on Binance Futures MAINNET ──────────────────────
+#
+# Live-mainnet rotating SpreadScalp config. Keeps N bots running on the
+# most-volatile USDT perp symbols, refreshed every 5 minutes. Each bot
+# uses the tuned SS params (validated on 48h DOGE mainnet backtest).
+#
+# Pre-flight checklist:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1 set in shell (safety interlock)
+#   2. .env in cwd OR shell vars: TIKR_BINANCE_FUTURES_API_KEY /
+#      TIKR_BINANCE_FUTURES_API_SECRET (auto-loaded via dotenvy)
+#   3. Futures account activated, USDT in Futures wallet >= $300
+#   4. API key has Futures trade perms (verify with positionRisk poll
+#      working on startup — no -2015 errors in logs)
+#
+# Tuned params (DOGE 48h backtest 2026-05-26 sweep winner — confirmed
+# at spread=8, advstop=120s/30bps; +93% banked profit vs unstopped):
+#   - min_spread_bps     = 8       entry trigger (cascade events)
+#   - adverse_stop       = 120s / 30bps        caps bad-tail
+#   - close_side_alwayson = true    (default)  drains at maker fee
+#   - requote_interval   = 1000ms
+#   - reject_cooldown    = 2000ms
+#   - price_tolerance    = 1 tick
+#
+# Sizing per bot (auto-derived from wallet balance):
+#   - order_balance_pct  = 1.5%    per-order notional vs wallet
+#   - max_position_pct   = 5%      per-bot inventory cap vs wallet
+#
+# At $700 wallet across 4 slots = $10.5 per order, $35 per-bot cap.
+# Grows naturally via the 5s account poll as PnL accrues.
+
+
+# ─── Account ───────────────────────────────────────────────────────────────
+[account]
+env = "futures-mainnet"
+state_dir = "./state/spread-scalp-rotator"
+
+# Credentials via .env (recommended) or shell env vars:
+#   TIKR_BINANCE_FUTURES_API_KEY
+#   TIKR_BINANCE_FUTURES_API_SECRET
+# Or uncomment and point at an HMAC key file:
+# key_file = "/home/mxaddict/keys/binance-futures.txt"
+
+# Per-order notional as % of margin balance, split across active bots.
+# When a bot's strategy specifies `notional` explicitly, this is overridden.
+order_balance_pct = "1.5"
+
+# Per-bot position cap as % of margin balance. Overrides
+# `max_position_usdt` in the bot strategy block unless set explicitly.
+max_position_pct = "5"
+
+
+# ─── Rotator ───────────────────────────────────────────────────────────────
+#
+# Rotating mode: keeps `slots` bots live, each on a different symbol
+# chosen by recent volatility. On rotation, old symbol bots stop, open
+# orders cancel, positions flatten, then new symbols start.
+#
+# Volatility ranking is by 24h price range × 24h quote-volume filter.
+# `min_quote_volume = 100M USDT` filters out illiquid mid-caps where
+# SS would sit idle (per 2026-05-25 alt-candidates probe).
+
+[scalp_rotation]
+enabled = true
+slots = 4
+refresh_secs = 300
+quote_asset = "USDT"
+min_quote_volume = 100000000
+
+# Optional allow-list. Empty (default) = scan all USDT futures symbols
+# above min_quote_volume. Curate to symbols with tick_bps >= 1.0 so the
+# 8bps trigger has natural cascade events to capture (per 2026-05-25
+# probe of mainnet alts).
+candidates = [
+    "DOGEUSDT",    # confirmed winner — 0.97bps tick, 279M vol
+    "NEARUSDT",    # 3.62bps tick, 777M vol, +14.7% / 20.9% range
+    "SUIUSDT",     # 0.95bps tick, 213M vol
+    "ONDOUSDT",    # 2.30bps tick, 177M vol
+    "NILUSDT",     # 1.14bps tick, 359M vol, high volatility
+    "INJUSDT",     # 1.74bps tick, 114M vol, +10% / 14% range
+    "WLDUSDT",     # 3.27bps tick, 133M vol
+    "1000SHIBUSDT", # 1.78bps tick, 26M vol (borderline)
+    "ADAUSDT",     # 4.08bps tick, 122M vol (wide tick)
+    "AVAXUSDT",    # 1.06bps tick, 92M vol
+    "LINKUSDT",    # 1.04bps tick, 82M vol
+]
+
+
+# ─── SpreadScalp template ─────────────────────────────────────────────────
+#
+# Rotation copies these params onto each selected symbol. The `symbol`
+# field is a template seed; rotation replaces it with current volatile
+# picks and auto-detects tick_size / min_notional via exchangeInfo.
+
+[[bot]]
+symbol = "DOGEUSDT"
+strategy = "spread-scalp"
+
+[bot.spread_scalp]
+# `notional` and `max_position_usdt` left UNSET — auto-derived from
+# account.order_balance_pct + account.max_position_pct per refresh tick.
+
+min_spread_bps = 8
+requote_interval_ms = 1000
+reject_cooldown_ms = 2000
+price_tolerance_ticks = 1
+
+# Adverse-drift hard stop (2026-05-25 sweep winner).
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+
+# Close-side passive quote stays alive when spread tightens — drains
+# inventory at maker fee on natural reversion. Default true; pinned
+# for visibility.
+close_side_always_quotes = true
+
+# Decay disabled — sweep showed -77% banked profit when enabled.
+# close_decay_after_secs_1 = 0
+# close_decay_factor_1 = 1.0
+# close_decay_after_secs_2 = 0
+# close_decay_factor_2 = 1.0

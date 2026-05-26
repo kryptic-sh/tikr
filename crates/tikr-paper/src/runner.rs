@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_backtest::pnl::PositionTracker;
 use tikr_core::{
-    Decimal, Fill, LiqEvent, MarketEvent, Notional, Position, Price, Side, Snapshot, Symbol,
-    Timestamp,
+    Decimal, Fill, LiqEvent, MarketEvent, Notional, Position, Price, Side, SignedSize, Snapshot,
+    Symbol, Timestamp,
 };
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
@@ -1440,6 +1440,51 @@ where
                         tikr_core::Side::Ask => (b, s + 1),
                     }
                 });
+                // Always refresh live_tap + snapshot_tap so the TUI's
+                // uptime timer stays live (uptime isn't in the
+                // fingerprint dedup below). Without this, idle bots
+                // appear frozen because snapshot_tap is otherwise only
+                // refreshed on Fill / BookUpdate events.
+                publish_live(
+                    &config.live_tap,
+                    &tracker,
+                    &fill_sim,
+                    &symbol,
+                    last_mid,
+                    &current_book,
+                    buy_fills,
+                    sell_fills,
+                    buy_volume,
+                    sell_volume,
+                    &last_fill,
+                );
+                if let Some(ref tap) = config.snapshot_tap {
+                    let mut heartbeat = finalize(
+                        &tracker,
+                        last_mid,
+                        started,
+                        events_processed,
+                        fills_emitted,
+                        &risk_gate,
+                        first_event_ts,
+                        last_event_ts,
+                        skim_cfg,
+                        skim_count,
+                        skim_total_usdt,
+                        base_stacked,
+                        &symbol,
+                        buy_volume,
+                        sell_volume,
+                        peak_position_usdt,
+                    );
+                    heartbeat.runtime_secs =
+                        resumed_runtime_secs.saturating_add(heartbeat.runtime_secs);
+                    heartbeat.sim_duration_secs =
+                        resumed_sim_duration_secs.saturating_add(heartbeat.sim_duration_secs);
+                    if let Ok(mut guard) = tap.try_write() {
+                        *guard = Some(heartbeat);
+                    }
+                }
                 let fingerprint = (fills_emitted, open_buys, open_sells, pos.size.0);
                 if last_status_fingerprint.as_ref() == Some(&fingerprint) {
                     continue;
@@ -1482,6 +1527,35 @@ where
                 );
             }
             _ = recon_tick.tick(), if live_mode => {
+                // Position-drift safety net: ground-truth via venue.position.
+                // Catches the case where WS user data stream silently stopped
+                // delivering fills (listenKey hijacked by another process,
+                // server-initiated close + bad reconnect, etc.) — without
+                // this the tracker stays at the pre-fill size while the
+                // strategy reasons against phantom inventory.
+                match venue.position(&symbol).await {
+                    Ok(venue_pos) => {
+                        let tracker_size = tracker.snapshot().size.0;
+                        let venue_size = venue_pos.size.0;
+                        let drift = (tracker_size - venue_size).abs();
+                        // Float-noise threshold. Real drift (missed fill) is
+                        // always much larger than this.
+                        let threshold = Decimal::from_str_exact("0.00000001").unwrap();
+                        if drift > threshold {
+                            warn!(
+                                tracker_size = %tracker_size,
+                                venue_size = %venue_size,
+                                drift = %drift,
+                                "position drift detected — WS likely missed fills; force-reconciling tracker to venue (PnL between drift events is not attributable)"
+                            );
+                            tracker.force_reconcile(
+                                SignedSize(venue_size),
+                                venue_pos.avg_entry,
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = ?e, "position drift check: venue.position failed"),
+                }
                 // Order reconciliation: ground-truth via venue.open_orders.
                 // Drop any FillSim ghosts (silent cancel / expiry / lost WS
                 // events). One REST call every 30 s per bot — cheap relative

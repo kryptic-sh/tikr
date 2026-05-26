@@ -145,7 +145,11 @@ fn ws_base_url(env: BinanceEnv) -> &'static str {
         BinanceEnv::SpotTestnet => "wss://testnet.binance.vision/ws",
         BinanceEnv::SpotMainnet => "wss://stream.binance.com:9443/ws",
         BinanceEnv::FuturesTestnet => "wss://stream.binancefuture.com/ws",
-        BinanceEnv::FuturesMainnet => "wss://fstream.binance.com/ws",
+        // Mainnet Futures user data stream moved under `/private/` (per
+        // 2026 docs). The legacy `/ws/` path still accepts connections
+        // but delivers no ORDER_TRADE_UPDATE events — silent failure
+        // mode that wasted hours of debugging.
+        BinanceEnv::FuturesMainnet => "wss://fstream.binance.com/private/ws",
     }
 }
 
@@ -574,8 +578,21 @@ async fn subscribe_futures_user_data_stream(
 ) -> Result<mpsc::UnboundedReceiver<Fill>, VenueError> {
     let listen_key = mint_listen_key(&http, env, &api_key).await?;
     let ws_url = format!("{}/{}", ws_base_url(env), listen_key);
+    let key_prefix: String = listen_key.chars().take(8).collect();
+    info!(
+        env = ?env,
+        symbol_filter = %symbol_filter,
+        ws_base = ws_base_url(env),
+        listen_key_prefix = %key_prefix,
+        "userDataStream (futures): connecting WS"
+    );
 
     let stream = open_user_data_ws(&ws_url).await?;
+    info!(
+        env = ?env,
+        symbol_filter = %symbol_filter,
+        "userDataStream (futures): WS connected — waiting for ORDER_TRADE_UPDATE events"
+    );
 
     let (tx, rx) = mpsc::unbounded_channel::<Fill>();
 
@@ -667,6 +684,7 @@ async fn user_data_pump(
     let reconnect_min_ms: u64 = 1_000;
     let reconnect_max_ms: u64 = 30_000;
     let mut backoff_ms = reconnect_min_ms;
+    let mut frames_seen: u64 = 0;
 
     loop {
         let frame_fut = stream.next();
@@ -726,10 +744,18 @@ async fn user_data_pump(
             }
             Some(Ok(Message::Text(txt))) => {
                 backoff_ms = reconnect_min_ms;
-                // Visibility into the WS stream: log every frame at debug so
-                // operators can confirm the channel is alive even when
-                // no fills are happening (only fills surface at info level).
+                frames_seen = frames_seen.saturating_add(1);
+                // Visibility: log every frame at debug. Every 50th frame
+                // surfaces at info level so default-log operators can
+                // confirm the channel is alive even without fills.
                 debug!(bytes = txt.len(), "userDataStream: frame received");
+                if frames_seen.is_multiple_of(50) {
+                    info!(
+                        frames = frames_seen,
+                        bytes = txt.len(),
+                        "userDataStream: alive (frame milestone)"
+                    );
+                }
                 if let Some(fill) = parse_user_data_message(&txt, kind, &symbol_filter) {
                     info!(
                         quote_id = ?fill.quote_id,

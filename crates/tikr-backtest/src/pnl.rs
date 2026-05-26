@@ -159,6 +159,22 @@ impl PositionTracker {
         self.realized_pnl
     }
 
+    /// Force-reconcile tracker to a known authoritative position
+    /// (e.g. from a venue `position_risk` REST poll when WS fills
+    /// were lost). Overwrites `size` + `avg_entry` directly;
+    /// `realized_pnl` and `fees_paid` are LEFT AS-IS — caller is
+    /// responsible for understanding that lost-fill PnL is now
+    /// invisible to the tracker. The strategy's next event will
+    /// see the corrected position via `ctx.position`.
+    ///
+    /// Returns the delta `(old_size, old_avg)` for logging.
+    pub fn force_reconcile(&mut self, new_size: SignedSize, new_avg: Price) -> (SignedSize, Price) {
+        let prev = (self.size, self.avg_entry);
+        self.size = new_size;
+        self.avg_entry = new_avg;
+        prev
+    }
+
     /// Total fees paid (positive) or rebated (negative).
     pub fn fees(&self) -> Notional {
         self.fees_paid
