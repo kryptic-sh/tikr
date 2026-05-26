@@ -397,6 +397,108 @@ pub async fn get_24hr_tickers(
     Ok(out)
 }
 
+/// One USD-M perp symbol + its tick width in basis points of current
+/// mid price. Used by the touch-refill auto-rotation to discover
+/// symbols where each tick is wide enough to clear maker fees.
+#[derive(Debug, Clone)]
+pub struct PerpTickInfo {
+    /// Binance symbol (e.g. `ESPORTSUSDT`).
+    pub symbol: String,
+    /// Last/mid price snapshot.
+    pub price: tikr_core::Decimal,
+    /// Venue tick size.
+    pub tick_size: tikr_core::Decimal,
+    /// `tick_size / price × 10000`. Driver of round-trip economics.
+    pub tick_bps: tikr_core::Decimal,
+    /// 24h quote volume — used as a coarse liquidity filter.
+    pub quote_volume_24h: tikr_core::Decimal,
+}
+
+/// Discover all USD-M PERPETUAL USDT-quoted symbols, joining
+/// exchangeInfo (tick filter) with the latest /ticker/price snapshot
+/// and 24h ticker volume. Returns one row per TRADING symbol.
+///
+/// Single REST call to exchangeInfo + one to ticker/price + one to
+/// ticker/24hr. Total ~3 requests. Caller decides the threshold.
+pub async fn list_perp_tick_info(
+    http: &HttpClient,
+    base_url: &str,
+) -> Result<Vec<PerpTickInfo>, VenueError> {
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    // 1. exchangeInfo for symbol filters.
+    let info = get_exchange_info(http, base_url).await?;
+    let parsed = crate::exchange_info::parse_exchange_info(&info);
+    let symbol_meta: HashMap<String, &crate::exchange_info::SymbolFilters> =
+        parsed.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+    // 2. ticker/price for current prices.
+    let url = format!("{base_url}/fapi/v1/ticker/price");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "ticker/price: expected array",
+        )))
+    })?;
+    let prices: HashMap<String, tikr_core::Decimal> = arr
+        .iter()
+        .filter_map(|row| {
+            let symbol = row.get("symbol").and_then(Value::as_str)?;
+            let price = row
+                .get("price")
+                .and_then(Value::as_str)
+                .and_then(|s| tikr_core::Decimal::from_str(s).ok())?;
+            Some((symbol.to_string(), price))
+        })
+        .collect();
+
+    // 3. 24h volumes for liquidity filter.
+    let tickers = get_24hr_tickers(http, base_url).await?;
+    let volumes: HashMap<String, tikr_core::Decimal> = tickers
+        .into_iter()
+        .map(|t| (t.symbol, t.quote_volume))
+        .collect();
+
+    // Restrict to PERPETUAL USDT-quoted TRADING contracts.
+    let mut out = Vec::new();
+    for sym_raw in &info.symbols {
+        let symbol = &sym_raw.symbol;
+        if sym_raw.quote_asset.as_deref() != Some("USDT") {
+            continue;
+        }
+        if sym_raw.contract_type.as_deref() != Some("PERPETUAL") {
+            continue;
+        }
+        if sym_raw.status.as_deref() != Some("TRADING") {
+            continue;
+        }
+        let Some(meta) = symbol_meta.get(symbol) else {
+            continue;
+        };
+        let Some(price) = prices.get(symbol).copied() else {
+            continue;
+        };
+        if price <= tikr_core::Decimal::ZERO {
+            continue;
+        }
+        if meta.tick_size <= tikr_core::Decimal::ZERO {
+            continue;
+        }
+        let tick_bps = meta.tick_size / price * tikr_core::Decimal::from(10_000);
+        let quote_volume_24h = volumes.get(symbol).copied().unwrap_or_default();
+        out.push(PerpTickInfo {
+            symbol: symbol.clone(),
+            price,
+            tick_size: meta.tick_size,
+            tick_bps,
+            quote_volume_24h,
+        });
+    }
+    Ok(out)
+}
+
 /// Fetch current best bid/ask for one USD-M futures symbol.
 pub async fn get_book_ticker(
     http: &HttpClient,

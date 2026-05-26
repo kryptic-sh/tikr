@@ -49,6 +49,10 @@ pub struct SymbolInfo {
     /// Futures contract type when exposed, e.g. `"PERPETUAL"`.
     #[serde(default)]
     pub contract_type: Option<String>,
+    /// Quote asset when exposed (e.g. `"USDT"`). Used by
+    /// auto-rotation to restrict discovery to USDT perps.
+    #[serde(default)]
+    pub quote_asset: Option<String>,
     /// Raw filter entries from the API.
     pub filters: Vec<FilterEntry>,
 }

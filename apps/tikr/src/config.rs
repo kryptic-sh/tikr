@@ -23,6 +23,11 @@ pub struct DashboardConfig {
     /// Optional rotating StaticGrid manager.
     #[serde(default)]
     pub static_grid_rotation: Option<ScalpRotationConfig>,
+    /// Optional TouchRefill auto-rotation: spawns a TouchRefill bot on
+    /// every USDT-perp where `tick_bps ≥ min_tick_bps`. No bot list
+    /// needed — symbols are auto-discovered.
+    #[serde(default)]
+    pub touch_refill_auto: Option<TouchRefillAutoConfig>,
 }
 
 /// Rotating SpreadScalp manager configuration.
@@ -205,6 +210,42 @@ pub struct TouchRefillParams {
 
 fn touch_refill_default_grid_levels() -> u32 {
     1
+}
+
+/// `[touch_refill_auto]` — auto-rotation manager. Discovers Binance
+/// Futures USDT-perp symbols with `tick_size / price × 10000 ≥
+/// min_tick_bps` AND `24h quote volume ≥ min_volume_usdt`. Spawns
+/// one TouchRefill bot per qualifying symbol. Re-checks every
+/// `recheck_interval_secs`; when a symbol drops below threshold,
+/// shuts down its bot and flattens the position via market order.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct TouchRefillAutoConfig {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum `tick_bps` to qualify. `6` is the recommended floor
+    /// (covers ~3.6 bps BNB-discounted maker RT fees with ~2.4 bps edge).
+    #[serde(default = "touch_refill_auto_default_min_tick_bps")]
+    pub min_tick_bps: Decimal,
+    /// Minimum 24h quote volume in USDT for a symbol to qualify.
+    /// Filters out thin/dead markets. Default `$20M`.
+    #[serde(default = "touch_refill_auto_default_min_volume_usdt")]
+    pub min_volume_usdt: Decimal,
+    /// How often to re-discover + diff (seconds). Clamped to ≥ 10s.
+    /// Default `60`.
+    #[serde(default = "touch_refill_auto_default_recheck_interval_secs")]
+    pub recheck_interval_secs: u64,
+}
+
+fn touch_refill_auto_default_min_tick_bps() -> Decimal {
+    Decimal::from(6)
+}
+fn touch_refill_auto_default_min_volume_usdt() -> Decimal {
+    Decimal::from(20_000_000)
+}
+fn touch_refill_auto_default_recheck_interval_secs() -> u64 {
+    60
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

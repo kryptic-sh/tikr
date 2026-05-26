@@ -1,0 +1,33 @@
+# ─── TouchRefill Auto-rotation — MAINNET ────────────────────────────────
+#
+# Auto-discovers Binance Futures USDT-perp symbols with
+#   tick_size / price × 10000 ≥ min_tick_bps
+#   AND 24h quote volume ≥ min_volume_usdt
+# Spawns one TouchRefill bot per qualifying symbol. Re-checks every
+# `recheck_interval_secs`; when a symbol's tick_bps falls below the
+# threshold, the bot is signaled to stop, all open orders are
+# cancelled, and the position is flattened via market order.
+#
+# Per-bot defaults:
+#   - notional comes from account.order_balance_pct ÷ active bot count
+#   - grid_levels = 12 (hardcoded in touch_refill_auto module)
+#   - leverage from account.leverage
+#
+# Tune notional sizing in account.* below.
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/touch-refill-auto"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+[touch_refill_auto]
+enabled = true
+# Symbol qualifies when tick_size / price × 10000 ≥ this.
+# 6 bps = ~2.4 bps net edge per RT after 3.6 bps BNB-discounted maker fees.
+min_tick_bps = "6"
+# Filter out thin / illiquid markets — $20M+ 24h quote volume only.
+min_volume_usdt = "20000000"
+# Discovery cadence. Minimum 10s.
+recheck_interval_secs = 60

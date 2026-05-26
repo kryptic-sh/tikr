@@ -19,6 +19,7 @@ mod scalp_rotation;
 mod selection;
 mod state;
 mod supervisor;
+mod touch_refill_auto;
 mod tui;
 mod venue;
 
@@ -502,6 +503,25 @@ async fn main() -> anyhow::Result<()> {
             rotation,
             cfg.bots.clone(),
             scalp_rotation::RotationAccountCtx {
+                env,
+                api_key: api_key.clone(),
+                key_material: key_material.clone(),
+                base_state_dir: cfg.account.state_dir.clone(),
+                order_balance_pct: cfg.account.order_balance_pct,
+                leverage: cfg.account.leverage,
+                max_position_pct: cfg.account.max_position_pct,
+                notional_rx: notional_rx.clone(),
+                max_position_rx: max_position_rx.clone(),
+                bnb_price_rx: bnb_price_rx.clone(),
+            },
+            shared_state.clone(),
+            global_shutdown_rx.clone(),
+        ));
+    }
+    if let Some(auto) = cfg.touch_refill_auto.clone().filter(|c| c.enabled) {
+        supervisors.push(touch_refill_auto::spawn_touch_refill_auto_manager(
+            auto,
+            touch_refill_auto::TouchRefillAutoAccountCtx {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),
