@@ -429,13 +429,23 @@ impl Strategy for Tide {
         //
         // - BID cancel if price < (best_bid - grid_levels × step)
         // - ASK cancel if price > (best_ask + grid_levels × step)
+        // Anchor the active window to the actual placement TOP (after
+        // min_self_spread shifts it down/up), NOT raw best_bid/ask.
+        // Otherwise orders placed at top_bid_override fall outside the
+        // best_bid-anchored window → cancel-place storm.
         if let Some(bp) = best_bid
             && bp.0 > Decimal::ZERO
             && step > Decimal::ZERO
         {
-            let bid_floor_active = bp.0 - Decimal::from(levels) * step;
+            let top = top_bid_override.map(|p| p.0).unwrap_or(bp.0);
+            // Window: place TOP + (levels-1)*step downward, plus 1 step
+            // of slop above to tolerate snap-rounding drift.
+            let bid_upper = top + step;
+            let bid_floor_active = top - Decimal::from(levels.saturating_sub(1).max(1)) * step;
             for (id, q) in ctx.open_quotes {
-                if q.side == Side::Bid && q.price.0 < bid_floor_active {
+                if q.side == Side::Bid
+                    && (q.price.0 < bid_floor_active || q.price.0 > bid_upper)
+                {
                     actions.push(Action::Cancel(*id));
                 }
             }
@@ -445,15 +455,21 @@ impl Strategy for Tide {
             && ap.0 > Decimal::ZERO
             && step > Decimal::ZERO
         {
-            let ask_ceiling_active = ap.0 + Decimal::from(levels) * step;
+            let top = top_ask_override.map(|p| p.0).unwrap_or(ap.0);
+            let ask_ceiling_active = top + Decimal::from(levels.saturating_sub(1).max(1)) * step;
+            let ask_lower = top - step;
             for (id, q) in ctx.open_quotes {
-                if q.side == Side::Ask && q.price.0 > ask_ceiling_active {
+                if q.side == Side::Ask
+                    && (q.price.0 > ask_ceiling_active || q.price.0 < ask_lower)
+                {
                     actions.push(Action::Cancel(*id));
                 }
             }
             self.ask_grid_ceiling = Some(ask_ceiling_active);
+            // Keep parity with the old assignment site; loop body below
+            // is preserved but the early-return short-circuit is gone.
+            let _ = ap;
         }
-
         // Rule 2: on FULL fill, place opposite-side close at a
         // distance defined by close_profit_bps. Partial fills
         // (is_full=false) skip the close — there's still residual
