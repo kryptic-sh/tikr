@@ -28,11 +28,10 @@ leverage = 5
 enabled = true
 quote_asset = "USDC"
 
-# Allowlist: only spawn bots on these symbols. Filters still apply
-# (min_tick_bps + min_volume), but candidates further restricted.
-# Add/remove symbols here to scope the fleet. Skip BTCUSDC because
-# its tick_bps is too tiny (price too high) — would require huge
-# min_self_spread to clear fees.
+# Allowlist: ONLY these symbols spawn. When set, min_tick_bps +
+# min_volume_usdt filters are BYPASSED — operator chose these
+# explicitly and min_self_spread_bps below synthesizes the required
+# spread regardless of natural book width.
 symbols_allowlist = [
     "ETHUSDC",
     "BNBUSDC",
@@ -50,12 +49,9 @@ symbols_allowlist = [
     "ARBUSDC",
 ]
 
-# Still apply tick + volume filters. 6 bps clears any potential
-# fee revert (0→1.8 maker would be 3.6 bps RT) with margin.
-min_tick_bps = "6"
-
-# USDC volumes much smaller than USDT. $5M floor surfaces the active
-# majors without including dead listings.
+# Ignored when symbols_allowlist set, but kept for reference if
+# you remove the allowlist and want free discovery.
+min_tick_bps = "0"
 min_volume_usdt = "5000000"
 
 recheck_interval_secs = 60

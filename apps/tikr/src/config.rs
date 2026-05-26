@@ -270,10 +270,13 @@ pub struct TouchRefillAutoConfig {
     #[serde(default = "touch_refill_auto_default_quote_asset")]
     pub quote_asset: String,
     /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
-    /// When non-empty, discovery STILL applies `min_tick_bps` +
-    /// `min_volume_usdt` filters but then restricts further to symbols
-    /// in this list. When empty (default), every qualifying symbol
-    /// passes — original auto behavior.
+    /// When non-empty, ONLY these symbols spawn and the
+    /// `min_tick_bps` + `min_volume_usdt` filters are BYPASSED.
+    /// `min_self_spread_bps` synthesizes the required spread
+    /// regardless of natural book width, so the tick filter is
+    /// redundant when the operator picks symbols explicitly.
+    /// When empty (default), free discovery — every qualifying symbol
+    /// passes the tick + volume filters.
     #[serde(default)]
     pub symbols_allowlist: Vec<String>,
 }

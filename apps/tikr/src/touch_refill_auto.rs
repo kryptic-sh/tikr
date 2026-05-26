@@ -111,10 +111,17 @@ pub fn spawn_touch_refill_auto_manager(
                 cfg.symbols_allowlist.iter().map(|s| s.as_str()).collect();
             let mut qualifying: HashSet<String> = HashSet::new();
             for row in discovered {
-                if row.tick_bps >= cfg.min_tick_bps && row.quote_volume_24h >= cfg.min_volume_usdt {
-                    if !allowlist.is_empty() && !allowlist.contains(row.symbol.as_str()) {
-                        continue;
+                if !allowlist.is_empty() {
+                    // Allowlist mode: operator chose these symbols
+                    // explicitly. Skip tick_bps + volume filters —
+                    // min_self_spread_bps synthesizes the required
+                    // spread regardless of book spread.
+                    if allowlist.contains(row.symbol.as_str()) {
+                        qualifying.insert(row.symbol);
                     }
+                } else if row.tick_bps >= cfg.min_tick_bps
+                    && row.quote_volume_24h >= cfg.min_volume_usdt
+                {
                     qualifying.insert(row.symbol);
                 }
             }
