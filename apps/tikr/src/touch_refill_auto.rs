@@ -122,7 +122,13 @@ pub fn spawn_touch_refill_auto_manager(
                 if active.contains_key(symbol) {
                     continue;
                 }
-                let bot = spawn_one_bot(symbol, &account, &shared_state);
+                let bot = spawn_one_bot(
+                    symbol,
+                    &account,
+                    &shared_state,
+                    cfg.grid_levels,
+                    cfg.min_self_spread_bps,
+                );
                 info!(symbol, "touch_refill_auto: spawned new bot");
                 active.insert(symbol.clone(), bot);
             }
@@ -181,6 +187,8 @@ fn spawn_one_bot(
     symbol: &str,
     account: &TouchRefillAutoAccountCtx,
     shared_state: &SharedBotState,
+    grid_levels: u32,
+    min_self_spread_bps: u32,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cfg = BotConfig {
@@ -190,10 +198,8 @@ fn spawn_one_bot(
         // account-wide order_balance_pct.
         touch_refill: Some(TouchRefillParams {
             notional: None,
-            grid_levels: 12,
-            // 10bps min self-spread: makes the strategy viable on tighter
-            // tick markets even when book spread alone wouldn't clear fees.
-            min_self_spread_bps: 10,
+            grid_levels,
+            min_self_spread_bps,
         }),
         sg: None,
         lg: None,

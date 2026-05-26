@@ -243,6 +243,14 @@ pub struct TouchRefillAutoConfig {
     /// Default `60`.
     #[serde(default = "touch_refill_auto_default_recheck_interval_secs")]
     pub recheck_interval_secs: u64,
+    /// Forwarded to every spawned TouchRefill bot as
+    /// `TouchRefillConfig.min_self_spread_bps`. Default `10`.
+    #[serde(default = "touch_refill_auto_default_min_self_spread_bps")]
+    pub min_self_spread_bps: u32,
+    /// Forwarded to every spawned TouchRefill bot as
+    /// `TouchRefillConfig.grid_levels`. Default `12`.
+    #[serde(default = "touch_refill_auto_default_grid_levels")]
+    pub grid_levels: u32,
 }
 
 fn touch_refill_auto_default_min_tick_bps() -> Decimal {
@@ -253,6 +261,12 @@ fn touch_refill_auto_default_min_volume_usdt() -> Decimal {
 }
 fn touch_refill_auto_default_recheck_interval_secs() -> u64 {
     60
+}
+fn touch_refill_auto_default_min_self_spread_bps() -> u32 {
+    10
+}
+fn touch_refill_auto_default_grid_levels() -> u32 {
+    12
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus
