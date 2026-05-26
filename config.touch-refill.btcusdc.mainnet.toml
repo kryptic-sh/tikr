@@ -23,7 +23,6 @@ order_balance_pct = "10"
 max_position_pct = "100"
 leverage = 5
 
-
 [touch_refill_auto]
 enabled = true
 quote_asset = "USDC"
@@ -34,23 +33,22 @@ symbols_allowlist = ["BTCUSDC"]
 # Ignored when allowlist is set.
 min_tick_bps = "0"
 min_volume_usdt = "5000000"
-
 recheck_interval_secs = 60
 
 # Self-spread synthesis — bot widens its own quotes to this gap when
 # the book is tighter. BTCUSDC at $76k has tick = 0.013 bps; 20 bps
 # self-spread = ~150 ticks apart for meaningful edge per RT.
-min_self_spread_bps = 20
+min_self_spread_bps = 1
 
 # Grid depth — N orders per side spaced grid_step_bps apart.
-grid_levels = 3
+grid_levels = 6
 
 # Profit target for close-on-fill (bps of fill price). 30 bps = 30×
 # tick capture on a 0.013-bps-tick market. Wider than self-spread
 # so close orders book real edge.
-close_profit_bps = 30
+close_profit_bps = 1
 
 # Grid spacing in bps of mid (snapped to tick, min 1 tick).
 # BTCUSDC tick is sub-bps so without this knob the grid would pile
 # all 3 levels at adjacent ticks. 4 bps spaces them ~4 bps apart.
-grid_step_bps = 4
+grid_step_bps = 1

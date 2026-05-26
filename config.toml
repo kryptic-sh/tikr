@@ -1,117 +1,75 @@
-# tikr default configuration — TouchRefill auto-rotation on mainnet.
+# ─── TouchRefill USDC majors-only — MAINNET ─────────────────────────────
 #
-# Discovery order when `--config` is not passed:
-#   1. ./config.toml                      (this file — wins if cwd has one)
-#   2. $XDG_CONFIG_HOME/tikr/config.toml  (default: ~/.config/tikr/config.toml)
+# USDC-margined perpetuals, restricted to bigger crypto markets.
+# Uses /fapi/v1/* (same as USDT-M, only quote-asset filter changes).
 #
-# What this config does:
-#   - Auto-discovers every Binance Futures USDT-perp with
-#     `tick_size / price × 10000 ≥ 6 bps` AND ≥ $20M 24h quote volume.
-#   - Spawns a TouchRefill bot per qualifying symbol (12-tick grid each
-#     side, 1-tick close on full fill, never cancels).
-#   - Re-checks every 60s. Symbols that drop below the threshold are
-#     shut down: orders cancelled + position flattened via market order.
+# Why this set?
+#   - USDC promo = 0 bps maker (verify at binance.com/en/fee/futureFee).
+#     Full min_self_spread_bps becomes net profit per RT.
+#   - Majors have the deepest USDC books → fewer adverse-selection
+#     surprises than the long-tail USDC perps.
+#   - Liquidity ensures fills actually happen (USDC perps are much
+#     thinner than USDT equivalents).
 #
 # Pre-flight:
-#   1. TIKR_BINANCE_ENABLE_MAINNET=1   in shell (mainnet write gate)
-#   2. .env loaded with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
-#   3. Futures wallet ≥ $200, leverage knob below picks per-symbol margin
-#
-# Economics per symbol (BNB-discounted maker fees ≈ 3.6 bps RT):
-#   tick_bps ≥ 6   →  net edge per round-trip ≥ ~2.4 bps
-#   Higher tick_bps = wider edge but fewer fills (less time AT touch).
-#
-# Tune knobs below; defaults assumed sensible for a $500-2000 wallet.
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet (NOT USDT)
+#   4. Confirm USDC maker fee still 0 bps
 
-# ─── Account ───────────────────────────────────────────────────────────────
 [account]
-# "futures-mainnet" | "futures-testnet"
 env = "futures-mainnet"
-
-# Per-bot snapshot subdirs live under <state_dir>/<symbol>/...
-state_dir = "./state/touch-refill-auto"
-
-# Percent of wallet allocated per order. Sized as
-#   per_order = wallet × order_balance_pct / 100 / active_bot_count
-# With auto-rotation, bot count fluctuates with discovery results.
-order_balance_pct = "1"
-
-# Percent of wallet for per-bot peak-position cap. TouchRefill ignores
-# this (no inventory management); kept for parity with other strategies.
+state_dir = "./state/touch-refill-usdc-majors"
+order_balance_pct = "2"
 max_position_pct = "100"
-
-# Per-symbol Binance leverage. Sent via POST /fapi/v1/leverage at venue
-# build time. Sizing is wallet-relative — leverage only changes
-# Binance's required initial margin, NOT tikr's order size.
 leverage = 5
 
-# Credentials: .env auto-loaded by dotenvy, OR env vars
-#   TIKR_BINANCE_FUTURES_API_KEY  /  TIKR_BINANCE_FUTURES_API_SECRET
-# Optional explicit key-file:
-# key_file = "./keys/binance-mainnet.txt"
-
-
-# ─── BNB-fee mode (auto-detected) ──────────────────────────────────────────
-#
-# tikr calls GET /fapi/v1/feeBurn at startup. When BNB-pays-fees is on:
-#   - converts BNB commissions → USDT-equivalent for accurate tracker
-#   - displays BNB balance + USDT-value in the api-account sidebar
-#   - includes BNB-balance delta in the api-net PnL calculation
-#   - warns when balance drops below `bnb_min_balance_usdt`
-#
-# Refill is monitor-only (logs WARN, no auto-buy yet). To get the
-# automatic refill behavior, enable Binance UI's "Auto-Purchase BNB"
-# toggle directly — it works account-wide.
-#
-# bnb_min_balance_usdt    = "1"     # refill trigger
-# bnb_target_balance_usdt = "50"    # refill target (monitor-only for now)
-# bnb_refill_enabled      = true    # enable the WARN monitor
-
-
-# ─── TouchRefill Auto-rotation ─────────────────────────────────────────────
 [touch_refill_auto]
 enabled = true
+quote_asset = "USDC"
 
-# Symbol qualifies when (tick_size / price × 10000) ≥ this value.
-# Lower = more symbols qualify but thinner per-RT edge after fees.
-# 6 bps clears 3.6 bps BNB-discount maker RT fees + leaves ~2.4 bps edge.
-min_tick_bps = "6"
+# Allowlist: ONLY these symbols spawn. When set, min_tick_bps +
+# min_volume_usdt filters are BYPASSED — operator chose these
+# explicitly and min_self_spread_bps below synthesizes the required
+# spread regardless of natural book width.
+symbols_allowlist = [
+  "ETHUSDC",
+  "BNBUSDC",
+  "SOLUSDC",
+  "XRPUSDC",
+  "DOGEUSDC",
+  "ADAUSDC",
+  "AVAXUSDC",
+  "LINKUSDC",
+  "SUIUSDC",
+  "1000PEPEUSDC",
+  "1000SHIBUSDC",
+  "WIFUSDC",
+  "WLDUSDC",
+  "ARBUSDC",
+]
 
-# Filter out thin / illiquid markets — 24h quote volume floor in USDT.
-# $20M ≈ a decent middle-of-pack USDT perp; tune up to $100M for the
-# major-name only set.
-min_volume_usdt = "20000000"
+# Ignored when symbols_allowlist set, but kept for reference if
+# you remove the allowlist and want free discovery.
+min_tick_bps = "0"
+min_volume_usdt = "5000000"
 
-# Re-discover + diff cadence. Clamped to ≥ 10s. Lower = more responsive
-# to entering/exiting symbols but more REST calls. 60s is plenty given
-# tick_bps changes slowly (tracks the price, not the book).
 recheck_interval_secs = 60
 
-# Minimum required gap (in bps of mid) between the top of the bid grid
-# and the top of the ask grid. When the book spread is already wider
-# than this, the grid tops sit at touch (no change). When narrower,
-# BOTH tops shift symmetrically outward (bid down, ask up, snapped to
-# tick boundaries) so the gap is met.
-#
-# 10 bps ≈ 2.8× BNB-discount maker RT fees (3.6 bps). Makes TouchRefill
-# viable on tight-tick markets where the book spread alone wouldn't
-# cover fees. Set to 0 to disable (always quote at touch).
+# 8 bps min spread = ~5 bps net edge at 0-bps-maker promo rates.
+# Tighter than USDT config because USDC fee saving lets us be more
+# aggressive on the spread.
 min_self_spread_bps = 20
 
-# Grid depth per side. N orders spaced 1 tick apart starting at touch.
-# With 12, defends against ~10-tick adverse jumps without chasing.
-# Inventory cap scales linearly: max per-side ≈ N × per_order_notional.
+# Smaller grid — thinner USDC books mean less safe inventory accumulation.
 grid_levels = 3
 
-# Profit target for close-on-fill orders (in bps of fill price). When
-# > 0, every close order is placed exactly this many bps from the fill
-# (snapped up to nearest tick, min 1 tick). When 0, falls back to
-# min_self_spread_bps. Set higher to capture more profit per RT at
-# the cost of slower fills.
-#
-# Example: fill at $100, close_profit_bps=30 → close at $100.30 (30 bps).
-close_profit_bps = 30
+# Wider close target = more profit per RT. USDC books are slow,
+# fewer fills, so make each one count more.
+close_profit_bps = 15
 
 # Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
-# 1-tick spacing on tight markets piles dozens of orders within sub-bps.
-grid_step_bps = 4
+# Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick
+# spacing piles dozens of orders within sub-bps. 4 bps gives
+# meaningful fill independence between levels.
+grid_step_bps = 10
