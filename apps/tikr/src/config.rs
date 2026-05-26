@@ -94,10 +94,35 @@ pub struct AccountConfig {
     /// divided across bots).
     #[serde(default = "default_max_position_pct")]
     pub max_position_pct: Decimal,
+    /// BNB-refill trigger in USDT-equivalent. When BNB-pays-fees is
+    /// enabled on the account AND `bnb_refill_enabled = true`, the
+    /// refill task tops up BNB whenever
+    /// `bnb_balance × bnb_price < bnb_min_balance_usdt`. Default `$1`.
+    #[serde(default = "default_bnb_min_balance_usdt")]
+    pub bnb_min_balance_usdt: Decimal,
+    /// BNB-refill target in USDT-equivalent. Refill buys enough BNB
+    /// to bring the USDT-value up to this level. Default `$50`.
+    #[serde(default = "default_bnb_target_balance_usdt")]
+    pub bnb_target_balance_usdt: Decimal,
+    /// Master switch for BNB auto-refill. Defaults `true`. Has no
+    /// effect unless BNB-pays-fees is also enabled on the Binance
+    /// account (auto-detected via `GET /fapi/v1/feeBurn`).
+    #[serde(default = "default_bnb_refill_enabled")]
+    pub bnb_refill_enabled: bool,
 }
 
 fn default_state_dir() -> PathBuf {
     PathBuf::from("./state")
+}
+
+fn default_bnb_min_balance_usdt() -> Decimal {
+    Decimal::ONE
+}
+fn default_bnb_target_balance_usdt() -> Decimal {
+    Decimal::from(50)
+}
+fn default_bnb_refill_enabled() -> bool {
+    true
 }
 
 fn default_order_balance_pct() -> Decimal {

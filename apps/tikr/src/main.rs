@@ -11,6 +11,7 @@
 //!   1. `./config.toml`                       — cwd, wins if present
 //!   2. `$XDG_CONFIG_HOME/tikr/config.toml`   — defaults to `~/.config/tikr/config.toml`
 
+mod bnb_refill;
 mod build;
 mod config;
 mod logs;
@@ -458,6 +459,19 @@ async fn main() -> anyhow::Result<()> {
     });
     // Silence unused-rx warning until user_stream parser wires it up.
     let _bnb_price_rx_for_parser = bnb_price_rx.clone();
+
+    // BNB-balance monitor — warns when balance drops below threshold.
+    // No-ops when bnb_refill_enabled=false in TOML OR when the account
+    // doesn't have BNB-pays-fees enabled. Refill is monitor-only for
+    // now; spot buy + transfer wiring will land in a follow-up commit
+    // once tikr-binance has a SAPI module.
+    bnb_refill::spawn_bnb_monitor(bnb_refill::BnbMonitorConfig {
+        shared_state: shared_state.clone(),
+        min_balance_usdt: cfg.account.bnb_min_balance_usdt,
+        target_balance_usdt: cfg.account.bnb_target_balance_usdt,
+        refill_enabled: cfg.account.bnb_refill_enabled,
+        shutdown: global_shutdown_rx.clone(),
+    });
 
     // Spawn supervisors. Each enabled rotation type gets its own manager.
     let mut supervisors = Vec::new();
