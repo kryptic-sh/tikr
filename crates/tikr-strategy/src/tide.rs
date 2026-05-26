@@ -361,45 +361,6 @@ impl Strategy for Tide {
             }
         }
 
-        // Rule 1.5: prune stale grid orders that drifted outside the
-        // active window. When the book moves, the grid extends in the
-        // new direction (Rule 1) but old orders on the FAR side become
-        // stale relative to current touch. Cancel them so the grid
-        // stays bounded to ~grid_levels per side.
-        //
-        // - BID cancel if price < (best_bid - grid_levels × step)
-        // - ASK cancel if price > (best_ask + grid_levels × step)
-        //
-        // Active window for each side spans `grid_levels` orders from
-        // current touch outward. Anything past that boundary is from a
-        // prior price regime and won't fill at any reasonable retrace.
-        if let Some(bp) = best_bid
-            && bp.0 > Decimal::ZERO
-            && step > Decimal::ZERO
-        {
-            let bid_floor_active = bp.0 - Decimal::from(levels) * step;
-            for (id, q) in ctx.open_quotes {
-                if q.side == Side::Bid && q.price.0 < bid_floor_active {
-                    actions.push(Action::Cancel(*id));
-                }
-            }
-            // Re-anchor floor to the active window so Rule 1 doesn't
-            // re-emit at the just-cancelled deep prices next cycle.
-            self.bid_grid_floor = Some(bid_floor_active);
-        }
-        if let Some(ap) = best_ask
-            && ap.0 > Decimal::ZERO
-            && step > Decimal::ZERO
-        {
-            let ask_ceiling_active = ap.0 + Decimal::from(levels) * step;
-            for (id, q) in ctx.open_quotes {
-                if q.side == Side::Ask && q.price.0 > ask_ceiling_active {
-                    actions.push(Action::Cancel(*id));
-                }
-            }
-            self.ask_grid_ceiling = Some(ask_ceiling_active);
-        }
-
         // Rule 2: on FULL fill, place opposite-side close at a
         // distance defined by close_profit_bps. Partial fills
         // (is_full=false) skip the close — there's still residual

@@ -5614,6 +5614,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tikr-mexc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "hex",
+ "hmac",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tikr-core",
+ "tikr-venue",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tikr-paper"
 version = "0.1.0"
 dependencies = [

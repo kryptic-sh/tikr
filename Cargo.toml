@@ -18,6 +18,7 @@ tikr-venue = { path = "crates/tikr-venue" }
 tikr-strategy = { path = "crates/tikr-strategy" }
 tikr-hyperliquid = { path = "crates/tikr-hyperliquid" }
 tikr-binance = { path = "crates/tikr-binance" }
+tikr-mexc = { path = "crates/tikr-mexc" }
 tikr-dodo = { path = "crates/tikr-dodo" }
 tikr-backtest = { path = "crates/tikr-backtest" }
 tikr-paper = { path = "crates/tikr-paper" }
