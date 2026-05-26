@@ -43,6 +43,11 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
 min_spread_bps = 0
+# quote_offset_ticks = 0 → join at touch. Legacy default (-1) quotes
+# INSIDE the touch and needs 2+ tick book spread; USDC majors run
+# 1-tick books so legacy mode places zero orders.
+quote_offset_ticks = 0
+close_target_ticks = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -62,6 +67,11 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
 min_spread_bps = 0
+# quote_offset_ticks = 0 → join at touch. Legacy default (-1) quotes
+# INSIDE the touch and needs 2+ tick book spread; USDC majors run
+# 1-tick books so legacy mode places zero orders.
+quote_offset_ticks = 0
+close_target_ticks = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -81,6 +91,11 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
 min_spread_bps = 0
+# quote_offset_ticks = 0 → join at touch. Legacy default (-1) quotes
+# INSIDE the touch and needs 2+ tick book spread; USDC majors run
+# 1-tick books so legacy mode places zero orders.
+quote_offset_ticks = 0
+close_target_ticks = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -101,6 +116,8 @@ strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 60
 min_spread_bps = 0
+quote_offset_ticks = 0
+close_target_ticks = 1
 requote_interval_ms = 500
 max_position_usdt = 100
 reject_cooldown_ms = 500

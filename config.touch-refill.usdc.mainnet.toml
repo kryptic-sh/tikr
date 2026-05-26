@@ -33,7 +33,6 @@ quote_asset = "USDC"
 # explicitly and min_self_spread_bps below synthesizes the required
 # spread regardless of natural book width.
 symbols_allowlist = [
-  "BTCUSDC",
   "ETHUSDC",
   "BNBUSDC",
   "SOLUSDC",
