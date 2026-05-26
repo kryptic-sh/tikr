@@ -96,9 +96,18 @@ recheck_interval_secs = 60
 # 10 bps ≈ 2.8× BNB-discount maker RT fees (3.6 bps). Makes TouchRefill
 # viable on tight-tick markets where the book spread alone wouldn't
 # cover fees. Set to 0 to disable (always quote at touch).
-min_self_spread_bps = 10
+min_self_spread_bps = 20
 
 # Grid depth per side. N orders spaced 1 tick apart starting at touch.
 # With 12, defends against ~10-tick adverse jumps without chasing.
 # Inventory cap scales linearly: max per-side ≈ N × per_order_notional.
-grid_levels = 12
+grid_levels = 3
+
+# Profit target for close-on-fill orders (in bps of fill price). When
+# > 0, every close order is placed exactly this many bps from the fill
+# (snapped up to nearest tick, min 1 tick). When 0, falls back to
+# min_self_spread_bps. Set higher to capture more profit per RT at
+# the cost of slower fills.
+#
+# Example: fill at $100, close_profit_bps=30 → close at $100.30 (30 bps).
+# close_profit_bps = 30

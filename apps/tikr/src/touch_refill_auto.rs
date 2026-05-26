@@ -128,6 +128,7 @@ pub fn spawn_touch_refill_auto_manager(
                     &shared_state,
                     cfg.grid_levels,
                     cfg.min_self_spread_bps,
+                    cfg.close_profit_bps,
                 );
                 info!(symbol, "touch_refill_auto: spawned new bot");
                 active.insert(symbol.clone(), bot);
@@ -189,6 +190,7 @@ fn spawn_one_bot(
     shared_state: &SharedBotState,
     grid_levels: u32,
     min_self_spread_bps: u32,
+    close_profit_bps: u32,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cfg = BotConfig {
@@ -200,6 +202,7 @@ fn spawn_one_bot(
             notional: None,
             grid_levels,
             min_self_spread_bps,
+            close_profit_bps,
         }),
         sg: None,
         lg: None,

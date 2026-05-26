@@ -24,7 +24,7 @@ use tikr_core::{
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
-    MicroPriceConfig, Strategy, TopOfBook, TopOfBookConfig,
+    MicroPriceConfig, Strategy, TopOfBook, TopOfBookConfig, TouchRefill, TouchRefillConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -40,6 +40,8 @@ enum StrategyArg {
     TopOfBook,
     #[value(name = "micro-price", alias = "mp")]
     MicroPrice,
+    #[value(name = "touch-refill", alias = "tr")]
+    TouchRefill,
 }
 
 #[derive(Parser, Debug)]
@@ -108,6 +110,31 @@ struct Args {
     /// MicroPrice: half-spread in ticks.
     #[arg(long, default_value_t = 1u32)]
     micro_half_spread_ticks: u32,
+
+    /// TouchRefill: grid depth per side (1 = single-touch).
+    #[arg(long, default_value_t = 12u32)]
+    tr_grid_levels: u32,
+
+    /// TouchRefill: minimum self-spread in bps of mid.
+    #[arg(long, default_value_t = 10u32)]
+    tr_min_self_spread_bps: u32,
+
+    /// TouchRefill: per-order notional in USDT.
+    #[arg(long, default_value = "10")]
+    tr_notional: String,
+
+    /// TouchRefill: venue step size (lot floor).
+    #[arg(long, default_value = "0.001")]
+    tr_step_size: String,
+
+    /// TouchRefill: venue min order notional in USDT.
+    #[arg(long, default_value = "5")]
+    tr_min_notional: String,
+
+    /// TouchRefill: profit target for close-on-fill in bps of fill
+    /// price. `0` (default) = falls back to min_self_spread_bps.
+    #[arg(long, default_value_t = 0u32)]
+    tr_close_profit_bps: u32,
 
     /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
     #[arg(long, default_value_t = 1000u64)]
@@ -275,6 +302,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_requote_interval_ms: 1000,
                 max_skew_ticks: args.max_skew_ticks,
                 skew_unit: Size(Decimal::from_str(&args.skew_unit)?),
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+                None,
+            )
+            .await
+        }
+        StrategyArg::TouchRefill => {
+            let strategy = TouchRefill::new(TouchRefillConfig {
+                notional_per_order: Decimal::from_str(&args.tr_notional)?,
+                tick_size: Decimal::from_str(&args.tick_size)?,
+                step_size: Decimal::from_str(&args.tr_step_size)?,
+                min_notional: Decimal::from_str(&args.tr_min_notional)?,
+                grid_levels: args.tr_grid_levels,
+                min_self_spread_bps: args.tr_min_self_spread_bps,
+                close_profit_bps: args.tr_close_profit_bps,
             });
             run_with_resume(
                 venue,

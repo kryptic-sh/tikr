@@ -213,6 +213,13 @@ pub struct TouchRefillParams {
     /// Use to make TouchRefill viable on tight-spread markets.
     #[serde(default)]
     pub min_self_spread_bps: u32,
+    /// Profit target (bps of fill price) for close-on-fill orders.
+    /// When `> 0`, close distance = N bps (snapped to tick, min 1 tick).
+    /// When `0` (default), falls back to `min_self_spread_bps`. Set
+    /// higher than min_self_spread_bps to capture more profit per RT
+    /// at the cost of slower fills.
+    #[serde(default)]
+    pub close_profit_bps: u32,
 }
 
 fn touch_refill_default_grid_levels() -> u32 {
@@ -251,6 +258,11 @@ pub struct TouchRefillAutoConfig {
     /// `TouchRefillConfig.grid_levels`. Default `12`.
     #[serde(default = "touch_refill_auto_default_grid_levels")]
     pub grid_levels: u32,
+    /// Forwarded to every spawned TouchRefill bot as
+    /// `TouchRefillConfig.close_profit_bps`. Default `0` = fall back to
+    /// `min_self_spread_bps`.
+    #[serde(default)]
+    pub close_profit_bps: u32,
 }
 
 fn touch_refill_auto_default_min_tick_bps() -> Decimal {

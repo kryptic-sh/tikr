@@ -59,6 +59,14 @@ pub struct TouchRefillConfig {
     /// markets where the natural book spread alone wouldn't cover
     /// 2× maker fees (~3.6 bps RT on BNB-discount Binance USD-M).
     pub min_self_spread_bps: u32,
+    /// Profit target for close-on-fill orders, in bps of fill price.
+    /// When `> 0`, every close order placed in response to a full
+    /// fill sits exactly this many bps away from the fill price
+    /// (snapped up to nearest tick, minimum 1 tick). When `0`, the
+    /// close distance falls back to `min_self_spread_bps` (or 1 tick,
+    /// whichever is larger). Set higher than `min_self_spread_bps` to
+    /// capture more profit per round-trip at the cost of slower fills.
+    pub close_profit_bps: u32,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
@@ -290,11 +298,19 @@ impl Strategy for TouchRefill {
         {
             let tick = self.config.tick_size;
             if tick > Decimal::ZERO && fill.price.0 > Decimal::ZERO {
-                let spread_required = fill.price.0 * Decimal::from(self.config.min_self_spread_bps)
-                    / Decimal::from(10_000);
-                let close_distance = if spread_required > tick {
-                    // Round up to nearest tick.
-                    (spread_required / tick).ceil() * tick
+                // close_profit_bps overrides min_self_spread_bps when set.
+                // Otherwise the close distance falls back to the
+                // self-spread requirement (whatever keeps the grid tops
+                // apart). Either way, always ≥ 1 tick.
+                let close_bps = if self.config.close_profit_bps > 0 {
+                    self.config.close_profit_bps
+                } else {
+                    self.config.min_self_spread_bps
+                };
+                let target_distance =
+                    fill.price.0 * Decimal::from(close_bps) / Decimal::from(10_000);
+                let close_distance = if target_distance > tick {
+                    (target_distance / tick).ceil() * tick
                 } else {
                     tick
                 };
@@ -387,6 +403,7 @@ mod tests {
             min_notional: Decimal::from(5),
             grid_levels: 1,
             min_self_spread_bps: 0,
+            close_profit_bps: 0,
         }
     }
 
@@ -558,6 +575,7 @@ mod tests {
             min_notional: Decimal::from(5),
             grid_levels: 1,
             min_self_spread_bps: 10,
+            close_profit_bps: 0,
         };
         c.tick_size = Decimal::new(1, 5);
         let mut s = TouchRefill::new(c);
@@ -580,10 +598,55 @@ mod tests {
         assert!(
             has_close,
             "close ASK should sit ≥ 10 ticks from fill; got: {:?}",
-            actions.iter().filter_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
-                _ => None,
-            }).collect::<Vec<_>>()
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn close_profit_bps_overrides_min_self_spread() {
+        // Setup: price=$100, tick=$0.01, min_self_spread=10, close_profit=50.
+        // min_self_spread distance = 100 × 10 / 10000 = $0.10 = 10 ticks.
+        // close_profit distance = 100 × 50 / 10000 = $0.50 = 50 ticks.
+        // Expect close to use 50 (the larger override), not 10.
+        let mut c = TouchRefillConfig {
+            notional_per_order: Decimal::from(10),
+            tick_size: Decimal::new(1, 2), // 0.01
+            step_size: Decimal::ONE,
+            min_notional: Decimal::from(5),
+            grid_levels: 1,
+            min_self_spread_bps: 10,
+            close_profit_bps: 50,
+        };
+        c.tick_size = Decimal::new(1, 2);
+        let mut s = TouchRefill::new(c);
+        let symbol = sym();
+        let p = pos();
+        let snap = book(Decimal::from(100), Decimal::new(10001, 2));
+        let fill = mk_fill(Side::Bid, Decimal::from(100), true);
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
+        let fill_p = Decimal::from(100);
+        let expected_distance = Decimal::new(50, 2); // 0.50 = 50 ticks
+        let has_close = actions.iter().any(|a| match a {
+            Action::Quote(q) if q.side == Side::Ask => q.price.0 - fill_p >= expected_distance,
+            _ => false,
+        });
+        assert!(
+            has_close,
+            "close ASK should sit ≥ 50 ticks from fill (close_profit_bps=50); got: {:?}",
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
         );
     }
 
