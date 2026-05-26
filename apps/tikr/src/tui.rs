@@ -863,16 +863,30 @@ fn draw_account(
         Span::styled("funding  ", Style::default().fg(Color::Gray)),
         Span::raw(format!("{:>+10.2}", dec_to_f64(agg.funding))),
     ]));
-    let net_display = if agg.has_api_positions {
-        agg.realized + agg.api_unrealized - agg.fees + agg.funding
+    // Split NET into two rows:
+    //   - real NET = realized − fees + funding (banked P&L)
+    //   - mtm  NET = real NET + unrealized      (mark-to-market, full picture)
+    // Per user 2026-05-26: seeing both at a glance lets you tell whether
+    // a negative full-NET is unrealized noise or an actual fee-burn loss.
+    let unreal_for_net = if agg.has_api_positions {
+        agg.api_unrealized
     } else {
-        agg.net
+        agg.unrealized
     };
+    let real_net = agg.realized - agg.fees + agg.funding;
+    let mtm_net = real_net + unreal_for_net;
     lines.push(Line::from(vec![
-        Span::styled("NET      ", Style::default().fg(Color::White)),
+        Span::styled("real NET ", Style::default().fg(Color::White)),
         Span::styled(
-            format!("{:>+10.2}", dec_to_f64(net_display)),
-            pnl_style(net_display),
+            format!("{:>+10.2}", dec_to_f64(real_net)),
+            pnl_style(real_net),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("mtm  NET ", Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{:>+10.2}", dec_to_f64(mtm_net)),
+            pnl_style(mtm_net),
         ),
     ]));
     lines.push(Line::from(""));
