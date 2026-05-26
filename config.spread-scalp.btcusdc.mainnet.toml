@@ -19,8 +19,8 @@
 env = "futures-mainnet"
 state_dir = "./state/spread-scalp-btcusdc"
 asset = "USDC"
-order_balance_pct = "1"
-max_position_pct = "50"
+order_balance_pct = "10"
+max_position_pct = "100"
 leverage = 5
 
 

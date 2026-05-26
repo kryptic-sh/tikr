@@ -1,0 +1,56 @@
+# ─── TouchRefill BTCUSDC solo — MAINNET ────────────────────────────────────
+#
+# Single-symbol TouchRefill on BTCUSDC. Same sizing as the SS BTCUSDC
+# solo config:
+#   order_balance_pct = 10  (10% of wallet per order)
+#   max_position_pct  = 100 (full wallet as inventory cap)
+#
+# Uses auto-rotation manager with a single-symbol allowlist so bot
+# lifecycle (cancel + flatten on shutdown) is handled by the same code
+# path as the multi-symbol USDC config.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/touch-refill-btcusdc"
+asset = "USDC"
+order_balance_pct = "10"
+max_position_pct = "100"
+leverage = 5
+
+
+[touch_refill_auto]
+enabled = true
+quote_asset = "USDC"
+
+# Single-symbol allowlist — bypasses tick + volume filters.
+symbols_allowlist = ["BTCUSDC"]
+
+# Ignored when allowlist is set.
+min_tick_bps = "0"
+min_volume_usdt = "5000000"
+
+recheck_interval_secs = 60
+
+# Self-spread synthesis — bot widens its own quotes to this gap when
+# the book is tighter. BTCUSDC at $76k has tick = 0.013 bps; 20 bps
+# self-spread = ~150 ticks apart for meaningful edge per RT.
+min_self_spread_bps = 20
+
+# Grid depth — N orders per side spaced grid_step_bps apart.
+grid_levels = 3
+
+# Profit target for close-on-fill (bps of fill price). 30 bps = 30×
+# tick capture on a 0.013-bps-tick market. Wider than self-spread
+# so close orders book real edge.
+close_profit_bps = 30
+
+# Grid spacing in bps of mid (snapped to tick, min 1 tick).
+# BTCUSDC tick is sub-bps so without this knob the grid would pile
+# all 3 levels at adjacent ticks. 4 bps spaces them ~4 bps apart.
+grid_step_bps = 4
