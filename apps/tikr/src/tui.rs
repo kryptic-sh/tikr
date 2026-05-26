@@ -96,6 +96,20 @@ struct UiState {
     /// scroll handlers can compute a valid anchor when transitioning
     /// from Follow → Anchored without waiting for a render.
     last_log_total: usize,
+    /// Last drawn rects for the left (bot detail) and right (account)
+    /// side panels — used for mouse hit-testing scroll wheel events.
+    last_bot_rect: Option<Rect>,
+    last_account_rect: Option<Rect>,
+    /// Scroll offsets for the side panels. Clamped to
+    /// `(line_count - visible_rows).max(0)` at render time. 0 = top.
+    bot_scroll: u16,
+    account_scroll: u16,
+    /// Last-rendered line counts so handlers can clamp scroll without
+    /// needing a render pass.
+    last_bot_total: u16,
+    last_account_total: u16,
+    last_bot_visible: u16,
+    last_account_visible: u16,
     /// Current modal state.
     mode: ModeState,
     /// Keymap for chord dispatch in Normal mode.
@@ -122,6 +136,14 @@ impl UiState {
             last_tab_ranges: Vec::new(),
             last_log_visible: 0,
             last_log_total: 0,
+            last_bot_rect: None,
+            last_account_rect: None,
+            bot_scroll: 0,
+            account_scroll: 0,
+            last_bot_total: 0,
+            last_account_total: 0,
+            last_bot_visible: 0,
+            last_account_visible: 0,
             mode: ModeState::Normal,
             keymap,
             last_key_ts: None,
@@ -147,6 +169,26 @@ impl UiState {
             return false;
         };
         x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+
+    fn in_bot_pane(&self, x: u16, y: u16) -> bool {
+        let Some(r) = self.last_bot_rect else {
+            return false;
+        };
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+
+    fn in_account_pane(&self, x: u16, y: u16) -> bool {
+        let Some(r) = self.last_account_rect else {
+            return false;
+        };
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+
+    /// Clamp `scroll` to `[0, total - visible]`.
+    fn clamp_scroll(scroll: u16, total: u16, visible: u16) -> u16 {
+        let max = total.saturating_sub(visible);
+        scroll.min(max)
     }
 }
 
@@ -536,6 +578,26 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
         MouseEventKind::ScrollDown if ui.in_log_pane(mev.column, mev.row) => {
             scroll_log(ui, 3);
         }
+        MouseEventKind::ScrollUp if ui.in_bot_pane(mev.column, mev.row) => {
+            ui.bot_scroll = ui.bot_scroll.saturating_sub(3);
+        }
+        MouseEventKind::ScrollDown if ui.in_bot_pane(mev.column, mev.row) => {
+            ui.bot_scroll = UiState::clamp_scroll(
+                ui.bot_scroll.saturating_add(3),
+                ui.last_bot_total,
+                ui.last_bot_visible,
+            );
+        }
+        MouseEventKind::ScrollUp if ui.in_account_pane(mev.column, mev.row) => {
+            ui.account_scroll = ui.account_scroll.saturating_sub(3);
+        }
+        MouseEventKind::ScrollDown if ui.in_account_pane(mev.column, mev.row) => {
+            ui.account_scroll = UiState::clamp_scroll(
+                ui.account_scroll.saturating_add(3),
+                ui.last_account_total,
+                ui.last_account_visible,
+            );
+        }
         _ => {}
     }
 }
@@ -786,13 +848,13 @@ fn draw_body(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(34), // left: bot detail
+            Constraint::Length(31), // left: bot detail
             Constraint::Min(40),    // middle: logs
-            Constraint::Length(28), // right: account
+            Constraint::Length(31), // right: account
         ])
         .split(area);
 
-    draw_bot_detail(f, cols[0], views.get(active));
+    draw_bot_detail(f, cols[0], views.get(active), ui);
     draw_logs(f, cols[1], views.get(active), log_lines, ui);
     draw_account(
         f,
@@ -803,6 +865,7 @@ fn draw_body(
         start_balance,
         bnb,
         bnb_start_value_usdt,
+        ui,
     );
 }
 
@@ -816,15 +879,15 @@ fn draw_account(
     start_balance: Option<Decimal>,
     bnb: Option<&crate::state::BnbState>,
     bnb_start_value_usdt: Option<Decimal>,
+    ui: &mut UiState,
 ) {
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("bots     ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{}", views.len()),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(kv_line(
+        "bots",
+        format!("{}", views.len()),
+        Style::default().fg(Color::Gray),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
     lines.push(Line::from(vec![
         Span::styled("  on     ", Style::default().fg(Color::Green)),
         Span::raw(format!("{}", agg.running_count)),
@@ -836,33 +899,35 @@ fn draw_account(
         Span::raw(format!("{}", agg.starting_count)),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("realized ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:>+10.2}", dec_to_f64(agg.realized)),
-            pnl_style(agg.realized),
-        ),
-    ]));
+    lines.push(kv_line(
+        "realized",
+        format!("{:>+.2}", dec_to_f64(agg.realized)),
+        Style::default().fg(Color::Gray),
+        pnl_style(agg.realized),
+    ));
     let unreal_display = if agg.has_api_positions {
         agg.api_unrealized
     } else {
         agg.unrealized
     };
-    lines.push(Line::from(vec![
-        Span::styled("unreal   ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:>+10.2}", dec_to_f64(unreal_display)),
-            pnl_style(unreal_display),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("fees     ", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{:>10.2}", dec_to_f64(agg.fees))),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("funding  ", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{:>+10.2}", dec_to_f64(agg.funding))),
-    ]));
+    lines.push(kv_line(
+        "unreal",
+        format!("{:>+.2}", dec_to_f64(unreal_display)),
+        Style::default().fg(Color::Gray),
+        pnl_style(unreal_display),
+    ));
+    lines.push(kv_line(
+        "fees",
+        format!("{:>.2}", dec_to_f64(agg.fees)),
+        Style::default().fg(Color::Gray),
+        Style::default(),
+    ));
+    lines.push(kv_line(
+        "funding",
+        format!("{:>+.2}", dec_to_f64(agg.funding)),
+        Style::default().fg(Color::Gray),
+        Style::default(),
+    ));
     // Split NET into two rows:
     //   - real NET = realized − fees + funding (banked P&L)
     //   - mtm  NET = real NET + unrealized      (mark-to-market, full picture)
@@ -875,67 +940,67 @@ fn draw_account(
     };
     let real_net = agg.realized - agg.fees + agg.funding;
     let mtm_net = real_net + unreal_for_net;
-    lines.push(Line::from(vec![
-        Span::styled("real NET ", Style::default().fg(Color::White)),
-        Span::styled(
-            format!("{:>+10.2}", dec_to_f64(real_net)),
-            pnl_style(real_net),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("mtm  NET ", Style::default().fg(Color::White)),
-        Span::styled(
-            format!("{:>+10.2}", dec_to_f64(mtm_net)),
-            pnl_style(mtm_net),
-        ),
-    ]));
+    lines.push(kv_line(
+        "real NET",
+        format!("{:>+.2}", dec_to_f64(real_net)),
+        Style::default().fg(Color::White),
+        pnl_style(real_net),
+    ));
+    lines.push(kv_line(
+        "mtm  NET",
+        format!("{:>+.2}", dec_to_f64(mtm_net)),
+        Style::default().fg(Color::White),
+        pnl_style(mtm_net),
+    ));
     lines.push(Line::from(""));
     lines.push(Line::styled(
         "api account",
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     ));
     if let Some(api) = api_account {
-        lines.push(Line::from(vec![
-            Span::styled("wallet   ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>10.2}", dec_to_f64(api.wallet_balance))),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("avail    ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>10.2}", dec_to_f64(api.available_balance))),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("api unrl ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+10.2}", dec_to_f64(api.cross_unrealized_pnl)),
-                pnl_style(api.cross_unrealized_pnl),
-            ),
-        ]));
+        lines.push(kv_line(
+            "wallet",
+            format!("{:>.2}", dec_to_f64(api.wallet_balance)),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "avail",
+            format!("{:>.2}", dec_to_f64(api.available_balance)),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "api unrl",
+            format!("{:>+.2}", dec_to_f64(api.cross_unrealized_pnl)),
+            Style::default().fg(Color::Gray),
+            pnl_style(api.cross_unrealized_pnl),
+        ));
         let local_vs_api_unreal = agg.mark_unrealized - agg.api_unrealized;
-        lines.push(Line::from(vec![
-            Span::styled("mark Δ   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+10.2}", dec_to_f64(local_vs_api_unreal)),
-                pnl_style(local_vs_api_unreal),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("mid unrl ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+10.2}", dec_to_f64(agg.unrealized)),
-                pnl_style(agg.unrealized),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("asset    ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>10}", api.asset)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("age      ", Style::default().fg(Color::Gray)),
-            Span::raw(format!(
-                "{:>10}",
-                format_ago(millis_ago(api.fetched_at_ms) / 1000)
-            )),
-        ]));
+        lines.push(kv_line(
+            "mark Δ",
+            format!("{:>+.2}", dec_to_f64(local_vs_api_unreal)),
+            Style::default().fg(Color::Gray),
+            pnl_style(local_vs_api_unreal),
+        ));
+        lines.push(kv_line(
+            "mid unrl",
+            format!("{:>+.2}", dec_to_f64(agg.unrealized)),
+            Style::default().fg(Color::Gray),
+            pnl_style(agg.unrealized),
+        ));
+        lines.push(kv_line(
+            "asset",
+            api.asset.clone(),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "age",
+            format_ago(millis_ago(api.fetched_at_ms) / 1000),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
         if let Some(start) = start_balance {
             // Base api_net = USDT wallet delta (already realized — the
             // exchange settled fees + realized PnL into wallet_balance).
@@ -949,20 +1014,18 @@ fn draw_account(
             };
             let api_real_net = usdt_delta + bnb_delta;
             let api_mtm_net = api_real_net + api.cross_unrealized_pnl;
-            lines.push(Line::from(vec![
-                Span::styled("api real ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{:>+10.2}", dec_to_f64(api_real_net)),
-                    pnl_style(api_real_net),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("api mtm  ", Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{:>+10.2}", dec_to_f64(api_mtm_net)),
-                    pnl_style(api_mtm_net),
-                ),
-            ]));
+            lines.push(kv_line(
+                "api real",
+                format!("{:>+.2}", dec_to_f64(api_real_net)),
+                Style::default().fg(Color::White),
+                pnl_style(api_real_net),
+            ));
+            lines.push(kv_line(
+                "api mtm",
+                format!("{:>+.2}", dec_to_f64(api_mtm_net)),
+                Style::default().fg(Color::White),
+                pnl_style(api_mtm_net),
+            ));
         }
         // BNB-fee mode panel — only render when feeBurn is enabled.
         if let Some(bnb) = bnb
@@ -975,21 +1038,24 @@ fn draw_account(
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::DIM),
             ));
-            lines.push(Line::from(vec![
-                Span::styled("bnb bal  ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{:>10.6}", dec_to_f64(bnb.balance))),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("bnb $    ", Style::default().fg(Color::Gray)),
-                Span::raw(format!(
-                    "{:>10.2}",
-                    dec_to_f64(bnb.balance * bnb.price_usdt)
-                )),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("bnb px   ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{:>10.2}", dec_to_f64(bnb.price_usdt))),
-            ]));
+            lines.push(kv_line(
+                "bnb bal",
+                format!("{:>.6}", dec_to_f64(bnb.balance)),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
+            lines.push(kv_line(
+                "bnb $",
+                format!("{:>.2}", dec_to_f64(bnb.balance * bnb.price_usdt)),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
+            lines.push(kv_line(
+                "bnb px",
+                format!("{:>.2}", dec_to_f64(bnb.price_usdt)),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
         }
     } else {
         lines.push(Line::styled(
@@ -998,57 +1064,54 @@ fn draw_account(
         ));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("events   ", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{}", agg.events)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("fills    ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:>5}", agg.buy_fills),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(" / "),
-        Span::styled(
-            format!("{:>5}", agg.sell_fills),
-            Style::default().fg(Color::Red),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("vol      ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:>5.0}", dec_to_f64(agg.buy_volume)),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(" / "),
-        Span::styled(
-            format!("{:>5.0}", dec_to_f64(agg.sell_volume)),
-            Style::default().fg(Color::Red),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("open b/s ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:>5}", agg.open_buys),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw(" / "),
-        Span::styled(
-            format!("{:>5}", agg.open_sells),
-            Style::default().fg(Color::Red),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("gross inv", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{:>10.2}", dec_to_f64(agg.gross_inventory))),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("net   inv", Style::default().fg(Color::Gray)),
-        Span::styled(
-            format!("{:>+10.2}", dec_to_f64(agg.net_inventory)),
-            pnl_style(agg.net_inventory),
-        ),
-    ]));
+    lines.push(kv_line(
+        "events",
+        format!("{}", agg.events),
+        Style::default().fg(Color::Gray),
+        Style::default(),
+    ));
+    // fills + vol + open use buy/sell split with colored fragments —
+    // can't go through kv_line. Build manually with computed spacer.
+    fn split_line<'a>(label: &'a str, buy_str: String, sell_str: String) -> Line<'a> {
+        let buy_w = buy_str.chars().count();
+        let sell_w = sell_str.chars().count();
+        let total = label.chars().count() + buy_w + sell_w + 3; // " / "
+        let pad = SIDE_PANEL_INNER.saturating_sub(total);
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(Color::Gray)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(buy_str, Style::default().fg(Color::Green)),
+            Span::raw(" / "),
+            Span::styled(sell_str, Style::default().fg(Color::Red)),
+        ])
+    }
+    lines.push(split_line(
+        "fills",
+        format!("{}", agg.buy_fills),
+        format!("{}", agg.sell_fills),
+    ));
+    lines.push(split_line(
+        "vol",
+        format!("{:.0}", dec_to_f64(agg.buy_volume)),
+        format!("{:.0}", dec_to_f64(agg.sell_volume)),
+    ));
+    lines.push(split_line(
+        "open b/s",
+        format!("{}", agg.open_buys),
+        format!("{}", agg.open_sells),
+    ));
+    lines.push(kv_line(
+        "gross inv",
+        format!("{:>.2}", dec_to_f64(agg.gross_inventory)),
+        Style::default().fg(Color::Gray),
+        Style::default(),
+    ));
+    lines.push(kv_line(
+        "net inv",
+        format!("{:>+.2}", dec_to_f64(agg.net_inventory)),
+        Style::default().fg(Color::Gray),
+        pnl_style(agg.net_inventory),
+    ));
     lines.push(Line::from(""));
     lines.push(Line::styled(
         "per symbol",
@@ -1063,16 +1126,25 @@ fn draw_account(
             .snapshot
             .as_ref()
             .map_or(Decimal::ZERO, |r| r.realized.0 - r.fees.0);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<10}", v.symbol),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(format!("{:>+10.2}", dec_to_f64(net)), pnl_style(net)),
-        ]));
+        lines.push(kv_line(
+            format!("  {}", v.symbol),
+            format!("{:>+.2}", dec_to_f64(net)),
+            Style::default().fg(Color::White),
+            pnl_style(net),
+        ));
     }
 
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" account "));
+    let total = lines.len() as u16;
+    // Visible content rows = inner area height (minus 2 border rows).
+    let visible = area.height.saturating_sub(2);
+    ui.last_account_total = total;
+    ui.last_account_visible = visible;
+    ui.last_account_rect = Some(area);
+    let scroll = UiState::clamp_scroll(ui.account_scroll, total, visible);
+    ui.account_scroll = scroll;
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" account "))
+        .scroll((scroll, 0));
     f.render_widget(p, area);
 }
 
@@ -1228,7 +1300,13 @@ fn split_long_word(word: &str, width: usize, out: &mut Vec<String>) {
     }
 }
 
-fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapshot>) {
+fn draw_bot_detail(
+    f: &mut Frame<'_>,
+    area: Rect,
+    active: Option<&BotViewSnapshot>,
+    ui: &mut UiState,
+) {
+    ui.last_bot_rect = Some(area);
     let Some(v) = active else {
         let p =
             Paragraph::new("no bot").block(Block::default().borders(Borders::ALL).title(" bot "));
@@ -1236,34 +1314,39 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
         return;
     };
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("symbol   ", Style::default().fg(Color::Gray)),
-        Span::styled(&v.symbol, Style::default().add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("strategy ", Style::default().fg(Color::Gray)),
-        Span::raw(&v.strategy),
-    ]));
+    lines.push(kv_line(
+        "symbol",
+        v.symbol.clone(),
+        Style::default().fg(Color::Gray),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    lines.push(kv_line(
+        "strategy",
+        v.strategy.clone(),
+        Style::default().fg(Color::Gray),
+        Style::default(),
+    ));
     let (status_text, status_color) = match &v.status {
         BotStatus::Running => ("running".to_string(), Color::Green),
         BotStatus::Starting => ("starting".to_string(), Color::Cyan),
         BotStatus::Crashed(why) => (format!("crashed: {why}"), Color::Red),
         BotStatus::Restarting(when) => (format!("restart {when}"), Color::Yellow),
     };
-    lines.push(Line::from(vec![
-        Span::styled("status   ", Style::default().fg(Color::Gray)),
-        Span::styled(status_text, Style::default().fg(status_color)),
-    ]));
+    lines.push(kv_line(
+        "status",
+        status_text,
+        Style::default().fg(Color::Gray),
+        Style::default().fg(status_color),
+    ));
     lines.push(Line::from(""));
 
     if let Some(ref r) = v.snapshot {
-        lines.push(Line::from(vec![
-            Span::styled("realized ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+10.4}", dec_to_f64(r.realized.0)),
-                pnl_style(r.realized.0),
-            ),
-        ]));
+        lines.push(kv_line(
+            "realized",
+            format!("{:>+.4}", dec_to_f64(r.realized.0)),
+            Style::default().fg(Color::Gray),
+            pnl_style(r.realized.0),
+        ));
         let unreal_display = v
             .api_position
             .as_ref()
@@ -1274,48 +1357,58 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
             .as_ref()
             .map(|_| r.realized.0 + unreal_display - r.fees.0 + r.funding.0)
             .unwrap_or(r.net.0);
-        lines.push(Line::from(vec![
-            Span::styled("unreal   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+10.4}", dec_to_f64(unreal_display)),
-                pnl_style(unreal_display),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("fees     ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>10.4}", dec_to_f64(r.fees.0))),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("funding  ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>+10.4}", dec_to_f64(r.funding.0))),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("NET      ", Style::default().fg(Color::White)),
-            Span::styled(
-                format!("{:>+10.4}", dec_to_f64(net_display)),
-                pnl_style(net_display),
-            ),
-        ]));
+        lines.push(kv_line(
+            "unreal",
+            format!("{:>+.4}", dec_to_f64(unreal_display)),
+            Style::default().fg(Color::Gray),
+            pnl_style(unreal_display),
+        ));
+        lines.push(kv_line(
+            "fees",
+            format!("{:>.4}", dec_to_f64(r.fees.0)),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "funding",
+            format!("{:>+.4}", dec_to_f64(r.funding.0)),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "NET",
+            format!("{:>+.4}", dec_to_f64(net_display)),
+            Style::default().fg(Color::White),
+            pnl_style(net_display),
+        ));
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("events   ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{}", r.events_processed)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("fills    ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{}", r.fills_emitted)),
-        ]));
+        lines.push(kv_line(
+            "events",
+            format!("{}", r.events_processed),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "fills",
+            format!("{}", r.fills_emitted),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
         if r.sim_duration_secs > 0 {
             let fpm = r.fills_emitted as f64 * 60.0 / r.sim_duration_secs as f64;
-            lines.push(Line::from(vec![
-                Span::styled("fpm      ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{fpm:.2}")),
-            ]));
+            lines.push(kv_line(
+                "fpm",
+                format!("{fpm:.2}"),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
         }
-        lines.push(Line::from(vec![
-            Span::styled("uptime   ", Style::default().fg(Color::Gray)),
-            Span::raw(format_secs(r.runtime_secs)),
-        ]));
+        lines.push(kv_line(
+            "uptime",
+            format_secs(r.runtime_secs),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
     } else {
         lines.push(Line::styled(
             "waiting for first snapshot…",
@@ -1329,47 +1422,47 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
             "── position ──",
             Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         ));
-        lines.push(Line::from(vec![
-            Span::styled("size     ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+13.4}", dec_to_f64(lv.position_size)),
-                pnl_style(lv.position_size),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("avg entry", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>13.4}", dec_to_f64(lv.avg_entry))),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("inventory", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>+13.4}", dec_to_f64(lv.inventory_usdt)),
-                pnl_style(lv.inventory_usdt),
-            ),
-        ]));
+        lines.push(kv_line(
+            "size",
+            format!("{:>+.4}", dec_to_f64(lv.position_size)),
+            Style::default().fg(Color::Gray),
+            pnl_style(lv.position_size),
+        ));
+        lines.push(kv_line(
+            "avg entry",
+            format!("{:>.4}", dec_to_f64(lv.avg_entry)),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
+        lines.push(kv_line(
+            "inventory",
+            format!("{:>+.4}", dec_to_f64(lv.inventory_usdt)),
+            Style::default().fg(Color::Gray),
+            pnl_style(lv.inventory_usdt),
+        ));
         lines.push(Line::from(""));
         lines.push(Line::styled(
             "── book ──",
             Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         ));
-        lines.push(Line::from(vec![
-            Span::styled("bid      ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>13.4}", dec_to_f64(lv.last_bid)),
-                Style::default().fg(Color::Green),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("ask      ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>13.4}", dec_to_f64(lv.last_ask)),
-                Style::default().fg(Color::Red),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("mid      ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:>13.4}", dec_to_f64(lv.last_mid))),
-        ]));
+        lines.push(kv_line(
+            "bid",
+            format!("{:>.4}", dec_to_f64(lv.last_bid)),
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Green),
+        ));
+        lines.push(kv_line(
+            "ask",
+            format!("{:>.4}", dec_to_f64(lv.last_ask)),
+            Style::default().fg(Color::Gray),
+            Style::default().fg(Color::Red),
+        ));
+        lines.push(kv_line(
+            "mid",
+            format!("{:>.4}", dec_to_f64(lv.last_mid)),
+            Style::default().fg(Color::Gray),
+            Style::default(),
+        ));
         if lv.last_ask > rust_decimal::Decimal::ZERO {
             let spread = lv.last_ask - lv.last_bid;
             let bps = if lv.last_mid > rust_decimal::Decimal::ZERO {
@@ -1377,10 +1470,12 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
             } else {
                 0.0
             };
-            lines.push(Line::from(vec![
-                Span::styled("spread   ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{bps:>13.2} bps")),
-            ]));
+            lines.push(kv_line(
+                "spread",
+                format!("{bps:.2} bps"),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
         }
         if let Some(ref api) = v.api_position {
             lines.push(Line::from(""));
@@ -1388,112 +1483,124 @@ fn draw_bot_detail(f: &mut Frame<'_>, area: Rect, active: Option<&BotViewSnapsho
                 "── api mark ──",
                 Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
             ));
-            lines.push(Line::from(vec![
-                Span::styled("api size ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!("{:>+13.4}", dec_to_f64(api.position_amount)),
-                    pnl_style(api.position_amount),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("api entry", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{:>13.6}", dec_to_f64(api.entry_price))),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("api be   ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{:>13.6}", dec_to_f64(api.break_even_price))),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("api mark ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{:>13.6}", dec_to_f64(api.mark_price))),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("api unrl ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!("{:>+13.4}", dec_to_f64(api.unrealized_profit)),
-                    pnl_style(api.unrealized_profit),
-                ),
-            ]));
+            lines.push(kv_line(
+                "api size",
+                format!("{:>+.4}", dec_to_f64(api.position_amount)),
+                Style::default().fg(Color::Gray),
+                pnl_style(api.position_amount),
+            ));
+            lines.push(kv_line(
+                "api entry",
+                format!("{:>.6}", dec_to_f64(api.entry_price)),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
+            lines.push(kv_line(
+                "api be",
+                format!("{:>.6}", dec_to_f64(api.break_even_price)),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
+            lines.push(kv_line(
+                "api mark",
+                format!("{:>.6}", dec_to_f64(api.mark_price)),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
+            lines.push(kv_line(
+                "api unrl",
+                format!("{:>+.4}", dec_to_f64(api.unrealized_profit)),
+                Style::default().fg(Color::Gray),
+                pnl_style(api.unrealized_profit),
+            ));
             if let (Some(r), Some(lv)) = (&v.snapshot, &v.live) {
                 let local_mark_unrealized = mark_unrealized(r.unrealized.0, lv, api.mark_price);
                 let delta = local_mark_unrealized - api.unrealized_profit;
-                lines.push(Line::from(vec![
-                    Span::styled("local mrk", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        format!("{:>+13.4}", dec_to_f64(local_mark_unrealized)),
-                        pnl_style(local_mark_unrealized),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("mark Δ  ", Style::default().fg(Color::Gray)),
-                    Span::styled(format!("{:>+13.4}", dec_to_f64(delta)), pnl_style(delta)),
-                ]));
+                lines.push(kv_line(
+                    "local mrk",
+                    format!("{:>+.4}", dec_to_f64(local_mark_unrealized)),
+                    Style::default().fg(Color::Gray),
+                    pnl_style(local_mark_unrealized),
+                ));
+                lines.push(kv_line(
+                    "mark Δ",
+                    format!("{:>+.4}", dec_to_f64(delta)),
+                    Style::default().fg(Color::Gray),
+                    pnl_style(delta),
+                ));
             }
-            lines.push(Line::from(vec![
-                Span::styled("age      ", Style::default().fg(Color::Gray)),
-                Span::raw(format!(
-                    "{:>13}",
-                    format_ago(millis_ago(api.fetched_at_ms) / 1000)
-                )),
-            ]));
+            lines.push(kv_line(
+                "age",
+                format_ago(millis_ago(api.fetched_at_ms) / 1000),
+                Style::default().fg(Color::Gray),
+                Style::default(),
+            ));
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
             "── orders ──",
             Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
         ));
-        lines.push(Line::from(vec![
-            Span::styled("open b/s ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>5}", lv.open_buys),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw(" / "),
-            Span::styled(
-                format!("{:>5}", lv.open_sells),
-                Style::default().fg(Color::Red),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("filled   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                format!("{:>5}", lv.buy_fills),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw(" / "),
-            Span::styled(
-                format!("{:>5}", lv.sell_fills),
-                Style::default().fg(Color::Red),
-            ),
-        ]));
+        fn split_line_local<'a>(label: &'a str, buy_str: String, sell_str: String) -> Line<'a> {
+            let total =
+                label.chars().count() + buy_str.chars().count() + sell_str.chars().count() + 3;
+            let pad = SIDE_PANEL_INNER.saturating_sub(total);
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(buy_str, Style::default().fg(Color::Green)),
+                Span::raw(" / "),
+                Span::styled(sell_str, Style::default().fg(Color::Red)),
+            ])
+        }
+        lines.push(split_line_local(
+            "open b/s",
+            format!("{}", lv.open_buys),
+            format!("{}", lv.open_sells),
+        ));
+        lines.push(split_line_local(
+            "filled",
+            format!("{}", lv.buy_fills),
+            format!("{}", lv.sell_fills),
+        ));
         if let Some(side) = lv.last_fill_side {
             let (tag, col) = match side {
                 tikr_core::Side::Bid => ("BUY ", Color::Green),
                 tikr_core::Side::Ask => ("SELL", Color::Red),
             };
-            lines.push(Line::from(vec![
-                Span::styled("last fill", Style::default().fg(Color::Gray)),
-                Span::raw(" "),
-                Span::styled(tag, Style::default().fg(col).add_modifier(Modifier::BOLD)),
-                Span::raw(format!(
-                    " {:.4} × {:.4}",
+            lines.push(kv_line(
+                "last fill",
+                format!(
+                    "{} {:.4}×{:.4}",
+                    tag,
                     dec_to_f64(lv.last_fill_price),
                     dec_to_f64(lv.last_fill_size)
-                )),
-            ]));
+                ),
+                Style::default().fg(Color::Gray),
+                Style::default().fg(col).add_modifier(Modifier::BOLD),
+            ));
             if let Some(ts) = lv.last_fill_ts {
                 let ago = secs_ago(ts);
-                lines.push(Line::from(vec![
-                    Span::styled("  ago    ", Style::default().fg(Color::Gray)),
-                    Span::raw(format_ago(ago)),
-                ]));
+                lines.push(kv_line(
+                    "  ago",
+                    format_ago(ago),
+                    Style::default().fg(Color::Gray),
+                    Style::default(),
+                ));
             }
         }
     }
 
+    let total = lines.len() as u16;
+    let visible = area.height.saturating_sub(2);
+    ui.last_bot_total = total;
+    ui.last_bot_visible = visible;
+    let scroll = UiState::clamp_scroll(ui.bot_scroll, total, visible);
+    ui.bot_scroll = scroll;
     let p = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" bot "))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(p, area);
 }
 
@@ -1537,6 +1644,37 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &ModeState, config_path: &st
 fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
     d.to_f64().unwrap_or(0.0)
+}
+
+/// Side panel inner width (panel width - 2 border chars). Both left
+/// and right side panels are 31 wide → 29 chars inside.
+const SIDE_PANEL_INNER: usize = 29;
+
+/// Build a label/value row that left-aligns the label and
+/// right-aligns the value to fill `SIDE_PANEL_INNER`. Inserts a
+/// computed spacer span between them. Trims labels of trailing
+/// whitespace so old "label   " literals also align cleanly.
+fn kv_line<L: Into<String>>(
+    label: L,
+    value: String,
+    label_style: Style,
+    value_style: Style,
+) -> Line<'static> {
+    let mut label = label.into();
+    let trimmed_len = label.trim_end().chars().count();
+    label.truncate(
+        label
+            .char_indices()
+            .nth(trimmed_len)
+            .map_or(label.len(), |(i, _)| i),
+    );
+    let total = label.chars().count() + value.chars().count();
+    let pad = SIDE_PANEL_INNER.saturating_sub(total);
+    Line::from(vec![
+        Span::styled(label, label_style),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(value, value_style),
+    ])
 }
 
 fn pnl_style(d: rust_decimal::Decimal) -> Style {
