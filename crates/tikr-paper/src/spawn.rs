@@ -15,8 +15,8 @@ use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, Hydra, HydraConfig,
     LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
     MicroMeanReversion, MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp,
-    SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
-    TouchRefill, TouchRefillConfig,
+    SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, Tide, TideConfig, TopOfBook,
+    TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -56,8 +56,8 @@ pub enum StrategyChoice {
     LiqFade(LiqFadeConfig),
     /// [`Hydra`] — straddle-bracket entry + pyramid/DCA + maker TP / IOC SL.
     Hydra(HydraConfig),
-    /// [`TouchRefill`] — minimal at-touch both-sided MM, refill on fill.
-    TouchRefill(TouchRefillConfig),
+    /// [`Tide`] — minimal at-touch both-sided MM, refill on fill.
+    Tide(TideConfig),
 }
 
 impl StrategyChoice {
@@ -75,7 +75,7 @@ impl StrategyChoice {
             Self::SpreadScalp(_) => "spread-scalp",
             Self::LiqFade(_) => "liq-fade",
             Self::Hydra(_) => "hydra",
-            Self::TouchRefill(_) => "touch-refill",
+            Self::Tide(_) => "tide",
         }
     }
 }
@@ -362,8 +362,8 @@ where
                     )
                     .await
                 }
-                StrategyChoice::TouchRefill(cfg) => {
-                    let strategy = TouchRefill::new(cfg);
+                StrategyChoice::Tide(cfg) => {
+                    let strategy = Tide::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,

@@ -23,11 +23,11 @@ pub struct DashboardConfig {
     /// Optional rotating StaticGrid manager.
     #[serde(default)]
     pub static_grid_rotation: Option<ScalpRotationConfig>,
-    /// Optional TouchRefill auto-rotation: spawns a TouchRefill bot on
+    /// Optional Tide auto-rotation: spawns a Tide bot on
     /// every USDT-perp where `tick_bps ≥ min_tick_bps`. No bot list
     /// needed — symbols are auto-discovered.
     #[serde(default)]
-    pub touch_refill_auto: Option<TouchRefillAutoConfig>,
+    pub tide_auto: Option<TideAutoConfig>,
 }
 
 /// Rotating SpreadScalp manager configuration.
@@ -125,7 +125,7 @@ pub struct AccountConfig {
     pub leverage: u32,
     /// Margin asset for the wallet balance poller + TUI display.
     /// `"USDT"` (default) for USDT-M perps, `"USDC"` for USDC-M.
-    /// When `touch_refill_auto.quote_asset` is set, that takes
+    /// When `tide_auto.quote_asset` is set, that takes
     /// precedence; this field covers the fixed-bot-list case.
     #[serde(default = "default_account_asset")]
     pub asset: String,
@@ -194,17 +194,17 @@ pub struct BotConfig {
     /// Hydra params (only honored when `strategy = "hydra"`).
     #[serde(default)]
     pub hydra: Option<HydraParams>,
-    /// TouchRefill params (only honored when `strategy = "touch-refill"`).
+    /// Tide params (only honored when `strategy = "tide"`).
     #[serde(default)]
-    pub touch_refill: Option<TouchRefillParams>,
+    pub tide: Option<TideParams>,
 }
 
-/// TouchRefill — minimal at-touch MM with optional N-tick grid depth.
+/// Tide — minimal at-touch MM with optional N-tick grid depth.
 /// `step_size` / `tick_size` / `min_notional` come from venue
 /// exchangeInfo.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
-pub struct TouchRefillParams {
+pub struct TideParams {
     /// Per-order notional in USDT. When omitted, the account-derived
     /// default applies (`account.order_balance_pct × wallet / bots`).
     #[serde(default)]
@@ -214,13 +214,13 @@ pub struct TouchRefillParams {
     /// starting at touch. Default `1`. With N=12 the bot defends
     /// against ~10-tick adverse price jumps. Inventory cap scales:
     /// max per-side position = N × notional_per_order.
-    #[serde(default = "touch_refill_default_grid_levels")]
+    #[serde(default = "tide_default_grid_levels")]
     pub grid_levels: u32,
     /// Minimum gap (in bps of mid) between the top of the bid grid
     /// and the top of the ask grid. When the book spread is wider,
     /// tops sit at touch. When narrower, both tops shift symmetrically
     /// around mid so the gap is met. `0` (default) = disabled.
-    /// Use to make TouchRefill viable on tight-spread markets.
+    /// Use to make Tide viable on tight-spread markets.
     #[serde(default)]
     pub min_self_spread_bps: u32,
     /// Profit target (bps of fill price) for close-on-fill orders.
@@ -236,44 +236,44 @@ pub struct TouchRefillParams {
     pub grid_step_bps: u32,
 }
 
-fn touch_refill_default_grid_levels() -> u32 {
+fn tide_default_grid_levels() -> u32 {
     1
 }
 
-/// `[touch_refill_auto]` — auto-rotation manager. Discovers Binance
+/// `[tide_auto]` — auto-rotation manager. Discovers Binance
 /// Futures USDT-perp symbols with `tick_size / price × 10000 ≥
 /// min_tick_bps` AND `24h quote volume ≥ min_volume_usdt`. Spawns
-/// one TouchRefill bot per qualifying symbol. Re-checks every
+/// one Tide bot per qualifying symbol. Re-checks every
 /// `recheck_interval_secs`; when a symbol drops below threshold,
 /// shuts down its bot and flattens the position via market order.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
-pub struct TouchRefillAutoConfig {
+pub struct TideAutoConfig {
     /// Master switch.
     #[serde(default)]
     pub enabled: bool,
     /// Minimum `tick_bps` to qualify. `6` is the recommended floor
     /// (covers ~3.6 bps BNB-discounted maker RT fees with ~2.4 bps edge).
-    #[serde(default = "touch_refill_auto_default_min_tick_bps")]
+    #[serde(default = "tide_auto_default_min_tick_bps")]
     pub min_tick_bps: Decimal,
     /// Minimum 24h quote volume in USDT for a symbol to qualify.
     /// Filters out thin/dead markets. Default `$20M`.
-    #[serde(default = "touch_refill_auto_default_min_volume_usdt")]
+    #[serde(default = "tide_auto_default_min_volume_usdt")]
     pub min_volume_usdt: Decimal,
     /// How often to re-discover + diff (seconds). Clamped to ≥ 10s.
     /// Default `60`.
-    #[serde(default = "touch_refill_auto_default_recheck_interval_secs")]
+    #[serde(default = "tide_auto_default_recheck_interval_secs")]
     pub recheck_interval_secs: u64,
-    /// Forwarded to every spawned TouchRefill bot as
-    /// `TouchRefillConfig.min_self_spread_bps`. Default `10`.
-    #[serde(default = "touch_refill_auto_default_min_self_spread_bps")]
+    /// Forwarded to every spawned Tide bot as
+    /// `TideConfig.min_self_spread_bps`. Default `10`.
+    #[serde(default = "tide_auto_default_min_self_spread_bps")]
     pub min_self_spread_bps: u32,
-    /// Forwarded to every spawned TouchRefill bot as
-    /// `TouchRefillConfig.grid_levels`. Default `12`.
-    #[serde(default = "touch_refill_auto_default_grid_levels")]
+    /// Forwarded to every spawned Tide bot as
+    /// `TideConfig.grid_levels`. Default `12`.
+    #[serde(default = "tide_auto_default_grid_levels")]
     pub grid_levels: u32,
-    /// Forwarded to every spawned TouchRefill bot as
-    /// `TouchRefillConfig.close_profit_bps`. Default `0` = fall back to
+    /// Forwarded to every spawned Tide bot as
+    /// `TideConfig.close_profit_bps`. Default `0` = fall back to
     /// `min_self_spread_bps`.
     #[serde(default)]
     pub close_profit_bps: u32,
@@ -281,13 +281,13 @@ pub struct TouchRefillAutoConfig {
     /// (default) or `"USDC"`. Affects which set of USD-M perps the
     /// rotation manager considers. Note: USDC perps are settled in
     /// USDC, so you'll need USDC in your futures wallet to trade them.
-    #[serde(default = "touch_refill_auto_default_quote_asset")]
+    #[serde(default = "tide_auto_default_quote_asset")]
     pub quote_asset: String,
-    /// Forwarded to every spawned TouchRefill bot as
-    /// `TouchRefillConfig.grid_step_bps`. Default `4` — sensible for
+    /// Forwarded to every spawned Tide bot as
+    /// `TideConfig.grid_step_bps`. Default `4` — sensible for
     /// tight-tick perps (ETHUSDC, etc.) where 1-tick spacing piles
     /// dozens of orders within sub-bps.
-    #[serde(default = "touch_refill_auto_default_grid_step_bps")]
+    #[serde(default = "tide_auto_default_grid_step_bps")]
     pub grid_step_bps: u32,
     /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
     /// When non-empty, ONLY these symbols spawn and the
@@ -301,25 +301,25 @@ pub struct TouchRefillAutoConfig {
     pub symbols_allowlist: Vec<String>,
 }
 
-fn touch_refill_auto_default_min_tick_bps() -> Decimal {
+fn tide_auto_default_min_tick_bps() -> Decimal {
     Decimal::from(6)
 }
-fn touch_refill_auto_default_min_volume_usdt() -> Decimal {
+fn tide_auto_default_min_volume_usdt() -> Decimal {
     Decimal::from(20_000_000)
 }
-fn touch_refill_auto_default_recheck_interval_secs() -> u64 {
+fn tide_auto_default_recheck_interval_secs() -> u64 {
     60
 }
-fn touch_refill_auto_default_min_self_spread_bps() -> u32 {
+fn tide_auto_default_min_self_spread_bps() -> u32 {
     10
 }
-fn touch_refill_auto_default_grid_levels() -> u32 {
+fn tide_auto_default_grid_levels() -> u32 {
     12
 }
-fn touch_refill_auto_default_quote_asset() -> String {
+fn tide_auto_default_quote_asset() -> String {
     "USDT".to_string()
 }
-fn touch_refill_auto_default_grid_step_bps() -> u32 {
+fn tide_auto_default_grid_step_bps() -> u32 {
     4
 }
 

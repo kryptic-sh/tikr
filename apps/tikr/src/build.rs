@@ -11,7 +11,7 @@ use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MicroMeanReversionConfig,
-    SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, TouchRefillConfig,
+    SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, TideConfig,
 };
 use tokio::sync::watch;
 
@@ -74,10 +74,10 @@ pub fn to_spec(
             default_notional,
             max_position_usdt_default,
         )?,
-        "touch-refill" | "tr" => build_touch_refill(cfg, &symbol, venue, default_notional)?,
+        "tide" | "td" => build_tide(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, touch-refill)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide)"
             ));
         }
     };
@@ -122,7 +122,7 @@ pub fn to_spec(
         // dust emits (close-side pinned to residual qty, etc.).
         min_notional: venue.min_notional(&symbol).unwrap_or(Decimal::ZERO),
         // Per-strategy expected max open order count. SS / SG / etc.
-        // emit at most 2 (one per side); TouchRefill emits up to
+        // emit at most 2 (one per side); Tide emits up to
         // 2 × grid_levels. The runner's 30s orphan sweep uses this
         // as a "wipe everything if exceeded" threshold; set to 0
         // (disabled) when the strategy intentionally keeps many.
@@ -174,7 +174,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "liq-fade" | "lf" => Ok(cfg.liq_fade.as_ref().map(|p| p.notional).unwrap_or(None)),
         // Hydra: notional is wallet-derived only — no per-bot override.
         "hydra" | "hd" | "hy" => Ok(None),
-        "touch-refill" | "tr" => Ok(cfg.touch_refill.as_ref().and_then(|p| p.notional)),
+        "tide" | "td" => Ok(cfg.tide.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -197,8 +197,8 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "sgap"
         | "micro-mean-reversion"
         | "mmr"
-        | "touch-refill"
-        | "tr" => None,
+        | "tide"
+        | "td" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -213,7 +213,7 @@ fn per_bot_state_dir(base: &std::path::Path, symbol: &str) -> PathBuf {
 /// many resting orders).
 fn max_open_orders_for(cfg: &BotConfig) -> usize {
     match cfg.strategy.as_str() {
-        "touch-refill" | "tr" => 0,
+        "tide" | "td" => 0,
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
@@ -341,43 +341,31 @@ fn build_simple_gap(
     }))
 }
 
-fn build_touch_refill(
+fn build_tide(
     cfg: &BotConfig,
     symbol: &Symbol,
     venue: &BinanceClient,
     default_notional: Decimal,
 ) -> Result<StrategyChoice> {
-    // touch_refill block is optional — strategy only needs notional,
+    // tide block is optional — strategy only needs notional,
     // and that can come from the account-wide default.
-    let notional_override = cfg.touch_refill.as_ref().and_then(|p| p.notional);
+    let notional_override = cfg.tide.as_ref().and_then(|p| p.notional);
     let notional = autobump_notional(notional_override.unwrap_or(default_notional), symbol, venue)?;
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
-    let grid_levels = cfg
-        .touch_refill
-        .as_ref()
-        .map(|p| p.grid_levels)
-        .unwrap_or(1);
+    let grid_levels = cfg.tide.as_ref().map(|p| p.grid_levels).unwrap_or(1);
     let min_self_spread_bps = cfg
-        .touch_refill
+        .tide
         .as_ref()
         .map(|p| p.min_self_spread_bps)
         .unwrap_or(0);
-    let close_profit_bps = cfg
-        .touch_refill
-        .as_ref()
-        .map(|p| p.close_profit_bps)
-        .unwrap_or(0);
-    let grid_step_bps = cfg
-        .touch_refill
-        .as_ref()
-        .map(|p| p.grid_step_bps)
-        .unwrap_or(0);
+    let close_profit_bps = cfg.tide.as_ref().map(|p| p.close_profit_bps).unwrap_or(0);
+    let grid_step_bps = cfg.tide.as_ref().map(|p| p.grid_step_bps).unwrap_or(0);
     // Initial max_position = 0 (no cap). Live value flows in via
     // on_max_position_updated from the account balance poller's
     // max_position_rx watch channel, typically within 5s of spawn.
-    Ok(StrategyChoice::TouchRefill(TouchRefillConfig {
+    Ok(StrategyChoice::Tide(TideConfig {
         notional_per_order: notional,
         tick_size,
         step_size,

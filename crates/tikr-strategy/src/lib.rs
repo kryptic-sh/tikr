@@ -44,8 +44,8 @@ pub mod simple_gap;
 pub mod spread_scalp;
 pub mod spread_scalp_old;
 pub mod static_grid;
+pub mod tide;
 pub mod top_of_book;
-pub mod touch_refill;
 pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
@@ -62,8 +62,8 @@ pub use simple_gap::{SimpleGap, SimpleGapConfig};
 pub use spread_scalp::{SpreadScalp, SpreadScalpConfig};
 pub use spread_scalp_old::{SpreadScalpOld, SpreadScalpOldConfig};
 pub use static_grid::{StaticGrid, StaticGridConfig};
+pub use tide::{Tide, TideConfig};
 pub use top_of_book::{TopOfBook, TopOfBookConfig};
-pub use touch_refill::{TouchRefill, TouchRefillConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
 
 use tikr_core::{

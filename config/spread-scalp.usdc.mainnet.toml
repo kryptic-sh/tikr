@@ -1,6 +1,6 @@
 # ─── SpreadScalp on USDC majors — MAINNET ──────────────────────────────────
 #
-# 14 fixed bots — same symbol list as config/touch-refill.usdc.mainnet.toml.
+# 14 fixed bots — same symbol list as config/tide.usdc.mainnet.toml.
 #
 # USDC-specific overrides:
 #   min_spread_bps    = 0   (USDC promo = 0 maker fee, no fee floor)

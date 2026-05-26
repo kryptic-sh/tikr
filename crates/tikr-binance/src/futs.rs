@@ -398,7 +398,7 @@ pub async fn get_24hr_tickers(
 }
 
 /// One USD-M perp symbol + its tick width in basis points of current
-/// mid price. Used by the touch-refill auto-rotation to discover
+/// mid price. Used by the tide auto-rotation to discover
 /// symbols where each tick is wide enough to clear maker fees.
 #[derive(Debug, Clone)]
 pub struct PerpTickInfo {

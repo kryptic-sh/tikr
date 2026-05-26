@@ -19,7 +19,7 @@ mod scalp_rotation;
 mod selection;
 mod state;
 mod supervisor;
-mod touch_refill_auto;
+mod tide_auto;
 mod tui;
 mod venue;
 
@@ -460,11 +460,11 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(0);
 
     // Margin asset priority:
-    // 1. touch_refill_auto.quote_asset (when auto-rotation enabled)
+    // 1. tide_auto.quote_asset (when auto-rotation enabled)
     // 2. account.asset (explicit override for fixed-bot configs)
     // 3. "USDT" (default)
     let wallet_asset = cfg
-        .touch_refill_auto
+        .tide_auto
         .as_ref()
         .filter(|c| c.enabled)
         .map(|c| c.quote_asset.clone())
@@ -542,10 +542,10 @@ async fn main() -> anyhow::Result<()> {
             global_shutdown_rx.clone(),
         ));
     }
-    if let Some(auto) = cfg.touch_refill_auto.clone().filter(|c| c.enabled) {
-        supervisors.push(touch_refill_auto::spawn_touch_refill_auto_manager(
+    if let Some(auto) = cfg.tide_auto.clone().filter(|c| c.enabled) {
+        supervisors.push(tide_auto::spawn_tide_auto_manager(
             auto,
-            touch_refill_auto::TouchRefillAutoAccountCtx {
+            tide_auto::TideAutoAccountCtx {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),

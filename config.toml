@@ -1,4 +1,4 @@
-# ─── TouchRefill USDC majors-only — MAINNET ─────────────────────────────
+# ─── Tide USDC majors-only — MAINNET ─────────────────────────────
 #
 # USDC-margined perpetuals, restricted to bigger crypto markets.
 # Uses /fapi/v1/* (same as USDT-M, only quote-asset filter changes).
@@ -19,12 +19,12 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/touch-refill-usdc-majors"
+state_dir = "./state/tide-usdc-majors"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-[touch_refill_auto]
+[tide_auto]
 enabled = true
 quote_asset = "USDC"
 

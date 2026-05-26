@@ -1,6 +1,6 @@
-# ─── TouchRefill BTCUSDC solo — MAINNET ────────────────────────────────────
+# ─── Tide BTCUSDC solo — MAINNET ────────────────────────────────────
 #
-# Single-symbol TouchRefill on BTCUSDC. Same sizing as the SS BTCUSDC
+# Single-symbol Tide on BTCUSDC. Same sizing as the SS BTCUSDC
 # solo config:
 #   order_balance_pct = 10  (10% of wallet per order)
 #   max_position_pct  = 100 (full wallet as inventory cap)
@@ -17,13 +17,13 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/touch-refill-btcusdc"
+state_dir = "./state/tide-btcusdc"
 asset = "USDC"
 order_balance_pct = "10"
 max_position_pct = "100"
 leverage = 5
 
-[touch_refill_auto]
+[tide_auto]
 enabled = true
 quote_asset = "USDC"
 

@@ -1,4 +1,4 @@
-# ─── TouchRefill on ESPORTSUSDT — MAINNET ───────────────────────────────
+# ─── Tide on ESPORTSUSDT — MAINNET ───────────────────────────────
 #
 # Minimal at-touch market making: post BID at top.bid and ASK at top.ask,
 # both post-only. Re-quote when the book moves; refill on every fill.
@@ -22,7 +22,7 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/touch-refill-esports"
+state_dir = "./state/tide-esports"
 
 # Per-order = wallet × 1% (single bot, no split).
 order_balance_pct = "1"
@@ -31,7 +31,7 @@ leverage = 5
 
 [[bot]]
 symbol = "ESPORTSUSDT"
-strategy = "touch-refill"
+strategy = "tide"
 
 # grid_levels = 12 → maintain a 12-tick deep grid per side. When the
 # book moves down, the bid grid extends down to follow (and vice versa
@@ -40,5 +40,5 @@ strategy = "touch-refill"
 #
 # Inventory cap scales: max per-side position ≈ 12 × notional. With
 # 1% wallet notional on $770 wallet = $7.70/order × 12 = $92 max per side.
-[bot.touch_refill]
+[bot.tide]
 grid_levels = 12

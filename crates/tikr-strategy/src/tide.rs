@@ -27,9 +27,9 @@ use tikr_venue::{QuoteId, QuoteIntent};
 
 use crate::{Action, Strategy, StrategyContext};
 
-/// Configuration for [`TouchRefill`].
+/// Configuration for [`Tide`].
 #[derive(Debug, Clone)]
-pub struct TouchRefillConfig {
+pub struct TideConfig {
     /// Notional USDT per order. Quantity = `notional / price`, floored
     /// to `step_size`, bumped to meet `min_notional`.
     pub notional_per_order: Decimal,
@@ -55,7 +55,7 @@ pub struct TouchRefillConfig {
     /// (bid down, ask up) symmetrically around mid so the gap meets
     /// the requirement. `0` (default) = disabled (always at touch).
     ///
-    /// Use to make TouchRefill viable on tight-spread / narrow-tick
+    /// Use to make Tide viable on tight-spread / narrow-tick
     /// markets where the natural book spread alone wouldn't cover
     /// 2× maker fees (~3.6 bps RT on BNB-discount Binance USD-M).
     pub min_self_spread_bps: u32,
@@ -87,8 +87,8 @@ pub struct TouchRefillConfig {
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
 /// `ctx.open_quotes` to avoid double-emitting in a single cycle.
-pub struct TouchRefill {
-    config: TouchRefillConfig,
+pub struct Tide {
+    config: TideConfig,
     /// Prices we've emitted Quote intents for this cycle, used to
     /// dedupe within `on_event` before the runner has dispatched +
     /// fill_sim has registered them. Cleared at the start of each
@@ -103,7 +103,7 @@ pub struct TouchRefill {
     ask_grid_ceiling: Option<Decimal>,
 }
 
-impl TouchRefill {
+impl Tide {
     fn quote_size(&self, price: Price) -> Size {
         if price.0 <= Decimal::ZERO {
             return Size(Decimal::ZERO);
@@ -178,8 +178,8 @@ impl TouchRefill {
     }
 }
 
-impl Strategy for TouchRefill {
-    type Config = TouchRefillConfig;
+impl Strategy for Tide {
+    type Config = TideConfig;
 
     fn new(config: Self::Config) -> Self {
         Self {
@@ -192,7 +192,7 @@ impl Strategy for TouchRefill {
     }
 
     fn name(&self) -> &str {
-        "touch-refill"
+        "tide"
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
@@ -638,8 +638,8 @@ mod tests {
         }
     }
 
-    fn cfg() -> TouchRefillConfig {
-        TouchRefillConfig {
+    fn cfg() -> TideConfig {
+        TideConfig {
             notional_per_order: Decimal::from(10),
             tick_size: Decimal::new(1, 4), // 0.0001
             step_size: Decimal::ONE,
@@ -685,7 +685,7 @@ mod tests {
 
     #[test]
     fn first_event_places_both_sides_at_touch() {
-        let mut s = TouchRefill::new(cfg());
+        let mut s = Tide::new(cfg());
         let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
         let p = pos();
         let symbol = sym();
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn does_not_re_emit_when_orders_already_at_best() {
-        let mut s = TouchRefill::new(cfg());
+        let mut s = Tide::new(cfg());
         let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
         let p = pos();
         let symbol = sym();
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn full_fill_creates_opposite_close_at_one_tick() {
-        let mut s = TouchRefill::new(cfg());
+        let mut s = Tide::new(cfg());
         let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
         let p = pos();
         let symbol = sym();
@@ -767,7 +767,7 @@ mod tests {
         let mut c = cfg();
         // Rule 2 (close-on-fill) requires close_profit_bps > 0.
         c.close_profit_bps = 1;
-        let mut s = TouchRefill::new(c);
+        let mut s = Tide::new(c);
         let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
         let p = pos();
         let symbol = sym();
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn partial_fill_does_not_create_close_order() {
-        let mut s = TouchRefill::new(cfg());
+        let mut s = Tide::new(cfg());
         let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
         let p = pos();
         let symbol = sym();
@@ -814,7 +814,7 @@ mod tests {
         // close_profit_bps = 0 → Rule 2 disabled entirely. Only Rule 1
         // (grid maintenance) emits. The fill should NOT trigger any
         // emit specifically tied to it.
-        let c = TouchRefillConfig {
+        let c = TideConfig {
             notional_per_order: Decimal::from(10),
             tick_size: Decimal::new(1, 5),
             step_size: Decimal::ONE,
@@ -825,7 +825,7 @@ mod tests {
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
         };
-        let mut s = TouchRefill::new(c);
+        let mut s = Tide::new(c);
         let symbol = sym();
         let p = pos();
         let snap = book(Decimal::new(99999, 6), Decimal::new(100001, 6));
@@ -862,7 +862,7 @@ mod tests {
         // min_self_spread distance = 100 × 10 / 10000 = $0.10 = 10 ticks.
         // close_profit distance = 100 × 50 / 10000 = $0.50 = 50 ticks.
         // Expect close to use 50 (the larger override), not 10.
-        let mut c = TouchRefillConfig {
+        let mut c = TideConfig {
             notional_per_order: Decimal::from(10),
             tick_size: Decimal::new(1, 2), // 0.01
             step_size: Decimal::ONE,
@@ -874,7 +874,7 @@ mod tests {
             max_position_usdt: Decimal::ZERO,
         };
         c.tick_size = Decimal::new(1, 2);
-        let mut s = TouchRefill::new(c);
+        let mut s = Tide::new(c);
         let symbol = sym();
         let p = pos();
         let snap = book(Decimal::from(100), Decimal::new(10001, 2));
@@ -904,7 +904,7 @@ mod tests {
     fn grid_places_levels_outward_from_touch() {
         let mut c = cfg();
         c.grid_levels = 3;
-        let mut s = TouchRefill::new(c);
+        let mut s = Tide::new(c);
         let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
         let p = pos();
         let symbol = sym();
@@ -944,7 +944,7 @@ mod tests {
     fn grid_extends_down_when_best_bid_falls() {
         let mut c = cfg();
         c.grid_levels = 3;
-        let mut s = TouchRefill::new(c);
+        let mut s = Tide::new(c);
         let symbol = sym();
         let p = pos();
 

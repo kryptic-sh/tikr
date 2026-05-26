@@ -24,7 +24,7 @@ use tikr_core::{
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
-    MicroPriceConfig, Strategy, TopOfBook, TopOfBookConfig, TouchRefill, TouchRefillConfig,
+    MicroPriceConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -40,8 +40,8 @@ enum StrategyArg {
     TopOfBook,
     #[value(name = "micro-price", alias = "mp")]
     MicroPrice,
-    #[value(name = "touch-refill", alias = "tr")]
-    TouchRefill,
+    #[value(name = "tide", alias = "td")]
+    Tide,
 }
 
 #[derive(Parser, Debug)]
@@ -111,32 +111,32 @@ struct Args {
     #[arg(long, default_value_t = 1u32)]
     micro_half_spread_ticks: u32,
 
-    /// TouchRefill: grid depth per side (1 = single-touch).
+    /// Tide: grid depth per side (1 = single-touch).
     #[arg(long, default_value_t = 12u32)]
     tr_grid_levels: u32,
 
-    /// TouchRefill: minimum self-spread in bps of mid.
+    /// Tide: minimum self-spread in bps of mid.
     #[arg(long, default_value_t = 10u32)]
     tr_min_self_spread_bps: u32,
 
-    /// TouchRefill: per-order notional in USDT.
+    /// Tide: per-order notional in USDT.
     #[arg(long, default_value = "10")]
     tr_notional: String,
 
-    /// TouchRefill: venue step size (lot floor).
+    /// Tide: venue step size (lot floor).
     #[arg(long, default_value = "0.001")]
     tr_step_size: String,
 
-    /// TouchRefill: venue min order notional in USDT.
+    /// Tide: venue min order notional in USDT.
     #[arg(long, default_value = "5")]
     tr_min_notional: String,
 
-    /// TouchRefill: profit target for close-on-fill in bps of fill
+    /// Tide: profit target for close-on-fill in bps of fill
     /// price. `0` (default) = falls back to min_self_spread_bps.
     #[arg(long, default_value_t = 0u32)]
     tr_close_profit_bps: u32,
 
-    /// TouchRefill: grid spacing in bps (snapped to tick, min 1 tick).
+    /// Tide: grid spacing in bps (snapped to tick, min 1 tick).
     /// `0` = legacy 1-tick spacing.
     #[arg(long, default_value_t = 0u32)]
     tr_grid_step_bps: u32,
@@ -323,8 +323,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        StrategyArg::TouchRefill => {
-            let strategy = TouchRefill::new(TouchRefillConfig {
+        StrategyArg::Tide => {
+            let strategy = Tide::new(TideConfig {
                 notional_per_order: Decimal::from_str(&args.tr_notional)?,
                 tick_size: Decimal::from_str(&args.tick_size)?,
                 step_size: Decimal::from_str(&args.tr_step_size)?,

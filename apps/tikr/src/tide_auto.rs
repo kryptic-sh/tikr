@@ -1,4 +1,4 @@
-//! Auto-rotation manager for TouchRefill across all USD-M perps that
+//! Auto-rotation manager for Tide across all USD-M perps that
 //! meet a minimum tick-bps threshold.
 //!
 //! Every `recheck_interval_secs` (default 60s):
@@ -6,7 +6,7 @@
 //! 2. Filter to symbols with `tick_size / price × 10000 ≥ min_tick_bps`
 //!    and `24h quote volume ≥ min_volume_usdt`.
 //! 3. Diff against currently-running set:
-//!    - New symbols → spawn a TouchRefill supervisor.
+//!    - New symbols → spawn a Tide supervisor.
 //!    - Symbols that fell below threshold → signal shutdown, then
 //!      cancel-all + flatten via `reset_symbol_state`.
 //!
@@ -24,13 +24,13 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::config::{BotConfig, TouchRefillAutoConfig, TouchRefillParams};
+use crate::config::{BotConfig, TideAutoConfig, TideParams};
 use crate::state::{BotStatus, BotView, SharedBotState};
 use crate::supervisor::{SupervisorCtx, reset_symbol_state, spawn_supervisor};
 use crate::venue;
 
-/// Account/env context shared by all spawned TouchRefill supervisors.
-pub struct TouchRefillAutoAccountCtx {
+/// Account/env context shared by all spawned Tide supervisors.
+pub struct TideAutoAccountCtx {
     pub env: BinanceEnv,
     pub api_key: String,
     pub key_material: Arc<BinanceKeyMaterial>,
@@ -50,9 +50,9 @@ struct ActiveBot {
 
 /// Spawn the auto-rotation manager. Returns immediately; manager runs
 /// in the background until global shutdown fires.
-pub fn spawn_touch_refill_auto_manager(
-    cfg: TouchRefillAutoConfig,
-    account: TouchRefillAutoAccountCtx,
+pub fn spawn_tide_auto_manager(
+    cfg: TideAutoConfig,
+    account: TideAutoAccountCtx,
     shared_state: SharedBotState,
     mut global_shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -68,7 +68,7 @@ pub fn spawn_touch_refill_auto_manager(
             min_volume_usdt = %cfg.min_volume_usdt,
             recheck_interval_secs = recheck,
             quote_asset = %cfg.quote_asset,
-            "touch_refill_auto: starting discovery loop"
+            "tide_auto: starting discovery loop"
         );
 
         loop {
@@ -76,7 +76,7 @@ pub fn spawn_touch_refill_auto_manager(
                 _ = tick.tick() => {}
                 _ = global_shutdown.changed() => {
                     if *global_shutdown.borrow() {
-                        info!("touch_refill_auto: global shutdown — flushing all bots");
+                        info!("tide_auto: global shutdown — flushing all bots");
                         let symbols: Vec<String> = active.keys().cloned().collect();
                         for (_, bot) in active.drain() {
                             let _ = bot.shutdown_tx.send(true);
@@ -102,7 +102,7 @@ pub fn spawn_touch_refill_auto_manager(
             {
                 Ok(rows) => rows,
                 Err(e) => {
-                    warn!(error = ?e, "touch_refill_auto: discovery failed, retrying next cycle");
+                    warn!(error = ?e, "tide_auto: discovery failed, retrying next cycle");
                     continue;
                 }
             };
@@ -128,7 +128,7 @@ pub fn spawn_touch_refill_auto_manager(
             info!(
                 qualifying = qualifying.len(),
                 running = active.len(),
-                "touch_refill_auto: discovery tick"
+                "tide_auto: discovery tick"
             );
 
             // 2. Spawn missing symbols.
@@ -145,7 +145,7 @@ pub fn spawn_touch_refill_auto_manager(
                     cfg.close_profit_bps,
                     cfg.grid_step_bps,
                 );
-                info!(symbol, "touch_refill_auto: spawned new bot");
+                info!(symbol, "tide_auto: spawned new bot");
                 active.insert(symbol.clone(), bot);
             }
 
@@ -159,7 +159,7 @@ pub fn spawn_touch_refill_auto_manager(
                 if let Some(bot) = active.remove(&symbol) {
                     warn!(
                         symbol = %symbol,
-                        "touch_refill_auto: tick_bps below threshold — shutting down + flattening"
+                        "tide_auto: tick_bps below threshold — shutting down + flattening"
                     );
                     let _ = bot.shutdown_tx.send(true);
                     let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
@@ -174,7 +174,7 @@ pub fn spawn_touch_refill_auto_manager(
     })
 }
 
-async fn flatten_symbols(symbols: &[String], account: &TouchRefillAutoAccountCtx) {
+async fn flatten_symbols(symbols: &[String], account: &TideAutoAccountCtx) {
     for symbol_str in symbols {
         let symbol = venue::perp_symbol(symbol_str);
         match venue::build_venue(
@@ -187,13 +187,13 @@ async fn flatten_symbols(symbols: &[String], account: &TouchRefillAutoAccountCtx
         .await
         {
             Ok(v) => {
-                info!(symbol = symbol_str, "touch_refill_auto: cancel + flatten");
+                info!(symbol = symbol_str, "tide_auto: cancel + flatten");
                 reset_symbol_state(&v, &symbol).await;
             }
             Err(e) => warn!(
                 symbol = symbol_str,
                 error = ?e,
-                "touch_refill_auto: venue build for flatten failed"
+                "tide_auto: venue build for flatten failed"
             ),
         }
     }
@@ -201,7 +201,7 @@ async fn flatten_symbols(symbols: &[String], account: &TouchRefillAutoAccountCtx
 
 fn spawn_one_bot(
     symbol: &str,
-    account: &TouchRefillAutoAccountCtx,
+    account: &TideAutoAccountCtx,
     shared_state: &SharedBotState,
     grid_levels: u32,
     min_self_spread_bps: u32,
@@ -211,10 +211,10 @@ fn spawn_one_bot(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cfg = BotConfig {
         symbol: symbol.to_string(),
-        strategy: "touch-refill".to_string(),
+        strategy: "tide".to_string(),
         // Strategy gets all its knobs from venue exchangeInfo + the
         // account-wide order_balance_pct.
-        touch_refill: Some(TouchRefillParams {
+        tide: Some(TideParams {
             notional: None,
             grid_levels,
             min_self_spread_bps,
@@ -233,9 +233,9 @@ fn spawn_one_bot(
     shared_state.insert(
         symbol,
         BotView {
-            label: format!("{symbol}/touch-refill"),
+            label: format!("{symbol}/tide"),
             symbol: symbol.to_string(),
-            strategy: "touch-refill".to_string(),
+            strategy: "tide".to_string(),
             status: BotStatus::Starting,
             snapshot: Arc::new(RwLock::new(None)),
             live: Arc::new(RwLock::new(None)),

@@ -139,7 +139,7 @@ pub struct RunnerConfig {
     /// Strategy's expected maximum open orders. The 30s reconcile
     /// sweep nukes everything when `venue_open` exceeds this — an
     /// orphan-accumulation safety net. SS quotes at most 1/side = 2.
-    /// Grid strategies like TouchRefill with N levels per side want
+    /// Grid strategies like Tide with N levels per side want
     /// `2 * N` (or more if they keep deeper historical levels). `0`
     /// (default) disables the sweep entirely — useful when the
     /// strategy intentionally keeps a lot of resting orders.
