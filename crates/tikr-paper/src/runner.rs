@@ -975,13 +975,14 @@ where
                                     }
                                     Err(e) => {
                                         let msg = format!("{e:?}");
-                                        let is_post_only_race = msg.contains("-5022")
-                                            || msg.contains("Post Only");
+                                        let is_transient = msg.contains("-5022")
+                                            || msg.contains("Post Only")
+                                            || msg.contains("RateLimited");
                                         warn!(error = ?e, "live: venue.quote failed");
                                         // Post-only races are market jitter, not a
                                         // strategy/config bug — don't burn the
                                         // side_fails budget on them.
-                                        if !is_post_only_race {
+                                        if !is_transient {
                                             match intent.side {
                                                 Side::Bid => state.0 += 1,
                                                 Side::Ask => state.1 += 1,
@@ -1804,9 +1805,11 @@ async fn dispatch_post_fill_actions<V, S>(
                     }
                     Err(e) => {
                         let msg = format!("{e:?}");
-                        let is_post_only_race = msg.contains("-5022") || msg.contains("Post Only");
+                        let is_transient = msg.contains("-5022")
+                            || msg.contains("Post Only")
+                            || msg.contains("RateLimited");
                         warn!(error = ?e, "live: venue.quote failed (post-fill)");
-                        if !is_post_only_race {
+                        if !is_transient {
                             match intent.side {
                                 Side::Bid => state.0 += 1,
                                 Side::Ask => state.1 += 1,
@@ -1920,10 +1923,11 @@ async fn dispatch_post_fill_actions<V, S>(
                             }
                             Err(e) => {
                                 let msg = format!("{e:?}");
-                                let is_post_only_race =
-                                    msg.contains("-5022") || msg.contains("Post Only");
+                                let is_transient = msg.contains("-5022")
+                                    || msg.contains("Post Only")
+                                    || msg.contains("RateLimited");
                                 warn!(error = ?e, round, "live: venue.quote failed (recovery)");
-                                if !is_post_only_race {
+                                if !is_transient {
                                     match intent.side {
                                         Side::Bid => state.0 += 1,
                                         Side::Ask => state.1 += 1,
