@@ -111,3 +111,7 @@ grid_levels = 3
 #
 # Example: fill at $100, close_profit_bps=30 → close at $100.30 (30 bps).
 close_profit_bps = 30
+
+# Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
+# 1-tick spacing on tight markets piles dozens of orders within sub-bps.
+grid_step_bps = 4

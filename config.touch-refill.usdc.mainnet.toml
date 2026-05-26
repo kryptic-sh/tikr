@@ -67,3 +67,9 @@ grid_levels = 3
 # Wider close target = more profit per RT. USDC books are slow,
 # fewer fills, so make each one count more.
 close_profit_bps = 15
+
+# Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
+# Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick
+# spacing piles dozens of orders within sub-bps. 4 bps gives
+# meaningful fill independence between levels.
+grid_step_bps = 4

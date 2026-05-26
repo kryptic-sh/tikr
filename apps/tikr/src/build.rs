@@ -365,6 +365,11 @@ fn build_touch_refill(
         .as_ref()
         .map(|p| p.close_profit_bps)
         .unwrap_or(0);
+    let grid_step_bps = cfg
+        .touch_refill
+        .as_ref()
+        .map(|p| p.grid_step_bps)
+        .unwrap_or(0);
     Ok(StrategyChoice::TouchRefill(TouchRefillConfig {
         notional_per_order: notional,
         tick_size,
@@ -373,6 +378,7 @@ fn build_touch_refill(
         grid_levels,
         min_self_spread_bps,
         close_profit_bps,
+        grid_step_bps,
     }))
 }
 

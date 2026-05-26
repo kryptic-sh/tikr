@@ -67,6 +67,13 @@ pub struct TouchRefillConfig {
     /// whichever is larger). Set higher than `min_self_spread_bps` to
     /// capture more profit per round-trip at the cost of slower fills.
     pub close_profit_bps: u32,
+    /// Spacing between grid levels in bps of mid. Effective spacing =
+    /// max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
+    /// `0` = legacy 1-tick spacing. On tight-tick markets (e.g.
+    /// ETHUSDC where 1 tick ≈ 0.005 bps), 1-tick spacing piles dozens
+    /// of orders within sub-bps; setting `grid_step_bps = 4` spaces
+    /// them ~4 bps apart for meaningful fill independence.
+    pub grid_step_bps: u32,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
@@ -189,9 +196,36 @@ impl Strategy for TouchRefill {
         // sit in the book until they fill.
         let levels = self.config.grid_levels.max(1);
         let tick = self.config.tick_size;
-        let outward = Decimal::from(levels.saturating_sub(1)) * tick;
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
+
+        // Effective grid step = max(1 tick, ceil(grid_step_bps × mid /
+        // 10000 / tick) × tick). On tight-tick markets, 1-tick spacing
+        // piles dozens of orders within sub-bps; grid_step_bps spaces
+        // them meaningfully apart.
+        let mid_for_step = match (best_bid, best_ask) {
+            (Some(b), Some(a)) if a.0 > b.0 && b.0 > Decimal::ZERO => {
+                (b.0 + a.0) / Decimal::from(2)
+            }
+            (Some(b), _) if b.0 > Decimal::ZERO => b.0,
+            (_, Some(a)) if a.0 > Decimal::ZERO => a.0,
+            _ => Decimal::ZERO,
+        };
+        let step = if self.config.grid_step_bps > 0
+            && mid_for_step > Decimal::ZERO
+            && tick > Decimal::ZERO
+        {
+            let target =
+                mid_for_step * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+            if target > tick {
+                (target / tick).ceil() * tick
+            } else {
+                tick
+            }
+        } else {
+            tick
+        };
+        let outward = Decimal::from(levels.saturating_sub(1)) * step;
 
         // Min-self-spread enforcement: when the book spread is tighter
         // than `min_self_spread_bps`, push the grid tops apart so that
@@ -249,7 +283,7 @@ impl Strategy for TouchRefill {
                 if !self.already_have_order(ctx, Side::Bid, p) {
                     actions.push(self.emit(ctx.symbol, Side::Bid, p));
                 }
-                price -= tick;
+                price -= step;
             }
         }
 
@@ -279,7 +313,7 @@ impl Strategy for TouchRefill {
                 if !self.already_have_order(ctx, Side::Ask, p) {
                     actions.push(self.emit(ctx.symbol, Side::Ask, p));
                 }
-                price += tick;
+                price += step;
             }
         }
 
@@ -404,6 +438,7 @@ mod tests {
             grid_levels: 1,
             min_self_spread_bps: 0,
             close_profit_bps: 0,
+            grid_step_bps: 0,
         }
     }
 
@@ -576,6 +611,7 @@ mod tests {
             grid_levels: 1,
             min_self_spread_bps: 10,
             close_profit_bps: 0,
+            grid_step_bps: 0,
         };
         c.tick_size = Decimal::new(1, 5);
         let mut s = TouchRefill::new(c);
@@ -622,6 +658,7 @@ mod tests {
             grid_levels: 1,
             min_self_spread_bps: 10,
             close_profit_bps: 50,
+            grid_step_bps: 0,
         };
         c.tick_size = Decimal::new(1, 2);
         let mut s = TouchRefill::new(c);

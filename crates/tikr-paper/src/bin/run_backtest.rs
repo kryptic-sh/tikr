@@ -136,6 +136,11 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     tr_close_profit_bps: u32,
 
+    /// TouchRefill: grid spacing in bps (snapped to tick, min 1 tick).
+    /// `0` = legacy 1-tick spacing.
+    #[arg(long, default_value_t = 0u32)]
+    tr_grid_step_bps: u32,
+
     /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
     #[arg(long, default_value_t = 1000u64)]
     heartbeat_ms: u64,
@@ -327,6 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 grid_levels: args.tr_grid_levels,
                 min_self_spread_bps: args.tr_min_self_spread_bps,
                 close_profit_bps: args.tr_close_profit_bps,
+                grid_step_bps: args.tr_grid_step_bps,
             });
             run_with_resume(
                 venue,

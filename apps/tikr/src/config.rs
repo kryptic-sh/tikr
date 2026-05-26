@@ -220,6 +220,10 @@ pub struct TouchRefillParams {
     /// at the cost of slower fills.
     #[serde(default)]
     pub close_profit_bps: u32,
+    /// Spacing between grid levels in bps of mid (snapped to tick,
+    /// min 1 tick). `0` = legacy 1-tick spacing.
+    #[serde(default)]
+    pub grid_step_bps: u32,
 }
 
 fn touch_refill_default_grid_levels() -> u32 {
@@ -269,6 +273,12 @@ pub struct TouchRefillAutoConfig {
     /// USDC, so you'll need USDC in your futures wallet to trade them.
     #[serde(default = "touch_refill_auto_default_quote_asset")]
     pub quote_asset: String,
+    /// Forwarded to every spawned TouchRefill bot as
+    /// `TouchRefillConfig.grid_step_bps`. Default `4` — sensible for
+    /// tight-tick perps (ETHUSDC, etc.) where 1-tick spacing piles
+    /// dozens of orders within sub-bps.
+    #[serde(default = "touch_refill_auto_default_grid_step_bps")]
+    pub grid_step_bps: u32,
     /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
     /// When non-empty, ONLY these symbols spawn and the
     /// `min_tick_bps` + `min_volume_usdt` filters are BYPASSED.
@@ -298,6 +308,9 @@ fn touch_refill_auto_default_grid_levels() -> u32 {
 }
 fn touch_refill_auto_default_quote_asset() -> String {
     "USDT".to_string()
+}
+fn touch_refill_auto_default_grid_step_bps() -> u32 {
+    4
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus
