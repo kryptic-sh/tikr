@@ -85,11 +85,13 @@ pub fn load_credentials(
 }
 
 /// Build a [`BinanceClient`] for `symbol` with the given env + key material.
+/// `leverage` is sent via `POST /fapi/v1/leverage` on futures envs.
 pub async fn build_venue(
     env: BinanceEnv,
     api_key: &str,
     key_material: &Arc<BinanceKeyMaterial>,
     symbol: &Symbol,
+    leverage: u32,
 ) -> Result<BinanceClient> {
     let owned = match key_material.as_ref() {
         BinanceKeyMaterial::Hmac { secret } => BinanceKeyMaterial::Hmac {
@@ -99,7 +101,7 @@ pub async fn build_venue(
             signing_key: signing_key.clone(),
         },
     };
-    BinanceClient::with_credentials(env, api_key.to_string(), owned, Some(symbol))
+    BinanceClient::with_credentials(env, api_key.to_string(), owned, Some(symbol), leverage)
         .await
         .map_err(|e| anyhow::anyhow!("BinanceClient::with_credentials: {e}"))
 }

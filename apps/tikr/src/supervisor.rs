@@ -34,11 +34,11 @@ pub struct SupervisorCtx {
     pub key_material: Arc<tikr_binance::BinanceKeyMaterial>,
     /// Base on-disk state directory; per-bot subdirs hang off this.
     pub base_state_dir: std::path::PathBuf,
-    /// Account margin percent allocated to all bot order sizes.
+    /// Wallet percent allocated to all bot order sizes.
     pub order_balance_pct: Decimal,
-    /// Multiplier applied to wallet balance before sizing, typically leverage.
-    pub margin_multiplier: Decimal,
-    /// Account margin percent for the per-bot peak-position cap (split by
+    /// Per-symbol Binance leverage, sent at venue build time.
+    pub leverage: u32,
+    /// Wallet percent for the per-bot peak-position cap (split by
     /// `bot_count`). Drives `max_position_usdt` defaults handed to
     /// strategies that don't set their own cap in TOML.
     pub max_position_pct: Decimal,
@@ -187,7 +187,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     if ctx.clear_on_start {
         info!("startup reset (cancel + flatten) — --clear was set");
         let reset_venue =
-            venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol).await?;
+            venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol, ctx.leverage).await?;
         reset_symbol_state(&reset_venue, &symbol).await;
         drop(reset_venue);
     } else {
@@ -196,7 +196,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
 
     info!("building venue for runner");
     let venue_for_run =
-        venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol).await?;
+        venue::build_venue(ctx.env, &ctx.api_key, &ctx.key_material, &symbol, ctx.leverage).await?;
 
     info!("subscribing user data stream");
     let (us_shutdown_tx, us_shutdown_rx) = watch::channel(false);
@@ -307,11 +307,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
 async fn default_order_notional(venue: &BinanceClient, ctx: &SupervisorCtx) -> Result<Decimal> {
     let balance = venue.futures_balance("USDT").await?;
     let bot_count = Decimal::from(ctx.bot_count.max(1) as u64);
-    Ok(
-        balance.wallet_balance * ctx.margin_multiplier * ctx.order_balance_pct
-            / Decimal::from(100)
-            / bot_count,
-    )
+    Ok(balance.wallet_balance * ctx.order_balance_pct / Decimal::from(100) / bot_count)
 }
 
 pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {

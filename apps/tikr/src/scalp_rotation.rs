@@ -25,11 +25,11 @@ pub struct RotationAccountCtx {
     pub key_material: Arc<BinanceKeyMaterial>,
     /// Base state directory.
     pub base_state_dir: std::path::PathBuf,
-    /// Account balance percent allocated to active scalp bots.
+    /// Wallet percent allocated to active scalp bots.
     pub order_balance_pct: Decimal,
-    /// Margin multiplier for notional sizing.
-    pub margin_multiplier: Decimal,
-    /// Account margin percent for per-bot peak-position cap (used by
+    /// Per-symbol Binance leverage applied at venue build time.
+    pub leverage: u32,
+    /// Wallet percent for per-bot peak-position cap (used by
     /// strategies that don't set their own `max_position_usdt`).
     pub max_position_pct: Decimal,
     /// Account-derived notional updates.
@@ -195,6 +195,7 @@ async fn flatten_symbols(symbols: &[String], account: &RotationAccountCtx) {
             &account.api_key,
             &account.key_material,
             &symbol,
+            account.leverage,
         )
         .await
         {
@@ -243,7 +244,7 @@ fn spawn_one_bot(
             key_material: account.key_material.clone(),
             base_state_dir: account.base_state_dir.clone(),
             order_balance_pct: account.order_balance_pct,
-            margin_multiplier: account.margin_multiplier,
+            leverage: account.leverage,
             max_position_pct: account.max_position_pct,
             bot_count: slots,
             notional_rx: account.notional_rx.clone(),

@@ -64,9 +64,10 @@ struct Args {
     #[arg(long)]
     order_balance_pct: Option<Decimal>,
 
-    /// Override [account].margin_multiplier for computed order notional.
+    /// Override [account].leverage for the POST /fapi/v1/leverage call
+    /// applied to each bot's symbol at startup.
     #[arg(long)]
-    margin_multiplier: Option<Decimal>,
+    leverage: Option<u32>,
 
     /// Reset open positions + cancel all resting orders at startup
     /// before spawning bots. Default `false` — the bot resumes against
@@ -125,7 +126,6 @@ struct AccountPollerConfig {
     symbols: Vec<String>,
     bot_count: usize,
     order_balance_pct: Decimal,
-    margin_multiplier: Decimal,
     shutdown: watch::Receiver<bool>,
     /// Published price (USDT per BNB) for the user-stream parser to
     /// convert BNB commissions → USDT-equivalent. Set to ZERO when
@@ -241,17 +241,20 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                         symbols
                     };
                     let bot_count = Decimal::from(cfg.bot_count.max(1) as u64);
-                    let notional =
-                        balance.wallet_balance * cfg.margin_multiplier * cfg.order_balance_pct
-                            / Decimal::from(100)
-                            / bot_count;
+                    // Sizing is purely wallet-relative — leverage only
+                    // affects the Binance POST /fapi/v1/leverage call.
+                    // With max_position_pct=100, the per-bot cap is the
+                    // full wallet split by bot_count, regardless of how
+                    // much margin headroom leverage exposes.
+                    let notional = balance.wallet_balance * cfg.order_balance_pct
+                        / Decimal::from(100)
+                        / bot_count;
                     if notional != *cfg.notional_tx.borrow() {
                         let _ = cfg.notional_tx.send(notional);
                     }
-                    let max_position =
-                        balance.wallet_balance * cfg.margin_multiplier * cfg.max_position_pct
-                            / Decimal::from(100)
-                            / bot_count;
+                    let max_position = balance.wallet_balance * cfg.max_position_pct
+                        / Decimal::from(100)
+                        / bot_count;
                     if max_position != *cfg.max_position_tx.borrow() {
                         let _ = cfg.max_position_tx.send(max_position);
                     }
@@ -340,14 +343,14 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pct) = args.order_balance_pct {
         cfg.account.order_balance_pct = pct;
     }
-    if let Some(multiplier) = args.margin_multiplier {
-        cfg.account.margin_multiplier = multiplier;
+    if let Some(lev) = args.leverage {
+        cfg.account.leverage = lev;
     }
     if cfg.account.order_balance_pct <= Decimal::ZERO {
         anyhow::bail!("order_balance_pct must be positive");
     }
-    if cfg.account.margin_multiplier <= Decimal::ZERO {
-        anyhow::bail!("margin_multiplier must be positive");
+    if cfg.account.leverage == 0 {
+        anyhow::bail!("leverage must be >= 1");
     }
 
     if args.check {
@@ -453,7 +456,6 @@ async fn main() -> anyhow::Result<()> {
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
         bot_count: total_slots.max(1),
         order_balance_pct: cfg.account.order_balance_pct,
-        margin_multiplier: cfg.account.margin_multiplier,
         shutdown: global_shutdown_rx.clone(),
         bnb_price_tx,
     });
@@ -485,7 +487,7 @@ async fn main() -> anyhow::Result<()> {
                 key_material: key_material.clone(),
                 base_state_dir: cfg.account.state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
-                margin_multiplier: cfg.account.margin_multiplier,
+                leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
@@ -505,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
                 key_material: key_material.clone(),
                 base_state_dir: cfg.account.state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
-                margin_multiplier: cfg.account.margin_multiplier,
+                leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
@@ -525,7 +527,7 @@ async fn main() -> anyhow::Result<()> {
                 key_material: key_material.clone(),
                 base_state_dir: cfg.account.state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
-                margin_multiplier: cfg.account.margin_multiplier,
+                leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
                 bot_count: cfg.bots.len(),
                 notional_rx: notional_rx.clone(),

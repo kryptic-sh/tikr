@@ -196,7 +196,8 @@ impl BinanceClient {
     ///
     /// Steps:
     /// 1. Fetches `exchangeInfo` and caches filters.
-    /// 2. For futures envs: calls `POST /fapi/v1/leverage` with `leverage=1`.
+    /// 2. For futures envs: calls `POST /fapi/v1/leverage` with the
+    ///    supplied `leverage` value.
     /// 3. Checks mainnet gate (warns if unset).
     ///
     /// `symbol` is used for the initial leverage call (futures only).
@@ -206,6 +207,7 @@ impl BinanceClient {
         api_key: String,
         key_material: BinanceKeyMaterial,
         symbol: Option<&Symbol>,
+        leverage: u32,
     ) -> Result<Self, VenueError> {
         let http = HttpClient::new();
         let base_url = env.rest_base_url();
@@ -247,10 +249,10 @@ impl BinanceClient {
             quote_symbols: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        // Futures: set 1x leverage at startup. Gated by mainnet flag — this is a
-        // write action against /fapi/v1/leverage and must respect the same gate as
-        // quote/cancel. On mainnet without the flag, skip silently (the same call
-        // will be retried by the operator after enabling writes).
+        // Futures: set per-symbol leverage at startup. Gated by mainnet flag —
+        // this is a write action against /fapi/v1/leverage and must respect the
+        // same gate as quote/cancel. On mainnet without the flag, skip silently
+        // (the same call will be retried by the operator after enabling writes).
         if env.is_futures()
             && let Some(sym) = symbol
             && (!env.is_mainnet() || mainnet_writes_enabled)
@@ -262,19 +264,21 @@ impl BinanceClient {
                 &client.api_key,
                 &client.key_material,
                 &sym_str,
-                1,
+                leverage,
             )
             .await
             {
                 warn!(
                     symbol = sym_str,
+                    leverage,
                     error = ?e,
-                    "update_leverage(1) at startup failed; proceeding"
+                    "update_leverage at startup failed; proceeding"
                 );
             }
         } else if env.is_futures() && env.is_mainnet() && !mainnet_writes_enabled {
             warn!(
-                "Skipping futures update_leverage(1) at startup: \
+                leverage,
+                "Skipping futures update_leverage at startup: \
                  TIKR_BINANCE_ENABLE_MAINNET not set. \
                  Order placement will also be refused until the flag is enabled."
             );

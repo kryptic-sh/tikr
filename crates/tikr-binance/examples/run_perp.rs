@@ -402,6 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
         Some(&symbol),
+        1,
     )
     .await?;
 
@@ -775,6 +776,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         },
         Some(&symbol_for_shutdown),
+        1,
     )
     .await?;
     reset_symbol_state(&shutdown_venue, &symbol_for_shutdown, "shutdown").await;

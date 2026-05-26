@@ -80,18 +80,17 @@ pub struct AccountConfig {
     /// snapshots under a subdir keyed by symbol.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    /// Percent of account margin balance allocated to orders across all bots.
-    /// Split evenly by bot count when a bot's strategy does not set `notional`.
+    /// Percent of wallet balance allocated to orders across all bots.
+    /// Split evenly by bot count when a bot's strategy does not set
+    /// `notional`. Strictly wallet-relative — leverage does NOT scale
+    /// this; set `leverage` separately for Binance-side margin
+    /// configuration.
     #[serde(default = "default_order_balance_pct")]
     pub order_balance_pct: Decimal,
-    /// Multiplier applied to wallet balance before order sizing, typically leverage.
-    #[serde(default = "default_margin_multiplier")]
-    pub margin_multiplier: Decimal,
-    /// Percent of account margin balance used as the per-bot peak position
+    /// Percent of wallet balance used as the per-bot peak position
     /// cap, split evenly by bot count. Per-bot max position USDT =
-    /// `wallet × margin_multiplier × max_position_pct / 100 / bot_count`.
-    /// Default `80` preserves legacy behavior (effectively 80% of wallet
-    /// divided across bots).
+    /// `wallet × max_position_pct / 100 / bot_count`.
+    /// Default `80` preserves legacy behavior.
     #[serde(default = "default_max_position_pct")]
     pub max_position_pct: Decimal,
     /// BNB-refill trigger in USDT-equivalent. When BNB-pays-fees is
@@ -109,6 +108,15 @@ pub struct AccountConfig {
     /// account (auto-detected via `GET /fapi/v1/feeBurn`).
     #[serde(default = "default_bnb_refill_enabled")]
     pub bnb_refill_enabled: bool,
+    /// Per-symbol Binance Futures leverage. Sent via
+    /// `POST /fapi/v1/leverage` at startup for each bot's symbol.
+    /// Default `1` = no leverage. Independent from sizing —
+    /// `order_balance_pct` + `max_position_pct` are wallet-relative,
+    /// not margin-relative. Leverage controls liquidation distance
+    /// and initial margin requirement on Binance's side; sizing is
+    /// untouched.
+    #[serde(default = "default_leverage")]
+    pub leverage: u32,
 }
 
 fn default_state_dir() -> PathBuf {
@@ -129,8 +137,8 @@ fn default_order_balance_pct() -> Decimal {
     Decimal::new(2, 1)
 }
 
-fn default_margin_multiplier() -> Decimal {
-    Decimal::ONE
+fn default_leverage() -> u32 {
+    1
 }
 
 fn default_max_position_pct() -> Decimal {
@@ -763,7 +771,7 @@ mod tests {
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
         let sg = cfg.bots[0].sg.as_ref().unwrap();
         assert_eq!(cfg.account.order_balance_pct, Decimal::new(2, 1));
-        assert_eq!(cfg.account.margin_multiplier, Decimal::ONE);
+        assert_eq!(cfg.account.leverage, 1);
         assert_eq!(cfg.account.max_position_pct, Decimal::from(80));
         assert_eq!(sg.notional, None);
         assert_eq!(sg.levels, 3);
