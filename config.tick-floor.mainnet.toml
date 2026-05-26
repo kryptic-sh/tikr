@@ -89,11 +89,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 
 # # Adverse stop scaled to symbol tick.
@@ -112,11 +112,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 20     # ~4 ticks at 5bps/tick
@@ -149,11 +149,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 adverse_stop_after_secs = 120
 adverse_stop_drift_bps = 45
@@ -166,11 +166,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 40
@@ -183,11 +183,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 36
@@ -200,11 +200,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 31
@@ -217,11 +217,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 30
@@ -234,11 +234,11 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+quote_offset_ticks = 0          # 1 tick outside touch (avoids -5022)
 close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
+requote_interval_ms = 5000
+reject_cooldown_ms = 250
+price_tolerance_ticks = 0
 close_side_always_quotes = true
 # adverse_stop_after_secs = 120
 # adverse_stop_drift_bps = 29
