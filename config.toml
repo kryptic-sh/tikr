@@ -59,7 +59,7 @@ recheck_interval_secs = 60
 # 8 bps min spread = ~5 bps net edge at 0-bps-maker promo rates.
 # Tighter than USDT config because USDC fee saving lets us be more
 # aggressive on the spread.
-min_self_spread_bps = 10
+min_self_spread_bps = 5
 
 # Smaller grid — thinner USDC books mean less safe inventory accumulation.
 grid_levels = 3
@@ -73,4 +73,4 @@ close_profit_bps = 0
 # Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick
 # spacing piles dozens of orders within sub-bps. 4 bps gives
 # meaningful fill independence between levels.
-grid_step_bps = 5
+grid_step_bps = 2

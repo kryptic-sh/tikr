@@ -23,7 +23,7 @@
 use std::collections::BTreeSet;
 
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
-use tikr_venue::QuoteIntent;
+use tikr_venue::{QuoteId, QuoteIntent};
 
 use crate::{Action, Strategy, StrategyContext};
 
@@ -60,12 +60,15 @@ pub struct TouchRefillConfig {
     /// 2× maker fees (~3.6 bps RT on BNB-discount Binance USD-M).
     pub min_self_spread_bps: u32,
     /// Profit target for close-on-fill orders, in bps of fill price.
-    /// When `> 0`, every close order placed in response to a full
-    /// fill sits exactly this many bps away from the fill price
-    /// (snapped up to nearest tick, minimum 1 tick). When `0`, the
-    /// close distance falls back to `min_self_spread_bps` (or 1 tick,
-    /// whichever is larger). Set higher than `min_self_spread_bps` to
-    /// capture more profit per round-trip at the cost of slower fills.
+    /// When `> 0`, every close order placed in response to a full fill
+    /// sits exactly this many bps away from the fill price (snapped up
+    /// to nearest tick, minimum 1 tick) — this is Rule 2.
+    ///
+    /// When `0` (default), Rule 2 is disabled and Rule 3
+    /// (shift-on-fill) activates: the grid slides by one step in the
+    /// fill direction per fill (top/bottom extend, opposite end
+    /// cancelled). Drain via opposite-side grid fills instead of
+    /// dedicated close orders.
     pub close_profit_bps: u32,
     /// Spacing between grid levels in bps of mid. Effective spacing =
     /// max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
@@ -432,6 +435,125 @@ impl Strategy for TouchRefill {
                     && !self.already_have_order(ctx, close_side, close_price, Decimal::ZERO)
                 {
                     actions.push(self.emit(ctx.symbol, close_side, close_price));
+                }
+            }
+        }
+
+        // Rule 3: shift-on-fill (active when close_profit_bps == 0).
+        // On every FULL fill, slide the grid by one step in the fill
+        // direction:
+        //
+        // SELL fills (price up):
+        //   + new ASK at top_ask + step  (extend ask stack up)
+        //   + new BID at top_bid + step  (shift bid stack up)
+        //   − cancel BID at bottom (lowest)
+        //
+        // BUY fills (price down):
+        //   + new BID at bottom_bid − step  (extend bid stack down)
+        //   + new ASK at bottom_ask − step  (shift ask stack down)
+        //   − cancel ASK at top (highest)
+        //
+        // Trigger is the FILL EVENT, not touch movement — grid walks
+        // even on stable books. Mutually exclusive with Rule 2 (close
+        // emits a close instead). Disabled when close_profit_bps > 0.
+        if let MarketEvent::Fill(fill) = event
+            && fill.is_full
+            && self.config.close_profit_bps == 0
+            && step > Decimal::ZERO
+        {
+            // Collect current bid/ask prices + ids from venue state.
+            let mut bid_entries: Vec<(QuoteId, Decimal)> = ctx
+                .open_quotes
+                .iter()
+                .filter(|(_, q)| q.side == Side::Bid)
+                .map(|(id, q)| (*id, q.price.0))
+                .collect();
+            let mut ask_entries: Vec<(QuoteId, Decimal)> = ctx
+                .open_quotes
+                .iter()
+                .filter(|(_, q)| q.side == Side::Ask)
+                .map(|(id, q)| (*id, q.price.0))
+                .collect();
+            bid_entries.sort_by_key(|e| e.1);
+            ask_entries.sort_by_key(|e| e.1);
+
+            match fill.side {
+                Side::Ask => {
+                    // SELL fill (we sold) — extend asks up + shift bids up.
+                    let top_ask = ask_entries
+                        .iter()
+                        .map(|(_, p)| *p)
+                        .chain(self.pending_ask_prices.iter().copied())
+                        .max();
+                    if let Some(t) = top_ask {
+                        let new_ask = Price(t + step);
+                        if !self.already_have_order(ctx, Side::Ask, new_ask, Decimal::ZERO) {
+                            actions.push(self.emit(ctx.symbol, Side::Ask, new_ask));
+                        }
+                    }
+                    let top_bid = bid_entries
+                        .iter()
+                        .map(|(_, p)| *p)
+                        .chain(self.pending_bid_prices.iter().copied())
+                        .max();
+                    if let Some(t) = top_bid {
+                        let new_bid_price = t + step;
+                        // Cross-guard: never emit BID at or above best_ask.
+                        let safe = match best_ask {
+                            Some(ap) if ap.0 > Decimal::ZERO => new_bid_price.min(ap.0 - tick),
+                            _ => new_bid_price,
+                        };
+                        if safe > Decimal::ZERO {
+                            let new_bid = Price(safe);
+                            if !self.already_have_order(ctx, Side::Bid, new_bid, Decimal::ZERO) {
+                                actions.push(self.emit(ctx.symbol, Side::Bid, new_bid));
+                            }
+                        }
+                    }
+                    // Cancel bottom bid (lowest price BID resting at venue).
+                    if let Some((id, _)) = bid_entries.first() {
+                        actions.push(Action::Cancel(*id));
+                    }
+                }
+                Side::Bid => {
+                    // BUY fill (we bought) — extend bids down + shift asks down.
+                    let bottom_bid = bid_entries
+                        .iter()
+                        .map(|(_, p)| *p)
+                        .chain(self.pending_bid_prices.iter().copied())
+                        .min();
+                    if let Some(b) = bottom_bid {
+                        let new_bid_price = b - step;
+                        if new_bid_price > Decimal::ZERO {
+                            let new_bid = Price(new_bid_price);
+                            if !self.already_have_order(ctx, Side::Bid, new_bid, Decimal::ZERO) {
+                                actions.push(self.emit(ctx.symbol, Side::Bid, new_bid));
+                            }
+                        }
+                    }
+                    let bottom_ask = ask_entries
+                        .iter()
+                        .map(|(_, p)| *p)
+                        .chain(self.pending_ask_prices.iter().copied())
+                        .min();
+                    if let Some(b) = bottom_ask {
+                        let new_ask_price = b - step;
+                        // Cross-guard: never emit ASK at or below best_bid.
+                        let safe = match best_bid {
+                            Some(bp) if bp.0 > Decimal::ZERO => new_ask_price.max(bp.0 + tick),
+                            _ => new_ask_price,
+                        };
+                        if safe > Decimal::ZERO {
+                            let new_ask = Price(safe);
+                            if !self.already_have_order(ctx, Side::Ask, new_ask, Decimal::ZERO) {
+                                actions.push(self.emit(ctx.symbol, Side::Ask, new_ask));
+                            }
+                        }
+                    }
+                    // Cancel top ask (highest price ASK resting at venue).
+                    if let Some((id, _)) = ask_entries.last() {
+                        actions.push(Action::Cancel(*id));
+                    }
                 }
             }
         }

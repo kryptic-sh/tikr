@@ -225,9 +225,9 @@ pub struct TouchRefillParams {
     pub min_self_spread_bps: u32,
     /// Profit target (bps of fill price) for close-on-fill orders.
     /// When `> 0`, close distance = N bps (snapped to tick, min 1 tick).
-    /// When `0` (default), falls back to `min_self_spread_bps`. Set
-    /// higher than min_self_spread_bps to capture more profit per RT
-    /// at the cost of slower fills.
+    /// When `0` (default), Rule 2 is DISABLED and Rule 3 (shift-on-fill)
+    /// activates instead — grid slides one step in the fill direction
+    /// per fill, drain via opposite-side grid.
     #[serde(default)]
     pub close_profit_bps: u32,
     /// Spacing between grid levels in bps of mid (snapped to tick,
