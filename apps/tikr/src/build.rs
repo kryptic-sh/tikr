@@ -327,10 +327,12 @@ fn build_touch_refill(
     // and that can come from the account-wide default.
     let notional_override = cfg.touch_refill.as_ref().and_then(|p| p.notional);
     let notional = autobump_notional(notional_override.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
     Ok(StrategyChoice::TouchRefill(TouchRefillConfig {
         notional_per_order: notional,
+        tick_size,
         step_size,
         min_notional,
     }))

@@ -1,24 +1,26 @@
-//! Minimal at-touch refill strategy for wide-tick markets.
+//! Minimal at-touch market-making strategy. Two rules:
 //!
-//! The whole idea: post a BUY at `top.bid` and a SELL at `top.ask`,
-//! both post-only. Whenever the book moves, re-quote so both sides
-//! sit at the current touches. On any fill, refill the filled side
-//! at the fresh touch. That's it — no inventory cap, no adverse
-//! stop, no close-side avg pin.
+//! 1. **Best-price maintenance**: always have ≥1 order at the current
+//!    `top.bid` and ≥1 at `top.ask`. If either side is missing such an
+//!    order, place one.
+//! 2. **Close-on-fill**: when a fill lands at price `P`, immediately
+//!    place an opposite-side order at `P ± 1 tick` (the 1-tick profit
+//!    target for that just-opened position).
 //!
-//! The economics:
-//!   gross RT capture ≈ tick_size_bps (you buy at bid, sell at ask)
-//!   maker fees       ≈ 1.8 bps × 2  = 3.6 bps RT (Binance USD-M + BNB)
-//!   net RT           ≈ tick_bps − 3.6 bps
+//! **NEVER cancels.** Each placed order is left alone until it fills
+//! or is canceled externally. Stale orders just sit in the book
+//! (post-only, no fee while resting). This means inventory CAN grow
+//! unbounded if the market trends — there's no cap or stop.
 //!
-//! Profitable when tick_bps > ~4 (e.g. ESPORTS 20bps → +16 bps RT,
-//! XPL 11bps → +7 bps, OP 7.5bps → +4 bps). Below that you're paying
-//! fees out of net.
+//! Suited to wide-tick perps where `tick_bps > 2 × maker_fee_bps` so
+//! each completed round-trip clears fees. See ESPORTS (~20bps tick).
 //!
-//! Risk: adverse selection. When your BID fills, market is often
-//! moving down (you got picked off). You'll either bag-hold or close
-//! at a loss. The strategy is a pure "is the spread wider than 2×
-//! fees" bet — no inventory management or trend protection.
+//! Inventory risk: when your bid fills repeatedly during a down-move,
+//! you'll accumulate longs. The close orders at fill+1 tick will not
+//! fill until the market reverts. This strategy is a pure
+//! "spread > 2×fees" bet — the operator owns the inventory risk.
+
+use std::collections::BTreeSet;
 
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
@@ -28,21 +30,27 @@ use crate::{Action, Strategy, StrategyContext};
 /// Configuration for [`TouchRefill`].
 #[derive(Debug, Clone)]
 pub struct TouchRefillConfig {
-    /// Notional USDT per order. Quantity = `notional_per_order / price`,
-    /// floored to `step_size`.
+    /// Notional USDT per order. Quantity = `notional / price`, floored
+    /// to `step_size`, bumped to meet `min_notional`.
     pub notional_per_order: Decimal,
-    /// Venue lot step. Quote sizes are floored to this.
+    /// Venue tick size. Used for the close-on-fill +/- 1 tick offset.
+    pub tick_size: Decimal,
+    /// Venue lot step.
     pub step_size: Decimal,
-    /// Venue min notional. Sizes are bumped up so `size × price ≥ min`.
+    /// Venue min order notional.
     pub min_notional: Decimal,
 }
 
-/// Strategy state. Holds the last-emitted bid/ask prices so the diff
-/// path can skip emits when targets haven't moved.
+/// Strategy state. Tracks intents emitted but not yet confirmed via
+/// `ctx.open_quotes` to avoid double-emitting in a single cycle.
 pub struct TouchRefill {
     config: TouchRefillConfig,
-    last_bid: Option<Price>,
-    last_ask: Option<Price>,
+    /// Prices we've emitted Quote intents for this cycle, used to
+    /// dedupe within `on_event` before the runner has dispatched +
+    /// fill_sim has registered them. Cleared at the start of each
+    /// `on_event` call.
+    pending_bid_prices: BTreeSet<Decimal>,
+    pending_ask_prices: BTreeSet<Decimal>,
 }
 
 impl TouchRefill {
@@ -56,9 +64,9 @@ impl TouchRefill {
         } else {
             raw
         };
-        // Bump up to meet min_notional if configured.
+        // Bump to min_notional if needed.
         let min = self.config.min_notional;
-        if min > Decimal::ZERO && stepped * price.0 < min {
+        if min > Decimal::ZERO && stepped * price.0 < min && self.config.step_size > Decimal::ZERO {
             let needed = (min / price.0 / self.config.step_size).ceil() * self.config.step_size;
             Size(needed)
         } else {
@@ -77,31 +85,31 @@ impl TouchRefill {
         })
     }
 
-    /// Emit the action set to bring both sides to (top.bid, top.ask).
-    /// Uses `CancelAll` + two fresh `Quote`s — simplest path that's
-    /// guaranteed to leave the venue in the intended state.
-    fn requote_to_touch(&mut self, ctx: &StrategyContext<'_>) -> Vec<Action> {
-        let snapshot = ctx.latest_book;
-        let bid = snapshot.bids.first().map(|l| l.price);
-        let ask = snapshot.asks.first().map(|l| l.price);
-        let (Some(bid), Some(ask)) = (bid, ask) else {
-            return Vec::new();
+    /// Does the venue (per fill_sim) OR this cycle's pending set
+    /// already hold an order on `side` at exactly `price`?
+    fn already_have_order(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> bool {
+        let pending = match side {
+            Side::Bid => &self.pending_bid_prices,
+            Side::Ask => &self.pending_ask_prices,
         };
-        if bid.0 >= ask.0 {
-            return Vec::new();
+        if pending.contains(&price.0) {
+            return true;
         }
-        // Skip if nothing moved since the last emit. The runner's
-        // 30s reconcile will catch orphans if any.
-        if self.last_bid == Some(bid) && self.last_ask == Some(ask) {
-            return Vec::new();
+        ctx.open_quotes
+            .iter()
+            .any(|(_, q)| q.side == side && q.price.0 == price.0)
+    }
+
+    fn emit(&mut self, symbol: &Symbol, side: Side, price: Price) -> Action {
+        match side {
+            Side::Bid => {
+                self.pending_bid_prices.insert(price.0);
+            }
+            Side::Ask => {
+                self.pending_ask_prices.insert(price.0);
+            }
         }
-        self.last_bid = Some(bid);
-        self.last_ask = Some(ask);
-        vec![
-            Action::CancelAll,
-            self.make_quote(ctx.symbol, Side::Bid, bid),
-            self.make_quote(ctx.symbol, Side::Ask, ask),
-        ]
+        self.make_quote(symbol, side, price)
     }
 }
 
@@ -111,8 +119,8 @@ impl Strategy for TouchRefill {
     fn new(config: Self::Config) -> Self {
         Self {
             config,
-            last_bid: None,
-            last_ask: None,
+            pending_bid_prices: BTreeSet::new(),
+            pending_ask_prices: BTreeSet::new(),
         }
     }
 
@@ -121,30 +129,65 @@ impl Strategy for TouchRefill {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
-        match event {
-            MarketEvent::BookUpdate { .. } => self.requote_to_touch(ctx),
-            MarketEvent::Fill(_) => {
-                // Force re-emit on fill: clear the last-emit cache so
-                // requote_to_touch always emits a fresh pair even when
-                // the book hasn't moved.
-                self.last_bid = None;
-                self.last_ask = None;
-                self.requote_to_touch(ctx)
-            }
-            MarketEvent::Heartbeat { .. } | MarketEvent::Trade { .. } => Vec::new(),
+        // Pending sets are per-event dedupe only; clear at the top.
+        self.pending_bid_prices.clear();
+        self.pending_ask_prices.clear();
+
+        let mut actions: Vec<Action> = Vec::new();
+
+        // Rule 1: ensure ≥1 order at best on each side.
+        let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
+        let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
+        if let Some(bp) = best_bid
+            && bp.0 > Decimal::ZERO
+            && !self.already_have_order(ctx, Side::Bid, bp)
+        {
+            actions.push(self.emit(ctx.symbol, Side::Bid, bp));
         }
+        if let Some(ap) = best_ask
+            && ap.0 > Decimal::ZERO
+            && !self.already_have_order(ctx, Side::Ask, ap)
+        {
+            actions.push(self.emit(ctx.symbol, Side::Ask, ap));
+        }
+
+        // Rule 2: on FULL fill, place opposite-side close at
+        // fill_price ± 1 tick. Partial fills (is_full=false) skip
+        // the close — there's still residual size on the same side
+        // that'll catch the rest of the flow; we don't want to
+        // pre-place a close for a position that's still being built.
+        if let MarketEvent::Fill(fill) = event
+            && fill.is_full
+        {
+            let tick = self.config.tick_size;
+            if tick > Decimal::ZERO {
+                let (close_side, close_price) = match fill.side {
+                    // Filled BID = long → close with SELL at fill+1tick.
+                    Side::Bid => (Side::Ask, Price(fill.price.0 + tick)),
+                    // Filled ASK = short → close with BUY at fill-1tick.
+                    Side::Ask => (Side::Bid, Price(fill.price.0 - tick)),
+                };
+                if close_price.0 > Decimal::ZERO
+                    && !self.already_have_order(ctx, close_side, close_price)
+                {
+                    actions.push(self.emit(ctx.symbol, close_side, close_price));
+                }
+            }
+        }
+
+        actions
     }
 
     fn on_quote_rejected(
         &mut self,
-        ctx: &StrategyContext<'_>,
+        _ctx: &StrategyContext<'_>,
         _intent: &QuoteIntent,
         _reason: &str,
     ) -> Vec<Action> {
-        // Re-emit at the fresh touch. Forces cache invalidation.
-        self.last_bid = None;
-        self.last_ask = None;
-        self.requote_to_touch(ctx)
+        // The next on_event for any book update will re-check the
+        // best-price invariant and re-emit if needed. No special path
+        // — strategy is stateless across events.
+        Vec::new()
     }
 
     fn on_notional_updated(
@@ -163,8 +206,10 @@ impl Strategy for TouchRefill {
 mod tests {
     use super::*;
     use tikr_core::{
-        Asset, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp, VenueId,
+        Asset, Fill, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp,
+        VenueId,
     };
+    use tikr_venue::QuoteId;
 
     fn sym() -> Symbol {
         Symbol {
@@ -176,9 +221,8 @@ mod tests {
     }
 
     fn book(bid: Decimal, ask: Decimal) -> Snapshot {
-        let symbol = sym();
         Snapshot {
-            symbol,
+            symbol: sym(),
             bids: vec![Level {
                 price: Price(bid),
                 size: Size(Decimal::from(100)),
@@ -203,101 +247,163 @@ mod tests {
     fn cfg() -> TouchRefillConfig {
         TouchRefillConfig {
             notional_per_order: Decimal::from(10),
+            tick_size: Decimal::new(1, 4), // 0.0001
             step_size: Decimal::ONE,
             min_notional: Decimal::from(5),
         }
     }
 
-    #[test]
-    fn first_book_event_emits_pair() {
-        let mut s = TouchRefill::new(cfg());
-        let snapshot = book(Decimal::new(1, 1), Decimal::new(2, 1));
-        let position = pos();
-        let ctx = StrategyContext {
-            symbol: &sym(),
+    fn make_ctx<'a>(
+        symbol: &'a Symbol,
+        snap: &'a Snapshot,
+        position: &'a Position,
+        open: &'a [(QuoteId, QuoteIntent)],
+    ) -> StrategyContext<'a> {
+        StrategyContext {
+            symbol,
             now: Timestamp(1),
-            position: &position,
+            position,
             recent_fills: &[],
-            latest_book: &snapshot,
-            open_quotes: &[],
+            latest_book: snap,
+            open_quotes: open,
             recent_liqs: &[],
-        };
-        let actions = s.on_event(
-            &ctx,
-            &MarketEvent::BookUpdate {
-                snapshot: snapshot.clone(),
-            },
-        );
-        assert_eq!(actions.len(), 3); // CancelAll + Quote x 2
-        assert!(matches!(actions[0], Action::CancelAll));
+        }
+    }
+
+    fn mk_fill(side: Side, price: Decimal, is_full: bool) -> Fill {
+        Fill {
+            quote_id: QuoteId::new(),
+            price: Price(price),
+            size: Size(Decimal::ONE),
+            fee_asset: Asset::new("USDT"),
+            fee_amount: Decimal::ZERO,
+            fee_quote: Notional(Decimal::ZERO),
+            side,
+            ts: Timestamp(1),
+            is_full,
+        }
     }
 
     #[test]
-    fn same_book_no_re_emit() {
+    fn first_event_places_both_sides_at_touch() {
         let mut s = TouchRefill::new(cfg());
-        let snapshot = book(Decimal::new(1, 1), Decimal::new(2, 1));
-        let position = pos();
-        let ctx = StrategyContext {
-            symbol: &sym(),
-            now: Timestamp(1),
-            position: &position,
-            recent_fills: &[],
-            latest_book: &snapshot,
-            open_quotes: &[],
-            recent_liqs: &[],
-        };
-        let _ = s.on_event(
-            &ctx,
-            &MarketEvent::BookUpdate {
-                snapshot: snapshot.clone(),
-            },
-        );
+        let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
+        let p = pos();
+        let symbol = sym();
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
         let actions = s.on_event(
             &ctx,
             &MarketEvent::BookUpdate {
-                snapshot: snapshot.clone(),
+                snapshot: snap.clone(),
             },
         );
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 2);
+        let prices: Vec<_> = actions
+            .iter()
+            .map(|a| match a {
+                Action::Quote(q) => (q.side, q.price.0),
+                _ => panic!("expected Quote"),
+            })
+            .collect();
+        assert!(prices.contains(&(Side::Bid, Decimal::new(10, 4))));
+        assert!(prices.contains(&(Side::Ask, Decimal::new(11, 4))));
     }
 
     #[test]
-    fn book_move_triggers_re_emit() {
+    fn does_not_re_emit_when_orders_already_at_best() {
         let mut s = TouchRefill::new(cfg());
-        let pos = pos();
-        let snap1 = book(Decimal::new(1, 1), Decimal::new(2, 1));
-        let ctx1 = StrategyContext {
-            symbol: &sym(),
-            now: Timestamp(1),
-            position: &pos,
-            recent_fills: &[],
-            latest_book: &snap1,
-            open_quotes: &[],
-            recent_liqs: &[],
+        let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
+        let p = pos();
+        let symbol = sym();
+        let bid_intent = QuoteIntent {
+            symbol: symbol.clone(),
+            side: Side::Bid,
+            price: Price(Decimal::new(10, 4)),
+            size: Size(Decimal::ONE),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
         };
-        let _ = s.on_event(
-            &ctx1,
-            &MarketEvent::BookUpdate {
-                snapshot: snap1.clone(),
-            },
-        );
-
-        let snap2 = book(Decimal::new(2, 1), Decimal::new(3, 1));
-        let ctx2 = StrategyContext {
-            symbol: &sym(),
-            now: Timestamp(2),
-            position: &pos,
-            recent_fills: &[],
-            latest_book: &snap2,
-            open_quotes: &[],
-            recent_liqs: &[],
+        let ask_intent = QuoteIntent {
+            symbol: symbol.clone(),
+            side: Side::Ask,
+            price: Price(Decimal::new(11, 4)),
+            size: Size(Decimal::ONE),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
         };
+        let open = vec![(QuoteId::new(), bid_intent), (QuoteId::new(), ask_intent)];
+        let ctx = make_ctx(&symbol, &snap, &p, &open);
         let actions = s.on_event(
-            &ctx2,
+            &ctx,
             &MarketEvent::BookUpdate {
-                snapshot: snap2.clone(),
+                snapshot: snap.clone(),
             },
         );
+        assert!(actions.is_empty(), "no emit when at best: {actions:?}");
+    }
+
+    #[test]
+    fn full_fill_creates_opposite_close_at_one_tick() {
+        let mut s = TouchRefill::new(cfg());
+        let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
+        let p = pos();
+        let symbol = sym();
+        let fill = mk_fill(Side::Bid, Decimal::new(10, 4), true);
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
+        // 1-tick book → close ASK at fill+1tick coincides with best ask.
+        let asks: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0], Decimal::new(11, 4));
+    }
+
+    #[test]
+    fn full_fill_creates_separate_close_when_book_is_wide() {
+        let mut s = TouchRefill::new(cfg());
+        let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
+        let p = pos();
+        let symbol = sym();
+        let fill = mk_fill(Side::Bid, Decimal::new(10, 4), true);
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
+        // BID at 0.0010 (best), ASK at 0.0011 (close), ASK at 0.0020 (best).
         assert_eq!(actions.len(), 3);
+        let asks: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asks.len(), 2);
+        assert!(asks.contains(&Decimal::new(11, 4)));
+        assert!(asks.contains(&Decimal::new(20, 4)));
+    }
+
+    #[test]
+    fn partial_fill_does_not_create_close_order() {
+        let mut s = TouchRefill::new(cfg());
+        let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
+        let p = pos();
+        let symbol = sym();
+        let fill = mk_fill(Side::Bid, Decimal::new(10, 4), false);
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
+        // Only the best-price maintenance emits — no close-on-fill.
+        let asks: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asks.len(), 1, "no close emit on partial fill: {asks:?}");
+        assert_eq!(asks[0], Decimal::new(20, 4));
     }
 }
