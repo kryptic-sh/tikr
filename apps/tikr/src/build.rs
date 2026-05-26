@@ -362,6 +362,11 @@ fn build_tide(
         .unwrap_or(0);
     let close_profit_bps = cfg.tide.as_ref().map(|p| p.close_profit_bps).unwrap_or(0);
     let grid_step_bps = cfg.tide.as_ref().map(|p| p.grid_step_bps).unwrap_or(0);
+    let adaptive_bps_enabled = cfg
+        .tide
+        .as_ref()
+        .map(|p| p.adaptive_bps_enabled)
+        .unwrap_or(true);
     // Initial max_position = 0 (no cap). Live value flows in via
     // on_max_position_updated from the account balance poller's
     // max_position_rx watch channel, typically within 5s of spawn.
@@ -375,6 +380,7 @@ fn build_tide(
         close_profit_bps,
         grid_step_bps,
         max_position_usdt: Decimal::ZERO,
+        adaptive_bps_enabled,
     }))
 }
 

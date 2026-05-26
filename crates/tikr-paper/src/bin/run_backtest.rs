@@ -334,6 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 close_profit_bps: args.tr_close_profit_bps,
                 grid_step_bps: args.tr_grid_step_bps,
                 max_position_usdt: Decimal::ZERO,
+                adaptive_bps_enabled: false,
             });
             run_with_resume(
                 venue,

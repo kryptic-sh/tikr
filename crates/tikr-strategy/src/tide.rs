@@ -83,12 +83,21 @@ pub struct TideConfig {
     /// suppressed. Close-on-fill orders are NEVER suppressed since
     /// they reduce position. `0` = no cap (legacy behavior).
     pub max_position_usdt: Decimal,
+    /// When `true`, tighten `min_self_spread_bps` + `grid_step_bps` by
+    /// 1 bps per minute of fpm < 1 (no fills), and relax back toward
+    /// configured baseline at 1 bps/min when fpm ≥ 1. Minimum effective
+    /// value is 1 bps (never below).
+    pub adaptive_bps_enabled: bool,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
 /// `ctx.open_quotes` to avoid double-emitting in a single cycle.
 pub struct Tide {
     config: TideConfig,
+    /// Configured baseline values — adaptive_bps walks current values
+    /// back toward these when fills resume.
+    baseline_min_self_spread_bps: u32,
+    baseline_grid_step_bps: u32,
     /// Prices we've emitted Quote intents for this cycle, used to
     /// dedupe within `on_event` before the runner has dispatched +
     /// fill_sim has registered them. Cleared at the start of each
@@ -101,6 +110,11 @@ pub struct Tide {
     bid_grid_floor: Option<Decimal>,
     /// Historic highest ASK grid ceiling — mirror of `bid_grid_floor`.
     ask_grid_ceiling: Option<Decimal>,
+    /// Adaptive bps state — rolling window of fill timestamps (ms,
+    /// truncated to last 60s) for fpm computation, and the last
+    /// minute boundary at which we evaluated walk-in/walk-out.
+    fill_ts_window: std::collections::VecDeque<u64>,
+    last_adapt_ms: u64,
 }
 
 impl Tide {
@@ -182,12 +196,18 @@ impl Strategy for Tide {
     type Config = TideConfig;
 
     fn new(config: Self::Config) -> Self {
+        let baseline_min_self_spread_bps = config.min_self_spread_bps;
+        let baseline_grid_step_bps = config.grid_step_bps;
         Self {
             config,
+            baseline_min_self_spread_bps,
+            baseline_grid_step_bps,
             pending_bid_prices: BTreeSet::new(),
             pending_ask_prices: BTreeSet::new(),
             bid_grid_floor: None,
             ask_grid_ceiling: None,
+            fill_ts_window: std::collections::VecDeque::new(),
+            last_adapt_ms: 0,
         }
     }
 
@@ -201,6 +221,46 @@ impl Strategy for Tide {
         self.pending_ask_prices.clear();
 
         let mut actions: Vec<Action> = Vec::new();
+
+        // Adaptive bps walk-in / walk-out. When enabled:
+        //   fpm < 1 → tighten min_self_spread + grid_step by 1 bps/min
+        //             (min 1 bps, never below)
+        //   fpm ≥ 1 → relax both back toward configured baseline at
+        //             1 bps/min, capped at baseline
+        // Fill rate measured over a rolling 60s window of fill timestamps.
+        let now_ms = ctx.now.0 / 1_000_000;
+        if let MarketEvent::Fill(fill) = event
+            && fill.is_full
+        {
+            self.fill_ts_window.push_back(now_ms);
+        }
+        // Drop fills older than 60s.
+        while let Some(&front) = self.fill_ts_window.front() {
+            if now_ms.saturating_sub(front) > 60_000 {
+                self.fill_ts_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.config.adaptive_bps_enabled && now_ms.saturating_sub(self.last_adapt_ms) >= 60_000 {
+            self.last_adapt_ms = now_ms;
+            let fpm = self.fill_ts_window.len() as u32;
+            if fpm < 1 {
+                if self.config.min_self_spread_bps > 1 {
+                    self.config.min_self_spread_bps -= 1;
+                }
+                if self.config.grid_step_bps > 1 {
+                    self.config.grid_step_bps -= 1;
+                }
+            } else {
+                if self.config.min_self_spread_bps < self.baseline_min_self_spread_bps {
+                    self.config.min_self_spread_bps += 1;
+                }
+                if self.config.grid_step_bps < self.baseline_grid_step_bps {
+                    self.config.grid_step_bps += 1;
+                }
+            }
+        }
 
         // Rule 1: maintain a grid that extends in both directions as the
         // book moves. Each side's grid spans from the current touch
@@ -524,6 +584,7 @@ mod tests {
             close_profit_bps: 0,
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
+            adaptive_bps_enabled: false,
         }
     }
 
@@ -699,6 +760,7 @@ mod tests {
             close_profit_bps: 0,
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
+            adaptive_bps_enabled: false,
         };
         let mut s = Tide::new(c);
         let symbol = sym();
@@ -747,6 +809,7 @@ mod tests {
             close_profit_bps: 50,
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
+            adaptive_bps_enabled: false,
         };
         c.tick_size = Decimal::new(1, 2);
         let mut s = Tide::new(c);

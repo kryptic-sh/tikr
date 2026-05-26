@@ -291,6 +291,15 @@ pub struct TideParams {
     /// min 1 tick). `0` = legacy 1-tick spacing.
     #[serde(default)]
     pub grid_step_bps: u32,
+    /// Adaptive bps walk: tighten min_self_spread + grid_step by 1
+    /// per minute when fpm<1, relax back toward baseline when fpm≥1.
+    /// Default `true`.
+    #[serde(default = "tide_adaptive_default")]
+    pub adaptive_bps_enabled: bool,
+}
+
+fn tide_adaptive_default() -> bool {
+    true
 }
 
 fn tide_default_grid_levels() -> u32 {
@@ -346,6 +355,10 @@ pub struct TideAutoConfig {
     /// dozens of orders within sub-bps.
     #[serde(default = "tide_auto_default_grid_step_bps")]
     pub grid_step_bps: u32,
+    /// Forwarded to every spawned Tide bot as
+    /// `TideConfig.adaptive_bps_enabled`. Default `true`.
+    #[serde(default = "tide_adaptive_default")]
+    pub adaptive_bps_enabled: bool,
     /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
     /// When non-empty, ONLY these symbols spawn and the
     /// `min_tick_bps` + `min_volume_usdt` filters are BYPASSED.
