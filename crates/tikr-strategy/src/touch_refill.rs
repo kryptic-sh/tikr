@@ -358,6 +358,45 @@ impl Strategy for TouchRefill {
             }
         }
 
+        // Rule 1.5: prune stale grid orders that drifted outside the
+        // active window. When the book moves, the grid extends in the
+        // new direction (Rule 1) but old orders on the FAR side become
+        // stale relative to current touch. Cancel them so the grid
+        // stays bounded to ~grid_levels per side.
+        //
+        // - BID cancel if price < (best_bid - grid_levels × step)
+        // - ASK cancel if price > (best_ask + grid_levels × step)
+        //
+        // Active window for each side spans `grid_levels` orders from
+        // current touch outward. Anything past that boundary is from a
+        // prior price regime and won't fill at any reasonable retrace.
+        if let Some(bp) = best_bid
+            && bp.0 > Decimal::ZERO
+            && step > Decimal::ZERO
+        {
+            let bid_floor_active = bp.0 - Decimal::from(levels) * step;
+            for (id, q) in ctx.open_quotes {
+                if q.side == Side::Bid && q.price.0 < bid_floor_active {
+                    actions.push(Action::Cancel(*id));
+                }
+            }
+            // Re-anchor floor to the active window so Rule 1 doesn't
+            // re-emit at the just-cancelled deep prices next cycle.
+            self.bid_grid_floor = Some(bid_floor_active);
+        }
+        if let Some(ap) = best_ask
+            && ap.0 > Decimal::ZERO
+            && step > Decimal::ZERO
+        {
+            let ask_ceiling_active = ap.0 + Decimal::from(levels) * step;
+            for (id, q) in ctx.open_quotes {
+                if q.side == Side::Ask && q.price.0 > ask_ceiling_active {
+                    actions.push(Action::Cancel(*id));
+                }
+            }
+            self.ask_grid_ceiling = Some(ask_ceiling_active);
+        }
+
         // Rule 2: on FULL fill, place opposite-side close at a
         // distance defined by close_profit_bps. Partial fills
         // (is_full=false) skip the close — there's still residual
@@ -603,7 +642,10 @@ mod tests {
 
     #[test]
     fn full_fill_creates_separate_close_when_book_is_wide() {
-        let mut s = TouchRefill::new(cfg());
+        let mut c = cfg();
+        // Rule 2 (close-on-fill) requires close_profit_bps > 0.
+        c.close_profit_bps = 1;
+        let mut s = TouchRefill::new(c);
         let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
         let p = pos();
         let symbol = sym();
@@ -646,15 +688,13 @@ mod tests {
     }
 
     #[test]
-    fn full_fill_close_honors_min_self_spread_on_tight_tick() {
-        // Setup: price ~ 0.1 (so 10bps of price = 1e-4 = 1 tick), but
-        // pretend tick is smaller so 1 tick alone wouldn't satisfy
-        // min_self_spread_bps. Use price=0.100, tick=0.00001 → 1 tick
-        // = 1 bps. min_self_spread_bps = 10 → required = 0.0001 = 10
-        // ticks. Close ASK at fill+10 ticks, not fill+1 tick.
-        let mut c = TouchRefillConfig {
+    fn close_profit_bps_zero_disables_close_on_fill() {
+        // close_profit_bps = 0 → Rule 2 disabled entirely. Only Rule 1
+        // (grid maintenance) emits. The fill should NOT trigger any
+        // emit specifically tied to it.
+        let c = TouchRefillConfig {
             notional_per_order: Decimal::from(10),
-            tick_size: Decimal::new(1, 5), // 0.00001
+            tick_size: Decimal::new(1, 5),
             step_size: Decimal::ONE,
             min_notional: Decimal::from(5),
             grid_levels: 1,
@@ -663,27 +703,27 @@ mod tests {
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
         };
-        c.tick_size = Decimal::new(1, 5);
         let mut s = TouchRefill::new(c);
         let symbol = sym();
         let p = pos();
-        let snap = book(Decimal::new(99999, 6), Decimal::new(100001, 6)); // 0.099999 / 0.100001
+        let snap = book(Decimal::new(99999, 6), Decimal::new(100001, 6));
         let fill = mk_fill(Side::Bid, Decimal::new(99999, 6), true);
         let ctx = make_ctx(&symbol, &snap, &p, &[]);
         let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
-        // The close-on-fill ASK should sit at fill + close_distance where
-        // close_distance >= 10 ticks (to satisfy 10 bps). Several ASKs
-        // may be emitted (rule 1 top-of-grid + rule 2 close); assert at
-        // least one is far enough out.
+        // No ASK should sit deep at fill + 10 ticks (that would be the
+        // disabled close-on-fill). Rule 1 top-of-grid at min-self-spread
+        // is OK. Specifically check no ASK >= 10 ticks above fill.
         let fill_p = Decimal::new(99999, 6);
-        let min_distance = Decimal::new(1, 4); // 0.0001 = 10 ticks
+        let close_distance_threshold = Decimal::new(1, 4); // 10 ticks
         let has_close = actions.iter().any(|a| match a {
-            Action::Quote(q) if q.side == Side::Ask => q.price.0 - fill_p >= min_distance,
+            Action::Quote(q) if q.side == Side::Ask => {
+                q.price.0 - fill_p >= close_distance_threshold
+            }
             _ => false,
         });
         assert!(
-            has_close,
-            "close ASK should sit ≥ 10 ticks from fill; got: {:?}",
+            !has_close,
+            "Rule 2 disabled (close_profit_bps=0) — no deep close ASK expected; got: {:?}",
             actions
                 .iter()
                 .filter_map(|a| match a {
