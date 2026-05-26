@@ -242,20 +242,28 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                         symbols
                     };
                     let bot_count = Decimal::from(cfg.bot_count.max(1) as u64);
+                    // Total balance for sizing = USDT wallet + BNB value
+                    // (when BNB-fee mode is on). BNB held in the futures
+                    // wallet for fee payment IS spendable capital — count
+                    // it toward the available pool for order sizing +
+                    // position cap. When BNB-fee mode is off, BnbState's
+                    // balance + price are 0 so the addition is a no-op.
+                    let bnb_snap = cfg.shared_state.bnb_snapshot();
+                    let bnb_value_usdt = if bnb_snap.enabled {
+                        bnb_snap.balance * bnb_snap.price_usdt
+                    } else {
+                        Decimal::ZERO
+                    };
+                    let total_balance = balance.wallet_balance + bnb_value_usdt;
                     // Sizing is purely wallet-relative — leverage only
                     // affects the Binance POST /fapi/v1/leverage call.
-                    // With max_position_pct=100, the per-bot cap is the
-                    // full wallet split by bot_count, regardless of how
-                    // much margin headroom leverage exposes.
-                    let notional = balance.wallet_balance * cfg.order_balance_pct
-                        / Decimal::from(100)
-                        / bot_count;
+                    let notional =
+                        total_balance * cfg.order_balance_pct / Decimal::from(100) / bot_count;
                     if notional != *cfg.notional_tx.borrow() {
                         let _ = cfg.notional_tx.send(notional);
                     }
-                    let max_position = balance.wallet_balance * cfg.max_position_pct
-                        / Decimal::from(100)
-                        / bot_count;
+                    let max_position =
+                        total_balance * cfg.max_position_pct / Decimal::from(100) / bot_count;
                     if max_position != *cfg.max_position_tx.borrow() {
                         let _ = cfg.max_position_tx.send(max_position);
                     }
