@@ -1,25 +1,31 @@
-//! Bagboy — MEXC spot accumulator.
+//! Bagboy — MEXC spot accumulator with optional laddered BUYs.
 //!
-//! Maintains one resting LIMIT BUY at best_bid for a single MEXC spot
-//! symbol. Refills on fill, repositions when book moves. No sells, no
-//! closes — pure accumulation.
+//! Maintains a ladder of `ladder_levels` resting LIMIT BUYs spaced
+//! `ladder_step_bps` apart, starting at best_bid:
+//!   level 0: best_bid
+//!   level 1: best_bid − step
+//!   ...
+//!   level N: best_bid − N×step
 //!
-//! Lifecycle (per `poll_interval_ms`):
-//! 1. Fetch best_bid/ask via `/api/v3/ticker/bookTicker`.
-//! 2. Detect fills: compare current base balance to the last seen value.
-//! 3. If no resting order: place LIMIT BUY at best_bid (size = usdt_per_order / price).
-//! 4. If resting order's price ≠ best_bid: cancel + replace at new best_bid.
-//! 5. If hard cap (USDT or base) hit: stop placing, just monitor.
+//! Each cycle:
+//! 1. Detect fills via base-balance delta.
+//! 2. Check USDT balance — skip placements if too low (avoids -2010 spam).
+//! 3. Check optional hard cap (USDT spent or base accumulated).
+//! 4. Fetch best_bid.
+//! 5. Reconcile ladder via openOrders:
+//!    - Cancel any resting BID outside the active window
+//!      `[best_bid − N×step, best_bid]` (snapped to tick).
+//!    - For each missing level in window, place LIMIT BUY.
 //!
 //! Credentials loaded from env: `MEXC_API_KEY`, `MEXC_API_SECRET`.
-//! TUI integration: pushes a BotView for the symbol so it appears as a
-//! tab alongside Binance bots.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
 use rust_decimal::Decimal;
+use tikr_core::Side;
 use tikr_mexc::MexcClient;
 use tikr_paper::live::LiveSnapshot;
 use tokio::sync::watch;
@@ -36,7 +42,6 @@ pub fn spawn_bagboy(
     mut global_shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Resolve credentials.
         let api_key = match std::env::var("MEXC_API_KEY") {
             Ok(v) => v,
             Err(_) => {
@@ -54,10 +59,11 @@ pub fn spawn_bagboy(
 
         let client = MexcClient::new(api_key, api_secret);
         let symbol = cfg.symbol.clone();
-        let poll = cfg.poll_interval_ms.max(250);
-        info!(symbol = %symbol, "bagboy: starting");
+        let poll = cfg.poll_interval_ms.max(200);
+        let levels = cfg.ladder_levels.max(1);
+        let step_bps = cfg.ladder_step_bps;
+        info!(symbol = %symbol, levels, step_bps, "bagboy: starting");
 
-        // Fetch symbol filters for size/notional bumping.
         let filters = match client.symbol_filters(&symbol).await {
             Ok(f) => f,
             Err(e) => {
@@ -67,7 +73,6 @@ pub fn spawn_bagboy(
         };
         let (base_asset, quote_asset) = split_symbol_assets(&symbol);
 
-        // Register in TUI.
         let live: Arc<StdRwLock<Option<LiveSnapshot>>> = Arc::new(StdRwLock::new(None));
         let snapshot: Arc<StdRwLock<Option<tikr_paper::PaperReport>>> =
             Arc::new(StdRwLock::new(None));
@@ -86,16 +91,15 @@ pub fn spawn_bagboy(
         );
         shared_state.set_status(&symbol, BotStatus::Running);
 
-        // State tracked in-loop.
-        let mut resting_coid: Option<String> = None;
-        let mut resting_price: Option<Decimal> = None;
         let mut total_spent_usdt = Decimal::ZERO;
         let mut total_base_acquired = Decimal::ZERO;
         let mut last_seen_base = Decimal::ZERO;
-        // Seed initial balance so we don't count pre-existing holdings as fills.
         if let Ok(b) = client.balance(&base_asset).await {
             last_seen_base = b.free + b.locked;
-            info!(symbol = %symbol, base = %base_asset, seed_balance = %last_seen_base, "bagboy: seeded");
+            info!(
+                symbol = %symbol, base = %base_asset,
+                seed_balance = %last_seen_base, "bagboy: seeded"
+            );
         }
 
         let mut tick = tokio::time::interval(Duration::from_millis(poll));
@@ -106,40 +110,30 @@ pub fn spawn_bagboy(
                 _ = tick.tick() => {}
                 _ = global_shutdown.changed() => {
                     if *global_shutdown.borrow() {
-                        info!(symbol = %symbol, "bagboy: shutdown — canceling resting order");
-                        if let Some(coid) = resting_coid.as_ref() {
-                            let _ = client.cancel_order(&symbol, coid).await;
-                        }
+                        info!(symbol = %symbol, "bagboy: shutdown — canceling all orders");
+                        let _ = client.cancel_all(&symbol).await;
                         return;
                     }
                 }
             }
 
             // 1. Detect fills via base balance delta.
-            let bal = match client.balance(&base_asset).await {
+            let bal_base = match client.balance(&base_asset).await {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!(error = ?e, "bagboy: balance fetch failed");
+                    warn!(error = ?e, "bagboy: base balance fetch failed");
                     continue;
                 }
             };
-            let cur_base = bal.free + bal.locked;
+            let cur_base = bal_base.free + bal_base.locked;
             if cur_base > last_seen_base {
                 let delta = cur_base - last_seen_base;
                 total_base_acquired += delta;
-                if let Some(p) = resting_price {
-                    total_spent_usdt += delta * p;
-                }
                 info!(
                     symbol = %symbol, fill_base = %delta,
                     total_base = %total_base_acquired,
-                    total_usdt = %total_spent_usdt,
                     "bagboy: fill detected"
                 );
-                // Order is fully filled (or partially — we'll let next cycle
-                // re-emit if it's gone from openOrders). Clear local state.
-                resting_coid = None;
-                resting_price = None;
                 last_seen_base = cur_base;
             }
 
@@ -151,17 +145,10 @@ pub fn spawn_bagboy(
                 .max_total_base
                 .is_some_and(|cap| total_base_acquired >= cap);
             if capped_usdt || capped_base {
-                if resting_coid.is_some() {
-                    info!(symbol = %symbol, "bagboy: cap reached — canceling resting order");
-                    if let Some(coid) = resting_coid.as_ref() {
-                        let _ = client.cancel_order(&symbol, coid).await;
-                    }
-                    resting_coid = None;
-                    resting_price = None;
-                }
+                info!(symbol = %symbol, "bagboy: cap reached — canceling all + monitoring");
+                let _ = client.cancel_all(&symbol).await;
                 publish(
                     &live,
-                    &symbol,
                     Decimal::ZERO,
                     total_base_acquired,
                     total_spent_usdt,
@@ -181,7 +168,6 @@ pub fn spawn_bagboy(
             if book.bid_price <= Decimal::ZERO {
                 publish(
                     &live,
-                    &symbol,
                     Decimal::ZERO,
                     total_base_acquired,
                     total_spent_usdt,
@@ -190,73 +176,159 @@ pub fn spawn_bagboy(
                 continue;
             }
 
-            // 4. Reposition if price moved.
-            if let Some(rp) = resting_price
-                && rp != book.bid_price
-            {
-                info!(
-                    symbol = %symbol,
-                    from = %rp, to = %book.bid_price,
-                    "bagboy: book moved — canceling stale order"
-                );
-                if let Some(coid) = resting_coid.as_ref() {
-                    let _ = client.cancel_order(&symbol, coid).await;
+            // 4. USDT balance gate — skip placements if we can't afford
+            //    even one min-notional order. Avoids -2010 / insufficient
+            //    funds error spam.
+            let bal_quote = match client.balance(&quote_asset).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = ?e, "bagboy: quote balance fetch failed");
+                    continue;
                 }
-                resting_coid = None;
-                resting_price = None;
+            };
+            let quote_free = bal_quote.free;
+            let min_order_cost = cfg.usdt_per_order.max(filters.min_notional);
+            if quote_free < min_order_cost {
+                // Update spent total from accumulated base × current price.
+                if total_base_acquired > Decimal::ZERO {
+                    total_spent_usdt = total_base_acquired * book.bid_price;
+                }
+                // Reconcile open count for display.
+                let open_count = match client.open_orders(&symbol).await {
+                    Ok(orders) => orders.len() as u32,
+                    Err(_) => 0,
+                };
+                publish(
+                    &live,
+                    book.bid_price,
+                    total_base_acquired,
+                    total_spent_usdt,
+                    open_count,
+                );
+                continue;
             }
 
-            // 5. Place if none resting.
-            if resting_coid.is_none() {
+            // 5. Reconcile ladder via openOrders.
+            let open_orders = match client.open_orders(&symbol).await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(error = ?e, "bagboy: openOrders fetch failed");
+                    continue;
+                }
+            };
+            let existing_bids: BTreeSet<Decimal> = open_orders
+                .iter()
+                .filter(|o| o.side == Side::Bid)
+                .map(|o| o.price)
+                .collect();
+
+            // Compute target ladder prices, snapped to tick.
+            let tick = if filters.tick_size > Decimal::ZERO {
+                filters.tick_size
+            } else {
+                Decimal::new(1, 8)
+            };
+            let step = if step_bps > 0 {
+                let raw = book.bid_price * Decimal::from(step_bps) / Decimal::from(10_000);
+                if raw > tick {
+                    (raw / tick).ceil() * tick
+                } else {
+                    tick
+                }
+            } else {
+                tick
+            };
+            let mut target_prices: Vec<Decimal> = Vec::with_capacity(levels as usize);
+            for i in 0..levels {
+                let p = book.bid_price - Decimal::from(i) * step;
+                if p > Decimal::ZERO {
+                    let snapped = (p / tick).floor() * tick;
+                    if snapped > Decimal::ZERO {
+                        target_prices.push(snapped);
+                    }
+                }
+            }
+            let target_set: BTreeSet<Decimal> = target_prices.iter().copied().collect();
+
+            // Cancel orders outside target window (price > top or below floor).
+            let target_top = *target_set.iter().max().unwrap_or(&Decimal::ZERO);
+            let target_floor = *target_set.iter().min().unwrap_or(&Decimal::ZERO);
+            for o in &open_orders {
+                if o.side != Side::Bid {
+                    continue;
+                }
+                if o.price > target_top || o.price < target_floor {
+                    let _ = client.cancel_order(&symbol, &o.client_order_id).await;
+                    info!(
+                        symbol = %symbol, price = %o.price,
+                        "bagboy: cancel stale ladder order"
+                    );
+                }
+            }
+
+            // Place missing ladder levels (respecting USDT budget).
+            let mut remaining_budget = quote_free;
+            for tgt_price in &target_prices {
+                if existing_bids.contains(tgt_price) {
+                    continue;
+                }
                 let qty = compute_quantity(
                     cfg.usdt_per_order,
-                    book.bid_price,
+                    *tgt_price,
                     filters.step_size,
                     filters.min_notional,
                     filters.min_qty,
                 );
-                if qty > Decimal::ZERO {
-                    let price_str = format_decimal(book.bid_price, filters.tick_size);
-                    let qty_str = format_decimal(qty, filters.step_size);
-                    let coid = format!("bb_{}", Uuid::new_v4().as_simple());
-                    match client
-                        .place_limit_buy(&symbol, &price_str, &qty_str, &coid)
-                        .await
-                    {
-                        Ok(_) => {
-                            resting_coid = Some(coid);
-                            resting_price = Some(book.bid_price);
-                            info!(
-                                symbol = %symbol,
-                                price = %book.bid_price, qty = %qty,
-                                "bagboy: order placed"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(error = ?e, symbol = %symbol, "bagboy: place failed");
-                        }
+                if qty <= Decimal::ZERO {
+                    continue;
+                }
+                let cost = qty * *tgt_price;
+                if cost > remaining_budget {
+                    // Skip rather than reject from venue.
+                    break;
+                }
+                let price_str = format_decimal(*tgt_price, tick);
+                let qty_str = format_decimal(qty, filters.step_size);
+                let coid = format!("bb_{}", Uuid::new_v4().as_simple());
+                match client
+                    .place_limit_buy(&symbol, &price_str, &qty_str, &coid)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            symbol = %symbol,
+                            price = %tgt_price, qty = %qty,
+                            "bagboy: ladder order placed"
+                        );
+                        remaining_budget -= cost;
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, symbol = %symbol, price = %tgt_price, "bagboy: place failed");
                     }
                 }
             }
 
+            // Update displayed metrics.
+            if total_base_acquired > Decimal::ZERO {
+                total_spent_usdt = total_base_acquired * book.bid_price;
+            }
+            let open_count_after = match client.open_orders(&symbol).await {
+                Ok(o) => o.len() as u32,
+                Err(_) => 0,
+            };
             publish(
                 &live,
-                &symbol,
                 book.bid_price,
                 total_base_acquired,
                 total_spent_usdt,
-                if resting_coid.is_some() { 1 } else { 0 },
+                open_count_after,
             );
-
-            // Silence unused suspect on quote_asset.
-            let _ = &quote_asset;
         }
     })
 }
 
 fn publish(
     live: &Arc<StdRwLock<Option<LiveSnapshot>>>,
-    _symbol: &str,
     bid: Decimal,
     total_base: Decimal,
     total_usdt: Decimal,
@@ -290,7 +362,6 @@ fn publish(
     }
 }
 
-/// Compute order qty from USDT budget; auto-bump to min_notional/min_qty.
 fn compute_quantity(
     usdt: Decimal,
     price: Decimal,
@@ -319,23 +390,17 @@ fn compute_quantity(
     }
 }
 
-/// Format a Decimal with the precision dictated by `unit` (a step or
-/// tick value). Uses unit's scale to pick decimal places.
 fn format_decimal(value: Decimal, unit: Decimal) -> String {
     let scale = unit.scale();
     format!("{value:.scale$}", scale = scale as usize)
 }
 
-/// Split a MEXC symbol like "NAVUSDT" into (base, quote) — assumes
-/// USDT/USDC/BUSD/TUSD 4-char suffix; falls back to splitting at the
-/// last position where the suffix matches.
 fn split_symbol_assets(symbol: &str) -> (String, String) {
     for suffix in ["USDT", "USDC", "BUSD", "TUSD"] {
         if let Some(base) = symbol.strip_suffix(suffix) {
             return (base.to_string(), suffix.to_string());
         }
     }
-    // Fallback: assume last 4 chars are quote.
     let split = symbol.len().saturating_sub(4);
     (symbol[..split].to_string(), symbol[split..].to_string())
 }

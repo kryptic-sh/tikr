@@ -24,4 +24,7 @@ usdt_per_order = "1.0"
 # Optional hard caps. Comment out for unlimited accumulation.
 # max_total_usdt = "100"
 # max_total_base = "10000"
-poll_interval_ms = 1000
+poll_interval_ms = 500
+# Ladder: 5 BUY orders stacked from best_bid down, 10 bps apart.
+ladder_levels = 5
+ladder_step_bps = 10

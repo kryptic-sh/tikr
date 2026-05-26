@@ -57,16 +57,34 @@ pub struct BagboyConfig {
     /// `None` = no cap.
     #[serde(default)]
     pub max_total_base: Option<Decimal>,
-    /// Book/order poll interval in ms. Default `1000`.
+    /// Book/order poll interval in ms. Default `500`. With MEXC's
+    /// 20-req/s public limit, 200-500ms is safe.
     #[serde(default = "bagboy_default_poll_ms")]
     pub poll_interval_ms: u64,
+    /// Number of laddered BUY orders. `1` = single resting order at
+    /// best_bid (legacy). `N > 1` places N orders: at best_bid,
+    /// best_bid − step, best_bid − 2×step, ... best_bid − (N−1)×step.
+    /// Catches deeper bids without re-emitting on every book tick.
+    /// Default `1`.
+    #[serde(default = "bagboy_default_ladder_levels")]
+    pub ladder_levels: u32,
+    /// Spacing between ladder levels in bps of best_bid (snapped to
+    /// tick). `0` = legacy 1-tick spacing. Default `5` bps.
+    #[serde(default = "bagboy_default_ladder_step_bps")]
+    pub ladder_step_bps: u32,
 }
 
 fn bagboy_default_usdt_per_order() -> Decimal {
     Decimal::new(1, 0) // $1
 }
 fn bagboy_default_poll_ms() -> u64 {
-    1000
+    500
+}
+fn bagboy_default_ladder_levels() -> u32 {
+    1
+}
+fn bagboy_default_ladder_step_bps() -> u32 {
+    5
 }
 
 /// Rotating SpreadScalp manager configuration.

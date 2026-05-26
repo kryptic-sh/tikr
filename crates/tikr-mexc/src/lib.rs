@@ -108,4 +108,15 @@ impl MexcClient {
     pub async fn symbol_filters(&self, symbol: &str) -> Result<spot::SymbolFilters, VenueError> {
         spot::get_symbol_filters(&self.http, &self.base_url, symbol).await
     }
+
+    pub async fn open_orders(&self, symbol: &str) -> Result<Vec<spot::OpenOrder>, VenueError> {
+        spot::get_open_orders(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            &self.api_secret,
+            symbol,
+        )
+        .await
+    }
 }

@@ -265,6 +265,87 @@ pub async fn get_balance(
     Ok(SpotBalance::default())
 }
 
+/// One open order from MEXC's `openOrders` endpoint.
+#[derive(Debug, Clone)]
+pub struct OpenOrder {
+    pub order_id: String,
+    pub client_order_id: String,
+    pub side: Side,
+    pub price: tikr_core::Decimal,
+    pub orig_qty: tikr_core::Decimal,
+    pub executed_qty: tikr_core::Decimal,
+}
+
+/// Fetch all open orders for a symbol.
+///
+/// Endpoint: `GET /api/v3/openOrders?symbol=...`
+pub async fn get_open_orders(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    api_secret: &str,
+    symbol: &str,
+) -> Result<Vec<OpenOrder>, VenueError> {
+    let params = format!("symbol={symbol}");
+    let signed = append_signature(&params, api_secret);
+    let url = format!("{base_url}/api/v3/openOrders?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MEXC-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if body.is_object()
+        && let Some(e) = try_parse_error(&body)
+    {
+        return Err(e);
+    }
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "mexc openOrders: expected array",
+        )))
+    })?;
+    let parse_dec = |row: &Value, k: &str| -> tikr_core::Decimal {
+        row.get(k)
+            .and_then(Value::as_str)
+            .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+            .unwrap_or_default()
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        let side_str = row.get("side").and_then(Value::as_str).unwrap_or("");
+        let side = match side_str {
+            "BUY" => Side::Bid,
+            "SELL" => Side::Ask,
+            _ => continue,
+        };
+        let order_id = row
+            .get("orderId")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let client_order_id = row
+            .get("clientOrderId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        out.push(OpenOrder {
+            order_id,
+            client_order_id,
+            side,
+            price: parse_dec(row, "price"),
+            orig_qty: parse_dec(row, "origQty"),
+            executed_qty: parse_dec(row, "executedQty"),
+        });
+    }
+    Ok(out)
+}
+
 /// Per-symbol exchangeInfo filter values.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SymbolFilters {
