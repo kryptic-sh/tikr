@@ -48,6 +48,17 @@ pub struct TouchRefillConfig {
     /// leaves the bot with orders in the path. Inventory cap scales
     /// linearly: max position = N × notional_per_order per side.
     pub grid_levels: u32,
+    /// Minimum required spread (in bps of mid) between the top of the
+    /// bid grid and the top of the ask grid. When the book spread is
+    /// wider than this, both tops sit at their touches (no change).
+    /// When the book spread is narrower, BOTH tops are pushed apart
+    /// (bid down, ask up) symmetrically around mid so the gap meets
+    /// the requirement. `0` (default) = disabled (always at touch).
+    ///
+    /// Use to make TouchRefill viable on tight-spread / narrow-tick
+    /// markets where the natural book spread alone wouldn't cover
+    /// 2× maker fees (~3.6 bps RT on BNB-discount Binance USD-M).
+    pub min_self_spread_bps: u32,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
@@ -174,8 +185,37 @@ impl Strategy for TouchRefill {
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
 
-        if let Some(bp) = best_bid
+        // Min-self-spread enforcement: when the book spread is tighter
+        // than `min_self_spread_bps`, push the grid tops apart so that
+        // top_ask − top_bid ≥ min_self_spread × mid / 10000. Both tops
+        // shift symmetrically around mid, snapped to tick boundaries
+        // (bid floor down, ask ceil up).
+        let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
+            (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
+            && ap.0 > bp.0
+            && tick > Decimal::ZERO
+            && self.config.min_self_spread_bps > 0
+        {
+            let mid = (bp.0 + ap.0) / Decimal::from(2);
+            let required_half =
+                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000);
+            let raw_top_bid = mid - required_half;
+            let raw_top_ask = mid + required_half;
+            // Snap to tick grid: bid floor, ask ceil.
+            let snapped_bid = (raw_top_bid / tick).floor() * tick;
+            let snapped_ask = (raw_top_ask / tick).ceil() * tick;
+            (
+                Some(Price(snapped_bid.min(bp.0))),
+                Some(Price(snapped_ask.max(ap.0))),
+            )
+        } else {
+            (best_bid, best_ask)
+        };
+
+        if let Some(bp_orig) = best_bid
+            && let Some(bp) = top_bid_override
+            && bp_orig.0 > Decimal::ZERO
             && tick > Decimal::ZERO
         {
             let target_floor = bp.0 - outward;
@@ -205,8 +245,9 @@ impl Strategy for TouchRefill {
             }
         }
 
-        if let Some(ap) = best_ask
-            && ap.0 > Decimal::ZERO
+        if let Some(ap_orig) = best_ask
+            && let Some(ap) = top_ask_override
+            && ap_orig.0 > Decimal::ZERO
             && tick > Decimal::ZERO
         {
             let target_ceiling = ap.0 + outward;
@@ -334,6 +375,7 @@ mod tests {
             step_size: Decimal::ONE,
             min_notional: Decimal::from(5),
             grid_levels: 1,
+            min_self_spread_bps: 0,
         }
     }
 

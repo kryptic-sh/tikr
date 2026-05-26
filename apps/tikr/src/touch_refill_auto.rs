@@ -191,6 +191,9 @@ fn spawn_one_bot(
         touch_refill: Some(TouchRefillParams {
             notional: None,
             grid_levels: 12,
+            // 10bps min self-spread: makes the strategy viable on tighter
+            // tick markets even when book spread alone wouldn't clear fees.
+            min_self_spread_bps: 10,
         }),
         sg: None,
         lg: None,

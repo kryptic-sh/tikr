@@ -86,3 +86,17 @@ min_volume_usdt = "20000000"
 # to entering/exiting symbols but more REST calls. 60s is plenty given
 # tick_bps changes slowly (tracks the price, not the book).
 recheck_interval_secs = 60
+
+# Minimum required gap (in bps of mid) between the top of the bid grid
+# and the top of the ask grid. When the book spread is already wider
+# than this, the grid tops sit at touch (no change). When narrower,
+# BOTH tops shift symmetrically outward (bid down, ask up, snapped to
+# tick boundaries) so the gap is met.
+#
+# 10 bps ≈ 2.8× BNB-discount maker RT fees (3.6 bps). Makes TouchRefill
+# viable on tight-tick markets where the book spread alone wouldn't
+# cover fees. Set to 0 to disable (always quote at touch).
+#
+# Note: this is currently hardcoded to 10 in touch_refill_auto.rs for
+# auto-spawned bots; tweak there if you want a different default.
+min_self_spread_bps = 10

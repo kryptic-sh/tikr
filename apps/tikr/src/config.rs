@@ -206,6 +206,13 @@ pub struct TouchRefillParams {
     /// max per-side position = N × notional_per_order.
     #[serde(default = "touch_refill_default_grid_levels")]
     pub grid_levels: u32,
+    /// Minimum gap (in bps of mid) between the top of the bid grid
+    /// and the top of the ask grid. When the book spread is wider,
+    /// tops sit at touch. When narrower, both tops shift symmetrically
+    /// around mid so the gap is met. `0` (default) = disabled.
+    /// Use to make TouchRefill viable on tight-spread markets.
+    #[serde(default)]
+    pub min_self_spread_bps: u32,
 }
 
 fn touch_refill_default_grid_levels() -> u32 {
