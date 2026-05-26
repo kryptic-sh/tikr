@@ -18,6 +18,8 @@ tikr-strategy = "0.1"
 tikr-venue = "0.1"
 tikr-paper = "0.1"
 tikr-binance = "0.1"
+tikr-mexc = "0.1"
+uuid = "1"
 tikr-backtest = "0.1"
 
 # CLI + config

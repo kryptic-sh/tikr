@@ -1,0 +1,27 @@
+# ─── Bagboy NAVUSDT on MEXC spot ────────────────────────────────────────
+#
+# Pure accumulator: places 1 LIMIT BUY at best_bid for NAVUSDT on MEXC
+# spot. Refills on fill, repositions when book moves. No sells.
+#
+# Pre-flight:
+#   1. .env with MEXC_API_KEY / MEXC_API_SECRET (spot trading enabled,
+#      IP-whitelisted recommended)
+#   2. Funded USDT on MEXC spot wallet
+#   3. The [account] section below is required by the parser — Binance
+#      env still loaded for compatibility but unused if no [[bot]] /
+#      [tide_auto] sections are present.
+
+[account]
+env = "futures-mainnet"   # ignored when no Binance bots configured
+state_dir = "./state/bagboy"
+asset = "USDT"
+
+[bagboy]
+enabled = true
+symbol = "NAVUSDT"
+# $1 per order. Auto-bumps to MEXC min_notional if below.
+usdt_per_order = "1.0"
+# Optional hard caps. Comment out for unlimited accumulation.
+# max_total_usdt = "100"
+# max_total_base = "10000"
+poll_interval_ms = 1000

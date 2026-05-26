@@ -5453,6 +5453,7 @@ dependencies = [
  "tikr-backtest",
  "tikr-binance",
  "tikr-core",
+ "tikr-mexc",
  "tikr-paper",
  "tikr-strategy",
  "tikr-venue",
@@ -5460,6 +5461,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

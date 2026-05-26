@@ -28,6 +28,45 @@ pub struct DashboardConfig {
     /// needed — symbols are auto-discovered.
     #[serde(default)]
     pub tide_auto: Option<TideAutoConfig>,
+    /// Optional MEXC spot accumulator (bagboy). Places a single
+    /// resting LIMIT BUY at best_bid for the configured symbol,
+    /// refills on fill, refreshes when book moves. Pure accumulator —
+    /// no sells, no closes. Independent of the Binance bots.
+    #[serde(default)]
+    pub bagboy: Option<BagboyConfig>,
+}
+
+/// Bagboy = MEXC spot accumulator. Maintains 1 limit BUY at best_bid
+/// for the configured symbol; refills on fill or book move.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct BagboyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// MEXC spot symbol, e.g. `"NAVUSDT"`.
+    pub symbol: String,
+    /// Quote-currency budget per order in USDT. Bot auto-bumps to the
+    /// venue's min_notional if this is too small.
+    #[serde(default = "bagboy_default_usdt_per_order")]
+    pub usdt_per_order: Decimal,
+    /// Hard cap on total USDT spent. `None` = no cap. Bot stops
+    /// placing new orders when cumulative_spent_usdt ≥ cap.
+    #[serde(default)]
+    pub max_total_usdt: Option<Decimal>,
+    /// Hard cap on total base asset accumulated (e.g. NAV count).
+    /// `None` = no cap.
+    #[serde(default)]
+    pub max_total_base: Option<Decimal>,
+    /// Book/order poll interval in ms. Default `1000`.
+    #[serde(default = "bagboy_default_poll_ms")]
+    pub poll_interval_ms: u64,
+}
+
+fn bagboy_default_usdt_per_order() -> Decimal {
+    Decimal::new(1, 0) // $1
+}
+fn bagboy_default_poll_ms() -> u64 {
+    1000
 }
 
 /// Rotating SpreadScalp manager configuration.

@@ -11,6 +11,7 @@
 //!   1. `./config.toml`                       — cwd, wins if present
 //!   2. `$XDG_CONFIG_HOME/tikr/config.toml`   — defaults to `~/.config/tikr/config.toml`
 
+mod bagboy;
 mod bnb_refill;
 mod build;
 mod config;
@@ -538,6 +539,13 @@ async fn main() -> anyhow::Result<()> {
                 max_position_rx: max_position_rx.clone(),
                 bnb_price_rx: bnb_price_rx.clone(),
             },
+            shared_state.clone(),
+            global_shutdown_rx.clone(),
+        ));
+    }
+    if let Some(bagboy_cfg) = cfg.bagboy.clone().filter(|c| c.enabled) {
+        supervisors.push(bagboy::spawn_bagboy(
+            bagboy_cfg,
             shared_state.clone(),
             global_shutdown_rx.clone(),
         ));
