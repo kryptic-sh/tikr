@@ -127,6 +127,9 @@ struct AccountPollerConfig {
     symbols: Vec<String>,
     bot_count: usize,
     order_balance_pct: Decimal,
+    /// Margin asset polled for wallet balance + displayed in TUI.
+    /// Typically "USDT" for USDT-M perps, "USDC" for USDC-M.
+    wallet_asset: String,
     shutdown: watch::Receiver<bool>,
     /// Published price (USDT per BNB) for the user-stream parser to
     /// convert BNB commissions → USDT-equivalent. Set to ZERO when
@@ -223,13 +226,13 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                 cfg.env.rest_base_url(),
                 &cfg.api_key,
                 &key_material,
-                "USDT",
+                &cfg.wallet_asset,
             )
             .await
             {
                 Ok(balance) => {
                     cfg.shared_state.set_api_account(ApiAccountSnapshot {
-                        asset: "USDT".to_string(),
+                        asset: cfg.wallet_asset.clone(),
                         wallet_balance: balance.wallet_balance,
                         available_balance: balance.available_balance,
                         cross_unrealized_pnl: balance.cross_unrealized_pnl,
@@ -454,6 +457,14 @@ async fn main() -> anyhow::Result<()> {
             .map(|r| r.slots)
             .unwrap_or(0);
 
+    // Margin asset: when touch_refill_auto is enabled with a non-USDT
+    // quote, that's the wallet asset (USDC perps settle in USDC).
+    let wallet_asset = cfg
+        .touch_refill_auto
+        .as_ref()
+        .filter(|c| c.enabled)
+        .map(|c| c.quote_asset.clone())
+        .unwrap_or_else(|| "USDT".to_string());
     spawn_account_balance_poller(AccountPollerConfig {
         shared_state: shared_state.clone(),
         notional_tx,
@@ -465,6 +476,7 @@ async fn main() -> anyhow::Result<()> {
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
         bot_count: total_slots.max(1),
         order_balance_pct: cfg.account.order_balance_pct,
+        wallet_asset,
         shutdown: global_shutdown_rx.clone(),
         bnb_price_tx,
     });
