@@ -338,10 +338,16 @@ impl SpreadScalp {
     }
 
     /// Emit a side-cancel for a tracked-but-no-longer-wanted side.
-    /// Drops the tracker entry too.
+    ///
+    /// Only drops the tracker entry when a Cancel was actually emitted
+    /// (i.e. the resting quote has a venue id). When the resting entry
+    /// is in-flight (no id yet), keep it — otherwise the in-flight
+    /// place lands successfully AFTER the tracker forgets it, leaving
+    /// an orphan on the venue forever. The next `reconcile` will stamp
+    /// the id and the subsequent cycle will emit the Cancel cleanly.
     fn drop_tracked_side(&mut self, side: Side) -> Vec<Action> {
         let actions = policy::drop_side(self.resting.current_for(side));
-        if !actions.is_empty() || self.resting.current_for(side).is_some() {
+        if !actions.is_empty() {
             self.resting.drop_side(side);
         }
         actions

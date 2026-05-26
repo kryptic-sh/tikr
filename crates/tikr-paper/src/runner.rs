@@ -1600,6 +1600,23 @@ where
                 match venue.open_orders(&symbol).await {
                     Ok(orders) => {
                         let venue_open = orders.len();
+                        // Orphan sweep: spread-scalp + tick-strategies quote
+                        // at most 1 per side = 2 total. Anything more is
+                        // an orphan accumulated through a race (cap fired
+                        // while in-flight, recovery loop placed without
+                        // cancel, etc.). Wipe + let strategy re-emit on
+                        // the next event.
+                        if venue_open > 2 {
+                            warn!(
+                                venue_open,
+                                "order reconciliation: > 2 open orders, cancelling all to wipe orphans"
+                            );
+                            if let Err(e) = venue.cancel_all(&symbol).await {
+                                warn!(error = ?e, "orphan sweep: cancel_all failed");
+                            } else {
+                                fill_sim.drop_quotes_for(&symbol);
+                            }
+                        }
                         let (removed, added) = fill_sim.reconcile_quotes_for(&symbol, &orders);
                         if removed > 0 || added > 0 {
                             warn!(
