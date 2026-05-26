@@ -333,6 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_self_spread_bps: args.tr_min_self_spread_bps,
                 close_profit_bps: args.tr_close_profit_bps,
                 grid_step_bps: args.tr_grid_step_bps,
+                max_position_usdt: Decimal::ZERO,
             });
             run_with_resume(
                 venue,

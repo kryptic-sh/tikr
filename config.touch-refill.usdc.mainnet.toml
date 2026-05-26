@@ -62,11 +62,11 @@ recheck_interval_secs = 60
 min_self_spread_bps = 20
 
 # Smaller grid — thinner USDC books mean less safe inventory accumulation.
-grid_levels = 3
+grid_levels = 2
 
 # Wider close target = more profit per RT. USDC books are slow,
 # fewer fills, so make each one count more.
-close_profit_bps = 30
+close_profit_bps = 15
 
 # Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
 # Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick

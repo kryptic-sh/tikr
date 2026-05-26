@@ -74,6 +74,12 @@ pub struct TouchRefillConfig {
     /// of orders within sub-bps; setting `grid_step_bps = 4` spaces
     /// them ~4 bps apart for meaningful fill independence.
     pub grid_step_bps: u32,
+    /// Per-bot peak position cap in USDT notional. When long
+    /// notional > cap, BID emits are suppressed (no more accumulation
+    /// on the long side); when short notional > cap, ASK emits are
+    /// suppressed. Close-on-fill orders are NEVER suppressed since
+    /// they reduce position. `0` = no cap (legacy behavior).
+    pub max_position_usdt: Decimal,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
@@ -214,6 +220,22 @@ impl Strategy for TouchRefill {
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
 
+        // Per-side cap: when long notional > cap, no more BID emits
+        // (close-side ASK emits still fire). Mirror for shorts.
+        let pos_size = ctx.position.size.0;
+        let cap = self.config.max_position_usdt;
+        let mid_for_pos = match (best_bid, best_ask) {
+            (Some(b), Some(a)) if a.0 > Decimal::ZERO && b.0 > Decimal::ZERO => {
+                (b.0 + a.0) / Decimal::from(2)
+            }
+            (Some(b), _) if b.0 > Decimal::ZERO => b.0,
+            (_, Some(a)) if a.0 > Decimal::ZERO => a.0,
+            _ => Decimal::ZERO,
+        };
+        let pos_notional = pos_size * mid_for_pos;
+        let suppress_bids = cap > Decimal::ZERO && pos_notional > cap;
+        let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
+
         // Effective grid step = max(1 tick, ceil(grid_step_bps × mid /
         // 10000 / tick) × tick). On tight-tick markets, 1-tick spacing
         // piles dozens of orders within sub-bps; grid_step_bps spaces
@@ -274,6 +296,7 @@ impl Strategy for TouchRefill {
             && let Some(bp) = top_bid_override
             && bp_orig.0 > Decimal::ZERO
             && tick > Decimal::ZERO
+            && !suppress_bids
         {
             let target_floor = bp.0 - outward;
             self.bid_grid_floor = Some(match self.bid_grid_floor {
@@ -307,6 +330,7 @@ impl Strategy for TouchRefill {
             && let Some(ap) = top_ask_override
             && ap_orig.0 > Decimal::ZERO
             && tick > Decimal::ZERO
+            && !suppress_asks
         {
             let target_ceiling = ap.0 + outward;
             self.ask_grid_ceiling = Some(match self.ask_grid_ceiling {
@@ -406,6 +430,17 @@ impl Strategy for TouchRefill {
         }
         Vec::new()
     }
+
+    fn on_max_position_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        max_position_usdt: Decimal,
+    ) -> Vec<Action> {
+        if max_position_usdt > Decimal::ZERO {
+            self.config.max_position_usdt = max_position_usdt;
+        }
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +495,7 @@ mod tests {
             min_self_spread_bps: 0,
             close_profit_bps: 0,
             grid_step_bps: 0,
+            max_position_usdt: Decimal::ZERO,
         }
     }
 
@@ -633,6 +669,7 @@ mod tests {
             min_self_spread_bps: 10,
             close_profit_bps: 0,
             grid_step_bps: 0,
+            max_position_usdt: Decimal::ZERO,
         };
         c.tick_size = Decimal::new(1, 5);
         let mut s = TouchRefill::new(c);
@@ -680,6 +717,7 @@ mod tests {
             min_self_spread_bps: 10,
             close_profit_bps: 50,
             grid_step_bps: 0,
+            max_position_usdt: Decimal::ZERO,
         };
         c.tick_size = Decimal::new(1, 2);
         let mut s = TouchRefill::new(c);

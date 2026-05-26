@@ -370,6 +370,9 @@ fn build_touch_refill(
         .as_ref()
         .map(|p| p.grid_step_bps)
         .unwrap_or(0);
+    // Initial max_position = 0 (no cap). Live value flows in via
+    // on_max_position_updated from the account balance poller's
+    // max_position_rx watch channel, typically within 5s of spawn.
     Ok(StrategyChoice::TouchRefill(TouchRefillConfig {
         notional_per_order: notional,
         tick_size,
@@ -379,6 +382,7 @@ fn build_touch_refill(
         min_self_spread_bps,
         close_profit_bps,
         grid_step_bps,
+        max_position_usdt: Decimal::ZERO,
     }))
 }
 
