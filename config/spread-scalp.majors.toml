@@ -3,7 +3,7 @@
 # strategy can build up symbol-specific state.
 #
 # Run with:
-#   tikr --config ./config.spread-scalp.majors.toml
+#   tikr --config ./config/spread-scalp.majors.toml
 #
 # ─── Testnet vs mainnet ────────────────────────────────────────────────────
 # This file is tuned for `futures-testnet` where the spread on majors is

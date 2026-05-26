@@ -3,7 +3,7 @@
 # strategy can build up per-symbol regime state.
 #
 # Run with:
-#   tikr --config ./config.static-grid.majors.toml
+#   tikr --config ./config/static-grid.majors.toml
 #
 # ─── Tuning source ─────────────────────────────────────────────────────────
 # Per-symbol `(inner_bps, step_bps, levels)` picked from 24h backtest sweep

@@ -1,7 +1,7 @@
 # Hydra on the major-cap pairs (BTC, ETH, BNB, SOL, DOGE).
 #
 # Run with:
-#   tikr --config ./config.hydra.majors.toml
+#   tikr --config ./config/hydra.majors.toml
 #
 # ─── Strategy summary ──────────────────────────────────────────────────────
 # Hydra plants a passive PostOnly Bid+Ask straddle at `entry_offset_bps`
