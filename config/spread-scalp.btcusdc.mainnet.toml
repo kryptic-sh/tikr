@@ -1,13 +1,8 @@
 # ─── SpreadScalp BTCUSDC solo — MAINNET ────────────────────────────────────
 #
-# Single BTCUSDC bot. Same SS knobs as the 15-symbol USDC config,
-# scaled sizing for solo run:
-#   order_balance_pct  = 1   (1% of wallet per order)
-#   max_position_pct   = 50  (50% of wallet as inventory cap)
-#
-# On a $737 wallet:
-#   per-order notional ≈ $7.37 → auto-bumps to BTC step 0.001 = ~$76
-#   peak inventory cap ≈ $368
+# Single BTCUSDC bot under USDC promo (0 bps maker). Conservative
+# sizing for solo run; bump `order_balance_pct` if wallet > $1k and
+# you want more notional per quote.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
@@ -19,7 +14,11 @@
 env = "futures-mainnet"
 state_dir = "./state/spread-scalp-btcusdc"
 asset = "USDC"
-order_balance_pct = "10"
+# 1% wallet per order; with $1000 wallet → ~$10 notional, will
+# auto-bump to BTC step minimum (~$76 at $76k price).
+order_balance_pct = "1"
+# 100% wallet as the per-bot peak-position cap (single bot, full
+# wallet is the limit).
 max_position_pct = "100"
 leverage = 5
 
@@ -29,11 +28,24 @@ leverage = 5
 symbol = "BTCUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
+# Quote whenever book spread > 0 bps (USDC promo = no fee floor).
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
+# Re-evaluate book every 500ms; cancel cooldown after a venue
+# rejection is also 500ms.
 requote_interval_ms = 500
 reject_cooldown_ms = 500
+# Tolerate 1-tick mid jitter before issuing a fresh quote.
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+# Take profit when unrealized hits 5 bps of position notional.
+take_profit_bps = 5
+# Hard stop at 30 bps unrealized loss → IOC out at opposing touch.
+stop_loss_bps = 30
+# Keep the close-side passive quote alive even when book spread
+# tightens below min_spread_bps so held positions still drain at maker.
+close_side_always_quotes = true
+# Adverse-selection guard: widen min_spread as the rolling EMA of
+# post-fill drift exceeds the threshold.
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
