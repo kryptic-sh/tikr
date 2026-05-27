@@ -115,6 +115,12 @@ pub struct Tide {
     /// minute boundary at which we evaluated walk-in/walk-out.
     fill_ts_window: std::collections::VecDeque<u64>,
     last_adapt_ms: u64,
+    /// Quote intents the venue rejected (typically -5022 post-only
+    /// would-cross). Held forever and re-emitted on the next event
+    /// whose book makes a post-only at that price safe (BID < best_ask
+    /// or ASK > best_bid). Entries also drop if `already_have_order`
+    /// covers them. Dedup on enqueue by (side, price).
+    pending_retries: Vec<(Side, Price, Size)>,
 }
 
 impl Tide {
@@ -208,6 +214,7 @@ impl Strategy for Tide {
             ask_grid_ceiling: None,
             fill_ts_window: std::collections::VecDeque::new(),
             last_adapt_ms: 0,
+            pending_retries: Vec::new(),
         }
     }
 
@@ -221,6 +228,46 @@ impl Strategy for Tide {
         self.pending_ask_prices.clear();
 
         let mut actions: Vec<Action> = Vec::new();
+
+        // Retry queue drain. For each rejected-and-still-pending intent,
+        // re-emit IF a post-only at that exact price would now be safe
+        // (BID strictly below best_ask, ASK strictly above best_bid)
+        // AND no existing/pending order already covers it. Otherwise
+        // keep waiting — entries stay until they fire or are covered.
+        let retry_best_bid = ctx.latest_book.bids.first().map(|l| l.price);
+        let retry_best_ask = ctx.latest_book.asks.first().map(|l| l.price);
+        let mut still_pending = Vec::with_capacity(self.pending_retries.len());
+        for (side, price, size) in std::mem::take(&mut self.pending_retries) {
+            if self.already_have_order(ctx, side, price, Decimal::ZERO) {
+                continue;
+            }
+            let safe = match (side, retry_best_bid, retry_best_ask) {
+                (Side::Bid, _, Some(ap)) => price.0 < ap.0,
+                (Side::Ask, Some(bp), _) => price.0 > bp.0,
+                _ => false,
+            };
+            if !safe {
+                still_pending.push((side, price, size));
+                continue;
+            }
+            match side {
+                Side::Bid => {
+                    self.pending_bid_prices.insert(price.0);
+                }
+                Side::Ask => {
+                    self.pending_ask_prices.insert(price.0);
+                }
+            }
+            actions.push(Action::Quote(QuoteIntent {
+                symbol: ctx.symbol.clone(),
+                side,
+                price,
+                size,
+                tif: TimeInForce::PostOnly,
+                kind: QuoteKind::Point,
+            }));
+        }
+        self.pending_retries = still_pending;
 
         // Adaptive bps walk-in / walk-out. When enabled:
         //   fpm < 1 → tighten min_self_spread + grid_step by 1 bps/min
@@ -473,12 +520,22 @@ impl Strategy for Tide {
     fn on_quote_rejected(
         &mut self,
         _ctx: &StrategyContext<'_>,
-        _intent: &QuoteIntent,
+        intent: &QuoteIntent,
         _reason: &str,
     ) -> Vec<Action> {
-        // The next on_event for any book update will re-check the
-        // best-price invariant and re-emit if needed. No special path
-        // — strategy is stateless across events.
+        // Stash the intent for retry. Drained at the top of every
+        // on_event when the book makes a post-only at this price
+        // safe again. Dedupe by (side, price) — same level rejected
+        // twice in quick succession only queues once.
+        let key = (intent.side, intent.price.0);
+        if !self
+            .pending_retries
+            .iter()
+            .any(|(s, p, _)| (*s, p.0) == key)
+        {
+            self.pending_retries
+                .push((intent.side, intent.price, intent.size));
+        }
         Vec::new()
     }
 
