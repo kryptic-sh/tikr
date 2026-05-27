@@ -138,14 +138,15 @@ struct AccountPollerConfig {
     bnb_price_tx: watch::Sender<Decimal>,
 }
 
-/// Spawn a 1-Hz watcher that reads each bot's LiveSnapshot and pushes
+/// Spawn a 10-Hz watcher that reads each bot's LiveSnapshot and pushes
 /// `last_bid` as a price-history sample + any new fills as markers.
 /// Single source for the TUI price-chart panel — works across tide,
-/// SS, bagboy, etc. without touching the runner.
+/// SS, bagboy, etc. without touching the runner. Polls at bot-tick rate
+/// (100 ms) so chart resolution matches what strategies actually see.
 fn spawn_price_history_watcher(state: SharedBotState, mut shutdown: watch::Receiver<bool>) {
     tokio::spawn(async move {
         use std::collections::HashMap;
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(1000));
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Per-symbol last_fill_ts seen, so we only push new fills.
         let mut last_fill_ts: HashMap<String, u64> = HashMap::new();

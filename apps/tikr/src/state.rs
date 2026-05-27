@@ -127,17 +127,21 @@ pub struct PriceHistory {
 }
 
 impl PriceHistory {
-    /// Max samples retained (≈1 sample/sec * 30 min = 1800).
+    /// Max samples retained (≈10 samples/sec * 3 min = 1800; chart
+    /// window is 60s so headroom for stalls).
     pub const MAX_SAMPLES: usize = 1800;
     /// Max fill markers retained.
     pub const MAX_FILLS: usize = 500;
 
-    /// Push a price sample IF >= 1s since last. Trims to MAX_SAMPLES.
+    /// Push a price sample. Dedupes consecutive identical prices to
+    /// keep the buffer tight when the book is quiet. Trims to MAX_SAMPLES.
     pub fn push_sample(&mut self, ts_ms: u64, price: Decimal) {
         if price <= Decimal::ZERO {
             return;
         }
-        if ts_ms.saturating_sub(self.last_sample_ms) < 1000 && self.last_sample_ms != 0 {
+        if let Some(&(_, last_price)) = self.samples.last()
+            && last_price == price
+        {
             return;
         }
         self.samples.push((ts_ms, price));
