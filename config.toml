@@ -1,82 +1,178 @@
-# ─── Tide USDC majors-only — MAINNET ─────────────────────────────
+# ─── SpreadScalp on USDC majors — MAINNET ──────────────────────────────────
 #
-# USDC-margined perpetuals, restricted to bigger crypto markets.
-# Uses /fapi/v1/* (same as USDT-M, only quote-asset filter changes).
+# 11 fixed bots — knob set copied from `config/spread-scalp.majors.toml`
+# (testnet winner). Per its header note, mainnet majors spread is 0.5-2 bps
+# vs testnet's 5-20, so min_spread_bps below WILL gate most of the time on
+# tight markets — accepting low fill rate to avoid adverse-selection drag.
 #
-# Why this set?
-#   - USDC promo = 0 bps maker (verify at binance.com/en/fee/futureFee).
-#     Full min_self_spread_bps becomes net profit per RT.
-#   - Majors have the deepest USDC books → fewer adverse-selection
-#     surprises than the long-tail USDC perps.
-#   - Liquidity ensures fills actually happen (USDC perps are much
-#     thinner than USDT equivalents).
+# Removed: take_profit_bps, stop_loss_bps, adverse_window_ms (EMA),
+# strict_touch_quotes. A/B testing showed TP/SL/adverse-EMA flipped
+# sign-negative. Time+drift adverse-stop replaces the EMA tracker.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
 #   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
-#   3. Funded USDC balance in Futures wallet (NOT USDT)
-#   4. Confirm USDC maker fee still 0 bps
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tide-usdc-majors"
+state_dir = "./state/spread-scalp-usdc-v2"
+asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-[tide_auto]
-enabled = true
-quote_asset = "USDC"
+# ─── BTCUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# Allowlist: ONLY these symbols spawn. When set, min_tick_bps +
-# min_volume_usdt filters are BYPASSED — operator chose these
-# explicitly and min_self_spread_bps below synthesizes the required
-# spread regardless of natural book width.
-symbols_allowlist = [
-  "1000PEPEUSDC",
-  "1000SHIBUSDC",
-  "ADAUSDC",
-  "ARBUSDC",
-  "AVAXUSDC",
-  "BNBUSDC",
-  "BTCUSDC",
-  "DOGEUSDC",
-  "ETHUSDC",
-  "LINKUSDC",
-  "SOLUSDC",
-  "SUIUSDC",
-  "WIFUSDC",
-  "WLDUSDC",
-  "XRPUSDC",
-]
+# ─── ETHUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ETHUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# Ignored when symbols_allowlist set, but kept for reference if
-# you remove the allowlist and want free discovery.
-min_tick_bps = "0"
-min_volume_usdt = "5000000"
+# ─── BNBUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BNBUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-recheck_interval_secs = 60
+# ─── SOLUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "SOLUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# 8 bps min spread = ~5 bps net edge at 0-bps-maker promo rates.
-# Tighter than USDT config because USDC fee saving lets us be more
-# aggressive on the spread.
-min_self_spread_bps = 10
+# ─── XRPUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "XRPUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# Smaller grid — thinner USDC books mean less safe inventory accumulation.
-grid_levels = 1
+# ─── DOGEUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "DOGEUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# 0 = DISABLED. Grid-only mode: filled orders are not paired with
-# close orders. Position drains via grid maintenance on the opposite
-# side instead. Set > 0 to re-enable close-on-fill at N bps.
-close_profit_bps = 0
+# ─── ADAUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ADAUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
-# Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick
-# spacing piles dozens of orders within sub-bps. 4 bps gives
-# meaningful fill independence between levels.
-grid_step_bps = 10
+# ─── AVAXUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "AVAXUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
 
-# Adaptive bps walk-in/out. When fills-per-minute < 1, tighten
-# min_self_spread_bps and grid_step_bps by 1 every 60s (floor 1).
-# When fpm >= 1, walk back out to the baseline values above. Default ON.
-adaptive_bps_enabled = false
+# ─── LINKUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "LINKUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
+
+# ─── SUIUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "SUIUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true
+
+# ─── ARBUSDC ───────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ARBUSDC"
+strategy = "spread-scalp"
+[bot.spread_scalp]
+min_spread_bps = 0
+quote_offset_ticks = 0
+requote_interval_ms = 500
+reject_cooldown_ms = 500
+price_tolerance_ticks = 1
+adverse_stop_after_secs = 120
+adverse_stop_drift_bps = 30
+close_side_always_quotes = true

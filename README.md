@@ -144,11 +144,11 @@ imbalance configs, plus BNB-discount variants) and prints a `fills`,
 
 ### Sample config — `config.toml`
 
-The repo's [`config.toml`](./config.toml) is a profitable Tide setting for
-Binance USD-M perp futures, USDC-margined. Allowlists 15 USDC perps, grid-only
-mode (`close_profit_bps = 0`), bounded `grid_levels = 3` per side with
-frozen-lattice pruning so the resting book stays clean. Re-read the warning
-above before pointing it at real funds.
+The repo's [`config.toml`](./config.toml) is a SpreadScalp setting for Binance
+USD-M perp futures, USDC-margined (0 bps maker promo). 11 fixed bots across USDC
+majors, joining touch on any positive spread, with a 120s+30bps adverse-stop as
+the only risk control (TP/SL/EMA disabled — A/B testing flipped them negative).
+Re-read the warning above before pointing it at real funds.
 
 ### Run live (testnet first!)
 
