@@ -7,10 +7,13 @@
 //!    place an opposite-side order at `P ± 1 tick` (the 1-tick profit
 //!    target for that just-opened position).
 //!
-//! **NEVER cancels.** Each placed order is left alone until it fills
-//! or is canceled externally. Stale orders just sit in the book
-//! (post-only, no fee while resting). This means inventory CAN grow
-//! unbounded if the market trends — there's no cap or stop.
+//! **Lattice-window pruning.** Each event computes a `grid_levels`-wide
+//! activation window on each side, snapped to the lattice. Orders
+//! outside the window are cancelled — the resting book stays bounded
+//! to ≤ `grid_levels` slots per side. Inventory still grows if one
+//! side fills faster than the other (operator owns position risk via
+//! `max_position_usdt`), but stale far-side orders no longer
+//! accumulate across regimes.
 //!
 //! Suited to wide-tick perps where `tick_bps > 2 × maker_fee_bps` so
 //! each completed round-trip clears fees. See ESPORTS (~20bps tick).
@@ -545,6 +548,75 @@ impl Strategy for Tide {
                     actions.push(self.emit(ctx.symbol, Side::Ask, p));
                 }
                 price += step;
+            }
+        }
+
+        // Window prune. Cancel any open order on either side whose
+        // price falls outside the active `grid_levels`-wide window
+        // for that side. Keeps the resting book bounded to ≤ levels
+        // per side; orders from earlier book regimes don't accumulate
+        // as the lattice activation slides with price.
+        //
+        // Window definition (mirrors the emit walks above):
+        //   BID: [slot_top − (levels−1)·step, slot_top]
+        //   ASK: [slot_top, slot_top + (levels−1)·step]
+        // where slot_top is the highest-permitted lattice slot for
+        // that side after min_self_spread + cross-guard, snapped to
+        // lattice via floor (BID) / ceil (ASK).
+        if lattice_ready
+            && let Some(step) = self.lattice_step
+            && step > Decimal::ZERO
+        {
+            let outward = Decimal::from(levels.saturating_sub(1)) * step;
+            if let (Some(bid_origin), Some(top_b)) =
+                (self.bid_lattice_origin, top_bid_override)
+                && tick > Decimal::ZERO
+            {
+                let mut top_cap = top_b.0;
+                if let Some(ap) = best_ask
+                    && ap.0 > Decimal::ZERO
+                {
+                    let max_bid = ap.0 - tick;
+                    if top_cap > max_bid {
+                        top_cap = max_bid;
+                    }
+                }
+                let n_top = ((top_cap - bid_origin) / step).floor();
+                let slot_top = bid_origin + n_top * step;
+                let window_low = slot_top - outward;
+                let window_high = slot_top;
+                for (id, q) in ctx.open_quotes {
+                    if q.side == Side::Bid
+                        && (q.price.0 < window_low || q.price.0 > window_high)
+                    {
+                        actions.push(Action::Cancel(*id));
+                    }
+                }
+            }
+            if let (Some(ask_origin), Some(top_a)) =
+                (self.ask_lattice_origin, top_ask_override)
+                && tick > Decimal::ZERO
+            {
+                let mut top_cap = top_a.0;
+                if let Some(bp) = best_bid
+                    && bp.0 > Decimal::ZERO
+                {
+                    let min_ask = bp.0 + tick;
+                    if top_cap < min_ask {
+                        top_cap = min_ask;
+                    }
+                }
+                let n_top = ((top_cap - ask_origin) / step).ceil();
+                let slot_top = ask_origin + n_top * step;
+                let window_low = slot_top;
+                let window_high = slot_top + outward;
+                for (id, q) in ctx.open_quotes {
+                    if q.side == Side::Ask
+                        && (q.price.0 < window_low || q.price.0 > window_high)
+                    {
+                        actions.push(Action::Cancel(*id));
+                    }
+                }
             }
         }
 
