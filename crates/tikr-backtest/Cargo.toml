@@ -29,6 +29,10 @@ name = "backtest_klines"
 path = "src/bin/backtest_klines.rs"
 
 [[bin]]
+name = "backtest_rsi_mr"
+path = "src/bin/backtest_rsi_mr.rs"
+
+[[bin]]
 name = "backtest_bands"
 path = "src/bin/backtest_bands.rs"
 
