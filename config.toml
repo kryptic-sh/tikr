@@ -60,7 +60,7 @@ recheck_interval_secs = 60
 # 8 bps min spread = ~5 bps net edge at 0-bps-maker promo rates.
 # Tighter than USDT config because USDC fee saving lets us be more
 # aggressive on the spread.
-min_self_spread_bps = 20
+min_self_spread_bps = 10
 
 # Smaller grid — thinner USDC books mean less safe inventory accumulation.
 grid_levels = 1

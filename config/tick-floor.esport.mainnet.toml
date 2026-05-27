@@ -9,7 +9,7 @@
 #   - Entry  side: `top.bid − N×tick` / `top.ask + N×tick`
 #   - Close  side: max(`avg_entry + M×tick`, touch) for long-close
 #                  min(`avg_entry − M×tick`, touch) for short-close
-#   - `close_target_ticks = 1` → auto = `quote_offset_ticks + 1`
+#   - `close_target_ticks = 0` → auto = `quote_offset_ticks + 1`
 #     so a symmetric (2N+1)-tick RT is the natural exit
 #
 # Expected per-RT gross spread (N=offset, M=close_target):
@@ -52,7 +52,7 @@ state_dir = "./state/tick-floor"
 # Credentials: .env auto-loaded by dotenvy, OR shell env vars
 # TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET.
 
-order_balance_pct = "1"
+order_balance_pct = "2"
 max_position_pct = "100"
 leverage = 5
 
@@ -88,13 +88,13 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 0           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
+close_side_always_quotes = true
+strict_touch_quotes = true
 
 # # Adverse stop scaled to symbol tick.
 # adverse_stop_after_secs = 120
@@ -124,15 +124,13 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 45
+close_side_always_quotes = true
+strict_touch_quotes = true
 
 
 # ─── FILUSDT ──────────────────────────────────────────────────────────────
@@ -142,15 +140,13 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 40
+close_side_always_quotes = true
+strict_touch_quotes = true
 
 
 # ─── ARBUSDT ──────────────────────────────────────────────────────────────
@@ -160,15 +156,13 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 36
+close_side_always_quotes = true
+strict_touch_quotes = true
 
 
 # ─── DOTUSDT ──────────────────────────────────────────────────────────────
@@ -178,15 +172,13 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 31
+close_side_always_quotes = true
+strict_touch_quotes = true
 
 
 # ─── OPUSDT ───────────────────────────────────────────────────────────────
@@ -196,15 +188,13 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
+close_side_always_quotes = true
+strict_touch_quotes = true
 
 
 # ─── ERAUSDT ──────────────────────────────────────────────────────────────
@@ -214,16 +204,10 @@ strategy = "spread-scalp"
 
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 1           # 1 tick outside touch (avoids -5022)
-close_target_ticks = 1           # close at avg ± 1 tick (1-tick RT min)
-requote_interval_ms = 500
+quote_offset_ticks = 1          # 1 tick outside touch (avoids -5022)
+close_target_ticks = 1          # close at avg ± 1 tick (1-tick RT min)
+requote_interval_ms = 5000
 reject_cooldown_ms = 250
 price_tolerance_ticks = 1
-close_side_always_quotes = false
-strict_touch_quotes = false
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 29
-
-
-# ATOMUSDT removed (4.49 bps tick — below 5bps floor)
-# RENDERUSDT removed (4.21 bps tick)
+close_side_always_quotes = true
+strict_touch_quotes = true

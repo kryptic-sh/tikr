@@ -1,11 +1,7 @@
 # ─── SpreadScalp on USDC majors — MAINNET ──────────────────────────────────
 #
-# 14 fixed bots — same symbol list as config/tide.usdc.mainnet.toml.
-#
-# USDC-specific overrides:
-#   min_spread_bps    = 0   (USDC promo = 0 maker fee, no fee floor)
-#   quote_offset_ticks = 0  (USDC majors run 1-tick books; legacy
-#                            inside-touch quoting would cross)
+# 15 fixed bots — same symbol list as the main config.toml USDC allowlist.
+# USDC promo (0 bps maker) — no fee floor → min_spread_bps = 0.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
@@ -17,10 +13,11 @@
 env = "futures-mainnet"
 state_dir = "./state/spread-scalp-usdc"
 asset = "USDC"
+# 0.5% per order × 15 bots = 7.5% per round trip if all fire at once.
 order_balance_pct = "0.5"
+# Per-bot peak-position cap = 100% wallet / bot_count (auto-split).
 max_position_pct = "100"
 leverage = 5
-
 
 # ─── BTCUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -28,14 +25,16 @@ symbol = "BTCUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── ETHUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -43,14 +42,16 @@ symbol = "ETHUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── BNBUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -58,14 +59,16 @@ symbol = "BNBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── SOLUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -73,14 +76,16 @@ symbol = "SOLUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── XRPUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -88,14 +93,16 @@ symbol = "XRPUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── DOGEUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -103,14 +110,16 @@ symbol = "DOGEUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── ADAUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -118,14 +127,16 @@ symbol = "ADAUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── AVAXUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -133,14 +144,16 @@ symbol = "AVAXUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── LINKUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -148,14 +161,16 @@ symbol = "LINKUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── SUIUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -163,14 +178,16 @@ symbol = "SUIUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── 1000PEPEUSDC ──────────────────────────────────────────────────────────
 [[bot]]
@@ -178,14 +195,16 @@ symbol = "1000PEPEUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── 1000SHIBUSDC ──────────────────────────────────────────────────────────
 [[bot]]
@@ -193,14 +212,16 @@ symbol = "1000SHIBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── WIFUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -208,14 +229,16 @@ symbol = "WIFUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── WLDUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -223,14 +246,16 @@ symbol = "WLDUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
-
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
 
 # ─── ARBUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
@@ -238,10 +263,13 @@ symbol = "ARBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
-close_target_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+take_profit_bps = 5
+stop_loss_bps = 30
+close_side_always_quotes = true
+adverse_window_ms = 60000
+adverse_half_life_fills = 20
+adverse_threshold_bps = "2"
+adverse_max_widen_bps = 10
