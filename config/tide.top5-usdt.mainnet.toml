@@ -50,9 +50,9 @@ min_self_spread_bps = 20
 # a fast move before all slots fill on one side.
 grid_levels = 6
 
-# 0 = grid-only mode. Filled orders rely on the opposite-side ladder
-# to catch the rebound (no dedicated close-on-fill emit).
-close_profit_bps = 0
+# Close-on-fill at +30 bps of fill price (snapped to tick, min 1 tick).
+# Matches the historic touch-refill profitable-era setting.
+close_profit_bps = 30
 
 # 10 bps between lattice slots. Frozen at first event; subsequent
 # adaptive_bps walks do NOT re-step the lattice.
