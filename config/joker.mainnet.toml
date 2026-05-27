@@ -1,16 +1,16 @@
-# ─── Joker on mixed USDC + USDT majors — MAINNET ──────────────────────────
+# ─── Joker on mixed USDC + USDC majors — MAINNET ──────────────────────────
 #
 # 4 bots running the Joker strategy: join touch on every event, dedupe
 # by exact same-side same-price match, never cancel. No close-on-fill,
 # no grid, no inventory cap inside the strategy.
 #
 # Best suited to USDC promo (0 bps maker) where any fill at touch
-# captures pure spread with no cost floor. USDT bots pay 2 bps maker.
+# captures pure spread with no cost floor. USDC bots pay 2 bps maker.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
 #   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
-#   3. Funded USDC AND USDT balance in Futures wallet (mixed)
+#   3. Funded USDC AND USDC balance in Futures wallet (mixed)
 
 [account]
 env = "futures-mainnet"
@@ -38,18 +38,18 @@ max_order_age_secs = 10
 order_tick_offset = 1
 order_tick_tolerance = 5
 
-# ─── BNBUSDT (USDT tier-0, 2 bps maker) ────────────────────────────────────
+# ─── BNBUSDC (USDC tier-0, 2 bps maker) ────────────────────────────────────
 [[bot]]
-symbol = "BNBUSDT"
+symbol = "BNBUSDC"
 strategy = "joker"
 [bot.joker]
 max_order_age_secs = 10
 order_tick_offset = 1
 order_tick_tolerance = 5
 
-# ─── DOGEUSDT (USDT tier-0, 2 bps maker) ───────────────────────────────────
+# ─── DOGEUSDC (USDC tier-0, 2 bps maker) ───────────────────────────────────
 [[bot]]
-symbol = "DOGEUSDT"
+symbol = "DOGEUSDC"
 strategy = "joker"
 [bot.joker]
 max_order_age_secs = 10
