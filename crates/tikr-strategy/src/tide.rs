@@ -208,12 +208,7 @@ impl Tide {
     fn would_self_cross(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> bool {
         match side {
             Side::Ask => {
-                if self
-                    .pending_bid_prices
-                    .range(price.0..)
-                    .next()
-                    .is_some()
-                {
+                if self.pending_bid_prices.range(price.0..).next().is_some() {
                     return true;
                 }
                 ctx.open_quotes
@@ -451,8 +446,7 @@ impl Strategy for Tide {
         {
             let mid = (top_b.0 + top_a.0) / Decimal::from(2);
             let step = if self.config.grid_step_bps > 0 {
-                let target =
-                    mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+                let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
                 if target > tick {
                     (target / tick).ceil() * tick
                 } else {
@@ -567,8 +561,7 @@ impl Strategy for Tide {
             && step > Decimal::ZERO
         {
             let outward = Decimal::from(levels.saturating_sub(1)) * step;
-            if let (Some(bid_origin), Some(top_b)) =
-                (self.bid_lattice_origin, top_bid_override)
+            if let (Some(bid_origin), Some(top_b)) = (self.bid_lattice_origin, top_bid_override)
                 && tick > Decimal::ZERO
             {
                 let mut top_cap = top_b.0;
@@ -589,8 +582,7 @@ impl Strategy for Tide {
                     }
                 }
             }
-            if let (Some(ask_origin), Some(top_a)) =
-                (self.ask_lattice_origin, top_ask_override)
+            if let (Some(ask_origin), Some(top_a)) = (self.ask_lattice_origin, top_ask_override)
                 && tick > Decimal::ZERO
             {
                 let mut top_cap = top_a.0;
