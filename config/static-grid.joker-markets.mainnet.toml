@@ -26,45 +26,33 @@ leverage = 5
 symbol = "ETHUSDC"
 strategy = "static-grid"
 [bot.sg]
-levels = 3
-inner_bps = 1
-step_bps = 5
-auto_skew = true
-regime_window_secs = 300
-regime_efficiency_threshold = "0.3"
+levels = 2
+inner_bps = 3
+step_bps = 1
 
 # ─── ZECUSDC (USDC promo, 0 bps maker, wide-tick) ──────────────────────────
 [[bot]]
 symbol = "ZECUSDC"
 strategy = "static-grid"
 [bot.sg]
-levels = 3
-inner_bps = 1
-step_bps = 5
-auto_skew = true
-regime_window_secs = 300
-regime_efficiency_threshold = "0.3"
+levels = 2
+inner_bps = 3
+step_bps = 1
 
 # ─── BNBUSDC (USDC tier-0, 2 bps maker) ────────────────────────────────────
 [[bot]]
 symbol = "BNBUSDC"
 strategy = "static-grid"
 [bot.sg]
-levels = 3
-inner_bps = 1
-step_bps = 5
-auto_skew = true
-regime_window_secs = 300
-regime_efficiency_threshold = "0.3"
+levels = 2
+inner_bps = 3
+step_bps = 1
 
 # ─── DOGEUSDC (USDC tier-0, 2 bps maker) ───────────────────────────────────
 [[bot]]
 symbol = "DOGEUSDC"
 strategy = "static-grid"
 [bot.sg]
-levels = 3
-inner_bps = 1
-step_bps = 5
-auto_skew = true
-regime_window_secs = 300
-regime_efficiency_threshold = "0.3"
+levels = 2
+inner_bps = 3
+step_bps = 1
