@@ -46,7 +46,7 @@ order_balance_pct = "1.5"
 
 # Per-bot position cap as % of margin balance. Overrides
 # `max_position_usdt` in the bot strategy block unless set explicitly.
-max_position_pct = "5"
+max_position_pct = "100"
 
 
 # ─── Rotator ───────────────────────────────────────────────────────────────
@@ -64,11 +64,11 @@ enabled = true
 slots = 4
 refresh_secs = 300
 quote_asset = "USDT"
-min_quote_volume = 100000000
+# min_quote_volume = 100000000
 # Only spawn on symbols where tick_size / price × 10000 ≥ N bps.
 # Ensures each round-trip clears USDT-M maker fees (~3.6 bps BNB-discounted
 # RT) with edge to spare. `0` (default) disables the filter.
-min_tick_bps = 6
+min_tick_bps = 4
 
 # Optional allow-list. Empty (default) = scan all USDT futures symbols
 # above min_quote_volume. Curate to symbols with tick_bps >= 1.0 so the
@@ -103,7 +103,7 @@ strategy = "spread-scalp"
 # `notional` and `max_position_usdt` left UNSET — auto-derived from
 # account.order_balance_pct + account.max_position_pct per refresh tick.
 
-min_spread_bps = 8
+min_spread_bps = 5
 # 0 = join touch directly. Legacy -1 (1 tick INSIDE touches) breaks on
 # very wide-tick markets where some symbols have ticks of 20-28 bps —
 # sitting 1 tick inside would either cross the venue book or sit so deep
