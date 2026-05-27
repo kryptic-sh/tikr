@@ -242,6 +242,13 @@ impl Strategy for Tide {
                 break;
             }
         }
+        // Seed the adaptation clock to the first observed timestamp so
+        // the initial 60s window measures from process start, not from
+        // the unix epoch (otherwise the first event always trips the
+        // `>= 60_000` gate and walks bps before any fills can land).
+        if self.last_adapt_ms == 0 {
+            self.last_adapt_ms = now_ms;
+        }
         if self.config.adaptive_bps_enabled && now_ms.saturating_sub(self.last_adapt_ms) >= 60_000 {
             self.last_adapt_ms = now_ms;
             let fpm = self.fill_ts_window.len() as u32;
