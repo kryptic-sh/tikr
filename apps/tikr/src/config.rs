@@ -261,6 +261,22 @@ pub struct BotConfig {
     /// Tide params (only honored when `strategy = "tide"`).
     #[serde(default)]
     pub tide: Option<TideParams>,
+    /// Joker params (only honored when `strategy = "joker"`).
+    #[serde(default)]
+    pub joker: Option<JokerParams>,
+}
+
+/// Joker — join touch, dedupe by exact price, never cancel.
+/// `step_size` / `tick_size` / `min_notional` come from venue
+/// exchangeInfo. Nothing else to tune.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct JokerParams {
+    /// Per-order notional in quote currency. When omitted, the
+    /// account-derived default applies
+    /// (`account.order_balance_pct × wallet / bots`).
+    #[serde(default)]
+    pub notional: Option<Decimal>,
 }
 
 /// Tide — minimal at-touch MM with optional N-tick grid depth.

@@ -12,11 +12,11 @@ use std::sync::{Arc, RwLock};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, Hydra, HydraConfig,
-    LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
-    MicroMeanReversion, MicroMeanReversionConfig, SimpleGap, SimpleGapConfig, SpreadScalp,
-    SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, Tide, TideConfig, TopOfBook,
-    TopOfBookConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, Hydra, HydraConfig, Joker,
+    JokerConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade,
+    LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig, SimpleGap, SimpleGapConfig,
+    SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, Tide, TideConfig,
+    TopOfBook, TopOfBookConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -58,6 +58,8 @@ pub enum StrategyChoice {
     Hydra(HydraConfig),
     /// [`Tide`] — minimal at-touch both-sided MM, refill on fill.
     Tide(TideConfig),
+    /// [`Joker`] — join touch, dedupe by exact price, never cancel.
+    Joker(JokerConfig),
 }
 
 impl StrategyChoice {
@@ -76,6 +78,7 @@ impl StrategyChoice {
             Self::LiqFade(_) => "liq-fade",
             Self::Hydra(_) => "hydra",
             Self::Tide(_) => "tide",
+            Self::Joker(_) => "joker",
         }
     }
 }
@@ -364,6 +367,23 @@ where
                 }
                 StrategyChoice::Tide(cfg) => {
                     let strategy = Tide::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
+                    )
+                    .await
+                }
+                StrategyChoice::Joker(cfg) => {
+                    let strategy = Joker::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,

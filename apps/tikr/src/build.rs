@@ -10,8 +10,8 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
-    HydraConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MicroMeanReversionConfig,
-    SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, TideConfig,
+    HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig,
+    MicroMeanReversionConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, TideConfig,
 };
 use tokio::sync::watch;
 
@@ -75,9 +75,10 @@ pub fn to_spec(
             max_position_usdt_default,
         )?,
         "tide" | "td" => build_tide(cfg, &symbol, venue, default_notional)?,
+        "joker" | "jk" => build_joker(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker)"
             ));
         }
     };
@@ -175,6 +176,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         // Hydra: notional is wallet-derived only — no per-bot override.
         "hydra" | "hd" | "hy" => Ok(None),
         "tide" | "td" => Ok(cfg.tide.as_ref().and_then(|p| p.notional)),
+        "joker" | "jk" => Ok(cfg.joker.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -198,7 +200,9 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "micro-mean-reversion"
         | "mmr"
         | "tide"
-        | "td" => None,
+        | "td"
+        | "joker"
+        | "jk" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -214,6 +218,7 @@ fn per_bot_state_dir(base: &std::path::Path, symbol: &str) -> PathBuf {
 fn max_open_orders_for(cfg: &BotConfig) -> usize {
     match cfg.strategy.as_str() {
         "tide" | "td" => 0,
+        "joker" | "jk" => 0,
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
@@ -381,6 +386,25 @@ fn build_tide(
         grid_step_bps,
         max_position_usdt: Decimal::ZERO,
         adaptive_bps_enabled,
+    }))
+}
+
+fn build_joker(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let notional_override = cfg.joker.as_ref().and_then(|p| p.notional);
+    let notional = autobump_notional(notional_override.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::Joker(JokerConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
     }))
 }
 
