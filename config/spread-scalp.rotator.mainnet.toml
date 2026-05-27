@@ -75,17 +75,17 @@ min_tick_bps = 6
 # 8bps trigger has natural cascade events to capture (per 2026-05-25
 # probe of mainnet alts).
 candidates = [
-    # "DOGEUSDT",    # confirmed winner — 0.97bps tick, 279M vol
-    # "NEARUSDT",    # 3.62bps tick, 777M vol, +14.7% / 20.9% range
-    # "SUIUSDT",     # 0.95bps tick, 213M vol
-    # "ONDOUSDT",    # 2.30bps tick, 177M vol
-    # "NILUSDT",     # 1.14bps tick, 359M vol, high volatility
-    # "INJUSDT",     # 1.74bps tick, 114M vol, +10% / 14% range
-    # "WLDUSDT",     # 3.27bps tick, 133M vol
-    # "1000SHIBUSDT", # 1.78bps tick, 26M vol (borderline)
-    # "ADAUSDT",     # 4.08bps tick, 122M vol (wide tick)
-    # "AVAXUSDT",    # 1.06bps tick, 92M vol
-    # "LINKUSDT",    # 1.04bps tick, 82M vol
+  # "DOGEUSDT",    # confirmed winner — 0.97bps tick, 279M vol
+  # "NEARUSDT",    # 3.62bps tick, 777M vol, +14.7% / 20.9% range
+  # "SUIUSDT",     # 0.95bps tick, 213M vol
+  # "ONDOUSDT",    # 2.30bps tick, 177M vol
+  # "NILUSDT",     # 1.14bps tick, 359M vol, high volatility
+  # "INJUSDT",     # 1.74bps tick, 114M vol, +10% / 14% range
+  # "WLDUSDT",     # 3.27bps tick, 133M vol
+  # "1000SHIBUSDT", # 1.78bps tick, 26M vol (borderline)
+  # "ADAUSDT",     # 4.08bps tick, 122M vol (wide tick)
+  # "AVAXUSDT",    # 1.06bps tick, 92M vol
+  # "LINKUSDT",    # 1.04bps tick, 82M vol
 ]
 
 
@@ -104,10 +104,12 @@ strategy = "spread-scalp"
 # account.order_balance_pct + account.max_position_pct per refresh tick.
 
 min_spread_bps = 8
-# -1 (default) = 1 tick INSIDE touches — captures cascade widenings,
-# needs book ≥ 2 ticks wide. Wide-tick markets (min_tick_bps ≥ 6) sit
-# wide most of the time so legacy -1 is fine and gives extra edge per RT.
-quote_offset_ticks = -1
+# 0 = join touch directly. Legacy -1 (1 tick INSIDE touches) breaks on
+# very wide-tick markets where some symbols have ticks of 20-28 bps —
+# sitting 1 tick inside would either cross the venue book or sit so deep
+# the close-side never fires. 0 is the safe universal pick for rotator
+# discovery.
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
