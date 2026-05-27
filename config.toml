@@ -34,8 +34,7 @@ quote_asset = "USDC"
 # spread regardless of natural book width.
 symbols_allowlist = [
   "ETHUSDC",
-  "BNBUSDC",
-  "DOGEUSDC",
+  "BTCUSDC",
 ]
 
 # Ignored when symbols_allowlist set, but kept for reference if
@@ -48,21 +47,21 @@ recheck_interval_secs = 60
 # 8 bps min spread = ~5 bps net edge at 0-bps-maker promo rates.
 # Tighter than USDT config because USDC fee saving lets us be more
 # aggressive on the spread.
-min_self_spread_bps = 1
+min_self_spread_bps = 10
 
 # Smaller grid — thinner USDC books mean less safe inventory accumulation.
-grid_levels = 2
+grid_levels = 3
 
 # 0 = DISABLED. Grid-only mode: filled orders are not paired with
 # close orders. Position drains via grid maintenance on the opposite
 # side instead. Set > 0 to re-enable close-on-fill at N bps.
-close_profit_bps = 5
+close_profit_bps = 30
 
 # Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
 # Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick
 # spacing piles dozens of orders within sub-bps. 4 bps gives
 # meaningful fill independence between levels.
-grid_step_bps = 1
+grid_step_bps = 10
 
 # Adaptive bps walk-in/out. When fills-per-minute < 1, tighten
 # min_self_spread_bps and grid_step_bps by 1 every 60s (floor 1).
