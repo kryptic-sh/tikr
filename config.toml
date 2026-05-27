@@ -40,6 +40,17 @@ symbols_allowlist = [
   "ARBUSDC",   #  9.20 bps
   "ADAUSDC",   #  4.17 bps
   "NEARUSDC",  #  4.01 bps
+  # Volume-leader majors. Tighter tick, but deep books absorb
+  # inventory and high fill rate compounds the per-RT edge.
+  "BTCUSDC",
+  "ETHUSDC",
+  "SOLUSDC",
+  "ZECUSDC",
+  "XRPUSDC",
+  "WLDUSDC",
+  "BNBUSDC",
+  "DOGEUSDC",
+  "SUIUSDC",
 ]
 
 # Ignored when symbols_allowlist set, but kept for reference if
@@ -52,7 +63,7 @@ recheck_interval_secs = 60
 # 8 bps min spread = ~5 bps net edge at 0-bps-maker promo rates.
 # Tighter than USDT config because USDC fee saving lets us be more
 # aggressive on the spread.
-min_self_spread_bps = 1
+min_self_spread_bps = 2
 
 # Smaller grid — thinner USDC books mean less safe inventory accumulation.
 grid_levels = 3
