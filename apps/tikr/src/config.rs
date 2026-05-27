@@ -277,6 +277,12 @@ pub struct JokerParams {
     /// (`account.order_balance_pct × wallet / bots`).
     #[serde(default)]
     pub notional: Option<Decimal>,
+    /// Cancel any open order older than this many seconds since its
+    /// emit. Forces the joker to refresh its book — stale orders that
+    /// sat through book moves get reaped instead of pinning margin.
+    /// `0` (default) disables the age sweep.
+    #[serde(default)]
+    pub max_order_age_secs: u64,
 }
 
 /// Tide — minimal at-touch MM with optional N-tick grid depth.

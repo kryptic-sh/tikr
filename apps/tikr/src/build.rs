@@ -400,11 +400,17 @@ fn build_joker(
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    let max_order_age_secs = cfg
+        .joker
+        .as_ref()
+        .map(|p| p.max_order_age_secs)
+        .unwrap_or(0);
     Ok(StrategyChoice::Joker(JokerConfig {
         notional_per_order: notional,
         tick_size,
         step_size,
         min_notional,
+        max_order_age_secs,
     }))
 }
 

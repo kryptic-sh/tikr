@@ -20,7 +20,11 @@
 //! at `best_bid + tick`, to avoid post-only-would-cross rejections on
 //! 1-tick books.
 
-use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
+use std::collections::HashMap;
+
+use tikr_core::{
+    Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp,
+};
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
@@ -38,11 +42,21 @@ pub struct JokerConfig {
     pub step_size: Decimal,
     /// Venue min order notional in quote currency.
     pub min_notional: Decimal,
+    /// Cancel any open order older than this many seconds since its emit.
+    /// Forces the joiner to keep its book fresh — stale orders that sat
+    /// through book moves get reaped instead of pinning margin. `0`
+    /// disables the age sweep (orders rest forever).
+    pub max_order_age_secs: u64,
 }
 
-/// Pure joker (join-the-touch) state. No fields — strategy is stateless.
+/// Joker (join-the-touch) state. Tracks emit timestamps per (side, price)
+/// so the on_event loop can cancel orders older than `MAX_ORDER_AGE_SECS`.
 pub struct Joker {
     config: JokerConfig,
+    /// `(side, price.0) → ts (ns) at emit`. Inserted on every emit;
+    /// removed when the corresponding open quote disappears (filled
+    /// or cancelled). Used to gate the age-based cancel pass.
+    placement_ts: HashMap<(Side, Decimal), Timestamp>,
 }
 
 impl Joker {
@@ -87,7 +101,10 @@ impl Strategy for Joker {
     type Config = JokerConfig;
 
     fn new(config: Self::Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            placement_ts: HashMap::new(),
+        }
     }
 
     fn name(&self) -> &str {
@@ -99,6 +116,33 @@ impl Strategy for Joker {
         let tick = self.config.tick_size;
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
+
+        // Age-based cancel sweep. For every open quote, look up its emit
+        // timestamp in `placement_ts`; if older than `max_order_age_secs`,
+        // emit Cancel(id) and drop the tracker entry. Quotes we have no
+        // record of (orphans from a prior session) are left alone.
+        let max_age_secs = self.config.max_order_age_secs;
+        if max_age_secs > 0 {
+            let max_age_ns = max_age_secs.saturating_mul(1_000_000_000);
+            let now_ns = ctx.now.0;
+            let open_keys: std::collections::HashSet<(Side, Decimal)> = ctx
+                .open_quotes
+                .iter()
+                .map(|(_, q)| (q.side, q.price.0))
+                .collect();
+            // Drop tracker entries that no longer have a matching open
+            // quote (filled, externally cancelled).
+            self.placement_ts.retain(|k, _| open_keys.contains(k));
+            for (id, q) in ctx.open_quotes {
+                let key = (q.side, q.price.0);
+                if let Some(ts) = self.placement_ts.get(&key)
+                    && now_ns.saturating_sub(ts.0) > max_age_ns
+                {
+                    actions.push(Action::Cancel(*id));
+                    self.placement_ts.remove(&key);
+                }
+            }
+        }
 
         if let Some(bp) = best_bid
             && bp.0 > Decimal::ZERO
@@ -116,6 +160,7 @@ impl Strategy for Joker {
             }
             if price.0 > Decimal::ZERO && !self.already_at(ctx, Side::Bid, price) {
                 actions.push(self.make_quote(ctx.symbol, Side::Bid, price));
+                self.placement_ts.insert((Side::Bid, price.0), ctx.now);
             }
         }
 
@@ -135,6 +180,7 @@ impl Strategy for Joker {
             }
             if price.0 > Decimal::ZERO && !self.already_at(ctx, Side::Ask, price) {
                 actions.push(self.make_quote(ctx.symbol, Side::Ask, price));
+                self.placement_ts.insert((Side::Ask, price.0), ctx.now);
             }
         }
 
@@ -200,6 +246,7 @@ mod tests {
             tick_size: Decimal::new(1, 1), // 0.1
             step_size: Decimal::new(1, 3), // 0.001
             min_notional: Decimal::from(5),
+            max_order_age_secs: 0,
         }
     }
 
