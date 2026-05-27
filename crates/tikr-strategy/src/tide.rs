@@ -64,11 +64,9 @@ pub struct TideConfig {
     /// sits exactly this many bps away from the fill price (snapped up
     /// to nearest tick, minimum 1 tick) — this is Rule 2.
     ///
-    /// When `0` (default), Rule 2 is disabled and Rule 3
-    /// (shift-on-fill) activates: the grid slides by one step in the
-    /// fill direction per fill (top/bottom extend, opposite end
-    /// cancelled). Drain via opposite-side grid fills instead of
-    /// dedicated close orders.
+    /// When `0` (default), Rule 2 is DISABLED — grid-only mode.
+    /// Filled orders are not paired with dedicated closes; the
+    /// opposite-side Rule 1 ladder catches the rebound.
     pub close_profit_bps: u32,
     /// Spacing between grid levels in bps of mid. Effective spacing =
     /// max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
@@ -104,12 +102,19 @@ pub struct Tide {
     /// `on_event` call.
     pending_bid_prices: BTreeSet<Decimal>,
     pending_ask_prices: BTreeSet<Decimal>,
-    /// Historic deepest BID grid floor. When the book drops, the grid
-    /// extends down to follow it; when it rises, the floor stays put
-    /// (existing deep bids keep resting). `None` until the first event.
-    bid_grid_floor: Option<Decimal>,
-    /// Historic highest ASK grid ceiling — mirror of `bid_grid_floor`.
-    ask_grid_ceiling: Option<Decimal>,
+    /// Frozen grid lattice. Set on first event with a usable book and
+    /// never changes for the bot's lifetime. All BID emits land on
+    /// slots `bid_lattice_origin - k * lattice_step` for non-negative
+    /// integer k; all ASK emits on `ask_lattice_origin + k *
+    /// lattice_step`. Each event we compute the activation window
+    /// (top of book ± levels) and fill any lattice slots inside it
+    /// that don't already have a resting/pending order. Result: the
+    /// resting book sits on a single deterministic price ladder
+    /// forever; adaptive_bps still moves min_self_spread (the
+    /// placement gate) but does NOT re-step the lattice.
+    bid_lattice_origin: Option<Decimal>,
+    ask_lattice_origin: Option<Decimal>,
+    lattice_step: Option<Decimal>,
     /// Adaptive bps state — rolling window of fill timestamps (ms,
     /// truncated to last 60s) for fpm computation, and the last
     /// minute boundary at which we evaluated walk-in/walk-out.
@@ -253,8 +258,9 @@ impl Strategy for Tide {
             baseline_grid_step_bps,
             pending_bid_prices: BTreeSet::new(),
             pending_ask_prices: BTreeSet::new(),
-            bid_grid_floor: None,
-            ask_grid_ceiling: None,
+            bid_lattice_origin: None,
+            ask_lattice_origin: None,
+            lattice_step: None,
             fill_ts_window: std::collections::VecDeque::new(),
             last_adapt_ms: 0,
             pending_retries: Vec::new(),
@@ -366,29 +372,29 @@ impl Strategy for Tide {
             }
         }
 
-        // Rule 1: maintain a grid that extends in both directions as the
-        // book moves. Each side's grid spans from the current touch
-        // outward by at least `grid_levels` ticks, AND keeps any deeper
-        // levels it has accumulated from past book moves.
+        // Rule 1: maintain a deterministic price-ladder grid. Two
+        // anchors (`bid_lattice_origin`, `ask_lattice_origin`) and one
+        // step (`lattice_step`) are frozen on the first event with a
+        // usable book. From then on, every BID emit lands on a slot
+        // `bid_lattice_origin - k × lattice_step` (k ≥ 0) and every
+        // ASK emit on `ask_lattice_origin + k × lattice_step` (k ≥ 0).
         //
-        // - BID floor: min(historic floor, current best_bid − (N−1)×tick).
-        //   When best_bid drops, the floor drops with it (extend down).
-        //   When best_bid rises, the floor stays put (existing deep bids
-        //   keep resting).
-        // - ASK ceiling: max(historic ceiling, current best_ask + (N−1)×tick).
-        //   Mirror behavior for the ask side.
+        // Each event we compute the current placement TOP (after
+        // min_self_spread shift + cross-guard) and fill any lattice
+        // slot in `[top - (levels-1)×step, top]` that does not already
+        // have a resting/pending order and would not self-cross.
+        // Result: orders stay on the same canonical ladder forever;
+        // as the book moves new slots become reachable and we
+        // "fill the gaps" without disturbing the grid.
         //
-        // Then place at every tick from current touch out to the
-        // historic extreme. Existing orders are deduped via
-        // `already_have_order`. Never cancels — stale levels just
-        // sit in the book until they fill.
+        // Never cancels — resting slots outside the current window
+        // keep waiting to be hit.
         let levels = self.config.grid_levels.max(1);
         let tick = self.config.tick_size;
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
 
-        // Per-side cap: when long notional > cap, no more BID emits
-        // (close-side ASK emits still fire). Mirror for shorts.
+        // Per-side cap: when long notional > cap, no more BID emits.
         let pos_size = ctx.position.size.0;
         let cap = self.config.max_position_usdt;
         let mid_for_pos = match (best_bid, best_ask) {
@@ -403,39 +409,10 @@ impl Strategy for Tide {
         let suppress_bids = cap > Decimal::ZERO && pos_notional > cap;
         let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
 
-        // Effective grid step = max(1 tick, ceil(grid_step_bps × mid /
-        // 10000 / tick) × tick). On tight-tick markets, 1-tick spacing
-        // piles dozens of orders within sub-bps; grid_step_bps spaces
-        // them meaningfully apart.
-        let mid_for_step = match (best_bid, best_ask) {
-            (Some(b), Some(a)) if a.0 > b.0 && b.0 > Decimal::ZERO => {
-                (b.0 + a.0) / Decimal::from(2)
-            }
-            (Some(b), _) if b.0 > Decimal::ZERO => b.0,
-            (_, Some(a)) if a.0 > Decimal::ZERO => a.0,
-            _ => Decimal::ZERO,
-        };
-        let step = if self.config.grid_step_bps > 0
-            && mid_for_step > Decimal::ZERO
-            && tick > Decimal::ZERO
-        {
-            let target =
-                mid_for_step * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
-            if target > tick {
-                (target / tick).ceil() * tick
-            } else {
-                tick
-            }
-        } else {
-            tick
-        };
-        let outward = Decimal::from(levels.saturating_sub(1)) * step;
-
         // Min-self-spread enforcement: when the book spread is tighter
-        // than `min_self_spread_bps`, push the grid tops apart so that
-        // top_ask − top_bid ≥ min_self_spread × mid / 10000. Both tops
-        // shift symmetrically around mid, snapped to tick boundaries
-        // (bid floor down, ask ceil up).
+        // than `min_self_spread_bps`, push the placement tops apart so
+        // top_ask − top_bid ≥ min_self_spread × mid / 10000. Snapped
+        // to tick (bid floor, ask ceil).
         let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
             (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
@@ -448,7 +425,6 @@ impl Strategy for Tide {
                 mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
-            // Snap to tick grid: bid floor, ask ceil.
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
             let snapped_ask = (raw_top_ask / tick).ceil() * tick;
             (
@@ -459,34 +435,73 @@ impl Strategy for Tide {
             (best_bid, best_ask)
         };
 
-        if let Some(bp_orig) = best_bid
-            && let Some(bp) = top_bid_override
-            && bp_orig.0 > Decimal::ZERO
+        // Freeze the lattice on the first event with both tops known.
+        // Step = max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
+        // Origins = current top_bid_override / top_ask_override —
+        // future slots descend from / ascend from them in `step`
+        // increments. Recorded once; ignored forever after.
+        if self.lattice_step.is_none()
+            && let (Some(top_b), Some(top_a)) = (top_bid_override, top_ask_override)
+            && top_b.0 > Decimal::ZERO
+            && top_a.0 > top_b.0
             && tick > Decimal::ZERO
+        {
+            let mid = (top_b.0 + top_a.0) / Decimal::from(2);
+            let step = if self.config.grid_step_bps > 0 {
+                let target =
+                    mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+                if target > tick {
+                    (target / tick).ceil() * tick
+                } else {
+                    tick
+                }
+            } else {
+                tick
+            };
+            self.lattice_step = Some(step);
+            self.bid_lattice_origin = Some(top_b.0);
+            self.ask_lattice_origin = Some(top_a.0);
+        }
+
+        let lattice_ready = self.lattice_step.is_some()
+            && self.bid_lattice_origin.is_some()
+            && self.ask_lattice_origin.is_some();
+
+        if lattice_ready
+            && let Some(step) = self.lattice_step
+            && let Some(bid_origin) = self.bid_lattice_origin
+            && let Some(top_b) = top_bid_override
+            && top_b.0 > Decimal::ZERO
+            && tick > Decimal::ZERO
+            && step > Decimal::ZERO
             && !suppress_bids
         {
-            let target_floor = bp.0 - outward;
-            self.bid_grid_floor = Some(match self.bid_grid_floor {
-                Some(f) if f <= target_floor => f,
-                _ => target_floor,
-            });
-            let floor = self.bid_grid_floor.unwrap();
-            // Cross-guard: never emit a BID at or above best_ask
-            // (snapshot may be stale vs current venue book — post-only
-            // would reject with -5022). Cap starting price at best_ask − tick.
-            let mut price = bp.0;
+            // Cross-guard the activation top.
+            let mut top_cap = top_b.0;
             if let Some(ap) = best_ask
                 && ap.0 > Decimal::ZERO
             {
                 let max_bid = ap.0 - tick;
-                if price > max_bid {
-                    price = max_bid;
+                if top_cap > max_bid {
+                    top_cap = max_bid;
                 }
             }
-            let tolerance = step / Decimal::from(2);
-            while price >= floor && price > Decimal::ZERO {
+            // Snap top_cap down onto the lattice: largest slot ≤ top_cap.
+            // k = ceil((bid_origin - top_cap) / step), slot = bid_origin - k*step.
+            // Negative k (top_cap above bid_origin) clamps to 0.
+            let raw_k = (bid_origin - top_cap) / step;
+            let k_top = if raw_k <= Decimal::ZERO {
+                Decimal::ZERO
+            } else {
+                raw_k.ceil()
+            };
+            let mut price = bid_origin - k_top * step;
+            for _ in 0..levels {
+                if price <= Decimal::ZERO {
+                    break;
+                }
                 let p = Price(price);
-                if !self.already_have_order(ctx, Side::Bid, p, tolerance)
+                if !self.already_have_order(ctx, Side::Bid, p, Decimal::ZERO)
                     && !self.would_self_cross(ctx, Side::Bid, p)
                 {
                     actions.push(self.emit(ctx.symbol, Side::Bid, p));
@@ -495,32 +510,35 @@ impl Strategy for Tide {
             }
         }
 
-        if let Some(ap_orig) = best_ask
-            && let Some(ap) = top_ask_override
-            && ap_orig.0 > Decimal::ZERO
+        if lattice_ready
+            && let Some(step) = self.lattice_step
+            && let Some(ask_origin) = self.ask_lattice_origin
+            && let Some(top_a) = top_ask_override
+            && top_a.0 > Decimal::ZERO
             && tick > Decimal::ZERO
+            && step > Decimal::ZERO
             && !suppress_asks
         {
-            let target_ceiling = ap.0 + outward;
-            self.ask_grid_ceiling = Some(match self.ask_grid_ceiling {
-                Some(c) if c >= target_ceiling => c,
-                _ => target_ceiling,
-            });
-            let ceiling = self.ask_grid_ceiling.unwrap();
-            // Cross-guard: never emit ASK at or below best_bid.
-            let mut price = ap.0;
+            let mut top_cap = top_a.0;
             if let Some(bp) = best_bid
                 && bp.0 > Decimal::ZERO
             {
                 let min_ask = bp.0 + tick;
-                if price < min_ask {
-                    price = min_ask;
+                if top_cap < min_ask {
+                    top_cap = min_ask;
                 }
             }
-            let tolerance = step / Decimal::from(2);
-            while price <= ceiling {
+            // Snap top_cap up onto the lattice: smallest slot ≥ top_cap.
+            let raw_k = (top_cap - ask_origin) / step;
+            let k_top = if raw_k <= Decimal::ZERO {
+                Decimal::ZERO
+            } else {
+                raw_k.ceil()
+            };
+            let mut price = ask_origin + k_top * step;
+            for _ in 0..levels {
                 let p = Price(price);
-                if !self.already_have_order(ctx, Side::Ask, p, tolerance)
+                if !self.already_have_order(ctx, Side::Ask, p, Decimal::ZERO)
                     && !self.would_self_cross(ctx, Side::Ask, p)
                 {
                     actions.push(self.emit(ctx.symbol, Side::Ask, p));
