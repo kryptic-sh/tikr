@@ -15,7 +15,7 @@
 [account]
 env = "futures-mainnet"
 state_dir = "./state/joker"
-# Mixed-quote bots — leave asset unset so account-poller uses default.
+asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
