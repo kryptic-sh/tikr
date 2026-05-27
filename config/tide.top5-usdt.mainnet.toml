@@ -44,7 +44,7 @@ recheck_interval_secs = 60
 # 20 bps synthesized spread = ~16 bps net edge at BNB-discounted maker
 # rates (~3.6 bps RT). Wide enough that grid rebounds clear fees plus
 # slippage on tight-tick majors.
-min_self_spread_bps = 20
+min_self_spread_bps = 8
 
 # 6 levels per side — extra depth so each leg of the ladder can absorb
 # a fast move before all slots fill on one side.
@@ -52,7 +52,7 @@ grid_levels = 3
 
 # Close-on-fill at +30 bps of fill price (snapped to tick, min 1 tick).
 # Matches the historic touch-refill profitable-era setting.
-close_profit_bps = 30
+close_profit_bps = 10
 
 # 10 bps between lattice slots. Frozen at first event; subsequent
 # adaptive_bps walks do NOT re-step the lattice.
