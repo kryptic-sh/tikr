@@ -68,7 +68,7 @@ grid_levels = 1
 # 0 = DISABLED. Grid-only mode: filled orders are not paired with
 # close orders. Position drains via grid maintenance on the opposite
 # side instead. Set > 0 to re-enable close-on-fill at N bps.
-close_profit_bps = 30
+close_profit_bps = 0
 
 # Grid spacing in bps of mid (snapped to tick, min 1 tick). Default 4.
 # Tight-tick markets like ETHUSDC have tick ≈ 0.005 bps — 1-tick
