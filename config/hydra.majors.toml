@@ -41,8 +41,9 @@
 #
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
-env = "futures-testnet"
+env = "futures-mainnet"
 state_dir = "./state"
+asset = "USDC"
 
 # 5 bots × 0.5% margin per bot = 2.5% of margin balance deployed per leg.
 # At wallet=$25k that's $125/leg per bot.
@@ -55,20 +56,19 @@ state_dir = "./state"
 # is now 150 (vs prior 50) — pyramid 2+ rarely fires, so the
 # knife-edge cap-arithmetic at 25% notional doesn't matter; the
 # strategy is pure straddle+bracket without pyramid spam.
-order_balance_pct = "2.5"
+order_balance_pct = "2"
 
 # 5 bots × 2% per bot = 10% of margin balance allowed at peak position.
 # Drives `max_position_usdt` for any bot that doesn't set it explicitly:
 #   per_bot_max_pos = wallet × margin_multiplier × max_position_pct / 100 / bots
 # At wallet=$25k, 5 bots → $500/bot peak. Scales linearly with wallet.
-max_position_pct = "10"
+max_position_pct = "100"
 
 # key_file = "./keys/binance-testnet.txt"
 
-
-# ─── BTCUSDT ───────────────────────────────────────────────────────────────
+# ─── BTCUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
-symbol = "BTCUSDT"
+symbol = "ZECUSDC"
 strategy = "hydra"
 
 [bot.hydra]
@@ -83,10 +83,9 @@ add_cooldown_ms = 1000
 pyramid_size_mult = "0.75"
 dca_size_mult = "0.5"
 
-
-# ─── ETHUSDT (disabled) ────────────────────────────────────────────────────
+# # ─── BTCUSDC ───────────────────────────────────────────────────────────────
 # [[bot]]
-# symbol = "ETHUSDT"
+# symbol = "BTCUSDC"
 # strategy = "hydra"
 #
 # [bot.hydra]
@@ -102,9 +101,9 @@ dca_size_mult = "0.5"
 # dca_size_mult = "0.5"
 
 
-# ─── BNBUSDT (disabled) ────────────────────────────────────────────────────
+# ─── ETHUSDC (disabled) ────────────────────────────────────────────────────
 # [[bot]]
-# symbol = "BNBUSDT"
+# symbol = "ETHUSDC"
 # strategy = "hydra"
 #
 # [bot.hydra]
@@ -120,9 +119,9 @@ dca_size_mult = "0.5"
 # dca_size_mult = "0.5"
 
 
-# ─── SOLUSDT (disabled) ────────────────────────────────────────────────────
+# ─── BNBUSDC (disabled) ────────────────────────────────────────────────────
 # [[bot]]
-# symbol = "SOLUSDT"
+# symbol = "BNBUSDC"
 # strategy = "hydra"
 #
 # [bot.hydra]
@@ -138,9 +137,27 @@ dca_size_mult = "0.5"
 # dca_size_mult = "0.5"
 
 
-# ─── DOGEUSDT (disabled) ───────────────────────────────────────────────────
+# ─── SOLUSDC (disabled) ────────────────────────────────────────────────────
 # [[bot]]
-# symbol = "DOGEUSDT"
+# symbol = "SOLUSDC"
+# strategy = "hydra"
+#
+# [bot.hydra]
+# entry_offset_bps = 50
+# pyramid_step_bps = 150
+# pyramid_max_adds = 3
+# dca_step_bps = 60
+# dca_max_adds = 0
+# tp_bps_from_avg = 50
+# sl_bps_from_first = 75
+# add_cooldown_ms = 1000
+# pyramid_size_mult = "0.75"
+# dca_size_mult = "0.5"
+
+
+# ─── DOGEUSDC (disabled) ───────────────────────────────────────────────────
+# [[bot]]
+# symbol = "DOGEUSDC"
 # strategy = "hydra"
 #
 # [bot.hydra]
@@ -162,7 +179,7 @@ dca_size_mult = "0.5"
 # tune.
 #
 # [bot.hydra]
-# notional               # required (per straddle leg + per add, USDT)
+# notional               # required (per straddle leg + per add, USDC)
 # entry_offset_bps = 100 # straddle distance from mid
 # pyramid_step_bps = 50  # favorable-drift band → pyramid add
 # pyramid_max_adds = 2   # 0 disables pyramid arm
