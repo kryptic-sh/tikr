@@ -65,6 +65,10 @@ slots = 4
 refresh_secs = 300
 quote_asset = "USDT"
 min_quote_volume = 100000000
+# Only spawn on symbols where tick_size / price × 10000 ≥ N bps.
+# Ensures each round-trip clears USDT-M maker fees (~3.6 bps BNB-discounted
+# RT) with edge to spare. `0` (default) disables the filter.
+min_tick_bps = 6
 
 # Optional allow-list. Empty (default) = scan all USDT futures symbols
 # above min_quote_volume. Curate to symbols with tick_bps >= 1.0 so the
@@ -100,6 +104,10 @@ strategy = "spread-scalp"
 # account.order_balance_pct + account.max_position_pct per refresh tick.
 
 min_spread_bps = 8
+# -1 (default) = 1 tick INSIDE touches — captures cascade widenings,
+# needs book ≥ 2 ticks wide. Wide-tick markets (min_tick_bps ≥ 6) sit
+# wide most of the time so legacy -1 is fine and gives extra edge per RT.
+quote_offset_ticks = -1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1

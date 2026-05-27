@@ -334,6 +334,15 @@ async fn top_symbols(
         } else {
             Decimal::ZERO
         };
+        // Tick-bps gate: tick_size / mid × 10000. When configured > 0,
+        // exclude symbols whose tick is too tight to absorb maker fees
+        // + spread cost across a round-trip.
+        if cfg.min_tick_bps > Decimal::ZERO && mid > Decimal::ZERO {
+            let tick_bps = filter.tick_size / mid * Decimal::from(10_000);
+            if tick_bps < cfg.min_tick_bps {
+                continue;
+            }
+        }
         if spread_bps < min_spread_bps {
             continue;
         }

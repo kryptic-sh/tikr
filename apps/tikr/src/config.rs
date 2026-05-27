@@ -110,6 +110,13 @@ pub struct ScalpRotationConfig {
     /// Minimum quote volume filter.
     #[serde(default)]
     pub min_quote_volume: Decimal,
+    /// Minimum `tick_bps = tick_size / price × 10000` filter. Symbols
+    /// below this threshold are excluded before volatility ranking.
+    /// `0` (default) = filter disabled. `6` recommended to ensure each
+    /// round-trip clears USDT-M maker fees (~3.6 bps BNB-discounted RT)
+    /// with edge to spare.
+    #[serde(default)]
+    pub min_tick_bps: Decimal,
     /// Optional allow-list. Empty means all matching quote assets.
     #[serde(default)]
     pub candidates: Vec<String>,
