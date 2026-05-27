@@ -35,6 +35,8 @@ quote_asset = "USDC"
 symbols_allowlist = [
   "ETHUSDC",
   "BTCUSDC",
+  "DOGEUSDC",
+  "BNBUSDC",
 ]
 
 # Ignored when symbols_allowlist set, but kept for reference if
