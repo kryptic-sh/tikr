@@ -33,16 +33,13 @@ quote_asset = "USDC"
 # explicitly and min_self_spread_bps below synthesizes the required
 # spread regardless of natural book width.
 symbols_allowlist = [
-  "BTCUSDC",
-  "ETHUSDC",
-  "SOLUSDC",
-  "ZECUSDC",
-  "XRPUSDC",
-  "NEARUSDC",
-  "WLDUSDC",
-  "BNBUSDC",
-  "DOGEUSDC",
-  "SUIUSDC",
+  # Big-tick USDC perps (tick_bps ≥ 4) — wide tick relative to price
+  # means each round-trip clears fees comfortably. Sorted by tick_bps.
+  "WLFIUSDC",  # 17.73 bps
+  "FILUSDC",   #  9.90 bps
+  "ARBUSDC",   #  9.20 bps
+  "ADAUSDC",   #  4.17 bps
+  "NEARUSDC",  #  4.01 bps
 ]
 
 # Ignored when symbols_allowlist set, but kept for reference if
