@@ -283,6 +283,18 @@ pub struct JokerParams {
     /// `0` (default) disables the age sweep.
     #[serde(default)]
     pub max_order_age_secs: u64,
+    /// Tick offset from best. `-1` improve (post in front), `0` join,
+    /// `1+` lag behind by N ticks. Default `0`.
+    #[serde(default)]
+    pub order_tick_offset: i32,
+    /// Skip emit if a same-side resting order sits within this many
+    /// ticks of target. `0` = exact-price dedupe. Default `5`.
+    #[serde(default = "joker_default_order_tick_tolerance")]
+    pub order_tick_tolerance: u32,
+}
+
+fn joker_default_order_tick_tolerance() -> u32 {
+    5
 }
 
 /// Tide — minimal at-touch MM with optional N-tick grid depth.

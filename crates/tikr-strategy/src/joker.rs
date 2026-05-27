@@ -47,6 +47,17 @@ pub struct JokerConfig {
     /// through book moves get reaped instead of pinning margin. `0`
     /// disables the age sweep (orders rest forever).
     pub max_order_age_secs: u64,
+    /// Tick offset from current best:
+    /// - `-1` = improve (BID = best_bid + tick, ASK = best_ask - tick)
+    /// - `0`  = join touch (BID = best_bid, ASK = best_ask)
+    /// - `1+` = lag behind by N ticks (BID = best_bid - N*tick,
+    ///   ASK = best_ask + N*tick)
+    pub order_tick_offset: i32,
+    /// Skip an emit if any open same-side order sits within this many
+    /// ticks of the target price. `0` = exact-price dedupe only. `1+`
+    /// stops the joker from spamming nearby orders when the book
+    /// wiggles a tick — a single resting order covers an N-tick band.
+    pub order_tick_tolerance: u32,
 }
 
 /// Joker (join-the-touch) state. Tracks emit timestamps per (side, price)
@@ -91,9 +102,12 @@ impl Joker {
     }
 
     fn already_at(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> bool {
+        let tol = Decimal::from(self.config.order_tick_tolerance) * self.config.tick_size;
+        let lo = price.0 - tol;
+        let hi = price.0 + tol;
         ctx.open_quotes
             .iter()
-            .any(|(_, q)| q.side == side && q.price.0 == price.0)
+            .any(|(_, q)| q.side == side && q.price.0 >= lo && q.price.0 <= hi)
     }
 }
 
@@ -144,14 +158,25 @@ impl Strategy for Joker {
             }
         }
 
+        // Per-side offset (signed ticks). Negative improves (in front of
+        // best), 0 joins, positive lags behind best.
+        let off = self.config.order_tick_offset;
+        let offset_dec = Decimal::from(off.unsigned_abs() as u64) * tick;
+
         if let Some(bp) = best_bid
             && bp.0 > Decimal::ZERO
+            && tick > Decimal::ZERO
         {
+            // BID with offset O: price = best_bid - O*tick.
+            // O=-1 → above best_bid (improve); O=0 → at; O=+1 → below.
+            let mut price = if off < 0 {
+                Price(bp.0 + offset_dec)
+            } else {
+                Price(bp.0 - offset_dec)
+            };
             // Cross-guard: never emit BID >= best_ask.
-            let mut price = bp;
             if let Some(ap) = best_ask
                 && ap.0 > Decimal::ZERO
-                && tick > Decimal::ZERO
             {
                 let cap = Price(ap.0 - tick);
                 if price.0 > cap.0 {
@@ -166,12 +191,18 @@ impl Strategy for Joker {
 
         if let Some(ap) = best_ask
             && ap.0 > Decimal::ZERO
+            && tick > Decimal::ZERO
         {
+            // ASK with offset O: price = best_ask + O*tick.
+            // O=-1 → below best_ask (improve); O=0 → at; O=+1 → above.
+            let mut price = if off < 0 {
+                Price(ap.0 - offset_dec)
+            } else {
+                Price(ap.0 + offset_dec)
+            };
             // Cross-guard: never emit ASK <= best_bid.
-            let mut price = ap;
             if let Some(bp) = best_bid
                 && bp.0 > Decimal::ZERO
-                && tick > Decimal::ZERO
             {
                 let floor = Price(bp.0 + tick);
                 if price.0 < floor.0 {
@@ -247,6 +278,8 @@ mod tests {
             step_size: Decimal::new(1, 3), // 0.001
             min_notional: Decimal::from(5),
             max_order_age_secs: 0,
+            order_tick_offset: 0,
+            order_tick_tolerance: 0,
         }
     }
 

@@ -405,12 +405,20 @@ fn build_joker(
         .as_ref()
         .map(|p| p.max_order_age_secs)
         .unwrap_or(0);
+    let order_tick_offset = cfg.joker.as_ref().map(|p| p.order_tick_offset).unwrap_or(0);
+    let order_tick_tolerance = cfg
+        .joker
+        .as_ref()
+        .map(|p| p.order_tick_tolerance)
+        .unwrap_or(5);
     Ok(StrategyChoice::Joker(JokerConfig {
         notional_per_order: notional,
         tick_size,
         step_size,
         min_notional,
         max_order_age_secs,
+        order_tick_offset,
+        order_tick_tolerance,
     }))
 }
 
