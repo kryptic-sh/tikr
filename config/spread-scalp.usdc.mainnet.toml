@@ -1,6 +1,10 @@
 # ─── SpreadScalp on USDC majors — MAINNET ──────────────────────────────────
 #
-# 15 fixed bots — same symbol list as the main config.toml USDC allowlist.
+# 11 fixed bots — majors only. Cheap-token volatiles (WLD, WIF, 1000PEPE,
+# 1000SHIB) dropped: min_notional bump on sub-$1 prices made per-order
+# notional uniform-and-large, and one bad symbol drained wallet margin
+# across the whole fleet.
+#
 # USDC promo (0 bps maker) — no fee floor → min_spread_bps = 0.
 #
 # Pre-flight:
@@ -13,9 +17,7 @@
 env = "futures-mainnet"
 state_dir = "./state/spread-scalp-usdc"
 asset = "USDC"
-# 0.5% per order × 15 bots = 7.5% per round trip if all fire at once.
 order_balance_pct = "0.5"
-# Per-bot peak-position cap = 100% wallet / bot_count (auto-split).
 max_position_pct = "100"
 leverage = 5
 
@@ -175,74 +177,6 @@ adverse_max_widen_bps = 10
 # ─── SUIUSDC ───────────────────────────────────────────────────────────────
 [[bot]]
 symbol = "SUIUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-take_profit_bps = 5
-stop_loss_bps = 30
-close_side_always_quotes = true
-adverse_window_ms = 60000
-adverse_half_life_fills = 20
-adverse_threshold_bps = "2"
-adverse_max_widen_bps = 10
-
-# ─── 1000PEPEUSDC ──────────────────────────────────────────────────────────
-[[bot]]
-symbol = "1000PEPEUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-take_profit_bps = 5
-stop_loss_bps = 30
-close_side_always_quotes = true
-adverse_window_ms = 60000
-adverse_half_life_fills = 20
-adverse_threshold_bps = "2"
-adverse_max_widen_bps = 10
-
-# ─── 1000SHIBUSDC ──────────────────────────────────────────────────────────
-[[bot]]
-symbol = "1000SHIBUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-take_profit_bps = 5
-stop_loss_bps = 30
-close_side_always_quotes = true
-adverse_window_ms = 60000
-adverse_half_life_fills = 20
-adverse_threshold_bps = "2"
-adverse_max_widen_bps = 10
-
-# ─── WIFUSDC ───────────────────────────────────────────────────────────────
-[[bot]]
-symbol = "WIFUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-take_profit_bps = 5
-stop_loss_bps = 30
-close_side_always_quotes = true
-adverse_window_ms = 60000
-adverse_half_life_fills = 20
-adverse_threshold_bps = "2"
-adverse_max_widen_bps = 10
-
-# ─── WLDUSDC ───────────────────────────────────────────────────────────────
-[[bot]]
-symbol = "WLDUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
