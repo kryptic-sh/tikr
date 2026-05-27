@@ -551,18 +551,17 @@ impl Strategy for Tide {
             }
         }
 
-        // Window prune. Cancel any open order on either side whose
-        // price falls outside the active `grid_levels`-wide window
-        // for that side. Keeps the resting book bounded to ≤ levels
-        // per side; orders from earlier book regimes don't accumulate
-        // as the lattice activation slides with price.
+        // Window prune. Cancel only the OUTER-side stragglers — orders
+        // far from current best that get left behind as the lattice
+        // activation slides with price. Inner orders (between current
+        // best and slot_top) stay: they're still in the play zone and
+        // may fill on a small reversion.
         //
-        // Window definition (mirrors the emit walks above):
-        //   BID: [slot_top − (levels−1)·step, slot_top]
-        //   ASK: [slot_top, slot_top + (levels−1)·step]
-        // where slot_top is the highest-permitted lattice slot for
-        // that side after min_self_spread + cross-guard, snapped to
-        // lattice via floor (BID) / ceil (ASK).
+        //   BID: cancel q.price < slot_top − (levels−1)·step
+        //   ASK: cancel q.price > slot_top + (levels−1)·step
+        //
+        // slot_top mirrors the emit walks above (floor / ceil onto
+        // lattice, after min_self_spread + cross-guard).
         if lattice_ready
             && let Some(step) = self.lattice_step
             && step > Decimal::ZERO
@@ -584,11 +583,8 @@ impl Strategy for Tide {
                 let n_top = ((top_cap - bid_origin) / step).floor();
                 let slot_top = bid_origin + n_top * step;
                 let window_low = slot_top - outward;
-                let window_high = slot_top;
                 for (id, q) in ctx.open_quotes {
-                    if q.side == Side::Bid
-                        && (q.price.0 < window_low || q.price.0 > window_high)
-                    {
+                    if q.side == Side::Bid && q.price.0 < window_low {
                         actions.push(Action::Cancel(*id));
                     }
                 }
@@ -608,12 +604,9 @@ impl Strategy for Tide {
                 }
                 let n_top = ((top_cap - ask_origin) / step).ceil();
                 let slot_top = ask_origin + n_top * step;
-                let window_low = slot_top;
                 let window_high = slot_top + outward;
                 for (id, q) in ctx.open_quotes {
-                    if q.side == Side::Ask
-                        && (q.price.0 < window_low || q.price.0 > window_high)
-                    {
+                    if q.side == Side::Ask && q.price.0 > window_high {
                         actions.push(Action::Cancel(*id));
                     }
                 }
