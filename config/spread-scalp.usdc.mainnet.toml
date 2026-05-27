@@ -29,7 +29,7 @@ symbol = "BTCUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 5
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -44,7 +44,7 @@ symbol = "ETHUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 5
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -59,7 +59,7 @@ symbol = "BNBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -74,7 +74,7 @@ symbol = "SOLUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -89,7 +89,7 @@ symbol = "XRPUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -104,7 +104,7 @@ symbol = "DOGEUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 8
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -119,7 +119,7 @@ symbol = "ADAUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -134,7 +134,7 @@ symbol = "AVAXUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -149,7 +149,7 @@ symbol = "LINKUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -164,7 +164,7 @@ symbol = "SUIUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
@@ -179,7 +179,7 @@ symbol = "ARBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 notional = 120
-min_spread_bps = 6
+min_spread_bps = 1
 requote_interval_ms = 500
 max_position_usdt = 200
 reject_cooldown_ms = 500
