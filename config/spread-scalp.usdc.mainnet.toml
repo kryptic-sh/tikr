@@ -28,7 +28,7 @@ leverage = 5
 symbol = "BTCUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -42,7 +42,7 @@ close_side_always_quotes = true
 symbol = "ETHUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -56,7 +56,7 @@ close_side_always_quotes = true
 symbol = "BNBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -70,7 +70,7 @@ close_side_always_quotes = true
 symbol = "SOLUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -84,7 +84,7 @@ close_side_always_quotes = true
 symbol = "XRPUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -98,7 +98,7 @@ close_side_always_quotes = true
 symbol = "DOGEUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -112,7 +112,7 @@ close_side_always_quotes = true
 symbol = "ADAUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -126,7 +126,7 @@ close_side_always_quotes = true
 symbol = "AVAXUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -140,7 +140,7 @@ close_side_always_quotes = true
 symbol = "LINKUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -154,7 +154,7 @@ close_side_always_quotes = true
 symbol = "SUIUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
@@ -168,7 +168,7 @@ close_side_always_quotes = true
 symbol = "ARBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
-min_spread_bps = 1
+min_spread_bps = 0
 quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
