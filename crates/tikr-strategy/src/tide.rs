@@ -185,6 +185,49 @@ impl Tide {
             .any(|(_, q)| q.side == side && q.price.0 >= lo && q.price.0 <= hi)
     }
 
+    /// Would a post-only emit on `side` at `price` cross one of OUR own
+    /// resting/pending orders on the OPPOSITE side?
+    ///
+    /// Binance fires `-5022` not only when a post-only would take from
+    /// the public book but also when self-trade prevention kicks in
+    /// against the bot's own resting opposite-side orders. Tide never
+    /// cancels, so old BIDs from when best_bid was high keep resting;
+    /// later when Rule 1 walks the ASK grid up to the historic ceiling,
+    /// any ASK emit at or above one of those old BIDs would self-cross.
+    ///
+    /// - Emitting ASK at P: unsafe if any open/pending BID has price ≥ P
+    /// - Emitting BID at P: unsafe if any open/pending ASK has price ≤ P
+    fn would_self_cross(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> bool {
+        match side {
+            Side::Ask => {
+                if self
+                    .pending_bid_prices
+                    .range(price.0..)
+                    .next()
+                    .is_some()
+                {
+                    return true;
+                }
+                ctx.open_quotes
+                    .iter()
+                    .any(|(_, q)| q.side == Side::Bid && q.price.0 >= price.0)
+            }
+            Side::Bid => {
+                if self
+                    .pending_ask_prices
+                    .range(..=price.0)
+                    .next_back()
+                    .is_some()
+                {
+                    return true;
+                }
+                ctx.open_quotes
+                    .iter()
+                    .any(|(_, q)| q.side == Side::Ask && q.price.0 <= price.0)
+            }
+        }
+    }
+
     fn emit(&mut self, symbol: &Symbol, side: Side, price: Price) -> Action {
         match side {
             Side::Bid => {
@@ -239,6 +282,13 @@ impl Strategy for Tide {
         let mut still_pending = Vec::with_capacity(self.pending_retries.len());
         for (side, price, size) in std::mem::take(&mut self.pending_retries) {
             if self.already_have_order(ctx, side, price, Decimal::ZERO) {
+                continue;
+            }
+            // Drop entries that would self-cross — these are guaranteed
+            // to be -5022'd again. They're stale (a never-cancelled
+            // opposite-side order from an earlier book regime sits in
+            // the way) and re-emitting them is pure noise.
+            if self.would_self_cross(ctx, side, price) {
                 continue;
             }
             let safe = match (side, retry_best_bid, retry_best_ask) {
@@ -436,7 +486,9 @@ impl Strategy for Tide {
             let tolerance = step / Decimal::from(2);
             while price >= floor && price > Decimal::ZERO {
                 let p = Price(price);
-                if !self.already_have_order(ctx, Side::Bid, p, tolerance) {
+                if !self.already_have_order(ctx, Side::Bid, p, tolerance)
+                    && !self.would_self_cross(ctx, Side::Bid, p)
+                {
                     actions.push(self.emit(ctx.symbol, Side::Bid, p));
                 }
                 price -= step;
@@ -468,7 +520,9 @@ impl Strategy for Tide {
             let tolerance = step / Decimal::from(2);
             while price <= ceiling {
                 let p = Price(price);
-                if !self.already_have_order(ctx, Side::Ask, p, tolerance) {
+                if !self.already_have_order(ctx, Side::Ask, p, tolerance)
+                    && !self.would_self_cross(ctx, Side::Ask, p)
+                {
                     actions.push(self.emit(ctx.symbol, Side::Ask, p));
                 }
                 price += step;
@@ -508,6 +562,7 @@ impl Strategy for Tide {
                 // happen to sit near the close price.
                 if close_price.0 > Decimal::ZERO
                     && !self.already_have_order(ctx, close_side, close_price, Decimal::ZERO)
+                    && !self.would_self_cross(ctx, close_side, close_price)
                 {
                     actions.push(self.emit(ctx.symbol, close_side, close_price));
                 }
