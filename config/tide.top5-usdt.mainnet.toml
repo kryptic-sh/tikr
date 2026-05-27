@@ -1,0 +1,63 @@
+# ─── Tide on top-5 USDT perps by volume — MAINNET ─────────────────────────
+#
+# 5 fixed bots — Binance USD-M USDT-margined perps ranked by 24h quote
+# volume (snapshot 2026-05-27, refresh allowlist periodically).
+#
+# Tide knobs:
+#   min_self_spread_bps = 20  — synth 20 bps spread floor
+#   grid_step_bps       = 10  — 10 bps between lattice slots
+#   grid_levels         = 6   — 6 orders per side
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDT balance in Futures wallet
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tide-top5-usdt"
+asset = "USDT"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+[tide_auto]
+enabled = true
+quote_asset = "USDT"
+
+# Top-5 by 24h quote volume (snapshot 2026-05-27 from /fapi/v1/ticker/24hr).
+# Allowlist mode bypasses min_tick_bps + min_volume_usdt filters.
+symbols_allowlist = [
+  "BTCUSDT",   # $12.6B / 24h
+  "ETHUSDT",   # $9.0B
+  "HYPEUSDT",  # $1.8B
+  "ZECUSDT",   # $1.6B
+  "SOLUSDT",   # $1.5B
+]
+
+# Ignored when symbols_allowlist set, kept for reference.
+min_tick_bps = "0"
+min_volume_usdt = "100000000"
+
+recheck_interval_secs = 60
+
+# 20 bps synthesized spread = ~16 bps net edge at BNB-discounted maker
+# rates (~3.6 bps RT). Wide enough that grid rebounds clear fees plus
+# slippage on tight-tick majors.
+min_self_spread_bps = 20
+
+# 6 levels per side — extra depth so each leg of the ladder can absorb
+# a fast move before all slots fill on one side.
+grid_levels = 6
+
+# 0 = grid-only mode. Filled orders rely on the opposite-side ladder
+# to catch the rebound (no dedicated close-on-fill emit).
+close_profit_bps = 0
+
+# 10 bps between lattice slots. Frozen at first event; subsequent
+# adaptive_bps walks do NOT re-step the lattice.
+grid_step_bps = 10
+
+# Adaptive bps walk: tighten min_self_spread + grid_step by 1 bps/min
+# when fpm < 1; relax back when fpm ≥ 1. `false` keeps lattice stable.
+adaptive_bps_enabled = false
