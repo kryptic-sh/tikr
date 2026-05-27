@@ -17,7 +17,7 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/spread-scalp-usdc"
+state_dir = "./state/spread-scalp-usdc-v2"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"
@@ -29,6 +29,7 @@ symbol = "BTCUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -42,6 +43,7 @@ symbol = "ETHUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -55,6 +57,7 @@ symbol = "BNBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -68,6 +71,7 @@ symbol = "SOLUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -81,6 +85,7 @@ symbol = "XRPUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -94,6 +99,7 @@ symbol = "DOGEUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -107,6 +113,7 @@ symbol = "ADAUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -120,6 +127,7 @@ symbol = "AVAXUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -133,6 +141,7 @@ symbol = "LINKUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -146,6 +155,7 @@ symbol = "SUIUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
@@ -159,6 +169,7 @@ symbol = "ARBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 1
+quote_offset_ticks = 0
 requote_interval_ms = 500
 reject_cooldown_ms = 500
 price_tolerance_ticks = 1
