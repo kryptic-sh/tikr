@@ -264,6 +264,97 @@ pub struct BotConfig {
     /// Joker params (only honored when `strategy = "joker"`).
     #[serde(default)]
     pub joker: Option<JokerParams>,
+    /// RSI-MR params (only honored when `strategy = "rsi-mr"`).
+    #[serde(default)]
+    pub rsi_mr: Option<RsiMrParams>,
+}
+
+/// RSI mean-reversion + KER regime gate, long-only.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RsiMrParams {
+    /// Per-order notional in quote currency. Account-derived if unset.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Bar interval in seconds. Default 60 (1-minute).
+    #[serde(default = "rsi_mr_default_bar_interval_secs")]
+    pub bar_interval_secs: u64,
+    /// Closed-bar buffer size. Default 200.
+    #[serde(default = "rsi_mr_default_max_bars")]
+    pub max_bars: usize,
+    /// RSI period. Default 14.
+    #[serde(default = "rsi_mr_default_rsi_period")]
+    pub rsi_period: u32,
+    /// Enter long when RSI < threshold. Default 25.
+    #[serde(default = "rsi_mr_default_rsi_buy_threshold")]
+    pub rsi_buy_threshold: u32,
+    /// Exit long when RSI > threshold. Default 50.
+    #[serde(default = "rsi_mr_default_rsi_exit_threshold")]
+    pub rsi_exit_threshold: u32,
+    /// Kaufman Efficiency Ratio period. Default 20.
+    #[serde(default = "rsi_mr_default_ker_period")]
+    pub ker_period: u32,
+    /// Skip entry when KER > value (trending). Default `"0.4"`.
+    #[serde(default = "rsi_mr_default_ker_max_trending")]
+    pub ker_max_trending: Decimal,
+    /// Volume z-score lookback. Default 20.
+    #[serde(default = "rsi_mr_default_vol_zscore_period")]
+    pub vol_zscore_period: u32,
+    /// Skip entry when volume z-score < value. Default `"1.5"`.
+    #[serde(default = "rsi_mr_default_vol_zscore_min")]
+    pub vol_zscore_min: Decimal,
+    /// ATR period. Default 14.
+    #[serde(default = "rsi_mr_default_atr_period")]
+    pub atr_period: u32,
+    /// SL distance in ATR multiples. Default `"2"`.
+    #[serde(default = "rsi_mr_default_atr_sl_mult")]
+    pub atr_sl_mult: Decimal,
+    /// TP distance in ATR multiples. Default `"3"`.
+    #[serde(default = "rsi_mr_default_atr_tp_mult")]
+    pub atr_tp_mult: Decimal,
+    /// Max bars to hold before timeout IOC. Default 60 (= 1h on 1m bars).
+    #[serde(default = "rsi_mr_default_max_hold_bars")]
+    pub max_hold_bars: u32,
+}
+
+fn rsi_mr_default_bar_interval_secs() -> u64 {
+    60
+}
+fn rsi_mr_default_max_bars() -> usize {
+    200
+}
+fn rsi_mr_default_rsi_period() -> u32 {
+    14
+}
+fn rsi_mr_default_rsi_buy_threshold() -> u32 {
+    25
+}
+fn rsi_mr_default_rsi_exit_threshold() -> u32 {
+    50
+}
+fn rsi_mr_default_ker_period() -> u32 {
+    20
+}
+fn rsi_mr_default_ker_max_trending() -> Decimal {
+    Decimal::new(4, 1)
+}
+fn rsi_mr_default_vol_zscore_period() -> u32 {
+    20
+}
+fn rsi_mr_default_vol_zscore_min() -> Decimal {
+    Decimal::new(15, 1)
+}
+fn rsi_mr_default_atr_period() -> u32 {
+    14
+}
+fn rsi_mr_default_atr_sl_mult() -> Decimal {
+    Decimal::from(2)
+}
+fn rsi_mr_default_atr_tp_mult() -> Decimal {
+    Decimal::from(3)
+}
+fn rsi_mr_default_max_hold_bars() -> u32 {
+    60
 }
 
 /// Joker — join touch, dedupe by exact price, never cancel.

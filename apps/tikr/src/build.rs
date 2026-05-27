@@ -11,7 +11,8 @@ use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig,
-    MicroMeanReversionConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, TideConfig,
+    MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
+    TideConfig,
 };
 use tokio::sync::watch;
 
@@ -76,9 +77,10 @@ pub fn to_spec(
         )?,
         "tide" | "td" => build_tide(cfg, &symbol, venue, default_notional)?,
         "joker" | "jk" => build_joker(cfg, &symbol, venue, default_notional)?,
+        "rsi-mr" | "rsimr" => build_rsi_mr(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr)"
             ));
         }
     };
@@ -177,6 +179,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "hydra" | "hd" | "hy" => Ok(None),
         "tide" | "td" => Ok(cfg.tide.as_ref().and_then(|p| p.notional)),
         "joker" | "jk" => Ok(cfg.joker.as_ref().and_then(|p| p.notional)),
+        "rsi-mr" | "rsimr" => Ok(cfg.rsi_mr.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -202,7 +205,9 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "tide"
         | "td"
         | "joker"
-        | "jk" => None,
+        | "jk"
+        | "rsi-mr"
+        | "rsimr" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -219,6 +224,7 @@ fn max_open_orders_for(cfg: &BotConfig) -> usize {
     match cfg.strategy.as_str() {
         "tide" | "td" => 0,
         "joker" | "jk" => 0,
+        "rsi-mr" | "rsimr" => 0,
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
@@ -419,6 +425,44 @@ fn build_joker(
         max_order_age_secs,
         order_tick_offset,
         order_tick_tolerance,
+    }))
+}
+
+fn build_rsi_mr(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let rsi_mr = cfg.rsi_mr.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=rsi-mr but [bot.rsi_mr] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional =
+        autobump_notional(rsi_mr.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::RsiMr(RsiMrConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        bar_interval_secs: rsi_mr.bar_interval_secs,
+        max_bars: rsi_mr.max_bars,
+        rsi_period: rsi_mr.rsi_period,
+        rsi_buy_threshold: rsi_mr.rsi_buy_threshold,
+        rsi_exit_threshold: rsi_mr.rsi_exit_threshold,
+        ker_period: rsi_mr.ker_period,
+        ker_max_trending: rsi_mr.ker_max_trending,
+        vol_zscore_period: rsi_mr.vol_zscore_period,
+        vol_zscore_min: rsi_mr.vol_zscore_min,
+        atr_period: rsi_mr.atr_period,
+        atr_sl_mult: rsi_mr.atr_sl_mult,
+        atr_tp_mult: rsi_mr.atr_tp_mult,
+        max_hold_bars: rsi_mr.max_hold_bars,
     }))
 }
 

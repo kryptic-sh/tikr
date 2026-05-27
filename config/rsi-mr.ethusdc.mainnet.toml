@@ -1,0 +1,62 @@
+# ─── RSI-MR (long-only) on ETHUSDC — MAINNET ──────────────────────────────
+#
+# Long-only RSI mean-reversion with Kaufman Efficiency Ratio (KER)
+# regime gate. Designed for USDC promo (0 bps maker).
+#
+# Entry triggers (all three must fire on the latest closed 1m bar):
+#   - RSI(14) < 25           → oversold
+#   - KER(20) < 0.4          → choppy (NOT trending) — kills falling-knife mode
+#   - volume_zscore(20) > 1.5 → real spike, not algo noise
+#
+# Exit ladder (whichever fires first):
+#   - TP maker:  entry + 3 × ATR(14)  → post-only ASK
+#   - SL taker:  entry - 2 × ATR(14)  → IOC SELL at best_bid
+#   - RSI exit:  RSI > 50              → cancel TP, post fresh ASK at best_ask
+#   - Timeout:   60 bars (1h)          → IOC out
+#
+# Fee model: USDC promo (0 maker / 5 taker bps).
+#   - Best case (entry + TP both maker): 0 bps cost. Pure spread capture.
+#   - SL case (entry maker + SL taker): 5 bps cost.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/rsi-mr-ethusdc"
+asset = "USDC"
+order_balance_pct = "5"
+max_position_pct = "50"
+leverage = 5
+
+[[bot]]
+symbol = "ETHUSDC"
+strategy = "rsi-mr"
+[bot.rsi_mr]
+# Bar / buffer
+bar_interval_secs = 60
+max_bars = 200
+
+# RSI
+rsi_period = 14
+rsi_buy_threshold = 25
+rsi_exit_threshold = 50
+
+# KER regime gate (skip entry when trending)
+ker_period = 20
+ker_max_trending = "0.4"
+
+# Volume confirmation
+vol_zscore_period = 20
+vol_zscore_min = "1.5"
+
+# ATR-based TP/SL
+atr_period = 14
+atr_sl_mult = "2"
+atr_tp_mult = "3"
+
+# Timeout
+max_hold_bars = 60
