@@ -78,4 +78,4 @@ grid_step_bps = 10
 # Adaptive bps walk-in/out. When fills-per-minute < 1, tighten
 # min_self_spread_bps and grid_step_bps by 1 every 60s (floor 1).
 # When fpm >= 1, walk back out to the baseline values above. Default ON.
-adaptive_bps_enabled = true
+adaptive_bps_enabled = false
