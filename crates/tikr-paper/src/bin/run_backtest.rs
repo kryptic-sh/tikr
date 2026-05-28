@@ -216,6 +216,19 @@ struct Args {
     /// required by RunnerConfig).
     #[arg(long, default_value = "./state/backtest")]
     state_dir: PathBuf,
+
+    /// Write a running equity-curve CSV: one row per snapshot tick with
+    /// `ts_ns,sim_secs,fills,pos_size,realized,unrealized,fees,funding,net`.
+    /// Lets you plot how PnL / position / fees evolve across the run. Cadence
+    /// is `--snapshot-every-n-events`.
+    #[arg(long)]
+    equity_csv: Option<PathBuf>,
+
+    /// Snapshot + equity-curve cadence, in events. `0` (default) emits only
+    /// the first-event row. When `--equity-csv` is set and this is `0`, it
+    /// defaults to 10000 so the curve actually has points.
+    #[arg(long, default_value_t = 0u32)]
+    snapshot_every_n_events: u32,
 }
 
 #[tokio::main]
@@ -276,9 +289,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Equity-curve cadence: when a CSV is requested but no cadence given,
+    // default to 10000 events so the curve has points.
+    let snapshot_every_n_events = if args.equity_csv.is_some() && args.snapshot_every_n_events == 0
+    {
+        10_000
+    } else {
+        args.snapshot_every_n_events
+    };
     let runner_config = RunnerConfig {
         state_dir: args.state_dir.clone(),
-        snapshot_every_n_events: 0, // backtest = no snapshots
+        snapshot_every_n_events,
         skim: None,
         funding,
         snapshot_tap: None,
@@ -287,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_rx: None,
         liq_window_secs: 0,
         seed_position: None,
-        equity_csv_path: None,
+        equity_csv_path: args.equity_csv.clone(),
         initial_balance: Decimal::from_str(&args.initial_balance)?,
         order_balance_pct: Decimal::from_str(&args.order_balance_pct)?,
         max_position_pct: Decimal::from_str(&args.max_position_pct)?,
