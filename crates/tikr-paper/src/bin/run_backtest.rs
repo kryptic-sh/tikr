@@ -170,6 +170,10 @@ struct Args {
     /// Wave: min ms between recenters (cooldown).
     #[arg(long, default_value_t = 1000u64)]
     wv_recenter_cooldown_ms: u64,
+    /// Wave: per-bot max position (quote notional). 0 = uncapped.
+    /// Enables inventory skew on recenter when > 0.
+    #[arg(long, default_value = "0")]
+    wv_max_position: String,
     /// Wave: per-order notional.
     #[arg(long, default_value = "10")]
     wv_notional: String,
@@ -407,7 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 grid_step_ticks: 0,
                 recenter_drain_slots: args.wv_recenter_drain_slots,
                 skew_max_pct: Decimal::from_str(&args.wv_skew_max_pct)?,
-                max_position_usdt: Decimal::ZERO,
+                max_position_usdt: Decimal::from_str(&args.wv_max_position)?,
                 bar_interval_secs: args.wv_bar_interval_secs,
                 max_bars: 200,
                 atr_period: args.wv_atr_period,

@@ -229,8 +229,7 @@ impl Wave {
             return Some(Decimal::from(self.config.grid_step_ticks) * tick);
         }
         if self.config.grid_step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
-            let target =
-                mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+            let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
             return Some(if target > tick {
                 (target / tick).ceil() * tick
             } else {
@@ -323,10 +322,7 @@ impl Wave {
         if self.config.step_atr_mult <= Decimal::ZERO {
             return false;
         }
-        let need = self
-            .config
-            .bar_warmup_bars
-            .max(self.config.atr_period) as usize;
+        let need = self.config.bar_warmup_bars.max(self.config.atr_period) as usize;
         self.closed_bars.len() < need
     }
 
@@ -382,12 +378,7 @@ impl Wave {
 
     /// Count slots in `window` whose price has no matching open quote
     /// on `side` in `ctx.open_quotes`.
-    fn count_missing(
-        &self,
-        ctx: &StrategyContext<'_>,
-        side: Side,
-        window: WindowRange,
-    ) -> u32 {
+    fn count_missing(&self, ctx: &StrategyContext<'_>, side: Side, window: WindowRange) -> u32 {
         let mut missing = 0u32;
         for k in window.low_k..=window.high_k {
             let price_opt = match side {
@@ -406,25 +397,42 @@ impl Wave {
         missing
     }
 
-    /// Compute (bid_count, ask_count) after applying mild inventory
-    /// skew. Long → fewer bids + more asks (drain bias).
+    /// Compute (bid_count, ask_count) for a recenter.
+    ///
+    /// When `max_position_usdt > 0`:
+    /// - **Hard cap:** once `|position notional| ≥ cap`, the
+    ///   accumulating side is suppressed entirely (bid_count = 0 when
+    ///   long-over-cap, ask_count = 0 when short-over-cap). Bounds
+    ///   inventory.
+    /// - **Mild skew below the cap:** long → fewer bids, more asks
+    ///   (drain bias), scaled by `skew_max_pct`.
+    ///
+    /// When `max_position_usdt == 0`: symmetric, no cap, no skew.
     fn skewed_counts(&self, pos_notional: Decimal) -> (u32, u32) {
         let levels = self.config.grid_levels.max(1);
-        if self.config.max_position_usdt <= Decimal::ZERO
-            || self.config.skew_max_pct <= Decimal::ZERO
-        {
+        let cap = self.config.max_position_usdt;
+        if cap <= Decimal::ZERO {
             return (levels, levels);
         }
-        let raw_pct = pos_notional / self.config.max_position_usdt;
+        // Hard cap: suppress the side that would grow the position past cap.
+        if pos_notional >= cap {
+            return (0, levels); // long-capped: asks only (drain)
+        }
+        if pos_notional <= -cap {
+            return (levels, 0); // short-capped: bids only (drain)
+        }
+        if self.config.skew_max_pct <= Decimal::ZERO {
+            return (levels, levels);
+        }
+        let raw_pct = pos_notional / cap;
         let clamped = raw_pct.max(Decimal::from(-1)).min(Decimal::ONE);
         let skew = clamped * self.config.skew_max_pct;
-        // skew > 0 (long) → fewer bids, more asks.
         let levels_dec = Decimal::from(levels);
         let bid_dec = (levels_dec * (Decimal::ONE - skew)).round();
         let ask_dec = (levels_dec * (Decimal::ONE + skew)).round();
         let to_u32 = |d: Decimal| -> u32 {
             let n = d.to_string().parse::<f64>().unwrap_or(0.0) as i64;
-            n.clamp(1, levels as i64) as u32
+            n.clamp(0, levels as i64) as u32
         };
         (to_u32(bid_dec), to_u32(ask_dec))
     }
@@ -432,11 +440,16 @@ impl Wave {
     /// Issue Quote actions for every slot in `[low_k, high_k]` on `side`
     /// that's not already present in `ctx.open_quotes`. Updates the
     /// in-event dedupe set as it emits.
+    ///
+    /// `force = true` skips the `open_quotes` presence check — used right
+    /// after a `CancelAll` (relattice), where `ctx.open_quotes` still
+    /// reflects the pre-cancel venue state and would wrongly suppress emits.
     fn emit_window_slots(
         &mut self,
         ctx: &StrategyContext<'_>,
         side: Side,
         window: WindowRange,
+        force: bool,
         actions: &mut Vec<Action>,
     ) {
         let cross_guard_ask = ctx.latest_book.asks.first().map(|l| l.price);
@@ -487,12 +500,14 @@ impl Wave {
             if emitted {
                 continue;
             }
-            let present = ctx
-                .open_quotes
-                .iter()
-                .any(|(_, q)| q.side == side && q.price.0 == safe_price);
-            if present {
-                continue;
+            if !force {
+                let present = ctx
+                    .open_quotes
+                    .iter()
+                    .any(|(_, q)| q.side == side && q.price.0 == safe_price);
+                if present {
+                    continue;
+                }
             }
             actions.push(self.make_quote(ctx.symbol, side, Price(safe_price)));
             match side {
@@ -615,8 +630,8 @@ impl Strategy for Wave {
             };
             self.bid_window = Some(bw);
             self.ask_window = Some(aw);
-            self.emit_window_slots(ctx, Side::Bid, bw, &mut actions);
-            self.emit_window_slots(ctx, Side::Ask, aw, &mut actions);
+            self.emit_window_slots(ctx, Side::Bid, bw, false, &mut actions);
+            self.emit_window_slots(ctx, Side::Ask, aw, false, &mut actions);
             return actions;
         }
 
@@ -645,12 +660,12 @@ impl Strategy for Wave {
         self.last_recenter_ts = Some(now_ns);
 
         // 4) Recenter — count event + maybe relattice.
-        self.recenters_since_relattice =
-            self.recenters_since_relattice.saturating_add(1);
+        self.recenters_since_relattice = self.recenters_since_relattice.saturating_add(1);
         let relattice = self.config.relattice_every_n_recenters > 0
             && self.recenters_since_relattice >= self.config.relattice_every_n_recenters
             && self.config.step_atr_mult > Decimal::ZERO
             && !self.warming_up();
+        let mut did_relattice = false;
         if relattice
             && let (Some(b), Some(a)) = (top_b, top_a)
             && b.0 > Decimal::ZERO
@@ -663,7 +678,16 @@ impl Strategy for Wave {
                 self.bid_lattice_origin = Some(b.0);
                 self.ask_lattice_origin = Some(a.0);
                 self.recenters_since_relattice = 0;
+                did_relattice = true;
             }
+        }
+
+        // On relattice the lattice identity changed — every resting order
+        // is now on a dead lattice and can never be reused (count_missing
+        // keys off the new lattice's prices). Cancel them all so they
+        // don't accumulate as orphans, then force-seed the fresh window.
+        if did_relattice {
+            actions.push(Action::CancelAll);
         }
 
         // Compute new windows around current top using (possibly new) lattice.
@@ -684,8 +708,9 @@ impl Strategy for Wave {
         };
         self.bid_window = Some(new_bw);
         self.ask_window = Some(new_aw);
-        self.emit_window_slots(ctx, Side::Bid, new_bw, &mut actions);
-        self.emit_window_slots(ctx, Side::Ask, new_aw, &mut actions);
+        // After CancelAll the ctx.open_quotes view is stale → force emit.
+        self.emit_window_slots(ctx, Side::Bid, new_bw, did_relattice, &mut actions);
+        self.emit_window_slots(ctx, Side::Ask, new_aw, did_relattice, &mut actions);
         actions
     }
 
@@ -801,7 +826,12 @@ mod tests {
         let p = pos_flat();
         let sm = sym();
         let c = ctx(&sm, &s, &p, &[]);
-        let actions = w.on_event(&c, &MarketEvent::BookUpdate { snapshot: s.clone() });
+        let actions = w.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
         // 6 bids + 6 asks
         assert_eq!(actions.len(), 12);
     }
@@ -814,7 +844,12 @@ mod tests {
         let sm = sym();
         let c = ctx(&sm, &s, &p, &[]);
         // First event seeds.
-        let _ = w.on_event(&c, &MarketEvent::BookUpdate { snapshot: s.clone() });
+        let _ = w.on_event(
+            &c,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
         // Build open_quotes from emitted-window state — full window alive.
         let bw = w.bid_window.unwrap();
         let aw = w.ask_window.unwrap();
@@ -846,7 +881,12 @@ mod tests {
             ));
         }
         let c2 = ctx(&sm, &s, &p, &open);
-        let actions = w.on_event(&c2, &MarketEvent::BookUpdate { snapshot: s.clone() });
+        let actions = w.on_event(
+            &c2,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
         assert!(actions.is_empty(), "no churn when window intact");
     }
 }
