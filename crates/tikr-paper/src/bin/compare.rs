@@ -2272,6 +2272,7 @@ async fn run_one<S: Strategy>(
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
         liquidation: None,
+        mark_series: None,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -2359,6 +2360,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
             liquidation: None,
+            mark_series: None,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");

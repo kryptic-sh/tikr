@@ -132,6 +132,7 @@ pub fn to_spec(
         // (disabled) when the strategy intentionally keeps many.
         max_expected_open_orders: max_open_orders_for(cfg),
         liquidation: None,
+        mark_series: None,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

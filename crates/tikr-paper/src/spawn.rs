@@ -476,5 +476,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         min_notional: tikr_core::Decimal::ZERO,
         max_expected_open_orders: 2,
         liquidation: None,
+        mark_series: None,
     }
 }

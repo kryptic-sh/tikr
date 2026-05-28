@@ -488,6 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
         liquidation: None,
+        mark_series: None,
     };
 
     info!(strategy = ?args.strategy, "strategy selected");

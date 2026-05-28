@@ -152,6 +152,13 @@ pub struct RunnerConfig {
     /// mirroring a real leveraged-perp blowup. Ignored in live mode (the
     /// venue performs its own liquidation). `None` (default) disables.
     pub liquidation: Option<LiquidationConfig>,
+    /// Optional recorded perp mark-price series (backtest). When `Some`, the
+    /// runner marks unrealized PnL, funding, and the liquidation trigger
+    /// against the recorded mark at each sim timestamp instead of the order-
+    /// book mid. `None` (default) → mark falls back to book mid (prior
+    /// behaviour). Loaded from `mark_<BASE>_*.parquet` via
+    /// [`tikr_backtest::mark::MarkSeries`].
+    pub mark_series: Option<tikr_backtest::mark::MarkSeries>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -205,6 +212,7 @@ impl Default for RunnerConfig {
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
             liquidation: None,
+            mark_series: None,
         }
     }
 }
@@ -525,6 +533,10 @@ where
 
     let mut current_book = empty_snapshot(&symbol);
     let mut last_mid = Price(Decimal::ZERO);
+    // Perp mark price for unrealized PnL, funding, and liquidation. Sourced
+    // from `config.mark_series` when present; otherwise falls back to
+    // `last_mid` so behaviour is unchanged when no mark stream is supplied.
+    let mut last_mark = Price(Decimal::ZERO);
     let mut last_fill: Option<Fill> = None;
     // Per-symbol side-failure tracker. When one side's venue.quote() fails
     // MAX_FAILS_PER_SIDE times consecutively, that side is skipped until the
@@ -553,6 +565,9 @@ where
     let funding_cfg = config.funding;
     // Isolated-margin liquidation model (paper/backtest only — see field doc).
     let mut liq_model = config.liquidation.map(LiquidationModel::new);
+    // Optional recorded mark-price series (backtest). Queried per event by
+    // sim-time; `None` → mark falls back to book mid.
+    let mut mark_series = config.mark_series;
     let mut notional_rx = config.notional_rx;
     let mut max_position_rx = config.max_position_rx;
     // Balance-compounding channels (backtest mode). When enabled,
@@ -603,7 +618,7 @@ where
             warn!("subscribe failed: {}", e);
             let mut report = finalize(
                 &tracker,
-                last_mid,
+                last_mark,
                 started,
                 events_processed,
                 fills_emitted,
@@ -804,12 +819,20 @@ where
                     }
                 }
 
+                // Refresh the perp mark from the recorded series (if any) at
+                // the current sim time; otherwise track book mid. Drives
+                // unrealized PnL, funding, and the liquidation trigger below.
+                last_mark = mark_series
+                    .as_mut()
+                    .and_then(|s| s.mark_at(ts.0))
+                    .unwrap_or(last_mid);
+
                 // Funding accrual: continuous model. On each event, charge
                 // (or credit) `position × mark × rate × (dt / 28800s)`. The
                 // sign convention: positive funding rate → longs pay,
                 // shorts receive (`amount = −size × mark × rate × dt/8h`).
                 if let Some(fcfg) = funding_cfg
-                    && last_mid.0 > Decimal::ZERO
+                    && last_mark.0 > Decimal::ZERO
                 {
                     if let Some(prev_ts) = last_funding_ts {
                         let dt_ns = ts.0.saturating_sub(prev_ts.0);
@@ -818,7 +841,7 @@ where
                             let interval = Decimal::from(fcfg.interval_secs.max(1));
                             let pos_size = tracker.snapshot().size.0;
                             let amount = -pos_size
-                                * last_mid.0
+                                * last_mark.0
                                 * fcfg.rate_per_interval
                                 * (dt_secs / interval);
                             tracker.accrue_funding(amount);
@@ -833,14 +856,14 @@ where
                 // flat position on this same event. The realized loss lands in
                 // the tracker via the synthetic close fill.
                 if !live_mode
-                    && last_mid.0 > Decimal::ZERO
+                    && last_mark.0 > Decimal::ZERO
                     && let Some(model) = liq_model.as_mut()
                 {
                     let pos_now = tracker.snapshot();
-                    if let Some(fill) = model.check(&pos_now, last_mid, ts) {
+                    if let Some(fill) = model.check(&pos_now, last_mark, ts) {
                         warn!(
                             liq_price = %fill.price.0,
-                            mark = %last_mid.0,
+                            mark = %last_mark.0,
                             size = %fill.size.0,
                             side = ?fill.side,
                             "LIQUIDATION — mark breached liq price; force-closing position"
@@ -886,7 +909,7 @@ where
                 let mut filtered: Vec<tikr_strategy::Action> = Vec::with_capacity(actions.len());
                 for action in actions {
                     if let Some(gate) = risk_gate.as_mut() {
-                        let pnl_now = tracker.report(last_mid);
+                        let pnl_now = tracker.report(last_mark);
                         let risk_ctx = RiskContext {
                             position: &pos,
                             pnl: pnl_now,
@@ -908,7 +931,7 @@ where
                                         })
                                         .await;
                                     if reason.contains("max_drawdown") {
-                                        let report = tracker.report(last_mid);
+                                        let report = tracker.report(last_mark);
                                         let _ = sink
                                             .send(Alert::Drawdown {
                                                 net: report.net,
@@ -1253,7 +1276,7 @@ where
                 // realized P&L (excluding skimmed dollars) crossed the next
                 // threshold and convert that chunk to base asset at last_mid.
                 if skim_cfg.is_some() && last_mid.0 > Decimal::ZERO {
-                    let rep = tracker.report(last_mid);
+                    let rep = tracker.report(last_mark);
                     let net_now = rep.realized.0 + rep.funding.0 - rep.fees.0 - skim_total_usdt;
                     let gain = net_now - last_net_seen;
                     if gain > Decimal::ZERO {
@@ -1310,7 +1333,7 @@ where
                 if first_paper_snapshot || interval_due || tap_due {
                     let mut report = finalize(
                         &tracker,
-                        last_mid,
+                        last_mark,
                         started,
                         events_processed,
                         fills_emitted,
@@ -1438,7 +1461,7 @@ where
                 if let Some(ref tap) = config.snapshot_tap {
                     let mut report = finalize(
                         &tracker,
-                        last_mid,
+                        last_mark,
                         started,
                         events_processed,
                         fills_emitted,
@@ -1565,7 +1588,7 @@ where
                 if let Some(ref tap) = config.snapshot_tap {
                     let mut heartbeat = finalize(
                         &tracker,
-                        last_mid,
+                        last_mark,
                         started,
                         events_processed,
                         fills_emitted,
@@ -1595,7 +1618,7 @@ where
                     continue;
                 }
                 last_status_fingerprint = Some(fingerprint);
-                let pnl = tracker.report(last_mid);
+                let pnl = tracker.report(last_mark);
                 let elapsed = started.elapsed().as_secs() + resumed_runtime_secs;
                 let fills_per_min = if elapsed > 0 {
                     (fills_emitted as f64) * 60.0 / (elapsed as f64)
@@ -1746,7 +1769,7 @@ where
 
     let mut report = finalize(
         &tracker,
-        last_mid,
+        last_mark,
         started,
         events_processed,
         fills_emitted,
@@ -2086,7 +2109,7 @@ async fn apply_fill(
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     tracker: &PositionTracker,
-    last_mid: Price,
+    last_mark: Price,
     started: Instant,
     events_processed: u64,
     fills_emitted: u64,
@@ -2103,7 +2126,7 @@ fn finalize(
     peak_position_usdt: Decimal,
     liquidations: u64,
 ) -> PaperReport {
-    let base = tracker.report(last_mid);
+    let base = tracker.report(last_mark);
     let sim_duration_secs = match (first_event_ts, last_event_ts) {
         (Some(a), Some(b)) if b.0 >= a.0 => (b.0 - a.0) / 1_000_000_000,
         _ => 0,
@@ -2115,7 +2138,7 @@ fn finalize(
         }
         None => Decimal::ZERO,
     };
-    let final_base_value = base_stacked * last_mid.0;
+    let final_base_value = base_stacked * last_mark.0;
     PaperReport {
         schema_version: SCHEMA_VERSION,
         realized: base.realized,
@@ -2398,6 +2421,7 @@ mod tests {
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
             liquidation: None,
+            mark_series: None,
         }
     }
 
@@ -2505,6 +2529,68 @@ mod tests {
         )
         .await;
         assert_eq!(report.liquidations, 0, "mark above liq must not liquidate");
+    }
+
+    #[tokio::test]
+    async fn mark_series_drives_liquidation_over_mid() {
+        let temp = TempDir::new().unwrap();
+        let symbol = make_symbol();
+        let seed = Position {
+            symbol: symbol.clone(),
+            size: tikr_core::SignedSize(Decimal::from(1)),
+            avg_entry: Price(Decimal::from(100)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let mut config = test_config(temp.path().into());
+        config.seed_position = Some(seed);
+        config.liquidation = Some(LiquidationConfig {
+            leverage: Decimal::from(10),
+            maint_margin_rate: Decimal::ZERO,
+            close_fee_bps: 0,
+        });
+        // Recorded mark dips to 89 (below liq 90) at t=500, while the book
+        // mid stays at 95 — proving the trigger marks against the mark
+        // series, not the order-book mid (which would NOT liquidate).
+        config.mark_series = Some(tikr_backtest::mark::MarkSeries::from_points(vec![(
+            500,
+            Price(Decimal::from(89)),
+        )]));
+        let book = MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: symbol.clone(),
+                bids: vec![Level {
+                    price: Price(Decimal::from(94)),
+                    size: Size(Decimal::from(10)),
+                }],
+                asks: vec![Level {
+                    price: Price(Decimal::from(96)),
+                    size: Size(Decimal::from(10)),
+                }],
+                ts: Timestamp(1_000),
+            },
+        };
+        let venue = MockVenue::finite(vec![book]);
+        let (_tx, rx) = watch::channel(false);
+        let report = run_with_resume(
+            venue,
+            layered_grid(),
+            fill_sim(),
+            symbol,
+            rx,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        // Mid (95) alone could never breach liq 90 — so a liquidation here
+        // proves the mark series (89) drove the trigger.
+        assert_eq!(report.liquidations, 1, "mark below liq must liquidate");
+        // Forced close executes at the liq price (90), not the mark: closed
+        // 1 @ 90 from entry 100 → realized −10.
+        assert_eq!(report.realized.0, Decimal::from(-10));
     }
 
     fn make_book_event(symbol: &Symbol, i: u64) -> MarketEvent {
@@ -2864,6 +2950,7 @@ mod tests {
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
             liquidation: None,
+            mark_series: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2959,6 +3046,7 @@ mod tests {
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
             liquidation: None,
+            mark_series: None,
         };
         let (_tx, rx) = watch::channel(false);
 

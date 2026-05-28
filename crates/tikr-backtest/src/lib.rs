@@ -13,6 +13,7 @@ pub mod fill_sim;
 pub mod grid_detect;
 pub mod liq_replay;
 pub mod liquidation;
+pub mod mark;
 pub mod parquet_util;
 pub mod pnl;
 pub mod replay;
