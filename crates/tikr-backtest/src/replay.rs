@@ -140,6 +140,11 @@ impl LoadedReplayData {
             // Empty data_dir means "no fixtures" — valid for the
             // empty-config heartbeat-only path. Skip discovery.
         } else if cfg.data_dir.exists() {
+            // Discover every shard first, then decode in parallel. A snapshot
+            // can be thousands of small parquet files; sequential
+            // open+decode dominated load time, so fan the decode out across
+            // cores (the final sort below makes load order irrelevant).
+            let mut tasks: Vec<(PathBuf, bool, usize)> = Vec::new();
             for (symbol_idx, symbol) in cfg.symbols.iter().enumerate() {
                 let base = symbol.base.0.as_ref();
                 let book_prefix = format!("book_{}_", base);
@@ -165,11 +170,44 @@ impl LoadedReplayData {
                         continue;
                     }
                     if name.starts_with(&book_prefix) {
-                        load_book_parquet(&path, symbol_idx, cfg.tick_size, &mut events)?;
+                        tasks.push((path, true, symbol_idx));
                     } else if name.starts_with(&trade_prefix) {
-                        load_trades_parquet(&path, symbol_idx, &mut events)?;
+                        tasks.push((path, false, symbol_idx));
                     }
                 }
+            }
+
+            let tick = cfg.tick_size;
+            let nthreads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(tasks.len().max(1));
+            let chunk = tasks.len().div_ceil(nthreads).max(1);
+            let results: Vec<Result<Vec<LoadedEvent>, ReplayError>> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = tasks
+                        .chunks(chunk)
+                        .map(|c| {
+                            s.spawn(move || {
+                                let mut local = Vec::new();
+                                for (path, is_book, idx) in c {
+                                    if *is_book {
+                                        load_book_parquet(path, *idx, tick, &mut local)?;
+                                    } else {
+                                        load_trades_parquet(path, *idx, &mut local)?;
+                                    }
+                                }
+                                Ok(local)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("parquet load thread panicked"))
+                        .collect()
+                });
+            for r in results {
+                events.extend(r?);
             }
         }
 

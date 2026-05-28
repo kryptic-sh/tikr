@@ -532,6 +532,9 @@ where
         .unwrap_or(Decimal::ZERO);
 
     let mut current_book = empty_snapshot(&symbol);
+    // Reused per-event buffer for the strategy's open-quote view, so the hot
+    // path refills one allocation instead of allocating a fresh Vec each event.
+    let mut open_quotes_buf: Vec<(tikr_venue::QuoteId, tikr_venue::QuoteIntent)> = Vec::new();
     let mut last_mid = Price(Decimal::ZERO);
     // Perp mark price for unrealized PnL, funding, and liquidation. Sourced
     // from `config.mark_series` when present; otherwise falls back to
@@ -806,7 +809,15 @@ where
                 last_event_ts = Some(ts);
 
                 if let MarketEvent::BookUpdate { snapshot } = &event {
-                    current_book = snapshot.clone();
+                    // Refresh in place rather than cloning the whole Snapshot:
+                    // the symbol is constant (single-symbol runner), so reuse
+                    // its (and the Vecs') allocation and skip the per-event
+                    // Arc<str> clone/drop churn that dominated the profile.
+                    current_book.bids.clear();
+                    current_book.bids.extend_from_slice(&snapshot.bids);
+                    current_book.asks.clear();
+                    current_book.asks.extend_from_slice(&snapshot.asks);
+                    current_book.ts = snapshot.ts;
                     if let (Some(b), Some(a)) = (snapshot.bids.first(), snapshot.asks.first()) {
                         last_mid = Price((b.price.0 + a.price.0) / Decimal::from(2));
                         // Sample peak position notional at this fresh
@@ -892,7 +903,8 @@ where
                 }
 
                 let pos = tracker.snapshot();
-                let open_quotes = fill_sim.live_quotes_for(&symbol);
+                fill_sim.live_quotes_into(&symbol, &mut open_quotes_buf);
+                let open_quotes = open_quotes_buf.as_slice();
                 let liqs = liq_window.observe(ts.0);
                 let ctx = StrategyContext {
                     symbol: &symbol,

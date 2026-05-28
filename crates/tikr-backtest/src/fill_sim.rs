@@ -302,28 +302,33 @@ impl FillSim {
     /// `size_remaining` carries the live remaining size, NOT the original
     /// intent size — important for strategies that look up partial state.
     pub fn live_quotes_for(&self, symbol: &Symbol) -> Vec<(QuoteId, QuoteIntent)> {
-        let mut out: Vec<(QuoteId, QuoteIntent)> = self
-            .live_quotes
-            .iter()
-            .filter(|q| &q.symbol == symbol)
-            .map(|q| {
-                (
-                    q.id,
-                    QuoteIntent {
-                        symbol: q.symbol.clone(),
-                        side: q.side,
-                        price: q.price,
-                        size: q.size_remaining,
-                        // Live resting orders are by construction post-only
-                        // here (FillSim's IOC/FOK paths return immediately
-                        // and never enter live_quotes). Stamp PostOnly so
-                        // strategies don't have to special-case.
-                        tif: TimeInForce::PostOnly,
-                        kind: tikr_core::QuoteKind::Point,
-                    },
-                )
-            })
-            .collect();
+        let mut out = Vec::new();
+        self.live_quotes_into(symbol, &mut out);
+        out
+    }
+
+    /// Same as [`Self::live_quotes_for`] but writes into a caller-owned buffer
+    /// (cleared first), so the hot per-event path can reuse one allocation
+    /// instead of allocating a fresh Vec every call.
+    pub fn live_quotes_into(&self, symbol: &Symbol, out: &mut Vec<(QuoteId, QuoteIntent)>) {
+        out.clear();
+        for q in self.live_quotes.iter().filter(|q| &q.symbol == symbol) {
+            out.push((
+                q.id,
+                QuoteIntent {
+                    symbol: q.symbol.clone(),
+                    side: q.side,
+                    price: q.price,
+                    size: q.size_remaining,
+                    // Live resting orders are by construction post-only here
+                    // (FillSim's IOC/FOK paths return immediately and never
+                    // enter live_quotes). Stamp PostOnly so strategies don't
+                    // have to special-case.
+                    tif: TimeInForce::PostOnly,
+                    kind: tikr_core::QuoteKind::Point,
+                },
+            ));
+        }
         // Live mode: include in-flight Place ops that already carry a
         // venue-issued id. They're physically resting on the exchange
         // book even though `apply_pending` hasn't promoted them into
@@ -342,7 +347,6 @@ impl FillSim {
                 out.push((*qid, intent.clone()));
             }
         }
-        out
     }
 
     /// Schedule a strategy action for venue submission at `now + appropriate_latency_ms`.
@@ -575,7 +579,14 @@ impl FillSim {
         // (IOC = unfilled remainder gets cancelled; we treat 0 fill as full
         // cancel). Partial-fill modeling for IOC is a future refinement.
         if matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK) {
-            let st = self.book_state.entry(intent.symbol.clone()).or_default();
+            if !self.book_state.contains_key(&intent.symbol) {
+                self.book_state
+                    .insert(intent.symbol.clone(), BookState::default());
+            }
+            let st = self
+                .book_state
+                .get_mut(&intent.symbol)
+                .expect("inserted above");
             // Walk the book: IOC consumes liquidity level by level from
             // the touch outward. Average fill price worsens as we eat
             // deeper into the order book — the realistic taker
@@ -609,10 +620,14 @@ impl FillSim {
             // Position notional uses the same Σ(p×q) we just computed —
             // it's the actual cash flow of the trade, not the touch
             // approximation.
+            if !self.position_notional.contains_key(&intent.symbol) {
+                self.position_notional
+                    .insert(intent.symbol.clone(), Decimal::ZERO);
+            }
             let entry = self
                 .position_notional
-                .entry(intent.symbol.clone())
-                .or_insert(Decimal::ZERO);
+                .get_mut(&intent.symbol)
+                .expect("inserted above");
             match intent.side {
                 Side::Bid => *entry = (*entry + notional).round_dp(8),
                 Side::Ask => *entry = (*entry - notional).round_dp(8),
@@ -789,7 +804,14 @@ impl FillSim {
         // vanished due to cancel" — skip attribution for those to avoid
         // phantom queue collapses. In-window edges: deepest visible bid /
         // ask price on each side.
-        let st = self.book_state.entry(snapshot.symbol.clone()).or_default();
+        if !self.book_state.contains_key(&snapshot.symbol) {
+            self.book_state
+                .insert(snapshot.symbol.clone(), BookState::default());
+        }
+        let st = self
+            .book_state
+            .get_mut(&snapshot.symbol)
+            .expect("inserted above");
         let deepest_bid = snapshot.bids.last().map(|l| l.price.0);
         let deepest_ask = snapshot.asks.last().map(|l| l.price.0);
         let prev_aggs: Vec<(usize, Decimal)> = self
@@ -915,10 +937,13 @@ impl FillSim {
             });
             // Same scale-bound treatment as the IOC arm; see comment above.
             let delta = (fill_price.0 * fill_amount).round_dp(8);
+            if !self.position_notional.contains_key(symbol) {
+                self.position_notional.insert(symbol.clone(), Decimal::ZERO);
+            }
             let entry = self
                 .position_notional
-                .entry(symbol.clone())
-                .or_insert(Decimal::ZERO);
+                .get_mut(symbol)
+                .expect("inserted above");
             match q.side {
                 Side::Bid => *entry = (*entry + delta).round_dp(8),
                 Side::Ask => *entry = (*entry - delta).round_dp(8),
