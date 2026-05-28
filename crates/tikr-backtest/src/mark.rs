@@ -37,20 +37,32 @@ pub enum MarkSeriesError {
     Decimal(String),
 }
 
-/// Sorted in-memory mark-price series for one symbol.
+/// One sampled mark observation: timestamp, mark price, and (optionally) the
+/// funding rate recorded at that instant.
+#[derive(Debug, Clone, Copy)]
+struct MarkPoint {
+    ts: u64,
+    mark: Price,
+    /// Recorded funding rate (fraction per funding interval) at this ts.
+    /// `None` when the shard predates the funding-rate column — the runner
+    /// then falls back to its flat configured rate.
+    funding: Option<Decimal>,
+}
+
+/// Sorted in-memory mark-price (+ funding-rate) series for one symbol.
 ///
 /// Constructed via [`MarkSeries::load`] (or [`MarkSeries::from_points`] for
-/// tests); queried via [`MarkSeries::mark_at`], which returns the latest mark
-/// whose timestamp is `<= now_ns`. Cloneable so a sweep can hand a fresh
-/// (cursor-0) copy to each preset run.
+/// tests); queried via [`MarkSeries::mark_at`] / [`MarkSeries::funding_at`],
+/// which return the latest value whose timestamp is `<= now_ns`. Cloneable so
+/// a sweep can hand a fresh (cursor-0) copy to each preset run.
 #[derive(Debug, Clone)]
 pub struct MarkSeries {
-    /// `(ts_ns, mark_price)` sorted ascending by `ts_ns`.
-    points: Vec<(u64, Price)>,
+    /// Points sorted ascending by `ts`.
+    points: Vec<MarkPoint>,
     /// Index of the next not-yet-consumed point.
     cursor: usize,
-    /// Latest mark whose ts was `<= ` the last queried `now_ns`.
-    current: Option<Price>,
+    /// Latest point whose ts was `<=` the last queried `now_ns`.
+    current: Option<MarkPoint>,
 }
 
 impl MarkSeries {
@@ -58,7 +70,7 @@ impl MarkSeries {
     /// (e.g. `"BTC"`), sorted ascending by `ts_ns`. An empty / missing dir or
     /// zero matching shards yields an empty series — not an error.
     pub fn load(data_dir: &Path, base: &str) -> Result<Self, MarkSeriesError> {
-        let mut points: Vec<(u64, Price)> = Vec::new();
+        let mut points: Vec<MarkPoint> = Vec::new();
         if data_dir.exists() {
             let prefix = format!("mark_{base}_");
             for entry in std::fs::read_dir(data_dir)? {
@@ -75,7 +87,7 @@ impl MarkSeries {
                 load_one(&path, &mut points)?;
             }
         }
-        points.sort_by_key(|(ts, _)| *ts);
+        points.sort_by_key(|p| p.ts);
         Ok(Self {
             points,
             cursor: 0,
@@ -83,9 +95,19 @@ impl MarkSeries {
         })
     }
 
-    /// Construct from an in-memory `(ts_ns, mark_price)` vector (tests / live).
-    pub fn from_points(mut points: Vec<(u64, Price)>) -> Self {
-        points.sort_by_key(|(ts, _)| *ts);
+    /// Construct a mark-only series from `(ts_ns, mark_price)` (tests / live);
+    /// funding is `None` for every point.
+    pub fn from_points(points: Vec<(u64, Price)>) -> Self {
+        Self::from_points_with_funding(points.into_iter().map(|(ts, m)| (ts, m, None)).collect())
+    }
+
+    /// Construct from `(ts_ns, mark_price, funding_rate)` triples (tests).
+    pub fn from_points_with_funding(points: Vec<(u64, Price, Option<Decimal>)>) -> Self {
+        let mut points: Vec<MarkPoint> = points
+            .into_iter()
+            .map(|(ts, mark, funding)| MarkPoint { ts, mark, funding })
+            .collect();
+        points.sort_by_key(|p| p.ts);
         Self {
             points,
             cursor: 0,
@@ -103,20 +125,35 @@ impl MarkSeries {
         self.points.is_empty()
     }
 
-    /// Latest mark price whose timestamp is `<= now_ns`, or `None` if the
-    /// series hasn't reached its first point yet. Cursor advances
-    /// monotonically — `now_ns` must be non-decreasing across calls (the
-    /// runner's sim clock guarantees this).
-    pub fn mark_at(&mut self, now_ns: u64) -> Option<Price> {
-        while self.cursor < self.points.len() && self.points[self.cursor].0 <= now_ns {
-            self.current = Some(self.points[self.cursor].1);
+    /// Advance the cursor to the latest point whose ts is `<= now_ns`.
+    /// `now_ns` must be non-decreasing across calls (the runner's sim clock
+    /// guarantees this); both [`Self::mark_at`] and [`Self::funding_at`] drive
+    /// it, so calling them with the same ts is idempotent.
+    fn advance(&mut self, now_ns: u64) {
+        while self.cursor < self.points.len() && self.points[self.cursor].ts <= now_ns {
+            self.current = Some(self.points[self.cursor]);
             self.cursor += 1;
         }
-        self.current
+    }
+
+    /// Latest mark price whose timestamp is `<= now_ns`, or `None` if the
+    /// series hasn't reached its first point yet.
+    pub fn mark_at(&mut self, now_ns: u64) -> Option<Price> {
+        self.advance(now_ns);
+        self.current.map(|p| p.mark)
+    }
+
+    /// Latest recorded funding rate (fraction per funding interval) whose
+    /// timestamp is `<= now_ns`. `None` when no point has been reached yet or
+    /// the shard carried no funding-rate column — the runner then falls back
+    /// to its flat configured rate.
+    pub fn funding_at(&mut self, now_ns: u64) -> Option<Decimal> {
+        self.advance(now_ns);
+        self.current.and_then(|p| p.funding)
     }
 }
 
-fn load_one(path: &Path, out: &mut Vec<(u64, Price)>) -> Result<(), MarkSeriesError> {
+fn load_one(path: &Path, out: &mut Vec<MarkPoint>) -> Result<(), MarkSeriesError> {
     let file = std::fs::File::open(path)?;
     let df = ParquetReader::new(file).finish()?;
     let ts_ns = df
@@ -135,6 +172,14 @@ fn load_one(path: &Path, out: &mut Vec<(u64, Price)>) -> Result<(), MarkSeriesEr
         .map_err(|e| {
             MarkSeriesError::Schema(format!("mark_price not f64 in {}: {e}", path.display()))
         })?;
+    // Funding rate is optional — older shards (or hand-made fixtures) may omit
+    // it. When present it must be f64.
+    let funding = match df.column("funding_rate") {
+        Ok(col) => Some(col.f64().map_err(|e| {
+            MarkSeriesError::Schema(format!("funding_rate not f64 in {}: {e}", path.display()))
+        })?),
+        Err(_) => None,
+    };
     let n = df.height();
     for i in 0..n {
         let ts = ts_ns
@@ -148,7 +193,20 @@ fn load_one(path: &Path, out: &mut Vec<(u64, Price)>) -> Result<(), MarkSeriesEr
         }
         let m_d = Decimal::try_from(m)
             .map_err(|e| MarkSeriesError::Decimal(format!("mark {m} at row {i}: {e}")))?;
-        out.push((ts, Price(m_d)));
+        // A null funding cell on an otherwise-present column → None for that
+        // row (fall back to flat rate); a malformed value errors.
+        let f_d =
+            match funding.as_ref().and_then(|c| c.get(i)) {
+                Some(f) => Some(Decimal::try_from(f).map_err(|e| {
+                    MarkSeriesError::Decimal(format!("funding {f} at row {i}: {e}"))
+                })?),
+                None => None,
+            };
+        out.push(MarkPoint {
+            ts,
+            mark: Price(m_d),
+            funding: f_d,
+        });
     }
     Ok(())
 }
@@ -182,6 +240,24 @@ mod tests {
         // Between points the prior mark holds.
         assert_eq!(s.mark_at(4_999), Some(Price(Decimal::from(100))));
         assert_eq!(s.mark_at(5_000), Some(Price(Decimal::from(200))));
+    }
+
+    #[test]
+    fn funding_at_tracks_recorded_rate_and_mark_only_is_none() {
+        let bp = |n: i64, d: u32| Decimal::new(n, d);
+        let mut s = MarkSeries::from_points_with_funding(vec![
+            (1_000, Price(Decimal::from(100)), Some(bp(1, 4))), // 0.0001
+            (5_000, Price(Decimal::from(100)), Some(bp(2, 4))), // 0.0002
+        ]);
+        assert_eq!(s.funding_at(500), None, "before first point");
+        assert_eq!(s.funding_at(1_000), Some(bp(1, 4)));
+        assert_eq!(s.funding_at(4_999), Some(bp(1, 4)), "holds between points");
+        assert_eq!(s.funding_at(5_000), Some(bp(2, 4)));
+
+        // A mark-only series exposes no funding → runner falls back to flat.
+        let mut m = MarkSeries::from_points(vec![pt(1_000, 100)]);
+        assert_eq!(m.mark_at(1_000), Some(Price(Decimal::from(100))));
+        assert_eq!(m.funding_at(1_000), None);
     }
 
     #[test]

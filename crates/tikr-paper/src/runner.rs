@@ -831,19 +831,24 @@ where
                 // (or credit) `position × mark × rate × (dt / 28800s)`. The
                 // sign convention: positive funding rate → longs pay,
                 // shorts receive (`amount = −size × mark × rate × dt/8h`).
+                // Rate source: the recorded funding rate from the mark series
+                // at this timestamp when present (real, time-varying), else
+                // the flat configured `rate_per_interval` fallback.
                 if let Some(fcfg) = funding_cfg
                     && last_mark.0 > Decimal::ZERO
                 {
                     if let Some(prev_ts) = last_funding_ts {
                         let dt_ns = ts.0.saturating_sub(prev_ts.0);
                         if dt_ns > 0 {
+                            let rate = mark_series
+                                .as_mut()
+                                .and_then(|s| s.funding_at(ts.0))
+                                .unwrap_or(fcfg.rate_per_interval);
                             let dt_secs = Decimal::from(dt_ns) / Decimal::from(1_000_000_000u64);
                             let interval = Decimal::from(fcfg.interval_secs.max(1));
                             let pos_size = tracker.snapshot().size.0;
-                            let amount = -pos_size
-                                * last_mark.0
-                                * fcfg.rate_per_interval
-                                * (dt_secs / interval);
+                            let amount =
+                                -pos_size * last_mark.0 * rate * (dt_secs / interval);
                             tracker.accrue_funding(amount);
                         }
                     }
@@ -2591,6 +2596,60 @@ mod tests {
         // Forced close executes at the liq price (90), not the mark: closed
         // 1 @ 90 from entry 100 → realized −10.
         assert_eq!(report.realized.0, Decimal::from(-10));
+    }
+
+    #[tokio::test]
+    async fn recorded_funding_rate_overrides_flat_config() {
+        let temp = TempDir::new().unwrap();
+        let symbol = make_symbol();
+        // Long 1 @ 100.
+        let seed = Position {
+            symbol: symbol.clone(),
+            size: tikr_core::SignedSize(Decimal::from(1)),
+            avg_entry: Price(Decimal::from(100)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let mut config = test_config(temp.path().into());
+        config.seed_position = Some(seed);
+        // Flat fallback rate is ZERO — so any funding accrual must come from
+        // the recorded series.
+        config.funding = Some(FundingConfig {
+            interval_secs: 28_800,
+            rate_per_interval: Decimal::ZERO,
+        });
+        // Recorded mark 100 + funding 0.0001 (1 bp) per 8h interval, from t=0.
+        config.mark_series = Some(tikr_backtest::mark::MarkSeries::from_points_with_funding(
+            vec![(0, Price(Decimal::from(100)), Some(Decimal::new(1, 4)))],
+        ));
+        // Two heartbeats exactly one funding interval apart.
+        let interval_ns = 28_800u64 * 1_000_000_000;
+        let events = vec![
+            MarketEvent::Heartbeat { ts: Timestamp(0) },
+            MarketEvent::Heartbeat {
+                ts: Timestamp(interval_ns),
+            },
+        ];
+        let venue = MockVenue::finite(events);
+        let (_tx, rx) = watch::channel(false);
+        let report = run_with_resume(
+            venue,
+            layered_grid(),
+            fill_sim(),
+            symbol,
+            rx,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        // dt = one full interval → funding = −pos × mark × rate × 1
+        //                                  = −1 × 100 × 0.0001 = −0.01.
+        // The flat config rate (0) would have produced 0, so −0.01 proves the
+        // recorded rate drove the accrual.
+        assert_eq!(report.funding.0, Decimal::new(-1, 2));
     }
 
     fn make_book_event(symbol: &Symbol, i: u64) -> MarketEvent {
