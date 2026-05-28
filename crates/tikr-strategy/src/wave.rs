@@ -341,6 +341,45 @@ impl Wave {
         k.to_string().parse::<i64>().ok()
     }
 
+    /// Cancel resting orders on `side` whose price is outside the band's
+    /// price range — the tail left behind as price travels. Holds the
+    /// resting-order count to ~`grid_levels` per side.
+    ///
+    /// BID band `[low_k, high_k]` → price band
+    /// `[origin - high_k·step, origin - low_k·step]` (high_k = deeper =
+    /// lower price). ASK → `[origin + low_k·step, origin + high_k·step]`.
+    fn prune_outside_band(
+        &self,
+        ctx: &StrategyContext<'_>,
+        side: Side,
+        band: WindowRange,
+        actions: &mut Vec<Action>,
+    ) {
+        let (lo, hi) = match side {
+            Side::Bid => {
+                let (Some(deep), Some(shallow)) =
+                    (self.bid_price(band.high_k), self.bid_price(band.low_k))
+                else {
+                    return;
+                };
+                (deep, shallow)
+            }
+            Side::Ask => {
+                let (Some(shallow), Some(deep)) =
+                    (self.ask_price(band.low_k), self.ask_price(band.high_k))
+                else {
+                    return;
+                };
+                (shallow, deep)
+            }
+        };
+        for (id, q) in ctx.open_quotes {
+            if q.side == side && (q.price.0 < lo || q.price.0 > hi) {
+                actions.push(Action::Cancel(*id));
+            }
+        }
+    }
+
     /// Count band slots on `side` with no matching resting order in
     /// `ctx.open_quotes` (= empty/filled). Used to gate batched refill.
     fn band_missing(&self, ctx: &StrategyContext<'_>, side: Side, band: WindowRange) -> u32 {
@@ -522,65 +561,59 @@ impl Strategy for Wave {
             return actions;
         }
 
-        // 2) Band gap-fill on the FIXED lattice. The lattice never moves;
-        // we just keep `grid_levels` slots filled on each side around the
-        // current touch. A slot that fills is re-emitted at its OWN price
-        // next event (refill in place). Slots that drift outside the band
-        // as price travels stay resting forever — never cancelled — so a
-        // reversion fills them. No recenter, no relattice, no prune.
+        // 2) Round-trip refill on the FIXED lattice.
+        //
+        // Refill fires ONLY when BOTH sides of the band have drained by
+        // ≥ refill_threshold slots since the last refill — i.e. at least
+        // one bid AND one ask filled. That pair is a completed round-trip
+        // (bought low + sold high), so every refill cycle banks the
+        // captured spread. On a one-way trend only one side fills → the
+        // both-sides trigger never fires → no refill → inventory is
+        // capped at the initial band (no chasing, no runaway).
+        //
+        // On refill: re-emit every empty slot on both sides at their
+        // current-touch band prices, then prune the tail (orders left
+        // outside the new band). Between refills: do nothing.
         let levels = self.config.grid_levels.max(1) as i64;
 
-        // BID band: highest lattice slot ≤ placement top (cross-guarded),
-        // then `levels-1` deeper slots.
-        if let Some(top) = top_b
-            && top.0 > Decimal::ZERO
-            && tick > Decimal::ZERO
-        {
+        // Compute both bands around the cross-guarded touch.
+        let bid_band = top_b.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
             let mut cap = top.0;
             if let Some(ap) = best_ask
                 && ap.0 > Decimal::ZERO
+                && tick > Decimal::ZERO
             {
-                let max_bid = ap.0 - tick;
-                if cap > max_bid {
-                    cap = max_bid;
-                }
+                cap = cap.min(ap.0 - tick);
             }
-            if let Some(top_k) = self.bid_k_at_or_below(cap) {
-                let band = WindowRange {
-                    low_k: top_k,
-                    high_k: top_k + levels - 1,
-                };
-                // Batched refill: only emit once ≥ refill_threshold band
-                // slots are empty.
-                if self.band_missing(ctx, Side::Bid, band) >= self.config.refill_threshold {
-                    self.emit_window_slots(ctx, Side::Bid, band, false, &mut actions);
-                }
-            }
-        }
-
-        // ASK band: lowest lattice slot ≥ placement top (cross-guarded),
-        // then `levels-1` higher slots.
-        if let Some(top) = top_a
-            && top.0 > Decimal::ZERO
-            && tick > Decimal::ZERO
-        {
+            self.bid_k_at_or_below(cap).map(|top_k| WindowRange {
+                low_k: top_k,
+                high_k: top_k + levels - 1,
+            })
+        });
+        let ask_band = top_a.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
             let mut cap = top.0;
             if let Some(bp) = best_bid
                 && bp.0 > Decimal::ZERO
+                && tick > Decimal::ZERO
             {
-                let min_ask = bp.0 + tick;
-                if cap < min_ask {
-                    cap = min_ask;
-                }
+                cap = cap.max(bp.0 + tick);
             }
-            if let Some(top_k) = self.ask_k_at_or_above(cap) {
-                let band = WindowRange {
-                    low_k: top_k,
-                    high_k: top_k + levels - 1,
-                };
-                if self.band_missing(ctx, Side::Ask, band) >= self.config.refill_threshold {
-                    self.emit_window_slots(ctx, Side::Ask, band, false, &mut actions);
-                }
+            self.ask_k_at_or_above(cap).map(|top_k| WindowRange {
+                low_k: top_k,
+                high_k: top_k + levels - 1,
+            })
+        });
+
+        if let (Some(bb), Some(ab)) = (bid_band, ask_band) {
+            let bid_drained = self.band_missing(ctx, Side::Bid, bb);
+            let ask_drained = self.band_missing(ctx, Side::Ask, ab);
+            let thr = self.config.refill_threshold.max(1);
+            // Both-sides round-trip trigger.
+            if bid_drained >= thr && ask_drained >= thr {
+                self.emit_window_slots(ctx, Side::Bid, bb, false, &mut actions);
+                self.emit_window_slots(ctx, Side::Ask, ab, false, &mut actions);
+                self.prune_outside_band(ctx, Side::Bid, bb, &mut actions);
+                self.prune_outside_band(ctx, Side::Ask, ab, &mut actions);
             }
         }
 
