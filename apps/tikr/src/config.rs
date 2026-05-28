@@ -272,7 +272,7 @@ pub struct BotConfig {
     pub wave: Option<WaveParams>,
 }
 
-/// Wave — lazy-recenter lattice with ATR-adaptive step + skew-on-recenter.
+/// Wave — frozen fixed-step lattice with round-trip refill.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct WaveParams {
@@ -294,22 +294,6 @@ pub struct WaveParams {
     /// Tick override for grid step. `> 0` wins over bps.
     #[serde(default)]
     pub grid_step_ticks: u32,
-    /// Bar interval (seconds) for ATR. Default 60.
-    #[serde(default = "wave_default_bar_interval_secs")]
-    pub bar_interval_secs: u64,
-    /// Max closed bars retained for ATR. Default 200.
-    #[serde(default = "wave_default_max_bars")]
-    pub max_bars: usize,
-    /// ATR period. Default 14.
-    #[serde(default = "wave_default_atr_period")]
-    pub atr_period: u32,
-    /// Step = ATR × mult when `> 0`. Default `0` (use ticks/bps).
-    #[serde(default)]
-    pub step_atr_mult: Decimal,
-    /// Wait this many bars before init when auto-step is on.
-    /// Default = `atr_period`.
-    #[serde(default = "wave_default_bar_warmup_bars")]
-    pub bar_warmup_bars: u32,
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,
@@ -321,18 +305,6 @@ fn wave_default_refill_threshold() -> u32 {
 
 fn wave_default_grid_levels() -> u32 {
     12
-}
-fn wave_default_bar_interval_secs() -> u64 {
-    60
-}
-fn wave_default_max_bars() -> usize {
-    200
-}
-fn wave_default_atr_period() -> u32 {
-    14
-}
-fn wave_default_bar_warmup_bars() -> u32 {
-    14
 }
 
 /// RSI mean-reversion + KER regime gate, long-only.

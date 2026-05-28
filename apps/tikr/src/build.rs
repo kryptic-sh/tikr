@@ -509,11 +509,6 @@ fn build_wave(
         min_self_spread_ticks: wave.min_self_spread_ticks,
         grid_step_bps: wave.grid_step_bps,
         grid_step_ticks: wave.grid_step_ticks,
-        bar_interval_secs: wave.bar_interval_secs,
-        max_bars: wave.max_bars,
-        atr_period: wave.atr_period,
-        step_atr_mult: wave.step_atr_mult,
-        bar_warmup_bars: wave.bar_warmup_bars,
         refill_threshold: wave.refill_threshold,
     }))
 }

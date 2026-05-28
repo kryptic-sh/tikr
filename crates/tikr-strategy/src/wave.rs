@@ -9,10 +9,9 @@
 //! reversion fills them.
 //!
 //! ## Behavior
-//! 1. **Init (first usable book event, after ATR warmup if enabled):**
-//!    freeze lattice. Step = `ATR × step_atr_mult` if set, else the
-//!    `*_ticks` / `*_bps` knobs, else 1 tick. Origins = current
-//!    top_bid / top_ask (after min_self_spread).
+//! 1. **Init (first usable book event):** freeze lattice. Step = the
+//!    `grid_step_ticks` / `grid_step_bps` knobs, else 1 tick. Origins =
+//!    current top_bid / top_ask (after min_self_spread).
 //! 2. **Band refill (every event):** for each side, compute the active
 //!    band = `grid_levels` lattice slots from the current cross-guarded
 //!    top. Emit any band slot not already resting in `open_quotes`.
@@ -21,11 +20,9 @@
 //! Inventory is bounded only by per-order size (no position cap) — run
 //! on small-min-notional markets so accumulated fills stay survivable.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
-use tikr_core::{
-    Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp,
-};
+use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
@@ -53,38 +50,11 @@ pub struct WaveConfig {
     /// Tick override for grid_step. `> 0` wins over bps.
     pub grid_step_ticks: u32,
 
-    // ----- adaptive step sizing -----
-    /// Bar interval (seconds) for ATR aggregation. Default 60 = 1m.
-    pub bar_interval_secs: u64,
-    /// Max closed bars retained for ATR.
-    pub max_bars: usize,
-    /// ATR lookback. Default 14.
-    pub atr_period: u32,
-    /// When `> 0`, lattice step at init / relattice = `ATR × mult`
-    /// snapped to tick. Replaces the bps/ticks knobs. `0` (default)
-    /// = use bps/ticks as configured.
-    pub step_atr_mult: Decimal,
-    /// Wait this many closed bars before seeding the first lattice
-    /// when `step_atr_mult > 0`. Default = `atr_period`. Ignored when
-    /// auto-step is disabled.
-    pub bar_warmup_bars: u32,
     /// Refill batching: only refill a side once ≥ this many of its band
     /// slots are empty (filled). `1` = refill on any single gap (most
     /// reactive). Higher = wait for N fills then refill them together,
     /// cutting re-emit churn. Default `1`.
     pub refill_threshold: u32,
-}
-
-/// Closed OHLCV bar.
-#[derive(Debug, Clone, Copy)]
-struct Bar {
-    #[allow(dead_code)]
-    open: Decimal,
-    high: Decimal,
-    low: Decimal,
-    close: Decimal,
-    #[allow(dead_code)]
-    volume: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,11 +75,6 @@ pub struct Wave {
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
-    // ----- adaptive step state (ATR for one-shot lattice init) -----
-    /// Bar buffer for ATR computation.
-    closed_bars: VecDeque<Bar>,
-    open_bar: Option<Bar>,
-    current_bucket: Option<u64>,
 }
 
 impl Wave {
@@ -179,125 +144,23 @@ impl Wave {
     }
 
     /// Compute lattice step. Priority order:
-    /// 1. ATR mode (`step_atr_mult > 0`): step = `ATR × mult` snapped to tick.
-    ///    Returns `None` if buffer warming.
-    /// 2. Tick mode (`grid_step_ticks > 0`).
-    /// 3. Bps mode (`grid_step_bps > 0`).
-    /// 4. Default: 1 tick.
-    fn compute_step(&self, mid: Decimal) -> Option<Decimal> {
+    /// 1. Tick mode (`grid_step_ticks > 0`).
+    /// 2. Bps mode (`grid_step_bps > 0`).
+    /// 3. Default: 1 tick.
+    fn compute_step(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
-        if self.config.step_atr_mult > Decimal::ZERO {
-            let atr = self.atr()?;
-            if atr <= Decimal::ZERO || tick <= Decimal::ZERO {
-                return None;
-            }
-            let target = atr * self.config.step_atr_mult;
-            let snapped = if target > tick {
+        if self.config.grid_step_ticks > 0 {
+            return Decimal::from(self.config.grid_step_ticks) * tick;
+        }
+        if self.config.grid_step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
+            let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+            return if target > tick {
                 (target / tick).ceil() * tick
             } else {
                 tick
             };
-            return Some(snapped);
         }
-        if self.config.grid_step_ticks > 0 {
-            return Some(Decimal::from(self.config.grid_step_ticks) * tick);
-        }
-        if self.config.grid_step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
-            let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
-            return Some(if target > tick {
-                (target / tick).ceil() * tick
-            } else {
-                tick
-            });
-        }
-        Some(tick)
-    }
-
-    // ----- bar aggregation -----
-
-    fn bucket_of(&self, ts: Timestamp) -> u64 {
-        let interval_ns = self.config.bar_interval_secs.saturating_mul(1_000_000_000);
-        ts.0.checked_div(interval_ns).unwrap_or(0)
-    }
-
-    /// Roll the open bar if the timestamp bucket changed.
-    fn maybe_roll_bar(&mut self, ts: Timestamp, price: Decimal) {
-        let bucket = self.bucket_of(ts);
-        match self.current_bucket {
-            None => {
-                self.current_bucket = Some(bucket);
-                self.open_bar = Some(Bar {
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
-                    volume: Decimal::ZERO,
-                });
-            }
-            Some(b) if b == bucket => {}
-            Some(_) => {
-                if let Some(bar) = self.open_bar.take() {
-                    self.closed_bars.push_back(bar);
-                    while self.closed_bars.len() > self.config.max_bars {
-                        self.closed_bars.pop_front();
-                    }
-                }
-                self.current_bucket = Some(bucket);
-                self.open_bar = Some(Bar {
-                    open: price,
-                    high: price,
-                    low: price,
-                    close: price,
-                    volume: Decimal::ZERO,
-                });
-            }
-        }
-    }
-
-    fn update_open_bar_price(&mut self, price: Decimal) {
-        if let Some(bar) = self.open_bar.as_mut() {
-            bar.close = price;
-            if price > bar.high {
-                bar.high = price;
-            }
-            if price < bar.low {
-                bar.low = price;
-            }
-        }
-    }
-
-    fn add_trade_volume(&mut self, size: Decimal) {
-        if let Some(bar) = self.open_bar.as_mut() {
-            bar.volume += size;
-        }
-    }
-
-    /// Simple ATR over `atr_period` closed bars. None until enough data.
-    fn atr(&self) -> Option<Decimal> {
-        let n = self.config.atr_period as usize;
-        if self.closed_bars.len() < n + 1 {
-            return None;
-        }
-        let bars: Vec<&Bar> = self.closed_bars.iter().rev().take(n + 1).collect();
-        let mut tr_sum = Decimal::ZERO;
-        for w in bars.windows(2) {
-            let h_l = w[0].high - w[0].low;
-            let h_pc = (w[0].high - w[1].close).abs();
-            let l_pc = (w[0].low - w[1].close).abs();
-            let tr = h_l.max(h_pc).max(l_pc);
-            tr_sum += tr;
-        }
-        Some(tr_sum / Decimal::from(n as u64))
-    }
-
-    /// `true` when auto-step is enabled AND the bar buffer hasn't
-    /// reached the warmup threshold yet.
-    fn warming_up(&self) -> bool {
-        if self.config.step_atr_mult <= Decimal::ZERO {
-            return false;
-        }
-        let need = self.config.bar_warmup_bars.max(self.config.atr_period) as usize;
-        self.closed_bars.len() < need
+        tick
     }
 
     /// BID slot price at index k (k=0 is the top, increases descending).
@@ -498,9 +361,6 @@ impl Strategy for Wave {
             lattice_step: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
-            closed_bars: VecDeque::new(),
-            open_bar: None,
-            current_bucket: None,
         }
     }
 
@@ -508,7 +368,7 @@ impl Strategy for Wave {
         "wave"
     }
 
-    fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+    fn on_event(&mut self, ctx: &StrategyContext<'_>, _event: &MarketEvent) -> Vec<Action> {
         self.emitted_this_event_bid.clear();
         self.emitted_this_event_ask.clear();
         let mut actions: Vec<Action> = Vec::new();
@@ -518,40 +378,17 @@ impl Strategy for Wave {
         let (top_b, top_a) = self.top_overrides(best_bid, best_ask);
         let tick = self.config.tick_size;
 
-        // 0) Drive bar aggregation (for ATR if enabled).
-        let bar_price = match event {
-            MarketEvent::BookUpdate { .. } => match (best_bid, best_ask) {
-                (Some(b), Some(a)) if a.0 > b.0 => Some((b.0 + a.0) / Decimal::from(2)),
-                _ => None,
-            },
-            MarketEvent::Trade { price, .. } => Some(price.0),
-            _ => None,
-        };
-        if let Some(p) = bar_price
-            && p > Decimal::ZERO
-        {
-            self.maybe_roll_bar(ctx.now, p);
-            self.update_open_bar_price(p);
-        }
-        if let MarketEvent::Trade { size, .. } = event {
-            self.add_trade_volume(size.0);
-        }
-
-        // 1) Lattice init (one-shot). When auto-step is on, defer until
-        // ATR buffer is warm.
+        // 1) Lattice init (one-shot): freeze step + origins on first usable book.
         if self.lattice_step.is_none()
-            && !self.warming_up()
             && let (Some(b), Some(a)) = (top_b, top_a)
             && b.0 > Decimal::ZERO
             && a.0 > b.0
             && tick > Decimal::ZERO
         {
             let mid = (b.0 + a.0) / Decimal::from(2);
-            if let Some(step) = self.compute_step(mid) {
-                self.lattice_step = Some(step);
-                self.bid_lattice_origin = Some(b.0);
-                self.ask_lattice_origin = Some(a.0);
-            }
+            self.lattice_step = Some(self.compute_step(mid));
+            self.bid_lattice_origin = Some(b.0);
+            self.ask_lattice_origin = Some(a.0);
         }
 
         let lattice_ready = self.lattice_step.is_some()
@@ -661,11 +498,6 @@ mod tests {
             min_self_spread_ticks: 0,
             grid_step_bps: 0,
             grid_step_ticks: 2,
-            bar_interval_secs: 60,
-            max_bars: 64,
-            atr_period: 14,
-            step_atr_mult: Decimal::ZERO,
-            bar_warmup_bars: 14,
             refill_threshold: 1,
         }
     }

@@ -13,8 +13,7 @@
 #     directional gamble + runaway inventory; higher batches deeper.
 #   - Tight 1bps step is safe ONLY under the round-trip threshold (rt5);
 #     rt1 at the same step blows inventory to $500+.
-#   - step_atr_mult=0 → fixed bps step (no ATR warmup). Replaces the old
-#     ATR/recenter/skew machinery (deleted).
+#   - Fixed bps step, no ATR/recenter/skew (that machinery was deleted).
 #
 # BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
 # $600 @ 5x account's capacity. Do not add BTCUSDC here.
@@ -45,9 +44,8 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 0
+min_self_spread_bps = 1
 grid_step_bps = 1
-step_atr_mult = "0.0"
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
@@ -59,9 +57,8 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 0
+min_self_spread_bps = 1
 grid_step_bps = 1
-step_atr_mult = "0.0"
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
 [[bot]]
@@ -70,9 +67,8 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 0
+min_self_spread_bps = 1
 grid_step_bps = 1
-step_atr_mult = "0.0"
 
 # ─── BNBUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -81,6 +77,5 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 0
+min_self_spread_bps = 1
 grid_step_bps = 1
-step_atr_mult = "0.0"

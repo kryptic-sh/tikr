@@ -146,28 +146,16 @@ struct Args {
     /// Wave: lattice slots per side.
     #[arg(long, default_value_t = 12u32)]
     wv_grid_levels: u32,
-    /// Wave: ATR step multiplier. 0 = use ticks/bps.
-    #[arg(long, default_value = "1.0")]
-    wv_step_atr_mult: String,
-    /// Wave: ATR period (bars).
-    #[arg(long, default_value_t = 14u32)]
-    wv_atr_period: u32,
-    /// Wave: bar interval (s).
-    #[arg(long, default_value_t = 60u64)]
-    wv_bar_interval_secs: u64,
-    /// Wave: bar warmup count.
-    #[arg(long, default_value_t = 14u32)]
-    wv_bar_warmup_bars: u32,
     /// Wave: refill batching threshold (slots empty before refill).
     #[arg(long, default_value_t = 1u32)]
     wv_refill_threshold: u32,
-    /// Wave: minimum self-spread in bps (used when atr-mult = 0). 0 = off.
+    /// Wave: minimum self-spread in bps. 0 = off.
     #[arg(long, default_value_t = 0u32)]
     wv_min_self_spread_bps: u32,
     /// Wave: minimum self-spread in ticks (wins over bps when > 0).
     #[arg(long, default_value_t = 0u32)]
     wv_min_self_spread_ticks: u32,
-    /// Wave: grid step in bps (used when atr-mult = 0). 0 = 1-tick lattice.
+    /// Wave: grid step in bps. 0 = 1-tick lattice.
     #[arg(long, default_value_t = 0u32)]
     wv_grid_step_bps: u32,
     /// Wave: per-order notional.
@@ -405,11 +393,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_self_spread_ticks: args.wv_min_self_spread_ticks,
                 grid_step_bps: args.wv_grid_step_bps,
                 grid_step_ticks: 0,
-                bar_interval_secs: args.wv_bar_interval_secs,
-                max_bars: 200,
-                atr_period: args.wv_atr_period,
-                step_atr_mult: Decimal::from_str(&args.wv_step_atr_mult)?,
-                bar_warmup_bars: args.wv_bar_warmup_bars,
                 refill_threshold: args.wv_refill_threshold,
             });
             run_with_resume(
