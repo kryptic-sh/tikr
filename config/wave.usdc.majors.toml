@@ -82,9 +82,9 @@ bar_warmup_bars = 120
 relattice_every_n_recenters = 5
 recenter_cooldown_ms = 1000
 
-# ─── ZECUSDC ──────────────────────────────────────────────────────────────
+# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
 [[bot]]
-symbol = "ZECUSDC"
+symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 4
