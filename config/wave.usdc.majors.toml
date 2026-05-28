@@ -43,13 +43,13 @@ symbol = "BTCUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 2
+recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
 bar_warmup_bars = 120
-relattice_every_n_recenters = 10
+relattice_every_n_recenters = 5
 recenter_cooldown_ms = 1000
 
 # ─── ETHUSDC ──────────────────────────────────────────────────────────────
@@ -58,13 +58,13 @@ symbol = "ETHUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 2
+recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
 bar_warmup_bars = 120
-relattice_every_n_recenters = 10
+relattice_every_n_recenters = 5
 recenter_cooldown_ms = 1000
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
@@ -73,13 +73,13 @@ symbol = "DOGEUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 2
+recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
 bar_warmup_bars = 120
-relattice_every_n_recenters = 10
+relattice_every_n_recenters = 5
 recenter_cooldown_ms = 1000
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
@@ -88,11 +88,11 @@ symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 2
+recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
 bar_warmup_bars = 120
-relattice_every_n_recenters = 10
+relattice_every_n_recenters = 5
 recenter_cooldown_ms = 1000
