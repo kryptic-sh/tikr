@@ -282,18 +282,9 @@ pub struct WaveParams {
     /// Lattice slots per side. Default 12.
     #[serde(default = "wave_default_grid_levels")]
     pub grid_levels: u32,
-    /// Min self-spread (bps). `0` = disabled.
+    /// Lattice geometry in bps — inner gap AND level spacing. `0` = 1-tick.
     #[serde(default)]
-    pub min_self_spread_bps: u32,
-    /// Tick override for min self-spread. `> 0` wins over bps.
-    #[serde(default)]
-    pub min_self_spread_ticks: u32,
-    /// Grid step (bps). `0` = 1-tick.
-    #[serde(default)]
-    pub grid_step_bps: u32,
-    /// Tick override for grid step. `> 0` wins over bps.
-    #[serde(default)]
-    pub grid_step_ticks: u32,
+    pub step_bps: u32,
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,

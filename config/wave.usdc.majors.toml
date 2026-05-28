@@ -1,27 +1,37 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 4 bots: SOLUSDC, ZECUSDC, DOGEUSDC, BNBUSDC. Wave = frozen lattice +
-# round-trip refill (refill only when BOTH sides drain ≥ refill_threshold
-# slots = a completed bid+ask round-trip). USDC promo (0 bps maker).
+# 4 bots: SOLUSDC, ZECUSDC, DOGEUSDC, BNBUSDC. Wave = frozen fixed-step
+# lattice + round-trip refill. USDC promo (0 bps maker).
 #
-# Tuned via 2h fixed-step sweep (2026-05-28): inner 0 bps / step 1 bps /
-# levels 10 / refill_threshold 5 was the top net AND best risk-adjusted of
-# 12 configs — ex-BTC +$5.39/2h, all 4 markets green. Key findings:
-#   - Edge lives in STEP width, not inner. Keep inner (min_self_spread) at 0
-#     so origins sit at top-of-book; widening it just starves fills.
-#   - refill_threshold ≈ levels/2 is the all-green sweet spot. Lower (rt1) =
-#     directional gamble + runaway inventory; higher batches deeper.
-#   - Tight 1bps step is safe ONLY under the round-trip threshold (rt5);
-#     rt1 at the same step blows inventory to $500+.
-#   - Fixed bps step, no ATR/recenter/skew (that machinery was deleted).
+# Refill fires when EITHER a both-sides round-trip completes (bid AND ask
+# each drained ≥ refill_threshold) OR one whole side is empty (re-arm after
+# a one-sided sweep — integral, not optional). Lattice never recenters; the
+# active window slides over the fixed grid and prunes the tail.
+#
+# `step_bps` is the single geometry knob — it sets BOTH the inner self-spread
+# (gap from mid to the first order each side) AND the spacing between levels.
+#
+# Tuned via 72h SOL snapshot (2026-05-28): step_bps=5 / levels=10 / rt=5 is
+# the best RISK-ADJUSTED config found. On the 72h SOL replay (maker 0 /
+# taker 5, $10/order): net +$17.50, peak inventory only ~$953, and ending
+# unrealized +$0.66 (near-flat — true lean MM, not held directional risk).
+# Key findings:
+#   - A WIDE step (5 bps) naturally bounds inventory: orders are spaced far
+#     apart, so a crash fills few slots per move → slow accumulation. This
+#     beats a hard position cap, which bounds inventory but kills net.
+#   - Tighter steps (1-2 bps) earn slightly more gross but pile 4-5x the
+#     inventory ($4-5k peak) — that "edge" is really leveraged dip-buying.
+#   - refill_threshold ≈ levels/2 is the sweet spot. Lower = runaway
+#     inventory; the side-empty re-arm keeps it live through one-way moves.
 #
 # BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
 # $600 @ 5x account's capacity. Do not add BTCUSDC here.
 #
-# RISK ($600 @ 5x): worst per-market inventory peak in backtest ~$631 (at
-# $10/order) → ~$126 margin; a ~19% adverse move ≈ $120 loss. wave has NO
-# position cap and keeps adding into a trend — watch a sustained one-way
-# move. Size orders so summed peaks stay well under buying power.
+# RISK ($600 @ 5x): worst per-market peak in the 72h backtest ~$953 at
+# $10/order → ~$570 at this account's ~$6/order → ~$114 margin at 5x. A ~19%
+# adverse move on that ≈ $108 loss. Wave still has NO hard cap and adds into
+# a trend, but the wide step keeps the excursion survivable. Watch sustained
+# one-way moves; size so summed peaks stay well under buying power.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
@@ -44,12 +54,11 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 1
-grid_step_bps = 2
+step_bps = 5
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
-# this account). NOT backtested — no 2h ZEC data; running on the winning
+# this account). NOT backtested — no ZEC snapshot; running on the winning
 # params unvalidated, watch first live session.
 [[bot]]
 symbol = "ZECUSDC"
@@ -57,8 +66,7 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 1
-grid_step_bps = 2
+step_bps = 5
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
 [[bot]]
@@ -67,8 +75,7 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 1
-grid_step_bps = 2
+step_bps = 5
 
 # ─── BNBUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -77,5 +84,4 @@ strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
-min_self_spread_bps = 1
-grid_step_bps = 2
+step_bps = 5

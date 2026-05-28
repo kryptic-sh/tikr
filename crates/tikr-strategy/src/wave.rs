@@ -9,9 +9,9 @@
 //! reversion fills them.
 //!
 //! ## Behavior
-//! 1. **Init (first usable book event):** freeze lattice. Step = the
-//!    `grid_step_ticks` / `grid_step_bps` knobs, else 1 tick. Origins =
-//!    current top_bid / top_ask (after min_self_spread).
+//! 1. **Init (first usable book event):** freeze lattice. Step = `step_bps`
+//!    of mid (snapped to tick), else 1 tick. `step_bps` also sets the inner
+//!    self-spread, so origins sit `step_bps/2` off mid on each side.
 //! 2. **Band refill (every event):** for each side, compute the active
 //!    band = `grid_levels` lattice slots from the current cross-guarded
 //!    top. Emit any band slot not already resting in `open_quotes`.
@@ -41,20 +41,24 @@ pub struct WaveConfig {
     /// Lattice slots per side. Default 12.
     pub grid_levels: u32,
 
-    /// Minimum self-spread in bps (small-tick markets). `0` = disabled.
-    pub min_self_spread_bps: u32,
-    /// Tick override for min_self_spread. `> 0` wins over bps.
-    pub min_self_spread_ticks: u32,
-    /// Grid step in bps (small-tick markets). `0` = 1-tick lattice.
-    pub grid_step_bps: u32,
-    /// Tick override for grid_step. `> 0` wins over bps.
-    pub grid_step_ticks: u32,
+    /// Lattice geometry in bps of mid — drives BOTH the inner self-spread
+    /// (gap from mid to the first order on each side) AND the spacing
+    /// between levels. Snapped to tick (min 1 tick). `0` = 1-tick lattice
+    /// with no inner gap (origins at the touch).
+    pub step_bps: u32,
 
     /// Refill batching: only refill a side once ≥ this many of its band
     /// slots are empty (filled). `1` = refill on any single gap (most
     /// reactive). Higher = wait for N fills then refill them together,
     /// cutting re-emit churn. Default `1`.
     pub refill_threshold: u32,
+
+    /// Hard position cap in quote notional. When `|position notional|`
+    /// exceeds this, the *adding* side stops emitting (longs → no more
+    /// bids, shorts → no more asks) while resting orders stay put to catch
+    /// the reversion. Updated live via [`Strategy::on_max_position_updated`]
+    /// from the account-derived cap. `0` (default) = uncapped.
+    pub max_position_usdt: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +82,8 @@ pub struct Wave {
 }
 
 impl Wave {
+    /// Order size for `price`: notional / price, rounded to the lot step and
+    /// floored at `min_notional`.
     fn quote_size(&self, price: Price) -> Size {
         if price.0 <= Decimal::ZERO {
             return Size(Decimal::ZERO);
@@ -108,16 +114,16 @@ impl Wave {
         })
     }
 
-    /// Compute `(top_bid_override, top_ask_override)` honoring
-    /// `min_self_spread_{ticks,bps}` — mirror of tide's logic.
+    /// Compute `(top_bid_override, top_ask_override)`, pushing the origins
+    /// apart to honor the inner self-spread (`step_bps` of mid, half each
+    /// side). Mirror of tide's logic.
     fn top_overrides(
         &self,
         best_bid: Option<Price>,
         best_ask: Option<Price>,
     ) -> (Option<Price>, Option<Price>) {
         let tick = self.config.tick_size;
-        let spread_active =
-            self.config.min_self_spread_ticks > 0 || self.config.min_self_spread_bps > 0;
+        let spread_active = self.config.step_bps > 0;
         if let (Some(bp), Some(ap)) = (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
@@ -125,11 +131,7 @@ impl Wave {
             && spread_active
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
-            let required_half = if self.config.min_self_spread_ticks > 0 {
-                Decimal::from(self.config.min_self_spread_ticks) * tick / Decimal::from(2)
-            } else {
-                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000)
-            };
+            let required_half = mid * Decimal::from(self.config.step_bps) / Decimal::from(20_000);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -143,17 +145,12 @@ impl Wave {
         }
     }
 
-    /// Compute lattice step. Priority order:
-    /// 1. Tick mode (`grid_step_ticks > 0`).
-    /// 2. Bps mode (`grid_step_bps > 0`).
-    /// 3. Default: 1 tick.
+    /// Lattice step = `step_bps` of mid, snapped up to tick (min 1 tick).
+    /// `step_bps = 0` → 1-tick lattice.
     fn compute_step(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
-        if self.config.grid_step_ticks > 0 {
-            return Decimal::from(self.config.grid_step_ticks) * tick;
-        }
-        if self.config.grid_step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
-            let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+        if self.config.step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
+            let target = mid * Decimal::from(self.config.step_bps) / Decimal::from(10_000);
             return if target > tick {
                 (target / tick).ceil() * tick
             } else {
@@ -445,11 +442,34 @@ impl Strategy for Wave {
             let bid_drained = self.band_missing(ctx, Side::Bid, bb);
             let ask_drained = self.band_missing(ctx, Side::Ask, ab);
             let thr = self.config.refill_threshold.max(1);
-            // Refill only when a round-trip completed: both sides drained
-            // ≥ threshold (a bid AND an ask filled → captured spread).
-            if bid_drained >= thr && ask_drained >= thr {
-                self.emit_window_slots(ctx, Side::Bid, bb, false, &mut actions);
-                self.emit_window_slots(ctx, Side::Ask, ab, false, &mut actions);
+            let full = self.config.grid_levels.max(1);
+            // Refill when a round-trip completed (both sides drained ≥
+            // threshold = a bid AND an ask filled → captured spread), OR
+            // when one whole side is empty — re-arming the grid after a
+            // one-sided sweep instead of going dormant. The side-empty
+            // re-arm is integral to keeping the bot live through one-way
+            // moves, not an option.
+            let round_trip = bid_drained >= thr && ask_drained >= thr;
+            let side_empty = bid_drained >= full || ask_drained >= full;
+            if round_trip || side_empty {
+                let mid = match (best_bid, best_ask) {
+                    (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
+                    _ => Decimal::ZERO,
+                };
+                // Hard position cap: when over the cap, suppress the side
+                // that would add to inventory (longs → no bids, shorts → no
+                // asks). Resting orders stay put to catch the reversion.
+                let pos = ctx.position.size.0;
+                let cap = self.config.max_position_usdt;
+                let pos_notional = pos * mid;
+                let suppress_bids = cap > Decimal::ZERO && pos_notional > cap;
+                let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
+                if !suppress_bids {
+                    self.emit_window_slots(ctx, Side::Bid, bb, false, &mut actions);
+                }
+                if !suppress_asks {
+                    self.emit_window_slots(ctx, Side::Ask, ab, false, &mut actions);
+                }
                 self.prune_outside_band(ctx, Side::Bid, bb, &mut actions);
                 self.prune_outside_band(ctx, Side::Ask, ab, &mut actions);
             }
@@ -466,6 +486,15 @@ impl Strategy for Wave {
         if notional_per_order > Decimal::ZERO {
             self.config.notional_per_order = notional_per_order;
         }
+        Vec::new()
+    }
+
+    fn on_max_position_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        max_position_usdt: Decimal,
+    ) -> Vec<Action> {
+        self.config.max_position_usdt = max_position_usdt.max(Decimal::ZERO);
         Vec::new()
     }
 }
@@ -494,11 +523,9 @@ mod tests {
             step_size: Decimal::new(1, 3),
             min_notional: Decimal::from(5),
             grid_levels: 6,
-            min_self_spread_bps: 0,
-            min_self_spread_ticks: 0,
-            grid_step_bps: 0,
-            grid_step_ticks: 2,
+            step_bps: 10,
             refill_threshold: 1,
+            max_position_usdt: Decimal::ZERO,
         }
     }
 

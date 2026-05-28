@@ -505,11 +505,11 @@ fn build_wave(
         step_size,
         min_notional,
         grid_levels: wave.grid_levels,
-        min_self_spread_bps: wave.min_self_spread_bps,
-        min_self_spread_ticks: wave.min_self_spread_ticks,
-        grid_step_bps: wave.grid_step_bps,
-        grid_step_ticks: wave.grid_step_ticks,
+        step_bps: wave.step_bps,
         refill_threshold: wave.refill_threshold,
+        // Account-derived cap arrives via on_max_position_updated (live
+        // channel); seed 0 = uncapped until the first update lands.
+        max_position_usdt: Decimal::ZERO,
     }))
 }
 
