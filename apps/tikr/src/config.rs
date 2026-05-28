@@ -434,17 +434,11 @@ pub struct TideParams {
     /// max per-side position = N × notional_per_order.
     #[serde(default = "tide_default_grid_levels")]
     pub grid_levels: u32,
-    /// Minimum gap (in bps of mid) between the top of the bid grid
-    /// and the top of the ask grid. When the book spread is wider,
-    /// tops sit at touch. When narrower, both tops shift symmetrically
-    /// around mid so the gap is met. `0` (default) = disabled.
-    /// Use to make Tide viable on tight-spread markets.
+    /// Lattice geometry in bps of mid — drives BOTH the inner self-spread
+    /// (min gap between top bid and top ask) AND the spacing between grid
+    /// levels. Snapped to tick. `0` (default) = at-touch with 1-tick spacing.
     #[serde(default)]
-    pub min_self_spread_bps: u32,
-    /// Spacing between grid levels in bps of mid (snapped to tick,
-    /// min 1 tick). `0` = 1-tick spacing.
-    #[serde(default)]
-    pub grid_step_bps: u32,
+    pub step_bps: u32,
     /// Cancel BID/ASK orders that drift outside the active lattice
     /// window. Default `true`. `false` = never cancel — orders rest
     /// forever, may pin margin.
@@ -484,10 +478,10 @@ pub struct TideAutoConfig {
     /// Default `60`.
     #[serde(default = "tide_auto_default_recheck_interval_secs")]
     pub recheck_interval_secs: u64,
-    /// Forwarded to every spawned Tide bot as
-    /// `TideConfig.min_self_spread_bps`. Default `10`.
-    #[serde(default = "tide_auto_default_min_self_spread_bps")]
-    pub min_self_spread_bps: u32,
+    /// Forwarded to every spawned Tide bot as `TideConfig.step_bps`
+    /// (inner gap + level spacing). Default `10`.
+    #[serde(default = "tide_auto_default_step_bps")]
+    pub step_bps: u32,
     /// Forwarded to every spawned Tide bot as
     /// `TideConfig.grid_levels`. Default `12`.
     #[serde(default = "tide_auto_default_grid_levels")]
@@ -498,12 +492,6 @@ pub struct TideAutoConfig {
     /// USDC, so you'll need USDC in your futures wallet to trade them.
     #[serde(default = "tide_auto_default_quote_asset")]
     pub quote_asset: String,
-    /// Forwarded to every spawned Tide bot as
-    /// `TideConfig.grid_step_bps`. Default `4` — sensible for
-    /// tight-tick perps (ETHUSDC, etc.) where 1-tick spacing piles
-    /// dozens of orders within sub-bps.
-    #[serde(default = "tide_auto_default_grid_step_bps")]
-    pub grid_step_bps: u32,
     /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
     /// When non-empty, ONLY these symbols spawn and the
     /// `min_tick_bps` + `min_volume_usdt` filters are BYPASSED.
@@ -525,7 +513,7 @@ fn tide_auto_default_min_volume_usdt() -> Decimal {
 fn tide_auto_default_recheck_interval_secs() -> u64 {
     60
 }
-fn tide_auto_default_min_self_spread_bps() -> u32 {
+fn tide_auto_default_step_bps() -> u32 {
     10
 }
 fn tide_auto_default_grid_levels() -> u32 {
@@ -533,9 +521,6 @@ fn tide_auto_default_grid_levels() -> u32 {
 }
 fn tide_auto_default_quote_asset() -> String {
     "USDT".to_string()
-}
-fn tide_auto_default_grid_step_bps() -> u32 {
-    4
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

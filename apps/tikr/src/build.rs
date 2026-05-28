@@ -371,12 +371,7 @@ fn build_tide(
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
     let grid_levels = cfg.tide.as_ref().map(|p| p.grid_levels).unwrap_or(1);
-    let min_self_spread_bps = cfg
-        .tide
-        .as_ref()
-        .map(|p| p.min_self_spread_bps)
-        .unwrap_or(0);
-    let grid_step_bps = cfg.tide.as_ref().map(|p| p.grid_step_bps).unwrap_or(0);
+    let step_bps = cfg.tide.as_ref().map(|p| p.step_bps).unwrap_or(0);
     let prune_stragglers = cfg
         .tide
         .as_ref()
@@ -391,8 +386,7 @@ fn build_tide(
         step_size,
         min_notional,
         grid_levels,
-        min_self_spread_bps,
-        grid_step_bps,
+        step_bps,
         max_position_usdt: Decimal::ZERO,
         prune_stragglers,
     }))

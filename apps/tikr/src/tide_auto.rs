@@ -141,8 +141,7 @@ pub fn spawn_tide_auto_manager(
                     &account,
                     &shared_state,
                     cfg.grid_levels,
-                    cfg.min_self_spread_bps,
-                    cfg.grid_step_bps,
+                    cfg.step_bps,
                 );
                 info!(symbol, "tide_auto: spawned new bot");
                 active.insert(symbol.clone(), bot);
@@ -203,8 +202,7 @@ fn spawn_one_bot(
     account: &TideAutoAccountCtx,
     shared_state: &SharedBotState,
     grid_levels: u32,
-    min_self_spread_bps: u32,
-    grid_step_bps: u32,
+    step_bps: u32,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cfg = BotConfig {
@@ -215,8 +213,7 @@ fn spawn_one_bot(
         tide: Some(TideParams {
             notional: None,
             grid_levels,
-            min_self_spread_bps,
-            grid_step_bps,
+            step_bps,
             prune_stragglers: true,
         }),
         sg: None,

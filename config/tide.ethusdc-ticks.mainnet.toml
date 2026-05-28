@@ -32,8 +32,7 @@ symbol = "ETHUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_bps = 2
-grid_step_bps = 2
+step_bps = 2
 prune_stragglers = false
 
 [[bot]]
@@ -41,6 +40,5 @@ symbol = "ZECUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_bps = 2
-grid_step_bps = 2
+step_bps = 2
 prune_stragglers = false

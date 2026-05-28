@@ -41,14 +41,11 @@ min_volume_usdt = "100000000"
 
 recheck_interval_secs = 60
 
-# 20 bps synthesized spread = ~16 bps net edge at BNB-discounted maker
-# rates (~3.6 bps RT). Wide enough that grid rebounds clear fees plus
-# slippage on tight-tick majors.
-min_self_spread_bps = 8
+# Lattice geometry in bps — inner self-spread gap AND level spacing
+# (unified from the old 8/10 split → 10). At BNB-discounted maker rates
+# (~3.6 bps RT) this clears fees plus slippage on tight-tick majors.
+step_bps = 10
 
-# 6 levels per side — extra depth so each leg of the ladder can absorb
+# 3 levels per side — depth so each leg of the ladder can absorb
 # a fast move before all slots fill on one side.
 grid_levels = 3
-
-# 10 bps between lattice slots. Frozen at first event; lattice is permanent.
-grid_step_bps = 10

@@ -35,15 +35,10 @@ min_tick_bps = "0"
 min_volume_usdt = "5000000"
 recheck_interval_secs = 60
 
-# Self-spread synthesis — bot widens its own quotes to this gap when
-# the book is tighter. BTCUSDC at $76k has tick = 0.013 bps; 20 bps
-# self-spread = ~150 ticks apart for meaningful edge per RT.
-min_self_spread_bps = 1
+# Lattice geometry in bps — inner self-spread gap AND level spacing.
+# BTCUSDC at $76k has tick = 0.013 bps; the bot widens its own quotes
+# to this gap when the book is tighter, and spaces grid levels this far.
+step_bps = 1
 
-# Grid depth — N orders per side spaced grid_step_bps apart.
+# Grid depth — N orders per side spaced step_bps apart.
 grid_levels = 6
-
-# Grid spacing in bps of mid (snapped to tick, min 1 tick).
-# BTCUSDC tick is sub-bps so without this knob the grid would pile
-# all 3 levels at adjacent ticks. 4 bps spaces them ~4 bps apart.
-grid_step_bps = 1

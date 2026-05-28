@@ -40,8 +40,7 @@ symbol = "SOLUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_bps = 20
-grid_step_bps = 20
+step_bps = 20
 
 prune_stragglers = true
 
@@ -52,8 +51,7 @@ symbol = "ZECUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_bps = 20
-grid_step_bps = 20
+step_bps = 20
 
 prune_stragglers = true
 
@@ -63,8 +61,7 @@ symbol = "DOGEUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_bps = 20
-grid_step_bps = 20
+step_bps = 20
 
 prune_stragglers = true
 
@@ -74,7 +71,6 @@ symbol = "BNBUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_bps = 20
-grid_step_bps = 20
+step_bps = 20
 
 prune_stragglers = true

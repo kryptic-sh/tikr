@@ -131,9 +131,9 @@ struct Args {
     #[arg(long, default_value_t = 12u32)]
     tr_grid_levels: u32,
 
-    /// Tide: minimum self-spread in bps of mid.
-    #[arg(long, default_value_t = 10u32)]
-    tr_min_self_spread_bps: u32,
+    /// Tide: lattice geometry in bps (inner gap AND level spacing). 0 = at-touch/1-tick.
+    #[arg(long, default_value_t = 0u32)]
+    tr_step_bps: u32,
 
     /// Tide: per-order notional in USDT.
     #[arg(long, default_value = "10")]
@@ -146,11 +146,6 @@ struct Args {
     /// Tide: venue min order notional in USDT.
     #[arg(long, default_value = "5")]
     tr_min_notional: String,
-
-    /// Tide: grid spacing in bps (snapped to tick, min 1 tick).
-    /// `0` = legacy 1-tick spacing.
-    #[arg(long, default_value_t = 0u32)]
-    tr_grid_step_bps: u32,
 
     /// Wave: lattice slots per side.
     #[arg(long, default_value_t = 12u32)]
@@ -363,8 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 step_size: Decimal::from_str(&args.tr_step_size)?,
                 min_notional: Decimal::from_str(&args.tr_min_notional)?,
                 grid_levels: args.tr_grid_levels,
-                min_self_spread_bps: args.tr_min_self_spread_bps,
-                grid_step_bps: args.tr_grid_step_bps,
+                step_bps: args.tr_step_bps,
                 max_position_usdt: Decimal::ZERO,
                 prune_stragglers: true,
             });

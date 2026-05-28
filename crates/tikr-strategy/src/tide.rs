@@ -2,7 +2,7 @@
 //!
 //! 1. **Grid maintenance**: maintain `grid_levels` resting orders per
 //!    side within the active lattice window, honouring the
-//!    `min_self_spread_bps` inner gap and `grid_step_bps` spacing.
+//!    `step_bps` (drives both the inner gap and the level spacing).
 //!
 //! **Lattice-window pruning.** Each event computes a `grid_levels`-wide
 //! activation window on each side, snapped to the lattice. Orders
@@ -48,21 +48,11 @@ pub struct TideConfig {
     /// leaves the bot with orders in the path. Inventory cap scales
     /// linearly: max position = N × notional_per_order per side.
     pub grid_levels: u32,
-    /// Minimum required spread (in bps of mid) between the top of the
-    /// bid grid and the top of the ask grid. When the book spread is
-    /// wider than this, both tops sit at their touches (no change).
-    /// When the book spread is narrower, BOTH tops are pushed apart
-    /// (bid down, ask up) symmetrically around mid so the gap meets
-    /// the requirement. `0` (default) = disabled (always at touch).
-    ///
-    /// Use to make Tide viable on tight-spread / narrow-tick
-    /// markets where the natural book spread alone wouldn't cover
-    /// 2× maker fees (~3.6 bps RT on BNB-discount Binance USD-M).
-    pub min_self_spread_bps: u32,
-    /// Spacing between grid levels in bps of mid. Effective spacing =
-    /// max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
-    /// `0` = 1-tick spacing.
-    pub grid_step_bps: u32,
+    /// Lattice geometry in bps of mid — drives BOTH the inner self-spread
+    /// (min gap between the top bid and top ask; tops push apart when the
+    /// book is tighter) AND the spacing between grid levels. Snapped to
+    /// tick (min 1 tick). `0` (default) = at-touch with 1-tick spacing.
+    pub step_bps: u32,
     /// Per-bot peak position cap in USDT notional. When long
     /// notional > cap, BID emits are suppressed (no more accumulation
     /// on the long side); when short notional > cap, ASK emits are
@@ -329,7 +319,7 @@ impl Strategy for Tide {
         // `top_ask − top_bid ≥ required_spread`. Snapped to tick.
         //
         // Bps mode: required_spread = `bps × mid / 10000`.
-        let spread_active = self.config.min_self_spread_bps > 0;
+        let spread_active = self.config.step_bps > 0;
         let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
             (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
@@ -338,8 +328,7 @@ impl Strategy for Tide {
             && spread_active
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
-            let required_half =
-                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000);
+            let required_half = mid * Decimal::from(self.config.step_bps) / Decimal::from(20_000);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -362,8 +351,8 @@ impl Strategy for Tide {
             && tick > Decimal::ZERO
         {
             let mid = (top_b.0 + top_a.0) / Decimal::from(2);
-            let step = if self.config.grid_step_bps > 0 {
-                let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
+            let step = if self.config.step_bps > 0 {
+                let target = mid * Decimal::from(self.config.step_bps) / Decimal::from(10_000);
                 if target > tick {
                     (target / tick).ceil() * tick
                 } else {
@@ -623,8 +612,7 @@ mod tests {
             step_size: Decimal::ONE,
             min_notional: Decimal::from(5),
             grid_levels: 1,
-            min_self_spread_bps: 0,
-            grid_step_bps: 0,
+            step_bps: 0,
             max_position_usdt: Decimal::ZERO,
             prune_stragglers: true,
         }
