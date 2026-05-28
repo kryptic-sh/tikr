@@ -41,7 +41,6 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 1
 step_bps = 20
-
 prune_stragglers = true
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
@@ -52,7 +51,6 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 1
 step_bps = 20
-
 prune_stragglers = true
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
@@ -62,7 +60,6 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 1
 step_bps = 20
-
 prune_stragglers = true
 
 # ─── BNBUSDC ──────────────────────────────────────────────────────────────
@@ -72,5 +69,4 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 1
 step_bps = 20
-
 prune_stragglers = true
