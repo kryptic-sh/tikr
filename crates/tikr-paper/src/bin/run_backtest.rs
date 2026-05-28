@@ -333,6 +333,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_self_spread_bps: args.tr_min_self_spread_bps,
                 close_profit_bps: args.tr_close_profit_bps,
                 grid_step_bps: args.tr_grid_step_bps,
+                min_self_spread_ticks: 0,
+                close_profit_ticks: 0,
+                grid_step_ticks: 0,
                 max_position_usdt: Decimal::ZERO,
                 adaptive_bps_enabled: false,
             });

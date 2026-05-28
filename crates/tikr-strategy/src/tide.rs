@@ -84,6 +84,22 @@ pub struct TideConfig {
     /// suppressed. Close-on-fill orders are NEVER suppressed since
     /// they reduce position. `0` = no cap (legacy behavior).
     pub max_position_usdt: Decimal,
+    /// Tick-based override for `min_self_spread_bps`. When `> 0`, the
+    /// minimum self-spread is `min_self_spread_ticks × tick_size` and
+    /// the bps value is ignored. Default `0` = use bps.
+    ///
+    /// Useful for wide-tick markets (BTC, where 1 tick ≈ 0.013 bps at
+    /// $75k) where bps math produces fractional-tick targets that snap
+    /// unpredictably. Tick mode is exact and predictable.
+    pub min_self_spread_ticks: u32,
+    /// Tick-based override for `close_profit_bps`. When `> 0`, the
+    /// close-on-fill distance is `close_profit_ticks × tick_size` and
+    /// the bps value is ignored. Default `0` = use bps.
+    pub close_profit_ticks: u32,
+    /// Tick-based override for `grid_step_bps`. When `> 0`, the lattice
+    /// step is exactly `grid_step_ticks × tick_size` and the bps value
+    /// is ignored. Default `0` = use bps.
+    pub grid_step_ticks: u32,
     /// When `true`, tighten `min_self_spread_bps` + `grid_step_bps` by
     /// 1 bps per minute of fpm < 1 (no fills), and relax back toward
     /// configured baseline at 1 bps/min when fpm ≥ 1. Minimum effective
@@ -408,19 +424,27 @@ impl Strategy for Tide {
         let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
 
         // Min-self-spread enforcement: when the book spread is tighter
-        // than `min_self_spread_bps`, push the placement tops apart so
-        // top_ask − top_bid ≥ min_self_spread × mid / 10000. Snapped
-        // to tick (bid floor, ask ceil).
+        // than the configured minimum, push the placement tops apart so
+        // `top_ask − top_bid ≥ required_spread`. Snapped to tick.
+        //
+        // Tick mode (`min_self_spread_ticks > 0`): required_spread =
+        // `ticks × tick_size` — exact, no bps math.
+        // Bps mode (default): required_spread = `bps × mid / 10000`.
+        let spread_active = self.config.min_self_spread_ticks > 0
+            || self.config.min_self_spread_bps > 0;
         let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
             (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
             && tick > Decimal::ZERO
-            && self.config.min_self_spread_bps > 0
+            && spread_active
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
-            let required_half =
-                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000);
+            let required_half = if self.config.min_self_spread_ticks > 0 {
+                Decimal::from(self.config.min_self_spread_ticks) * tick / Decimal::from(2)
+            } else {
+                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000)
+            };
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -434,10 +458,9 @@ impl Strategy for Tide {
         };
 
         // Freeze the lattice on the first event with both tops known.
-        // Step = max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
-        // Origins = current top_bid_override / top_ask_override —
-        // future slots descend from / ascend from them in `step`
-        // increments. Recorded once; ignored forever after.
+        // Step (tick mode): `grid_step_ticks × tick_size` exact.
+        // Step (bps mode): `max(1 tick, ceil(bps × mid / 10000 / tick) × tick)`.
+        // Default (both 0): 1 tick.
         if self.lattice_step.is_none()
             && let (Some(top_b), Some(top_a)) = (top_bid_override, top_ask_override)
             && top_b.0 > Decimal::ZERO
@@ -445,7 +468,9 @@ impl Strategy for Tide {
             && tick > Decimal::ZERO
         {
             let mid = (top_b.0 + top_a.0) / Decimal::from(2);
-            let step = if self.config.grid_step_bps > 0 {
+            let step = if self.config.grid_step_ticks > 0 {
+                Decimal::from(self.config.grid_step_ticks) * tick
+            } else if self.config.grid_step_bps > 0 {
                 let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
                 if target > tick {
                     (target / tick).ceil() * tick
@@ -616,17 +641,23 @@ impl Strategy for Tide {
         // the opposite side.
         if let MarketEvent::Fill(fill) = event
             && fill.is_full
-            && self.config.close_profit_bps > 0
+            && (self.config.close_profit_ticks > 0 || self.config.close_profit_bps > 0)
         {
             let tick = self.config.tick_size;
             if tick > Decimal::ZERO && fill.price.0 > Decimal::ZERO {
-                let close_bps = self.config.close_profit_bps;
-                let target_distance =
-                    fill.price.0 * Decimal::from(close_bps) / Decimal::from(10_000);
-                let close_distance = if target_distance > tick {
-                    (target_distance / tick).ceil() * tick
+                // Tick mode: exact `ticks × tick_size`.
+                // Bps mode: `ceil(bps × fill_price / 10000 / tick) × tick`, min 1 tick.
+                let close_distance = if self.config.close_profit_ticks > 0 {
+                    Decimal::from(self.config.close_profit_ticks) * tick
                 } else {
-                    tick
+                    let close_bps = self.config.close_profit_bps;
+                    let target_distance =
+                        fill.price.0 * Decimal::from(close_bps) / Decimal::from(10_000);
+                    if target_distance > tick {
+                        (target_distance / tick).ceil() * tick
+                    } else {
+                        tick
+                    }
                 };
                 let (close_side, close_price) = match fill.side {
                     Side::Bid => (Side::Ask, Price(fill.price.0 + close_distance)),
@@ -747,6 +778,9 @@ mod tests {
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
             adaptive_bps_enabled: false,
+            min_self_spread_ticks: 0,
+            close_profit_ticks: 0,
+            grid_step_ticks: 0,
         }
     }
 
@@ -923,6 +957,9 @@ mod tests {
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
             adaptive_bps_enabled: false,
+            min_self_spread_ticks: 0,
+            close_profit_ticks: 0,
+            grid_step_ticks: 0,
         };
         let mut s = Tide::new(c);
         let symbol = sym();
@@ -972,6 +1009,9 @@ mod tests {
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
             adaptive_bps_enabled: false,
+            min_self_spread_ticks: 0,
+            close_profit_ticks: 0,
+            grid_step_ticks: 0,
         };
         c.tick_size = Decimal::new(1, 2);
         let mut s = Tide::new(c);

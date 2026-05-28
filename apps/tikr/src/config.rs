@@ -423,9 +423,23 @@ pub struct TideParams {
     /// min 1 tick). `0` = legacy 1-tick spacing.
     #[serde(default)]
     pub grid_step_bps: u32,
+    /// Tick override for min_self_spread. When `> 0`, the minimum
+    /// self-spread is `ticks × tick_size` and `min_self_spread_bps`
+    /// is ignored. Default `0` = bps mode.
+    #[serde(default)]
+    pub min_self_spread_ticks: u32,
+    /// Tick override for close_profit. When `> 0`, the close-on-fill
+    /// distance is `ticks × tick_size` and `close_profit_bps` is
+    /// ignored. Default `0` = bps mode.
+    #[serde(default)]
+    pub close_profit_ticks: u32,
+    /// Tick override for grid_step. When `> 0`, the lattice step is
+    /// `ticks × tick_size` and `grid_step_bps` is ignored. Default `0`.
+    #[serde(default)]
+    pub grid_step_ticks: u32,
     /// Adaptive bps walk: tighten min_self_spread + grid_step by 1
     /// per minute when fpm<1, relax back toward baseline when fpm≥1.
-    /// Default `true`.
+    /// Default `true`. Inactive when tick-overrides are set.
     #[serde(default = "tide_adaptive_default")]
     pub adaptive_bps_enabled: bool,
 }

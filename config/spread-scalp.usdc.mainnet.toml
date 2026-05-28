@@ -29,12 +29,13 @@ symbol = "BTCUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── ETHUSDC ───────────────────────────────────────────────────────────────
@@ -43,12 +44,13 @@ symbol = "ETHUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── BNBUSDC ───────────────────────────────────────────────────────────────
@@ -57,12 +59,13 @@ symbol = "BNBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── SOLUSDC ───────────────────────────────────────────────────────────────
@@ -71,12 +74,13 @@ symbol = "SOLUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── XRPUSDC ───────────────────────────────────────────────────────────────
@@ -85,12 +89,13 @@ symbol = "XRPUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── DOGEUSDC ──────────────────────────────────────────────────────────────
@@ -99,12 +104,13 @@ symbol = "DOGEUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── ADAUSDC ───────────────────────────────────────────────────────────────
@@ -113,12 +119,13 @@ symbol = "ADAUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── AVAXUSDC ──────────────────────────────────────────────────────────────
@@ -127,12 +134,13 @@ symbol = "AVAXUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── LINKUSDC ──────────────────────────────────────────────────────────────
@@ -141,12 +149,13 @@ symbol = "LINKUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── SUIUSDC ───────────────────────────────────────────────────────────────
@@ -155,12 +164,13 @@ symbol = "SUIUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true
 
 # ─── ARBUSDC ───────────────────────────────────────────────────────────────
@@ -169,10 +179,11 @@ symbol = "ARBUSDC"
 strategy = "spread-scalp"
 [bot.spread_scalp]
 min_spread_bps = 0
-quote_offset_ticks = 0
+quote_offset_ticks = 1
 requote_interval_ms = 500
 reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-adverse_stop_after_secs = 120
-adverse_stop_drift_bps = 30
+price_tolerance_ticks = 0
+strict_touch_quotes = false
+# adverse_stop_after_secs = 120
+# adverse_stop_drift_bps = 30
 close_side_always_quotes = true

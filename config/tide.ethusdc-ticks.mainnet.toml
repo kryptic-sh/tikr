@@ -1,0 +1,46 @@
+# ─── Tide ETHUSDC tick-tuned — MAINNET ────────────────────────────────────
+#
+# Tight tick-based geometry, single bot on ETHUSDC. Uses the new
+# tick-override knobs (`*_ticks`) so the lattice + spread + close
+# distances are exact ticks, not bps math.
+#
+# ETHUSDC tick_size = 0.01 USD.
+#   inner = 5 ticks  = $0.05  ≈ ~2.5 bps at $2000
+#   step  = 5 ticks  = $0.05
+#   close = 10 ticks = $0.10  ≈ ~5 bps at $2000
+#   levels = 3       → 3 orders per side, span = 2 × 5 ticks = $0.10
+#
+# USDC promo (0 bps maker) — any 1-tick rebound after a fill prints PnL.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tide-ethusdc-ticks"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+[[bot]]
+symbol = "ETHUSDC"
+strategy = "tide"
+[bot.tide]
+grid_levels = 3
+
+# Tick-mode geometry — bps fields are ignored when these are > 0.
+min_self_spread_ticks = 5
+grid_step_ticks = 5
+close_profit_ticks = 10
+
+# bps fields kept at default 0 (overridden by ticks above).
+min_self_spread_bps = 0
+grid_step_bps = 0
+close_profit_bps = 0
+
+# Adaptive walk has no effect in tick mode (lattice is frozen on first
+# event with exact tick spacing). Disabled for clarity.
+adaptive_bps_enabled = false
