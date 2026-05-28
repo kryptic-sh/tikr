@@ -338,6 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 grid_step_ticks: 0,
                 max_position_usdt: Decimal::ZERO,
                 adaptive_bps_enabled: false,
+                prune_stragglers: true,
             });
             run_with_resume(
                 venue,

@@ -100,6 +100,11 @@ pub struct TideConfig {
     /// step is exactly `grid_step_ticks × tick_size` and the bps value
     /// is ignored. Default `0` = use bps.
     pub grid_step_ticks: u32,
+    /// When `true` (default), cancel BID/ASK orders that drift outside
+    /// the active `grid_levels`-wide lattice window. When `false`,
+    /// far-side stragglers stay resting forever — they may catch a
+    /// future reversion fill but pin margin in the meantime.
+    pub prune_stragglers: bool,
     /// When `true`, tighten `min_self_spread_bps` + `grid_step_bps` by
     /// 1 bps per minute of fpm < 1 (no fills), and relax back toward
     /// configured baseline at 1 bps/min when fpm ≥ 1. Minimum effective
@@ -581,7 +586,8 @@ impl Strategy for Tide {
         //
         // slot_top mirrors the emit walks above (floor / ceil onto
         // lattice, after min_self_spread + cross-guard).
-        if lattice_ready
+        if self.config.prune_stragglers
+            && lattice_ready
             && let Some(step) = self.lattice_step
             && step > Decimal::ZERO
         {
@@ -781,6 +787,7 @@ mod tests {
             min_self_spread_ticks: 0,
             close_profit_ticks: 0,
             grid_step_ticks: 0,
+            prune_stragglers: true,
         }
     }
 
@@ -960,6 +967,7 @@ mod tests {
             min_self_spread_ticks: 0,
             close_profit_ticks: 0,
             grid_step_ticks: 0,
+            prune_stragglers: true,
         };
         let mut s = Tide::new(c);
         let symbol = sym();
@@ -1012,6 +1020,7 @@ mod tests {
             min_self_spread_ticks: 0,
             close_profit_ticks: 0,
             grid_step_ticks: 0,
+            prune_stragglers: true,
         };
         c.tick_size = Decimal::new(1, 2);
         let mut s = Tide::new(c);

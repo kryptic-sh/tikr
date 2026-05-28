@@ -30,17 +30,19 @@ symbol = "ETHUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 3
+min_self_spread_ticks = 10
+grid_step_ticks = 10
+close_profit_ticks = 50
+prune_stragglers = false
+adaptive_bps_enabled = false
 
-# Tick-mode geometry — bps fields are ignored when these are > 0.
-min_self_spread_ticks = 5
-grid_step_ticks = 5
-close_profit_ticks = 10
-
-# bps fields kept at default 0 (overridden by ticks above).
-min_self_spread_bps = 0
-grid_step_bps = 0
-close_profit_bps = 0
-
-# Adaptive walk has no effect in tick mode (lattice is frozen on first
-# event with exact tick spacing). Disabled for clarity.
+[[bot]]
+symbol = "ZECUSDC"
+strategy = "tide"
+[bot.tide]
+grid_levels = 3
+min_self_spread_ticks = 10
+grid_step_ticks = 10
+close_profit_ticks = 50
+prune_stragglers = false
 adaptive_bps_enabled = false

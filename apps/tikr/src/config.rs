@@ -442,6 +442,15 @@ pub struct TideParams {
     /// Default `true`. Inactive when tick-overrides are set.
     #[serde(default = "tide_adaptive_default")]
     pub adaptive_bps_enabled: bool,
+    /// Cancel BID/ASK orders that drift outside the active lattice
+    /// window. Default `true`. `false` = never cancel — orders rest
+    /// forever, may pin margin.
+    #[serde(default = "tide_prune_default")]
+    pub prune_stragglers: bool,
+}
+
+fn tide_prune_default() -> bool {
+    true
 }
 
 fn tide_adaptive_default() -> bool {

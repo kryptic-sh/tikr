@@ -385,6 +385,11 @@ fn build_tide(
         .as_ref()
         .map(|p| p.adaptive_bps_enabled)
         .unwrap_or(true);
+    let prune_stragglers = cfg
+        .tide
+        .as_ref()
+        .map(|p| p.prune_stragglers)
+        .unwrap_or(true);
     // Initial max_position = 0 (no cap). Live value flows in via
     // on_max_position_updated from the account balance poller's
     // max_position_rx watch channel, typically within 5s of spawn.
@@ -402,6 +407,7 @@ fn build_tide(
         grid_step_ticks,
         max_position_usdt: Decimal::ZERO,
         adaptive_bps_enabled,
+        prune_stragglers,
     }))
 }
 

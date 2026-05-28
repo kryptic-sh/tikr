@@ -227,6 +227,7 @@ fn spawn_one_bot(
             close_profit_ticks: 0,
             grid_step_ticks: 0,
             adaptive_bps_enabled,
+            prune_stragglers: true,
         }),
         sg: None,
         lg: None,
