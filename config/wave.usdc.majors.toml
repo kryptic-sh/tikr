@@ -1,13 +1,25 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
 # 4 bots: BTCUSDC, ETHUSDC, DOGEUSDC, ZECUSDC. Wave strategy = frozen
-# lattice + lazy recenter on inner-drain. Adaptive ATR step every 10
-# recenters. USDC promo (0 bps maker).
+# lattice + lazy recenter on inner-drain. Adaptive ATR step. USDC promo
+# (0 bps maker).
+#
+# Tuned from 2h ETHUSDT sweep (2026-05-28): 1-second bars + atr_period=120
+# + step_atr_mult=8 was the top net (+$1.60 vs +$0.62 for 1m/atr14/mult0.5),
+# and warms up in ~2 min instead of ~15 min. atr_mult must scale ~8× on
+# 1s bars because per-bar ATR shrinks ~√(60) vs 1m bars. drain=2 +
+# cooldown=1000ms is safe (cooldown prevents the tight-grid recenter
+# cascade that blew inventory to $810k without it).
+#
+# NOTE: warmup is event-driven (a 1s bar only closes when an event lands
+# in a new second). On quiet symbols (ZEC/DOGE) real warmup may exceed
+# 120s. Keep atr_period ≤ 120 on 1s bars — atr_period=300 never warmed
+# up in the 2h test.
 #
 # Key behavior:
-#   - Init: wait for 14 closed 1m bars → seed lattice at ATR × 1.0 step
-#   - Each event: do nothing unless ≥ 4 of 12 slots drained one side
-#   - Recenter: emit missing slots on (skewed-by-inventory) new window
+#   - Init: wait ~120 closed 1s bars → seed lattice at ATR × 8 step
+#   - Each event: do nothing unless ≥ 2 of 12 slots drained one side
+#   - Recenter (≥1s since last): emit missing slots on skewed window
 #   - Every 10 recenters: recompute ATR + step, re-anchor lattice
 #   - Never cancel — old orders rest forever (queue priority preserved)
 #
@@ -25,21 +37,20 @@ order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-# ─── BTCUSDC (USDC promo, wide-tick at ~75k) ──────────────────────────────
+# ─── BTCUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
 symbol = "BTCUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 4
+recenter_drain_slots = 2
 skew_max_pct = "0.25"
-# Adaptive step from ATR (per-symbol vol auto-detect).
-bar_interval_secs = 60
-atr_period = 14
-step_atr_mult = "1.0"
-bar_warmup_bars = 14
+bar_interval_secs = 1
+atr_period = 120
+step_atr_mult = "8.0"
+bar_warmup_bars = 120
 relattice_every_n_recenters = 10
-# Tick / bps overrides ignored when step_atr_mult > 0.
+recenter_cooldown_ms = 1000
 
 # ─── ETHUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -47,13 +58,14 @@ symbol = "ETHUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 4
+recenter_drain_slots = 2
 skew_max_pct = "0.25"
-bar_interval_secs = 60
-atr_period = 14
-step_atr_mult = "1.0"
-bar_warmup_bars = 14
+bar_interval_secs = 1
+atr_period = 120
+step_atr_mult = "8.0"
+bar_warmup_bars = 120
 relattice_every_n_recenters = 10
+recenter_cooldown_ms = 1000
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
 [[bot]]
@@ -61,13 +73,14 @@ symbol = "DOGEUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 4
+recenter_drain_slots = 2
 skew_max_pct = "0.25"
-bar_interval_secs = 60
-atr_period = 14
-step_atr_mult = "1.0"
-bar_warmup_bars = 14
+bar_interval_secs = 1
+atr_period = 120
+step_atr_mult = "8.0"
+bar_warmup_bars = 120
 relattice_every_n_recenters = 10
+recenter_cooldown_ms = 1000
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -75,10 +88,11 @@ symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 12
-recenter_drain_slots = 4
+recenter_drain_slots = 2
 skew_max_pct = "0.25"
-bar_interval_secs = 60
-atr_period = 14
-step_atr_mult = "1.0"
-bar_warmup_bars = 14
+bar_interval_secs = 1
+atr_period = 120
+step_atr_mult = "8.0"
+bar_warmup_bars = 120
 relattice_every_n_recenters = 10
+recenter_cooldown_ms = 1000
