@@ -442,11 +442,29 @@ impl SpreadScalp {
         let want_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
             && !self.side_in_cooldown(Side::Ask, ts);
         // Close-side qty pin: when holding inventory, the side that
-        // reduces it (long→Ask, short→Bid) is sized to abs(position.size)
-        // rather than notional/price. Eliminates lot-step jitter from
-        // recomputed sizes when price moves within price_tolerance_ticks.
+        // reduces it (long→Ask, short→Bid) is sized to the entry-chunk
+        // size (notional_per_order / price, min-notional-bumped),
+        // CAPPED at the remaining position. This drains a position
+        // larger than one chunk as a stream of normal-size fills
+        // rather than dumping the full inventory in a single quote.
+        // Avoids the failure mode where margin starvation forces
+        // exit-only mode and a full-position close quote eats the
+        // entire move from avg_entry in one fill.
         let close_side = Self::close_side_for(ctx.position.size.0);
-        let close_qty = ctx.position.size.0.abs();
+        let pos_abs = ctx.position.size.0.abs();
+        // Entry-chunk size for whichever side is the close side
+        // (use that side's price for the size calculation).
+        let chunk_price = match close_side {
+            Some(Side::Bid) => bid,
+            Some(Side::Ask) => ask,
+            None => bid,
+        };
+        let entry_chunk = self.size_at_least_min_notional(chunk_price, Decimal::ONE);
+        let close_qty = if entry_chunk > Decimal::ZERO {
+            pos_abs.min(entry_chunk)
+        } else {
+            pos_abs
+        };
         if want_bid {
             if close_side == Some(Side::Bid) && close_qty > Decimal::ZERO {
                 actions.extend(self.diff_emit_close(ctx, Side::Bid, bid, close_qty));
