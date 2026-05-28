@@ -142,9 +142,7 @@ pub fn spawn_tide_auto_manager(
                     &shared_state,
                     cfg.grid_levels,
                     cfg.min_self_spread_bps,
-                    cfg.close_profit_bps,
                     cfg.grid_step_bps,
-                    cfg.adaptive_bps_enabled,
                 );
                 info!(symbol, "tide_auto: spawned new bot");
                 active.insert(symbol.clone(), bot);
@@ -200,16 +198,13 @@ async fn flatten_symbols(symbols: &[String], account: &TideAutoAccountCtx) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_one_bot(
     symbol: &str,
     account: &TideAutoAccountCtx,
     shared_state: &SharedBotState,
     grid_levels: u32,
     min_self_spread_bps: u32,
-    close_profit_bps: u32,
     grid_step_bps: u32,
-    adaptive_bps_enabled: bool,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let cfg = BotConfig {
@@ -221,12 +216,7 @@ fn spawn_one_bot(
             notional: None,
             grid_levels,
             min_self_spread_bps,
-            close_profit_bps,
             grid_step_bps,
-            min_self_spread_ticks: 0,
-            close_profit_ticks: 0,
-            grid_step_ticks: 0,
-            adaptive_bps_enabled,
             prune_stragglers: true,
         }),
         sg: None,

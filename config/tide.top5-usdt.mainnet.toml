@@ -50,14 +50,5 @@ min_self_spread_bps = 8
 # a fast move before all slots fill on one side.
 grid_levels = 3
 
-# Close-on-fill at +30 bps of fill price (snapped to tick, min 1 tick).
-# Matches the historic touch-refill profitable-era setting.
-close_profit_bps = 10
-
-# 10 bps between lattice slots. Frozen at first event; subsequent
-# adaptive_bps walks do NOT re-step the lattice.
+# 10 bps between lattice slots. Frozen at first event; lattice is permanent.
 grid_step_bps = 10
-
-# Adaptive bps walk: tighten min_self_spread + grid_step by 1 bps/min
-# when fpm < 1; relax back when fpm ≥ 1. `false` keeps lattice stable.
-adaptive_bps_enabled = false

@@ -417,7 +417,7 @@ fn joker_default_order_tick_tolerance() -> u32 {
     5
 }
 
-/// Tide — minimal at-touch MM with optional N-tick grid depth.
+/// Tide — grid-only at-touch MM with optional N-level depth.
 /// `step_size` / `tick_size` / `min_notional` come from venue
 /// exchangeInfo.
 #[allow(dead_code)]
@@ -428,7 +428,7 @@ pub struct TideParams {
     #[serde(default)]
     pub notional: Option<Decimal>,
     /// Grid depth per side. `1` = single order at touch (classic),
-    /// `N > 1` places `N` orders per side spaced one tick apart
+    /// `N > 1` places `N` orders per side spaced `grid_step_bps` apart
     /// starting at touch. Default `1`. With N=12 the bot defends
     /// against ~10-tick adverse price jumps. Inventory cap scales:
     /// max per-side position = N × notional_per_order.
@@ -441,36 +441,10 @@ pub struct TideParams {
     /// Use to make Tide viable on tight-spread markets.
     #[serde(default)]
     pub min_self_spread_bps: u32,
-    /// Profit target (bps of fill price) for close-on-fill orders.
-    /// When `> 0`, close distance = N bps (snapped to tick, min 1 tick).
-    /// When `0` (default), Rule 2 is DISABLED and Rule 3 (shift-on-fill)
-    /// activates instead — grid slides one step in the fill direction
-    /// per fill, drain via opposite-side grid.
-    #[serde(default)]
-    pub close_profit_bps: u32,
     /// Spacing between grid levels in bps of mid (snapped to tick,
-    /// min 1 tick). `0` = legacy 1-tick spacing.
+    /// min 1 tick). `0` = 1-tick spacing.
     #[serde(default)]
     pub grid_step_bps: u32,
-    /// Tick override for min_self_spread. When `> 0`, the minimum
-    /// self-spread is `ticks × tick_size` and `min_self_spread_bps`
-    /// is ignored. Default `0` = bps mode.
-    #[serde(default)]
-    pub min_self_spread_ticks: u32,
-    /// Tick override for close_profit. When `> 0`, the close-on-fill
-    /// distance is `ticks × tick_size` and `close_profit_bps` is
-    /// ignored. Default `0` = bps mode.
-    #[serde(default)]
-    pub close_profit_ticks: u32,
-    /// Tick override for grid_step. When `> 0`, the lattice step is
-    /// `ticks × tick_size` and `grid_step_bps` is ignored. Default `0`.
-    #[serde(default)]
-    pub grid_step_ticks: u32,
-    /// Adaptive bps walk: tighten min_self_spread + grid_step by 1
-    /// per minute when fpm<1, relax back toward baseline when fpm≥1.
-    /// Default `true`. Inactive when tick-overrides are set.
-    #[serde(default = "tide_adaptive_default")]
-    pub adaptive_bps_enabled: bool,
     /// Cancel BID/ASK orders that drift outside the active lattice
     /// window. Default `true`. `false` = never cancel — orders rest
     /// forever, may pin margin.
@@ -479,10 +453,6 @@ pub struct TideParams {
 }
 
 fn tide_prune_default() -> bool {
-    true
-}
-
-fn tide_adaptive_default() -> bool {
     true
 }
 
@@ -522,11 +492,6 @@ pub struct TideAutoConfig {
     /// `TideConfig.grid_levels`. Default `12`.
     #[serde(default = "tide_auto_default_grid_levels")]
     pub grid_levels: u32,
-    /// Forwarded to every spawned Tide bot as
-    /// `TideConfig.close_profit_bps`. Default `0` = fall back to
-    /// `min_self_spread_bps`.
-    #[serde(default)]
-    pub close_profit_bps: u32,
     /// Quote asset to filter discovery on. Typical values: `"USDT"`
     /// (default) or `"USDC"`. Affects which set of USD-M perps the
     /// rotation manager considers. Note: USDC perps are settled in
@@ -539,10 +504,6 @@ pub struct TideAutoConfig {
     /// dozens of orders within sub-bps.
     #[serde(default = "tide_auto_default_grid_step_bps")]
     pub grid_step_bps: u32,
-    /// Forwarded to every spawned Tide bot as
-    /// `TideConfig.adaptive_bps_enabled`. Default `true`.
-    #[serde(default = "tide_adaptive_default")]
-    pub adaptive_bps_enabled: bool,
     /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
     /// When non-empty, ONLY these symbols spawn and the
     /// `min_tick_bps` + `min_volume_usdt` filters are BYPASSED.

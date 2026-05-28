@@ -376,20 +376,7 @@ fn build_tide(
         .as_ref()
         .map(|p| p.min_self_spread_bps)
         .unwrap_or(0);
-    let close_profit_bps = cfg.tide.as_ref().map(|p| p.close_profit_bps).unwrap_or(0);
     let grid_step_bps = cfg.tide.as_ref().map(|p| p.grid_step_bps).unwrap_or(0);
-    let min_self_spread_ticks = cfg
-        .tide
-        .as_ref()
-        .map(|p| p.min_self_spread_ticks)
-        .unwrap_or(0);
-    let close_profit_ticks = cfg.tide.as_ref().map(|p| p.close_profit_ticks).unwrap_or(0);
-    let grid_step_ticks = cfg.tide.as_ref().map(|p| p.grid_step_ticks).unwrap_or(0);
-    let adaptive_bps_enabled = cfg
-        .tide
-        .as_ref()
-        .map(|p| p.adaptive_bps_enabled)
-        .unwrap_or(true);
     let prune_stragglers = cfg
         .tide
         .as_ref()
@@ -405,13 +392,8 @@ fn build_tide(
         min_notional,
         grid_levels,
         min_self_spread_bps,
-        close_profit_bps,
         grid_step_bps,
-        min_self_spread_ticks,
-        close_profit_ticks,
-        grid_step_ticks,
         max_position_usdt: Decimal::ZERO,
-        adaptive_bps_enabled,
         prune_stragglers,
     }))
 }

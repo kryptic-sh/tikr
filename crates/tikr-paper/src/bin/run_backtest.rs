@@ -78,6 +78,20 @@ struct Args {
     #[arg(long, default_value_t = 5u32)]
     taker_bps: u32,
 
+    /// Balance-sim: initial wallet balance (USDT). When > 0 with
+    /// order-balance-pct > 0, order notional + position cap compound off the
+    /// running balance (initial + realized − fees), mirroring live sizing.
+    /// `0` (default) = fixed notional from the per-strategy notional arg.
+    #[arg(long, default_value = "0")]
+    initial_balance: String,
+    /// Balance-sim: percent of running balance per order (0-100).
+    #[arg(long, default_value = "0")]
+    order_balance_pct: String,
+    /// Balance-sim: percent of running balance as the per-bot position cap
+    /// (0-100). `0` = uncapped.
+    #[arg(long, default_value = "0")]
+    max_position_pct: String,
+
     // --- A-S / GLFT spread ---
     /// Half-spread in bps (used by A-S + GLFT).
     #[arg(long, default_value_t = 5u32)]
@@ -132,11 +146,6 @@ struct Args {
     /// Tide: venue min order notional in USDT.
     #[arg(long, default_value = "5")]
     tr_min_notional: String,
-
-    /// Tide: profit target for close-on-fill in bps of fill
-    /// price. `0` (default) = falls back to min_self_spread_bps.
-    #[arg(long, default_value_t = 0u32)]
-    tr_close_profit_bps: u32,
 
     /// Tide: grid spacing in bps (snapped to tick, min 1 tick).
     /// `0` = legacy 1-tick spacing.
@@ -223,9 +232,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: None,
-        initial_balance: Decimal::ZERO,
-        order_balance_pct: Decimal::ZERO,
-        max_position_pct: Decimal::ZERO,
+        initial_balance: Decimal::from_str(&args.initial_balance)?,
+        order_balance_pct: Decimal::from_str(&args.order_balance_pct)?,
+        max_position_pct: Decimal::from_str(&args.max_position_pct)?,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
     };
@@ -355,13 +364,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_notional: Decimal::from_str(&args.tr_min_notional)?,
                 grid_levels: args.tr_grid_levels,
                 min_self_spread_bps: args.tr_min_self_spread_bps,
-                close_profit_bps: args.tr_close_profit_bps,
                 grid_step_bps: args.tr_grid_step_bps,
-                min_self_spread_ticks: 0,
-                close_profit_ticks: 0,
-                grid_step_ticks: 0,
                 max_position_usdt: Decimal::ZERO,
-                adaptive_bps_enabled: false,
                 prune_stragglers: true,
             });
             run_with_resume(

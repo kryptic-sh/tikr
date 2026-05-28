@@ -1,11 +1,8 @@
-//! Minimal at-touch market-making strategy. Two rules:
+//! Grid-only market-making strategy. One rule:
 //!
-//! 1. **Best-price maintenance**: always have ≥1 order at the current
-//!    `top.bid` and ≥1 at `top.ask`. If either side is missing such an
-//!    order, place one.
-//! 2. **Close-on-fill**: when a fill lands at price `P`, immediately
-//!    place an opposite-side order at `P ± 1 tick` (the 1-tick profit
-//!    target for that just-opened position).
+//! 1. **Grid maintenance**: maintain `grid_levels` resting orders per
+//!    side within the active lattice window, honouring the
+//!    `min_self_spread_bps` inner gap and `grid_step_bps` spacing.
 //!
 //! **Lattice-window pruning.** Each event computes a `grid_levels`-wide
 //! activation window on each side, snapped to the lattice. Orders
@@ -19,9 +16,9 @@
 //! each completed round-trip clears fees. See ESPORTS (~20bps tick).
 //!
 //! Inventory risk: when your bid fills repeatedly during a down-move,
-//! you'll accumulate longs. The close orders at fill+1 tick will not
-//! fill until the market reverts. This strategy is a pure
-//! "spread > 2×fees" bet — the operator owns the inventory risk.
+//! you'll accumulate longs. The strategy is grid-only — position
+//! drains only via grid maintenance on the opposite side. The operator
+//! owns the inventory risk.
 
 use std::collections::BTreeSet;
 
@@ -36,16 +33,16 @@ pub struct TideConfig {
     /// Notional USDT per order. Quantity = `notional / price`, floored
     /// to `step_size`, bumped to meet `min_notional`.
     pub notional_per_order: Decimal,
-    /// Venue tick size. Used for the close-on-fill +/- 1 tick offset
-    /// and for grid level spacing.
+    /// Venue tick size. Used for snapping spread and grid step
+    /// computations to the nearest tick.
     pub tick_size: Decimal,
     /// Venue lot step.
     pub step_size: Decimal,
     /// Venue min order notional.
     pub min_notional: Decimal,
     /// Grid depth per side. `1` (default) = classic single-level
-    /// at-touch. `N > 1` places orders at `best_bid − i × tick` for
-    /// `i ∈ [0, N)` on the bid side, and `best_ask + i × tick` on the
+    /// at-touch. `N > 1` places orders at `best_bid − i × step` for
+    /// `i ∈ [0, N)` on the bid side, and `best_ask + i × step` on the
     /// ask side. Defends against price jumps that would otherwise leave
     /// the bot unfilled and chasing — with N=12, a 10-tick jump still
     /// leaves the bot with orders in the path. Inventory cap scales
@@ -62,64 +59,26 @@ pub struct TideConfig {
     /// markets where the natural book spread alone wouldn't cover
     /// 2× maker fees (~3.6 bps RT on BNB-discount Binance USD-M).
     pub min_self_spread_bps: u32,
-    /// Profit target for close-on-fill orders, in bps of fill price.
-    /// When `> 0`, every close order placed in response to a full fill
-    /// sits exactly this many bps away from the fill price (snapped up
-    /// to nearest tick, minimum 1 tick) — this is Rule 2.
-    ///
-    /// When `0` (default), Rule 2 is DISABLED — grid-only mode.
-    /// Filled orders are not paired with dedicated closes; the
-    /// opposite-side Rule 1 ladder catches the rebound.
-    pub close_profit_bps: u32,
     /// Spacing between grid levels in bps of mid. Effective spacing =
     /// max(1 tick, ceil(grid_step_bps × mid / 10000 / tick) × tick).
-    /// `0` = legacy 1-tick spacing. On tight-tick markets (e.g.
-    /// ETHUSDC where 1 tick ≈ 0.005 bps), 1-tick spacing piles dozens
-    /// of orders within sub-bps; setting `grid_step_bps = 4` spaces
-    /// them ~4 bps apart for meaningful fill independence.
+    /// `0` = 1-tick spacing.
     pub grid_step_bps: u32,
     /// Per-bot peak position cap in USDT notional. When long
     /// notional > cap, BID emits are suppressed (no more accumulation
     /// on the long side); when short notional > cap, ASK emits are
-    /// suppressed. Close-on-fill orders are NEVER suppressed since
-    /// they reduce position. `0` = no cap (legacy behavior).
+    /// suppressed. `0` = no cap (legacy behavior).
     pub max_position_usdt: Decimal,
-    /// Tick-based override for `min_self_spread_bps`. When `> 0`, the
-    /// minimum self-spread is `min_self_spread_ticks × tick_size` and
-    /// the bps value is ignored. Default `0` = use bps.
-    ///
-    /// Useful for wide-tick markets (BTC, where 1 tick ≈ 0.013 bps at
-    /// $75k) where bps math produces fractional-tick targets that snap
-    /// unpredictably. Tick mode is exact and predictable.
-    pub min_self_spread_ticks: u32,
-    /// Tick-based override for `close_profit_bps`. When `> 0`, the
-    /// close-on-fill distance is `close_profit_ticks × tick_size` and
-    /// the bps value is ignored. Default `0` = use bps.
-    pub close_profit_ticks: u32,
-    /// Tick-based override for `grid_step_bps`. When `> 0`, the lattice
-    /// step is exactly `grid_step_ticks × tick_size` and the bps value
-    /// is ignored. Default `0` = use bps.
-    pub grid_step_ticks: u32,
     /// When `true` (default), cancel BID/ASK orders that drift outside
     /// the active `grid_levels`-wide lattice window. When `false`,
     /// far-side stragglers stay resting forever — they may catch a
     /// future reversion fill but pin margin in the meantime.
     pub prune_stragglers: bool,
-    /// When `true`, tighten `min_self_spread_bps` + `grid_step_bps` by
-    /// 1 bps per minute of fpm < 1 (no fills), and relax back toward
-    /// configured baseline at 1 bps/min when fpm ≥ 1. Minimum effective
-    /// value is 1 bps (never below).
-    pub adaptive_bps_enabled: bool,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
 /// `ctx.open_quotes` to avoid double-emitting in a single cycle.
 pub struct Tide {
     config: TideConfig,
-    /// Configured baseline values — adaptive_bps walks current values
-    /// back toward these when fills resume.
-    baseline_min_self_spread_bps: u32,
-    baseline_grid_step_bps: u32,
     /// Prices we've emitted Quote intents for this cycle, used to
     /// dedupe within `on_event` before the runner has dispatched +
     /// fill_sim has registered them. Cleared at the start of each
@@ -134,16 +93,10 @@ pub struct Tide {
     /// (top of book ± levels) and fill any lattice slots inside it
     /// that don't already have a resting/pending order. Result: the
     /// resting book sits on a single deterministic price ladder
-    /// forever; adaptive_bps still moves min_self_spread (the
-    /// placement gate) but does NOT re-step the lattice.
+    /// forever.
     bid_lattice_origin: Option<Decimal>,
     ask_lattice_origin: Option<Decimal>,
     lattice_step: Option<Decimal>,
-    /// Adaptive bps state — rolling window of fill timestamps (ms,
-    /// truncated to last 60s) for fpm computation, and the last
-    /// minute boundary at which we evaluated walk-in/walk-out.
-    fill_ts_window: std::collections::VecDeque<u64>,
-    last_adapt_ms: u64,
     /// Quote intents the venue rejected (typically -5022 post-only
     /// would-cross). Held forever and re-emitted on the next event
     /// whose book makes a post-only at that price safe (BID < best_ask
@@ -187,8 +140,7 @@ impl Tide {
     /// Does the venue (per fill_sim) OR this cycle's pending set
     /// already hold an order on `side` within `tolerance` of `price`?
     ///
-    /// Exact-price matching breaks on tight-tick markets: prior
-    /// close-on-fill orders sit at arbitrary fill prices, and grid
+    /// Exact-price matching breaks on tight-tick markets: grid
     /// emits at step boundaries. A fresh emit one tick off an
     /// existing order would create a duplicate. With tolerance set
     /// to `step / 2`, any existing order within half a step "covers"
@@ -269,19 +221,13 @@ impl Strategy for Tide {
     type Config = TideConfig;
 
     fn new(config: Self::Config) -> Self {
-        let baseline_min_self_spread_bps = config.min_self_spread_bps;
-        let baseline_grid_step_bps = config.grid_step_bps;
         Self {
             config,
-            baseline_min_self_spread_bps,
-            baseline_grid_step_bps,
             pending_bid_prices: BTreeSet::new(),
             pending_ask_prices: BTreeSet::new(),
             bid_lattice_origin: None,
             ask_lattice_origin: None,
             lattice_step: None,
-            fill_ts_window: std::collections::VecDeque::new(),
-            last_adapt_ms: 0,
             pending_retries: Vec::new(),
         }
     }
@@ -344,56 +290,9 @@ impl Strategy for Tide {
         }
         self.pending_retries = still_pending;
 
-        // Adaptive bps walk-in / walk-out. When enabled:
-        //   fpm < 1 → tighten min_self_spread + grid_step by 1 bps/min
-        //             (min 1 bps, never below)
-        //   fpm ≥ 1 → relax both back toward configured baseline at
-        //             1 bps/min, capped at baseline
-        // Fill rate measured over a rolling 60s window of fill timestamps.
-        let now_ms = ctx.now.0 / 1_000_000;
-        if let MarketEvent::Fill(fill) = event
-            && fill.is_full
-        {
-            self.fill_ts_window.push_back(now_ms);
-        }
-        // Drop fills older than 60s.
-        while let Some(&front) = self.fill_ts_window.front() {
-            if now_ms.saturating_sub(front) > 60_000 {
-                self.fill_ts_window.pop_front();
-            } else {
-                break;
-            }
-        }
-        // Seed the adaptation clock to the first observed timestamp so
-        // the initial 60s window measures from process start, not from
-        // the unix epoch (otherwise the first event always trips the
-        // `>= 60_000` gate and walks bps before any fills can land).
-        if self.last_adapt_ms == 0 {
-            self.last_adapt_ms = now_ms;
-        }
-        if self.config.adaptive_bps_enabled && now_ms.saturating_sub(self.last_adapt_ms) >= 60_000 {
-            self.last_adapt_ms = now_ms;
-            let fpm = self.fill_ts_window.len() as u32;
-            if fpm < 1 {
-                if self.config.min_self_spread_bps > 1 {
-                    self.config.min_self_spread_bps -= 1;
-                }
-                if self.config.grid_step_bps > 1 {
-                    self.config.grid_step_bps -= 1;
-                }
-            } else {
-                if self.config.min_self_spread_bps < self.baseline_min_self_spread_bps {
-                    self.config.min_self_spread_bps += 1;
-                }
-                if self.config.grid_step_bps < self.baseline_grid_step_bps {
-                    self.config.grid_step_bps += 1;
-                }
-            }
-        }
-
-        // Rule 1: maintain a deterministic price-ladder grid. Two
-        // anchors (`bid_lattice_origin`, `ask_lattice_origin`) and one
-        // step (`lattice_step`) are frozen on the first event with a
+        // Grid maintenance (Rule 1): maintain a deterministic price-ladder
+        // grid. Two anchors (`bid_lattice_origin`, `ask_lattice_origin`) and
+        // one step (`lattice_step`) are frozen on the first event with a
         // usable book. From then on, every BID emit lands on a slot
         // `bid_lattice_origin - k × lattice_step` (k ≥ 0) and every
         // ASK emit on `ask_lattice_origin + k × lattice_step` (k ≥ 0).
@@ -405,9 +304,6 @@ impl Strategy for Tide {
         // Result: orders stay on the same canonical ladder forever;
         // as the book moves new slots become reachable and we
         // "fill the gaps" without disturbing the grid.
-        //
-        // Never cancels — resting slots outside the current window
-        // keep waiting to be hit.
         let levels = self.config.grid_levels.max(1);
         let tick = self.config.tick_size;
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
@@ -432,11 +328,8 @@ impl Strategy for Tide {
         // than the configured minimum, push the placement tops apart so
         // `top_ask − top_bid ≥ required_spread`. Snapped to tick.
         //
-        // Tick mode (`min_self_spread_ticks > 0`): required_spread =
-        // `ticks × tick_size` — exact, no bps math.
-        // Bps mode (default): required_spread = `bps × mid / 10000`.
-        let spread_active =
-            self.config.min_self_spread_ticks > 0 || self.config.min_self_spread_bps > 0;
+        // Bps mode: required_spread = `bps × mid / 10000`.
+        let spread_active = self.config.min_self_spread_bps > 0;
         let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
             (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
@@ -445,11 +338,8 @@ impl Strategy for Tide {
             && spread_active
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
-            let required_half = if self.config.min_self_spread_ticks > 0 {
-                Decimal::from(self.config.min_self_spread_ticks) * tick / Decimal::from(2)
-            } else {
-                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000)
-            };
+            let required_half =
+                mid * Decimal::from(self.config.min_self_spread_bps) / Decimal::from(20_000);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -463,9 +353,8 @@ impl Strategy for Tide {
         };
 
         // Freeze the lattice on the first event with both tops known.
-        // Step (tick mode): `grid_step_ticks × tick_size` exact.
         // Step (bps mode): `max(1 tick, ceil(bps × mid / 10000 / tick) × tick)`.
-        // Default (both 0): 1 tick.
+        // Default (0): 1 tick.
         if self.lattice_step.is_none()
             && let (Some(top_b), Some(top_a)) = (top_bid_override, top_ask_override)
             && top_b.0 > Decimal::ZERO
@@ -473,9 +362,7 @@ impl Strategy for Tide {
             && tick > Decimal::ZERO
         {
             let mid = (top_b.0 + top_a.0) / Decimal::from(2);
-            let step = if self.config.grid_step_ticks > 0 {
-                Decimal::from(self.config.grid_step_ticks) * tick
-            } else if self.config.grid_step_bps > 0 {
+            let step = if self.config.grid_step_bps > 0 {
                 let target = mid * Decimal::from(self.config.grid_step_bps) / Decimal::from(10_000);
                 if target > tick {
                     (target / tick).ceil() * tick
@@ -636,51 +523,8 @@ impl Strategy for Tide {
             }
         }
 
-        // Rule 2: on FULL fill, place opposite-side close at a
-        // distance defined by close_profit_bps. Partial fills
-        // (is_full=false) skip the close — there's still residual
-        // size on the same side that'll catch the rest of the flow.
-        //
-        // When close_profit_bps = 0, Rule 2 is DISABLED entirely —
-        // grid-only mode. Filled orders are not re-paired with a
-        // close target; position drains only via grid maintenance on
-        // the opposite side.
-        if let MarketEvent::Fill(fill) = event
-            && fill.is_full
-            && (self.config.close_profit_ticks > 0 || self.config.close_profit_bps > 0)
-        {
-            let tick = self.config.tick_size;
-            if tick > Decimal::ZERO && fill.price.0 > Decimal::ZERO {
-                // Tick mode: exact `ticks × tick_size`.
-                // Bps mode: `ceil(bps × fill_price / 10000 / tick) × tick`, min 1 tick.
-                let close_distance = if self.config.close_profit_ticks > 0 {
-                    Decimal::from(self.config.close_profit_ticks) * tick
-                } else {
-                    let close_bps = self.config.close_profit_bps;
-                    let target_distance =
-                        fill.price.0 * Decimal::from(close_bps) / Decimal::from(10_000);
-                    if target_distance > tick {
-                        (target_distance / tick).ceil() * tick
-                    } else {
-                        tick
-                    }
-                };
-                let (close_side, close_price) = match fill.side {
-                    Side::Bid => (Side::Ask, Price(fill.price.0 + close_distance)),
-                    Side::Ask => (Side::Bid, Price(fill.price.0 - close_distance)),
-                };
-                // Close uses exact match (tolerance = 0) — each fill
-                // gets its own close target. Tolerating overlap here
-                // would skip legitimate close emits when grid orders
-                // happen to sit near the close price.
-                if close_price.0 > Decimal::ZERO
-                    && !self.already_have_order(ctx, close_side, close_price, Decimal::ZERO)
-                    && !self.would_self_cross(ctx, close_side, close_price)
-                {
-                    actions.push(self.emit(ctx.symbol, close_side, close_price));
-                }
-            }
-        }
+        // Suppress unused-variable warning for events we no longer process.
+        let _ = event;
 
         actions
     }
@@ -780,13 +624,8 @@ mod tests {
             min_notional: Decimal::from(5),
             grid_levels: 1,
             min_self_spread_bps: 0,
-            close_profit_bps: 0,
             grid_step_bps: 0,
             max_position_usdt: Decimal::ZERO,
-            adaptive_bps_enabled: false,
-            min_self_spread_ticks: 0,
-            close_profit_ticks: 0,
-            grid_step_ticks: 0,
             prune_stragglers: true,
         }
     }
@@ -808,6 +647,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn mk_fill(side: Side, price: Decimal, is_full: bool) -> Fill {
         Fill {
             quote_id: QuoteId::new(),
@@ -881,53 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn full_fill_creates_opposite_close_at_one_tick() {
-        let mut s = Tide::new(cfg());
-        let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
-        let p = pos();
-        let symbol = sym();
-        let fill = mk_fill(Side::Bid, Decimal::new(10, 4), true);
-        let ctx = make_ctx(&symbol, &snap, &p, &[]);
-        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
-        // 1-tick book → close ASK at fill+1tick coincides with best ask.
-        let asks: Vec<_> = actions
-            .iter()
-            .filter_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0], Decimal::new(11, 4));
-    }
-
-    #[test]
-    fn full_fill_creates_separate_close_when_book_is_wide() {
-        let mut c = cfg();
-        // Rule 2 (close-on-fill) requires close_profit_bps > 0.
-        c.close_profit_bps = 1;
-        let mut s = Tide::new(c);
-        let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
-        let p = pos();
-        let symbol = sym();
-        let fill = mk_fill(Side::Bid, Decimal::new(10, 4), true);
-        let ctx = make_ctx(&symbol, &snap, &p, &[]);
-        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
-        // BID at 0.0010 (best), ASK at 0.0011 (close), ASK at 0.0020 (best).
-        assert_eq!(actions.len(), 3);
-        let asks: Vec<_> = actions
-            .iter()
-            .filter_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(asks.len(), 2);
-        assert!(asks.contains(&Decimal::new(11, 4)));
-        assert!(asks.contains(&Decimal::new(20, 4)));
-    }
-
-    #[test]
     fn partial_fill_does_not_create_close_order() {
         let mut s = Tide::new(cfg());
         let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
@@ -936,7 +729,7 @@ mod tests {
         let fill = mk_fill(Side::Bid, Decimal::new(10, 4), false);
         let ctx = make_ctx(&symbol, &snap, &p, &[]);
         let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
-        // Only the best-price maintenance emits — no close-on-fill.
+        // Only the grid maintenance emits — no close-on-fill.
         let asks: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
@@ -944,109 +737,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(asks.len(), 1, "no close emit on partial fill: {asks:?}");
+        assert_eq!(asks.len(), 1, "only grid ask, no close emit: {asks:?}");
         assert_eq!(asks[0], Decimal::new(20, 4));
-    }
-
-    #[test]
-    fn close_profit_bps_zero_disables_close_on_fill() {
-        // close_profit_bps = 0 → Rule 2 disabled entirely. Only Rule 1
-        // (grid maintenance) emits. The fill should NOT trigger any
-        // emit specifically tied to it.
-        let c = TideConfig {
-            notional_per_order: Decimal::from(10),
-            tick_size: Decimal::new(1, 5),
-            step_size: Decimal::ONE,
-            min_notional: Decimal::from(5),
-            grid_levels: 1,
-            min_self_spread_bps: 10,
-            close_profit_bps: 0,
-            grid_step_bps: 0,
-            max_position_usdt: Decimal::ZERO,
-            adaptive_bps_enabled: false,
-            min_self_spread_ticks: 0,
-            close_profit_ticks: 0,
-            grid_step_ticks: 0,
-            prune_stragglers: true,
-        };
-        let mut s = Tide::new(c);
-        let symbol = sym();
-        let p = pos();
-        let snap = book(Decimal::new(99999, 6), Decimal::new(100001, 6));
-        let fill = mk_fill(Side::Bid, Decimal::new(99999, 6), true);
-        let ctx = make_ctx(&symbol, &snap, &p, &[]);
-        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
-        // No ASK should sit deep at fill + 10 ticks (that would be the
-        // disabled close-on-fill). Rule 1 top-of-grid at min-self-spread
-        // is OK. Specifically check no ASK >= 10 ticks above fill.
-        let fill_p = Decimal::new(99999, 6);
-        let close_distance_threshold = Decimal::new(1, 4); // 10 ticks
-        let has_close = actions.iter().any(|a| match a {
-            Action::Quote(q) if q.side == Side::Ask => {
-                q.price.0 - fill_p >= close_distance_threshold
-            }
-            _ => false,
-        });
-        assert!(
-            !has_close,
-            "Rule 2 disabled (close_profit_bps=0) — no deep close ASK expected; got: {:?}",
-            actions
-                .iter()
-                .filter_map(|a| match a {
-                    Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn close_profit_bps_overrides_min_self_spread() {
-        // Setup: price=$100, tick=$0.01, min_self_spread=10, close_profit=50.
-        // min_self_spread distance = 100 × 10 / 10000 = $0.10 = 10 ticks.
-        // close_profit distance = 100 × 50 / 10000 = $0.50 = 50 ticks.
-        // Expect close to use 50 (the larger override), not 10.
-        let mut c = TideConfig {
-            notional_per_order: Decimal::from(10),
-            tick_size: Decimal::new(1, 2), // 0.01
-            step_size: Decimal::ONE,
-            min_notional: Decimal::from(5),
-            grid_levels: 1,
-            min_self_spread_bps: 10,
-            close_profit_bps: 50,
-            grid_step_bps: 0,
-            max_position_usdt: Decimal::ZERO,
-            adaptive_bps_enabled: false,
-            min_self_spread_ticks: 0,
-            close_profit_ticks: 0,
-            grid_step_ticks: 0,
-            prune_stragglers: true,
-        };
-        c.tick_size = Decimal::new(1, 2);
-        let mut s = Tide::new(c);
-        let symbol = sym();
-        let p = pos();
-        let snap = book(Decimal::from(100), Decimal::new(10001, 2));
-        let fill = mk_fill(Side::Bid, Decimal::from(100), true);
-        let ctx = make_ctx(&symbol, &snap, &p, &[]);
-        let actions = s.on_event(&ctx, &MarketEvent::Fill(fill));
-        let fill_p = Decimal::from(100);
-        let expected_distance = Decimal::new(50, 2); // 0.50 = 50 ticks
-        let has_close = actions.iter().any(|a| match a {
-            Action::Quote(q) if q.side == Side::Ask => q.price.0 - fill_p >= expected_distance,
-            _ => false,
-        });
-        assert!(
-            has_close,
-            "close ASK should sit ≥ 50 ticks from fill (close_profit_bps=50); got: {:?}",
-            actions
-                .iter()
-                .filter_map(|a| match a {
-                    Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]

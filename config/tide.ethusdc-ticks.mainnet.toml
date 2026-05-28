@@ -1,16 +1,18 @@
-# ─── Tide ETHUSDC tick-tuned — MAINNET ────────────────────────────────────
+# ─── Tide ETHUSDC bps-mode — MAINNET ───────────────────────────────────────
 #
-# Tight tick-based geometry, single bot on ETHUSDC. Uses the new
-# tick-override knobs (`*_ticks`) so the lattice + spread + close
-# distances are exact ticks, not bps math.
+# Migrated from tick-override mode (removed 2026-05-28). Tick values converted
+# to bps using ETHUSDC tick_size=0.01, price≈$2500:
+#   min_self_spread_ticks=50 → 50 × 0.01 / 2500 × 10000 = 2 bps
+#   grid_step_ticks=50       → 2 bps
+#   close_profit_ticks=80    → removed (Rule 2 / close-on-fill removed)
+#   adaptive_bps_enabled     → removed (adaptive bps removed)
 #
 # ETHUSDC tick_size = 0.01 USD.
-#   inner = 5 ticks  = $0.05  ≈ ~2.5 bps at $2000
-#   step  = 5 ticks  = $0.05
-#   close = 10 ticks = $0.10  ≈ ~5 bps at $2000
-#   levels = 3       → 3 orders per side, span = 2 × 5 ticks = $0.10
+#   inner = 2 bps ≈ 5 ticks at $2500
+#   step  = 2 bps ≈ 5 ticks at $2500
+#   levels = 1 per side
 #
-# USDC promo (0 bps maker) — any 1-tick rebound after a fill prints PnL.
+# USDC promo (0 bps maker) — any rebound after a fill prints PnL.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
@@ -30,19 +32,15 @@ symbol = "ETHUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_ticks = 50
-grid_step_ticks = 50
-close_profit_ticks = 80
+min_self_spread_bps = 2
+grid_step_bps = 2
 prune_stragglers = false
-adaptive_bps_enabled = false
 
 [[bot]]
 symbol = "ZECUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
-min_self_spread_ticks = 50
-grid_step_ticks = 50
-close_profit_ticks = 80
+min_self_spread_bps = 2
+grid_step_bps = 2
 prune_stragglers = false
-adaptive_bps_enabled = false

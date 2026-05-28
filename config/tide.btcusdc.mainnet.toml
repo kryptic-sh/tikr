@@ -43,11 +43,6 @@ min_self_spread_bps = 1
 # Grid depth — N orders per side spaced grid_step_bps apart.
 grid_levels = 6
 
-# Profit target for close-on-fill (bps of fill price). 30 bps = 30×
-# tick capture on a 0.013-bps-tick market. Wider than self-spread
-# so close orders book real edge.
-close_profit_bps = 1
-
 # Grid spacing in bps of mid (snapped to tick, min 1 tick).
 # BTCUSDC tick is sub-bps so without this knob the grid would pile
 # all 3 levels at adjacent ticks. 4 bps spaces them ~4 bps apart.

@@ -14,9 +14,7 @@
 #   - lvl1 ≫ lvl10: single-touch keeps inventory lean; deep grids accumulate.
 #   - Tide needs a WIDE step. step≤10 bps churns into losses (step5/lvl10 =
 #     −28%/mo); the edge only appears at 15-20 bps.
-#   - close_profit_bps = 0 → falls back to min_self_spread_bps (20).
-#   - adaptive_bps_enabled = false: pin the fixed 20 bps (default is TRUE,
-#     which would override the tuned spread — must be set false to match).
+#   - close-on-fill and adaptive bps removed; grid-only mode with fixed spreads.
 #
 # CAVEATS: single 54h window, one symbol tuned (SOL). +119%/mo is one
 # regime's extrapolation, NOT a forecast — validate live and across windows.
@@ -44,7 +42,7 @@ strategy = "tide"
 grid_levels = 1
 min_self_spread_bps = 20
 grid_step_bps = 20
-adaptive_bps_enabled = false
+
 prune_stragglers = true
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
@@ -56,7 +54,7 @@ strategy = "tide"
 grid_levels = 1
 min_self_spread_bps = 20
 grid_step_bps = 20
-adaptive_bps_enabled = false
+
 prune_stragglers = true
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
@@ -67,7 +65,7 @@ strategy = "tide"
 grid_levels = 1
 min_self_spread_bps = 20
 grid_step_bps = 20
-adaptive_bps_enabled = false
+
 prune_stragglers = true
 
 # ─── BNBUSDC ──────────────────────────────────────────────────────────────
@@ -78,5 +76,5 @@ strategy = "tide"
 grid_levels = 1
 min_self_spread_bps = 20
 grid_step_bps = 20
-adaptive_bps_enabled = false
+
 prune_stragglers = true
