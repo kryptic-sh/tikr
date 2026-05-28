@@ -45,7 +45,7 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 min_self_spread_bps = 1
-grid_step_bps = 1
+grid_step_bps = 2
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
@@ -58,7 +58,7 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 min_self_spread_bps = 1
-grid_step_bps = 1
+grid_step_bps = 2
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
 [[bot]]
@@ -68,7 +68,7 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 min_self_spread_bps = 1
-grid_step_bps = 1
+grid_step_bps = 2
 
 # ─── BNBUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -78,4 +78,4 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 min_self_spread_bps = 1
-grid_step_bps = 1
+grid_step_bps = 2
