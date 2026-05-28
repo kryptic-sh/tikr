@@ -320,6 +320,13 @@ pub struct WaveParams {
     /// Relattice every Nth recenter (auto-step only). Default 10. `0` = never.
     #[serde(default = "wave_default_relattice_every_n")]
     pub relattice_every_n_recenters: u32,
+    /// Min ms between recenters. Default 1000. `0` = no cooldown (unsafe).
+    #[serde(default = "wave_default_recenter_cooldown_ms")]
+    pub recenter_cooldown_ms: u64,
+}
+
+fn wave_default_recenter_cooldown_ms() -> u64 {
+    1000
 }
 
 fn wave_default_grid_levels() -> u32 {

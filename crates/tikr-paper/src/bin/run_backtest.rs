@@ -24,7 +24,7 @@ use tikr_core::{
 use tikr_paper::{RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
-    MicroPriceConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig,
+    MicroPriceConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -42,6 +42,8 @@ enum StrategyArg {
     MicroPrice,
     #[value(name = "tide", alias = "td")]
     Tide,
+    #[value(name = "wave", alias = "wv")]
+    Wave,
 }
 
 #[derive(Parser, Debug)]
@@ -140,6 +142,43 @@ struct Args {
     /// `0` = legacy 1-tick spacing.
     #[arg(long, default_value_t = 0u32)]
     tr_grid_step_bps: u32,
+
+    /// Wave: lattice slots per side.
+    #[arg(long, default_value_t = 12u32)]
+    wv_grid_levels: u32,
+    /// Wave: drain trigger (slots, either side).
+    #[arg(long, default_value_t = 4u32)]
+    wv_recenter_drain_slots: u32,
+    /// Wave: max skew on recenter (fraction).
+    #[arg(long, default_value = "0.25")]
+    wv_skew_max_pct: String,
+    /// Wave: ATR step multiplier. 0 = use ticks/bps.
+    #[arg(long, default_value = "1.0")]
+    wv_step_atr_mult: String,
+    /// Wave: ATR period (bars).
+    #[arg(long, default_value_t = 14u32)]
+    wv_atr_period: u32,
+    /// Wave: bar interval (s).
+    #[arg(long, default_value_t = 60u64)]
+    wv_bar_interval_secs: u64,
+    /// Wave: bar warmup count.
+    #[arg(long, default_value_t = 14u32)]
+    wv_bar_warmup_bars: u32,
+    /// Wave: relattice every Nth recenter.
+    #[arg(long, default_value_t = 10u32)]
+    wv_relattice_every_n: u32,
+    /// Wave: min ms between recenters (cooldown).
+    #[arg(long, default_value_t = 1000u64)]
+    wv_recenter_cooldown_ms: u64,
+    /// Wave: per-order notional.
+    #[arg(long, default_value = "10")]
+    wv_notional: String,
+    /// Wave: step size.
+    #[arg(long, default_value = "0.001")]
+    wv_step_size: String,
+    /// Wave: min notional.
+    #[arg(long, default_value = "5")]
+    wv_min_notional: String,
 
     /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
     #[arg(long, default_value_t = 1000u64)]
@@ -339,6 +378,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_position_usdt: Decimal::ZERO,
                 adaptive_bps_enabled: false,
                 prune_stragglers: true,
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+                None,
+            )
+            .await
+        }
+        StrategyArg::Wave => {
+            let strategy = Wave::new(WaveConfig {
+                notional_per_order: Decimal::from_str(&args.wv_notional)?,
+                tick_size: Decimal::from_str(&args.tick_size)?,
+                step_size: Decimal::from_str(&args.wv_step_size)?,
+                min_notional: Decimal::from_str(&args.wv_min_notional)?,
+                grid_levels: args.wv_grid_levels,
+                min_self_spread_bps: 0,
+                min_self_spread_ticks: 0,
+                grid_step_bps: 0,
+                grid_step_ticks: 0,
+                recenter_drain_slots: args.wv_recenter_drain_slots,
+                skew_max_pct: Decimal::from_str(&args.wv_skew_max_pct)?,
+                max_position_usdt: Decimal::ZERO,
+                bar_interval_secs: args.wv_bar_interval_secs,
+                max_bars: 200,
+                atr_period: args.wv_atr_period,
+                step_atr_mult: Decimal::from_str(&args.wv_step_atr_mult)?,
+                bar_warmup_bars: args.wv_bar_warmup_bars,
+                relattice_every_n_recenters: args.wv_relattice_every_n,
+                recenter_cooldown_ms: args.wv_recenter_cooldown_ms,
             });
             run_with_resume(
                 venue,

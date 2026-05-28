@@ -85,6 +85,11 @@ pub struct WaveConfig {
     /// event. `0` = never (lattice frozen at init). Default `10`
     /// (typical: relattice ~hourly if recenters are ~6/hour).
     pub relattice_every_n_recenters: u32,
+    /// Minimum wall-clock gap (ms) between recenter events. Guards
+    /// against the runaway loop where a tight grid + low drain trigger
+    /// recenters every event → re-emit cascade → inventory explosion.
+    /// Default `1000`. `0` = no cooldown (unsafe with tight params).
+    pub recenter_cooldown_ms: u64,
 }
 
 /// Closed OHLCV bar.
@@ -129,6 +134,8 @@ pub struct Wave {
     /// Recenter events since last relattice. Used with
     /// `relattice_every_n_recenters` to decide when to recompute step.
     recenters_since_relattice: u32,
+    /// Timestamp (ns) of the last recenter, for cooldown gating.
+    last_recenter_ts: Option<u64>,
 }
 
 impl Wave {
@@ -517,6 +524,7 @@ impl Strategy for Wave {
             open_bar: None,
             current_bucket: None,
             recenters_since_relattice: 0,
+            last_recenter_ts: None,
         }
     }
 
@@ -621,6 +629,20 @@ impl Strategy for Wave {
         if missing_bids < threshold && missing_asks < threshold {
             return actions; // quiet — do nothing
         }
+
+        // Cooldown gate: refuse to recenter if the last recenter was
+        // within `recenter_cooldown_ms`. Prevents the every-event
+        // recenter cascade (tight grid + low drain → inventory blowup).
+        let now_ns = ctx.now.0;
+        if self.config.recenter_cooldown_ms > 0
+            && let Some(last) = self.last_recenter_ts
+        {
+            let gap_ms = now_ns.saturating_sub(last) / 1_000_000;
+            if gap_ms < self.config.recenter_cooldown_ms {
+                return actions; // still cooling down
+            }
+        }
+        self.last_recenter_ts = Some(now_ns);
 
         // 4) Recenter — count event + maybe relattice.
         self.recenters_since_relattice =
@@ -727,6 +749,7 @@ mod tests {
             step_atr_mult: Decimal::ZERO,
             bar_warmup_bars: 14,
             relattice_every_n_recenters: 10,
+            recenter_cooldown_ms: 1000,
         }
     }
 
