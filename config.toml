@@ -1,13 +1,45 @@
-# ─── SpreadScalp on USDC majors — MAINNET ──────────────────────────────────
+# ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 11 fixed bots — knob set copied from `config/spread-scalp.majors.toml`
-# (testnet winner). Per its header note, mainnet majors spread is 0.5-2 bps
-# vs testnet's 5-20, so min_spread_bps below WILL gate most of the time on
-# tight markets — accepting low fill rate to avoid adverse-selection drag.
+# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC. Wave = frozen fixed-step
+# lattice + round-trip refill. USDC promo (0 bps maker).
 #
-# Removed: take_profit_bps, stop_loss_bps, adverse_window_ms (EMA),
-# strict_touch_quotes. A/B testing showed TP/SL/adverse-EMA flipped
-# sign-negative. Time+drift adverse-stop replaces the EMA tracker.
+# Lineup rotated 2026-05-28: SOL/BNB/DOGE (low vol, weak performers) swapped
+# for higher-volatility USDC perps that resemble ZEC's profile (high realized
+# range + liquidity → more grid oscillation). Selection by volatility +
+# volume, NOT spread (the fixed lattice ignores the live touch). NONE of the
+# new names are backtested — same unvalidated posture as ZEC; watch the first
+# live sessions, and note higher vol means higher peak inventory than the SOL
+# figures below.
+#
+# Refill fires when EITHER a both-sides round-trip completes (bid AND ask
+# each drained ≥ refill_threshold) OR one whole side is empty (re-arm after
+# a one-sided sweep — integral, not optional). Lattice never recenters; the
+# active window slides over the fixed grid and prunes the tail.
+#
+# `step_bps` is the single geometry knob — it sets BOTH the inner self-spread
+# (gap from mid to the first order each side) AND the spacing between levels.
+#
+# Tuned via 72h SOL snapshot (2026-05-28): step_bps=5 / levels=10 / rt=5 is
+# the best RISK-ADJUSTED config found. On the 72h SOL replay (maker 0 /
+# taker 5, $10/order): net +$17.50, peak inventory only ~$953, and ending
+# unrealized +$0.66 (near-flat — true lean MM, not held directional risk).
+# Key findings:
+#   - A WIDE step (5 bps) naturally bounds inventory: orders are spaced far
+#     apart, so a crash fills few slots per move → slow accumulation. This
+#     beats a hard position cap, which bounds inventory but kills net.
+#   - Tighter steps (1-2 bps) earn slightly more gross but pile 4-5x the
+#     inventory ($4-5k peak) — that "edge" is really leveraged dip-buying.
+#   - refill_threshold ≈ levels/2 is the sweet spot. Lower = runaway
+#     inventory; the side-empty re-arm keeps it live through one-way moves.
+#
+# BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
+# $600 @ 5x account's capacity. Do not add BTCUSDC here.
+#
+# RISK ($600 @ 5x): worst per-market peak in the 72h backtest ~$953 at
+# $10/order → ~$570 at this account's ~$6/order → ~$114 margin at 5x. A ~19%
+# adverse move on that ≈ $108 loss. Wave still has NO hard cap and adds into
+# a trend, but the wide step keeps the excursion survivable. Watch sustained
+# one-way moves; size so summed peaks stay well under buying power.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
@@ -17,162 +49,55 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/spread-scalp-usdc-v2"
+state_dir = "./state/wave-usdc-majors"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-# ─── BTCUSDC (disabled — min_notional → ~$75 per order, too heavy) ─────────
-# [[bot]]
-# symbol = "BTCUSDC"
-# strategy = "spread-scalp"
-# [bot.spread_scalp]
-# min_spread_bps = 1
-# quote_offset_ticks = 0
-# requote_interval_ms = 500
-# reject_cooldown_ms = 500
-# price_tolerance_ticks = 1
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-# close_side_always_quotes = true
-
-# ─── ETHUSDC (disabled — min_notional → ~$20 per order, too heavy) ─────────
-# [[bot]]
-# symbol = "ETHUSDC"
-# strategy = "spread-scalp"
-# [bot.spread_scalp]
-# min_spread_bps = 1
-# quote_offset_ticks = 0
-# requote_interval_ms = 500
-# reject_cooldown_ms = 500
-# price_tolerance_ticks = 1
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-# close_side_always_quotes = true
-
-# ─── BNBUSDC ───────────────────────────────────────────────────────────────
+# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
+# Replaces SOLUSDC. ~19% 24h range, ~$42M vol — most ZEC-like (high vol +
+# liquid). Unvalidated.
 [[bot]]
-symbol = "BNBUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
+symbol = "NEARUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 10
+refill_threshold = 5
+step_bps = 5
 
-# ─── SOLUSDC ───────────────────────────────────────────────────────────────
+# ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
+# Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
+# this account). NOT backtested — no ZEC snapshot; running on the winning
+# params unvalidated, watch first live session.
 [[bot]]
-symbol = "SOLUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
+symbol = "ZECUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 10
+refill_threshold = 5
+step_bps = 5
 
-# ─── XRPUSDC ───────────────────────────────────────────────────────────────
+# ─── WLDUSDC ──────────────────────────────────────────────────────────────
+# Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
+# highest reward but also highest inventory/pile risk on one-way moves. Watch
+# closely. Unvalidated.
 [[bot]]
-symbol = "XRPUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
+symbol = "WLDUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 10
+refill_threshold = 5
+step_bps = 5
 
-# ─── DOGEUSDC (disabled — min_notional bumps step too high) ───────────────
-# [[bot]]
-# symbol = "DOGEUSDC"
-# strategy = "spread-scalp"
-# [bot.spread_scalp]
-# min_spread_bps = 1
-# quote_offset_ticks = 0
-# requote_interval_ms = 500
-# reject_cooldown_ms = 500
-# price_tolerance_ticks = 1
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-# close_side_always_quotes = true
-
-# ─── ADAUSDC ───────────────────────────────────────────────────────────────
-[[bot]]
-symbol = "ADAUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-
-# ─── AVAXUSDC ──────────────────────────────────────────────────────────────
-[[bot]]
-symbol = "AVAXUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-
-# ─── LINKUSDC ──────────────────────────────────────────────────────────────
-[[bot]]
-symbol = "LINKUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-
-# ─── SUIUSDC ───────────────────────────────────────────────────────────────
+# ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
+# Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
+# little wave oscillation). SUI: ZEC-like vol (~12% range) + strong liquidity
+# (~$19M). Unvalidated.
 [[bot]]
 symbol = "SUIUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
-close_side_always_quotes = true
-
-# ─── ARBUSDC ───────────────────────────────────────────────────────────────
-[[bot]]
-symbol = "ARBUSDC"
-strategy = "spread-scalp"
-[bot.spread_scalp]
-min_spread_bps = 1
-quote_offset_ticks = 0
-requote_interval_ms = 500
-reject_cooldown_ms = 500
-price_tolerance_ticks = 1
-close_side_always_quotes = true
-# adverse_stop_after_secs = 120
-# adverse_stop_drift_bps = 30
+strategy = "wave"
+[bot.wave]
+grid_levels = 10
+refill_threshold = 5
+step_bps = 5
