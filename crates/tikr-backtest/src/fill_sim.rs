@@ -48,6 +48,16 @@ pub struct FillSimConfig {
     /// Deterministic RNG seed for silent cancellations. Same seed =
     /// same dropped quotes for reproducible backtests.
     pub rng_seed: u64,
+    /// Mean additional latency (ms) drawn per submitted op on top of the
+    /// fixed `submit_latency_ms` / `cancel_latency_ms` base. Modelled as an
+    /// exponential distribution, so most ops see a little extra delay while a
+    /// few hit a long tail — capturing real network jitter + occasional
+    /// spikes with one knob. Jitter naturally reorders the pending queue
+    /// (a spiked order can land after a later one), exercising
+    /// cancel/replace races. Drawn from a dedicated RNG stream seeded off
+    /// `rng_seed`, so runs stay reproducible. `0` (default) = no jitter
+    /// (fixed latency, fully deterministic).
+    pub latency_jitter_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +234,10 @@ pub struct FillSim {
     position_notional: HashMap<Symbol, Decimal>,
     /// xorshift64 state for silent-cancellation rolls.
     rng_state: u64,
+    /// Separate xorshift64 state for latency-jitter draws. Kept distinct from
+    /// `rng_state` so jitter values don't shift when silent-cancel config
+    /// changes (the two would otherwise interleave draws).
+    latency_rng_state: u64,
     /// Last `on_market_event` timestamp, in nanoseconds. Used to compute
     /// the elapsed window for `silent_cancel_rate_per_min`.
     last_event_ts_ns: Option<u64>,
@@ -238,6 +252,8 @@ impl FillSim {
         } else {
             cfg.rng_seed
         };
+        // Derive a distinct, non-zero latency-jitter stream from the same seed.
+        let latency_rng_state = rng_state ^ 0xA5A5_A5A5_A5A5_A5A5;
         Self {
             cfg,
             pending: Vec::new(),
@@ -246,8 +262,27 @@ impl FillSim {
             pending_rejections: Vec::new(),
             position_notional: HashMap::new(),
             rng_state,
+            latency_rng_state,
             last_event_ts_ns: None,
         }
+    }
+
+    /// Total scheduling delay in nanoseconds for an op submitted now: the
+    /// fixed `base_ms` plus an exponential jitter draw with mean
+    /// `cfg.latency_jitter_ms` (capped at 20× the mean to bound outliers).
+    /// Returns exactly `base_ms` (no RNG draw) when jitter is disabled, so
+    /// fixed-latency runs stay bit-for-bit deterministic.
+    fn sample_latency_ns(&mut self, base_ms: u64) -> u64 {
+        let jitter_ms = if self.cfg.latency_jitter_ms == 0 {
+            0
+        } else {
+            let mean = self.cfg.latency_jitter_ms as f64;
+            // Inverse-CDF of Exp(mean): -mean * ln(1-u), u in [0,1).
+            let u = next_unit_f64(&mut self.latency_rng_state);
+            let sample = -mean * (1.0 - u).ln();
+            sample.min(mean * 20.0).round() as u64
+        };
+        base_ms.saturating_add(jitter_ms).saturating_mul(1_000_000)
     }
 
     /// Drain post-only rejections accumulated since the last call.
@@ -312,21 +347,31 @@ impl FillSim {
 
     /// Schedule a strategy action for venue submission at `now + appropriate_latency_ms`.
     pub fn on_action(&mut self, action: Action, now: Timestamp) {
-        let submit_ns = self.cfg.submit_latency_ms.saturating_mul(1_000_000);
-        let cancel_ns = self.cfg.cancel_latency_ms.saturating_mul(1_000_000);
+        // Each op draws its own latency (base + jitter), so a spiked submit
+        // can land after a later, faster one — the pending queue is re-sorted
+        // below, which models real out-of-order arrival.
+        let submit_base = self.cfg.submit_latency_ms;
+        let cancel_base = self.cfg.cancel_latency_ms;
         let (scheduled, op) = match action {
             Action::Quote(intent) => (
-                now.0.saturating_add(submit_ns),
+                now.0.saturating_add(self.sample_latency_ns(submit_base)),
                 Op::Place {
                     intent,
                     override_id: None,
                 },
             ),
-            Action::Requote { id, intent } => {
-                (now.0.saturating_add(submit_ns), Op::Replace { id, intent })
-            }
-            Action::Cancel(id) => (now.0.saturating_add(cancel_ns), Op::Cancel(id)),
-            Action::CancelAll => (now.0.saturating_add(cancel_ns), Op::CancelAll),
+            Action::Requote { id, intent } => (
+                now.0.saturating_add(self.sample_latency_ns(submit_base)),
+                Op::Replace { id, intent },
+            ),
+            Action::Cancel(id) => (
+                now.0.saturating_add(self.sample_latency_ns(cancel_base)),
+                Op::Cancel(id),
+            ),
+            Action::CancelAll => (
+                now.0.saturating_add(self.sample_latency_ns(cancel_base)),
+                Op::CancelAll,
+            ),
             Action::NoOp => return,
         };
         self.pending.push(PendingOp {
@@ -348,7 +393,8 @@ impl FillSim {
         now: Timestamp,
         venue_id: QuoteId,
     ) {
-        let submit_ns = self.cfg.submit_latency_ms.saturating_mul(1_000_000);
+        let submit_base = self.cfg.submit_latency_ms;
+        let submit_ns = self.sample_latency_ns(submit_base);
         self.pending.push(PendingOp {
             scheduled_ts_ns: now.0.saturating_add(submit_ns),
             op: Op::Place {
@@ -1003,6 +1049,7 @@ mod tests {
             max_position_notional_usdt: None,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
+            latency_jitter_ms: 0,
         }
     }
 
@@ -1313,6 +1360,7 @@ mod tests {
             max_position_notional_usdt: None,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
+            latency_jitter_ms: 0,
         };
         let mut sim = FillSim::new(cfg);
 
@@ -1354,6 +1402,7 @@ mod tests {
             max_position_notional_usdt: None,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
+            latency_jitter_ms: 0,
         };
         let mut sim = FillSim::new(cfg);
         // Seed the book via a snapshot: best_bid=99, best_ask=101.
@@ -1394,6 +1443,66 @@ mod tests {
         assert_eq!(fills[0].fee_amount, expected_fee);
         // No resting quote left.
         assert_eq!(sim.live_quotes.len(), 0);
+    }
+
+    #[test]
+    fn latency_jitter_adds_spread_but_respects_base() {
+        let sym = make_symbol();
+        let base_ms = 10u64;
+        let cfg = FillSimConfig {
+            submit_latency_ms: base_ms,
+            cancel_latency_ms: 0,
+            fees: VenueFees {
+                maker_bps: 0,
+                taker_bps: 0,
+            },
+            max_position_notional_usdt: None,
+            silent_cancel_rate_per_min: 0.0,
+            rng_seed: 42,
+            latency_jitter_ms: 50,
+        };
+        let base_ns = base_ms * 1_000_000;
+        let mut sim = FillSim::new(cfg.clone());
+        for _ in 0..40 {
+            sim.on_action(
+                Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+                Timestamp(0),
+            );
+        }
+        let sched: Vec<u64> = sim.pending.iter().map(|p| p.scheduled_ts_ns).collect();
+        // Jitter only ADDS delay — never schedules before the fixed base.
+        assert!(
+            sched.iter().all(|&s| s >= base_ns),
+            "jitter went below base"
+        );
+        // The exponential draw produces a spread, not a constant.
+        assert!(
+            sched.iter().any(|&s| s > base_ns),
+            "expected some jittered delay above base"
+        );
+
+        // Same seed → identical schedule (reproducible).
+        let mut sim2 = FillSim::new(cfg);
+        for _ in 0..40 {
+            sim2.on_action(
+                Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+                Timestamp(0),
+            );
+        }
+        let sched2: Vec<u64> = sim2.pending.iter().map(|p| p.scheduled_ts_ns).collect();
+        assert_eq!(sched, sched2, "same seed must reproduce the same latencies");
+    }
+
+    #[test]
+    fn zero_jitter_is_exact_base_latency() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg()); // latency_jitter_ms = 0
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        // submit_latency_ms = 10 in default_cfg, no jitter → exactly 10ms.
+        assert_eq!(sim.pending[0].scheduled_ts_ns, 10 * 1_000_000);
     }
 
     #[tokio::test]

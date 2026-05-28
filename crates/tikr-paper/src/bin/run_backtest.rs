@@ -85,6 +85,12 @@ struct Args {
     #[arg(long, default_value_t = 0u64)]
     submit_latency_ms: u64,
 
+    /// Mean exponential latency jitter (ms) added per op on top of
+    /// `--submit-latency-ms`. Models network jitter + occasional spikes
+    /// (the exponential tail). `0` (default) = fixed latency, deterministic.
+    #[arg(long, default_value_t = 0u64)]
+    submit_latency_jitter_ms: u64,
+
     /// Funding rate per interval as a fraction (e.g. 0.0001 = 1bp/8h).
     /// Positive = longs pay shorts. `0` (default) = funding off. Charged on
     /// open inventory every `--funding-interval-secs`, mirroring perp funding.
@@ -234,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_notional_usdt: None,
         silent_cancel_rate_per_min: args.silent_cancel_rate_per_min,
         rng_seed: 0,
+        latency_jitter_ms: args.submit_latency_jitter_ms,
     });
 
     let funding_rate = Decimal::from_str(&args.funding_bps)?;

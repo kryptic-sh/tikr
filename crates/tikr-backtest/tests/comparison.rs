@@ -116,6 +116,7 @@ fn fill_sim_config() -> FillSimConfig {
         max_position_notional_usdt: None,
         silent_cancel_rate_per_min: 0.0,
         rng_seed: 0,
+        latency_jitter_ms: 0,
     }
 }
 

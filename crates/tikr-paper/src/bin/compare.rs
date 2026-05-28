@@ -694,6 +694,12 @@ struct Args {
     #[arg(long, default_value_t = 0u64)]
     sim_rng_seed: u64,
 
+    /// FillSim: mean exponential latency jitter (ms) added per op on top of
+    /// `--sim-submit-latency-ms`. `0` (default) = fixed latency. Note sweeps
+    /// are easier to compare with jitter off (deterministic fills).
+    #[arg(long, default_value_t = 0u64)]
+    sim_latency_jitter_ms: u64,
+
     /// Comma-separated list of strategy categories to run. Empty
     /// (default) runs the full suite. Categories: avellaneda-stoikov,
     /// glft, top-of-book, micro-price, layered-grid, simple-gap,
@@ -1219,6 +1225,7 @@ async fn run_sweep_collect(
         },
         silent_cancel_rate_per_min: args.sim_silent_cancel_rate_per_min,
         rng_seed: args.sim_rng_seed,
+        latency_jitter_ms: args.sim_latency_jitter_ms,
     };
     let simple_gap_notional = Decimal::from_str(&args.simple_gap_notional)?;
     let ladder_reentry_notional = Decimal::from_str(&args.ladder_reentry_notional)?;

@@ -87,6 +87,7 @@ async fn golden_layered_grid_btc_single_fill() {
         max_position_notional_usdt: None,
         silent_cancel_rate_per_min: 0.0,
         rng_seed: 0,
+        latency_jitter_ms: 0,
     });
 
     let report = run(replay, strategy, fill_sim, symbol).await;

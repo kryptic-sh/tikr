@@ -142,6 +142,7 @@ async fn main() {
         max_position_notional_usdt: None,
         silent_cancel_rate_per_min: 0.0,
         rng_seed: 0,
+        latency_jitter_ms: 0,
     });
 
     let (tx, rx) = watch::channel(false);
