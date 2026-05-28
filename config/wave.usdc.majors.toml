@@ -1,7 +1,15 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 4 bots: SOLUSDC, ZECUSDC, DOGEUSDC, BNBUSDC. Wave = frozen fixed-step
+# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, BCHUSDC. Wave = frozen fixed-step
 # lattice + round-trip refill. USDC promo (0 bps maker).
+#
+# Lineup rotated 2026-05-28: SOL/BNB/DOGE (low vol, weak performers) swapped
+# for higher-volatility USDC perps that resemble ZEC's profile (high realized
+# range + liquidity → more grid oscillation). Selection by volatility +
+# volume, NOT spread (the fixed lattice ignores the live touch). NONE of the
+# new names are backtested — same unvalidated posture as ZEC; watch the first
+# live sessions, and note higher vol means higher peak inventory than the SOL
+# figures below.
 #
 # Refill fires when EITHER a both-sides round-trip completes (bid AND ask
 # each drained ≥ refill_threshold) OR one whole side is empty (re-arm after
@@ -47,9 +55,11 @@ order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-# ─── SOLUSDC ($5 floor) ───────────────────────────────────────────────────
+# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
+# Replaces SOLUSDC. ~19% 24h range, ~$42M vol — most ZEC-like (high vol +
+# liquid). Unvalidated.
 [[bot]]
-symbol = "SOLUSDC"
+symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 10
@@ -68,18 +78,23 @@ grid_levels = 10
 refill_threshold = 5
 step_bps = 5
 
-# ─── DOGEUSDC ─────────────────────────────────────────────────────────────
+# ─── WLDUSDC ──────────────────────────────────────────────────────────────
+# Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
+# highest reward but also highest inventory/pile risk on one-way moves. Watch
+# closely. Unvalidated.
 [[bot]]
-symbol = "DOGEUSDC"
+symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 10
 refill_threshold = 5
 step_bps = 5
 
-# ─── BNBUSDC ──────────────────────────────────────────────────────────────
+# ─── BCHUSDC ──────────────────────────────────────────────────────────────
+# Replaces BNBUSDC. ~17% 24h range, ~$23M vol. High unit price (~$300) but $5
+# floor + lot sizing keeps orders ~$6. Unvalidated.
 [[bot]]
-symbol = "BNBUSDC"
+symbol = "BCHUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 10
