@@ -655,10 +655,15 @@ impl Strategy for Wave {
             }
         }
 
-        // Force a refill this cycle if the position shrank toward flat
-        // since last event (a take-profit or band exit filled → profit
-        // banked → round-trip complete).
-        let force_refill = pos.abs() < self.last_pos_size.abs();
+        // Force a refill this cycle only when the residual just closed
+        // out fully (position crossed back to flat). The TP order is sized
+        // to the whole position, so its fill lands us exactly flat — this
+        // catches that without firing on every ordinary opposing band fill
+        // (which would bypass the both-sides round-trip discipline and let
+        // inventory run away on a trend).
+        let force_refill = self.config.take_profit_ticks > 0
+            && pos == Decimal::ZERO
+            && self.last_pos_size != Decimal::ZERO;
         self.last_pos_size = pos;
 
         // Compute both bands around the cross-guarded touch.
