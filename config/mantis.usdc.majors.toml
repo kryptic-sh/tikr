@@ -1,0 +1,73 @@
+# ─── Mantis on USDC majors — MAINNET ──────────────────────────────────────
+#
+# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC (same lineup as wave). Mantis =
+# symmetric touch scalper: rests one post-only bid + one ask at (or near) the
+# book touch whenever spread ≥ min_spread_bps, and waits for price to come to
+# it. Pre-placed resting orders fill with zero submission latency (no chasing),
+# which is the latency-robust property — relevant since live RTT eats thin
+# scalp edges. USDC promo (0 bps maker).
+#
+# Geometry:
+#   - `min_spread_bps` — only quote when the book spread is at least this wide;
+#     below it, both sides cancel and the bot waits.
+#   - `tick_offset` — placement vs the touch, in ticks (venue tick auto-detected
+#     from the symbol; operators don't set it):
+#       0  (default) = JOIN the touch  (bid = best_bid, ask = best_ask)
+#      -1            = INSIDE / outbid  (bid = best_bid + 1 tick, ask = best_ask − 1 tick)
+#      +1, +2, …     = OUTSIDE          (bid = best_bid − N tick, ask = best_ask + N tick)
+#
+# Order size + position cap are account-derived (order_balance_pct /
+# max_position_pct below), same as wave/tide. One bid + one ask per side; the
+# inventory-deepening side is suppressed once the cap is breached.
+#
+# UNVALIDATED on these symbols — same posture as the wave/tide USDC lineups.
+# First backtest (SOL 72h, $600/5×, 0-maker, 50ms+jitter, join/1bps): net
+# +$11.64, peak ~$998, 0 liquidations, near-flat ending inventory — lean and
+# low-churn (~5k fills). Watch first live sessions; higher-vol names build more
+# inventory.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/mantis-usdc-majors"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
+[[bot]]
+symbol = "NEARUSDC"
+strategy = "mantis"
+[bot.mantis]
+min_spread_bps = 1
+tick_offset = 0
+
+# ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
+[[bot]]
+symbol = "ZECUSDC"
+strategy = "mantis"
+[bot.mantis]
+min_spread_bps = 1
+tick_offset = 0
+
+# ─── WLDUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "WLDUSDC"
+strategy = "mantis"
+[bot.mantis]
+min_spread_bps = 1
+tick_offset = 0
+
+# ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
+[[bot]]
+symbol = "SUIUSDC"
+strategy = "mantis"
+[bot.mantis]
+min_spread_bps = 1
+tick_offset = 0
