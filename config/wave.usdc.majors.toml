@@ -1,6 +1,6 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 4 bots: SOLUSDC, ETHUSDC, DOGEUSDC, BNBUSDC. Wave = frozen lattice +
+# 4 bots: SOLUSDC, ZECUSDC, DOGEUSDC, BNBUSDC. Wave = frozen lattice +
 # round-trip refill (refill only when BOTH sides drain ≥ refill_threshold
 # slots = a completed bid+ask round-trip). USDC promo (0 bps maker).
 #
@@ -49,9 +49,12 @@ min_self_spread_bps = 0
 grid_step_bps = 1
 step_atr_mult = "0.0"
 
-# ─── ETHUSDC ──────────────────────────────────────────────────────────────
+# ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
+# Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
+# this account). NOT backtested — no 2h ZEC data; running on the winning
+# params unvalidated, watch first live session.
 [[bot]]
-symbol = "ETHUSDC"
+symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 10
