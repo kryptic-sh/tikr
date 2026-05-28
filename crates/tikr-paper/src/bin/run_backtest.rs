@@ -21,7 +21,7 @@ use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
     VenueId,
 };
-use tikr_paper::{RunnerConfig, run_with_resume};
+use tikr_paper::{FundingConfig, RunnerConfig, run_with_resume};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
     MicroPriceConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
@@ -77,6 +77,27 @@ struct Args {
     /// Taker fee in basis points.
     #[arg(long, default_value_t = 5u32)]
     taker_bps: u32,
+
+    /// Order submit (and cancel) latency in ms. Models the book moving
+    /// while an order is in flight: a post-only that crosses the touch on
+    /// arrival is rejected (Binance -5022), exercising on_quote_rejected.
+    /// `0` (default) = instant placement (optimistic).
+    #[arg(long, default_value_t = 0u64)]
+    submit_latency_ms: u64,
+
+    /// Funding rate per interval as a fraction (e.g. 0.0001 = 1bp/8h).
+    /// Positive = longs pay shorts. `0` (default) = funding off. Charged on
+    /// open inventory every `--funding-interval-secs`, mirroring perp funding.
+    #[arg(long, default_value = "0")]
+    funding_bps: String,
+    /// Funding interval in seconds (Binance USD-M = 8h = 28800).
+    #[arg(long, default_value_t = 28800u64)]
+    funding_interval_secs: u64,
+
+    /// Venue silent-cancel/expiry rate per minute (post-only orders the
+    /// venue randomly drops). `0.0` (default) = off.
+    #[arg(long, default_value_t = 0.0f64)]
+    silent_cancel_rate_per_min: f64,
 
     /// Balance-sim: initial wallet balance (USDT). When > 0 with
     /// order-balance-pct > 0, order notional + position cap compound off the
@@ -204,22 +225,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let size_per_quote = Size(Decimal::from_str(&args.size)?);
 
     let fill_sim = FillSim::new(FillSimConfig {
-        submit_latency_ms: 0,
-        cancel_latency_ms: 0,
+        submit_latency_ms: args.submit_latency_ms,
+        cancel_latency_ms: args.submit_latency_ms,
         fees: VenueFees {
             maker_bps: args.maker_bps,
             taker_bps: args.taker_bps,
         },
         max_position_notional_usdt: None,
-        silent_cancel_rate_per_min: 0.0,
+        silent_cancel_rate_per_min: args.silent_cancel_rate_per_min,
         rng_seed: 0,
     });
 
+    let funding_rate = Decimal::from_str(&args.funding_bps)?;
+    let funding = if funding_rate != Decimal::ZERO {
+        Some(FundingConfig {
+            interval_secs: args.funding_interval_secs,
+            rate_per_interval: funding_rate,
+        })
+    } else {
+        None
+    };
     let runner_config = RunnerConfig {
         state_dir: args.state_dir.clone(),
         snapshot_every_n_events: 0, // backtest = no snapshots
         skim: None,
-        funding: None,
+        funding,
         snapshot_tap: None,
         live_tap: None,
         notional_rx: None,
@@ -232,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_pct: Decimal::from_str(&args.max_position_pct)?,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
+        liquidation: None,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.

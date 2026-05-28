@@ -1197,10 +1197,12 @@ async fn run_sweep_collect(
     } else {
         None
     };
-    // Perp funding model. Disabled when rate == 0.
+    // Perp funding model. Disabled when rate == 0. CLI takes integer bps per
+    // 8h; convert to the per-interval fraction the runner expects.
     let funding_cfg: Option<FundingConfig> = if args.funding_bps_per_8h != 0 {
         Some(FundingConfig {
-            rate_bps_per_8h: args.funding_bps_per_8h,
+            interval_secs: 28_800,
+            rate_per_interval: Decimal::from(args.funding_bps_per_8h) / Decimal::from(10_000),
         })
     } else {
         None
@@ -2269,6 +2271,7 @@ async fn run_one<S: Strategy>(
         max_position_pct: balance_compounding().2,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
+        liquidation: None,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -2355,6 +2358,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             max_position_pct: balance_compounding().2,
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
+            liquidation: None,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");

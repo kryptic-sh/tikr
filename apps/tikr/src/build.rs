@@ -131,6 +131,7 @@ pub fn to_spec(
         // as a "wipe everything if exceeded" threshold; set to 0
         // (disabled) when the strategy intentionally keeps many.
         max_expected_open_orders: max_open_orders_for(cfg),
+        liquidation: None,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

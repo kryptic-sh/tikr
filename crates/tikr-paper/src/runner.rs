@@ -21,6 +21,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tikr_backtest::fill_sim::FillSim;
+use tikr_backtest::liquidation::{LiquidationConfig, LiquidationModel};
 use tikr_backtest::pnl::PositionTracker;
 use tikr_core::{
     Decimal, Fill, LiqEvent, MarketEvent, Notional, Position, Price, Side, SignedSize, Snapshot,
@@ -144,6 +145,13 @@ pub struct RunnerConfig {
     /// (default) disables the sweep entirely — useful when the
     /// strategy intentionally keeps a lot of resting orders.
     pub max_expected_open_orders: usize,
+    /// Optional isolated-margin liquidation model (paper / backtest only).
+    /// When `Some` AND not in live mode, the runner force-closes the open
+    /// position when the mark (book-mid proxy) breaches the computed
+    /// liquidation price — realizing the loss and cancelling resting orders,
+    /// mirroring a real leveraged-perp blowup. Ignored in live mode (the
+    /// venue performs its own liquidation). `None` (default) disables.
+    pub liquidation: Option<LiquidationConfig>,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -151,9 +159,13 @@ pub struct RunnerConfig {
 /// over time) for backtest simplicity. Positive rate = longs pay shorts.
 #[derive(Debug, Clone, Copy)]
 pub struct FundingConfig {
-    /// Funding rate per 8h interval, as a signed bps value. Binance default
-    /// cap is ±75 bps but typical mid-cap pairs sit at ±1 bps (~0.01%).
-    pub rate_bps_per_8h: i32,
+    /// Funding interval in seconds (Binance USD-M = 8h = 28800). The
+    /// per-event accrual prorates `rate_per_interval` by `dt / interval_secs`.
+    pub interval_secs: u64,
+    /// Funding rate per interval, as a signed fraction (e.g. `0.0001` =
+    /// 1 bp = 0.01%). Positive = longs pay shorts. Binance caps at ±0.0075
+    /// (±75 bp) but typical mid-cap pairs sit near ±0.0001.
+    pub rate_per_interval: Decimal,
 }
 
 /// Profit-skim parameters. When enabled the runner reports `base_stacked`,
@@ -192,6 +204,7 @@ impl Default for RunnerConfig {
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
+            liquidation: None,
         }
     }
 }
@@ -538,6 +551,8 @@ where
     // On each subsequent event we apply `position × mark × rate × dt/28800s`
     // continuously, then advance.
     let funding_cfg = config.funding;
+    // Isolated-margin liquidation model (paper/backtest only — see field doc).
+    let mut liq_model = config.liquidation.map(LiquidationModel::new);
     let mut notional_rx = config.notional_rx;
     let mut max_position_rx = config.max_position_rx;
     // Balance-compounding channels (backtest mode). When enabled,
@@ -603,6 +618,7 @@ where
                 buy_volume,
                 sell_volume,
                 peak_position_usdt,
+                liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
             );
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
@@ -799,15 +815,52 @@ where
                         let dt_ns = ts.0.saturating_sub(prev_ts.0);
                         if dt_ns > 0 {
                             let dt_secs = Decimal::from(dt_ns) / Decimal::from(1_000_000_000u64);
-                            let rate_per_8h =
-                                Decimal::from(fcfg.rate_bps_per_8h) / Decimal::from(10_000);
-                            let interval = Decimal::from(28_800u64);
+                            let interval = Decimal::from(fcfg.interval_secs.max(1));
                             let pos_size = tracker.snapshot().size.0;
-                            let amount = -pos_size * last_mid.0 * rate_per_8h * (dt_secs / interval);
+                            let amount = -pos_size
+                                * last_mid.0
+                                * fcfg.rate_per_interval
+                                * (dt_secs / interval);
                             tracker.accrue_funding(amount);
                         }
                     }
                     last_funding_ts = Some(ts);
+                }
+
+                // Forced liquidation (paper/backtest only — live venue runs
+                // its own). Checked against the current mark (book-mid proxy)
+                // BEFORE the strategy reacts, so the strategy sees a freshly
+                // flat position on this same event. The realized loss lands in
+                // the tracker via the synthetic close fill.
+                if !live_mode
+                    && last_mid.0 > Decimal::ZERO
+                    && let Some(model) = liq_model.as_mut()
+                {
+                    let pos_now = tracker.snapshot();
+                    if let Some(fill) = model.check(&pos_now, last_mid, ts) {
+                        warn!(
+                            liq_price = %fill.price.0,
+                            mark = %last_mid.0,
+                            size = %fill.size.0,
+                            side = ?fill.side,
+                            "LIQUIDATION — mark breached liq price; force-closing position"
+                        );
+                        // A real liquidation cancels the account's resting orders.
+                        fill_sim.drop_quotes_for(&symbol);
+                        apply_fill(
+                            fill,
+                            &mut tracker,
+                            &mut risk_gate,
+                            &mut fills_emitted,
+                            &mut buy_fills,
+                            &mut sell_fills,
+                            &mut buy_volume,
+                            &mut sell_volume,
+                            alert_sink.as_deref(),
+                            &symbol,
+                        )
+                        .await;
+                    }
                 }
 
                 let pos = tracker.snapshot();
@@ -1272,6 +1325,7 @@ where
                         buy_volume,
                         sell_volume,
                         peak_position_usdt,
+                        liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1399,6 +1453,7 @@ where
                         buy_volume,
                         sell_volume,
                         peak_position_usdt,
+                        liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1525,6 +1580,7 @@ where
                         buy_volume,
                         sell_volume,
                         peak_position_usdt,
+                        liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                     );
                     heartbeat.runtime_secs =
                         resumed_runtime_secs.saturating_add(heartbeat.runtime_secs);
@@ -1705,6 +1761,7 @@ where
         buy_volume,
         sell_volume,
         peak_position_usdt,
+        liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
@@ -2044,6 +2101,7 @@ fn finalize(
     buy_volume: Decimal,
     sell_volume: Decimal,
     peak_position_usdt: Decimal,
+    liquidations: u64,
 ) -> PaperReport {
     let base = tracker.report(last_mid);
     let sim_duration_secs = match (first_event_ts, last_event_ts) {
@@ -2083,6 +2141,7 @@ fn finalize(
         buy_volume_usdt: Notional(buy_volume),
         sell_volume_usdt: Notional(sell_volume),
         peak_position_usdt: Notional(peak_position_usdt),
+        liquidations,
     }
 }
 
@@ -2338,7 +2397,114 @@ mod tests {
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
+            liquidation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn liquidation_force_closes_seeded_long() {
+        let temp = TempDir::new().unwrap();
+        let symbol = make_symbol();
+        // Seed a 10× long, size 1 @ entry 100. With mmr=0 the liquidation
+        // price is 100 × (1 − 0.1) = 90.
+        let seed = Position {
+            symbol: symbol.clone(),
+            size: tikr_core::SignedSize(Decimal::from(1)),
+            avg_entry: Price(Decimal::from(100)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let mut config = test_config(temp.path().into());
+        config.seed_position = Some(seed);
+        config.liquidation = Some(LiquidationConfig {
+            leverage: Decimal::from(10),
+            maint_margin_rate: Decimal::ZERO,
+            close_fee_bps: 0,
+        });
+        // Book mid = (88 + 90) / 2 = 89 < liq 90 → liquidation fires.
+        let book = MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: symbol.clone(),
+                bids: vec![Level {
+                    price: Price(Decimal::from(88)),
+                    size: Size(Decimal::from(10)),
+                }],
+                asks: vec![Level {
+                    price: Price(Decimal::from(90)),
+                    size: Size(Decimal::from(10)),
+                }],
+                ts: Timestamp(1_000),
+            },
+        };
+        let venue = MockVenue::finite(vec![book]);
+        let (_tx, rx) = watch::channel(false);
+        let report = run_with_resume(
+            venue,
+            layered_grid(),
+            fill_sim(),
+            symbol,
+            rx,
+            config,
+            None,
+            None,
+            None,
+            None, // paper mode
+            None,
+        )
+        .await;
+        assert_eq!(report.liquidations, 1, "seeded long must be liquidated");
+        // Closed 1 @ liq 90 from entry 100 → realized −10.
+        assert_eq!(report.realized.0, Decimal::from(-10));
+    }
+
+    #[tokio::test]
+    async fn no_liquidation_when_mark_holds_above_liq() {
+        let temp = TempDir::new().unwrap();
+        let symbol = make_symbol();
+        let seed = Position {
+            symbol: symbol.clone(),
+            size: tikr_core::SignedSize(Decimal::from(1)),
+            avg_entry: Price(Decimal::from(100)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let mut config = test_config(temp.path().into());
+        config.seed_position = Some(seed);
+        config.liquidation = Some(LiquidationConfig {
+            leverage: Decimal::from(10),
+            maint_margin_rate: Decimal::ZERO,
+            close_fee_bps: 0,
+        });
+        // Mid = 95.5 > liq 90 → no liquidation.
+        let book = MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: symbol.clone(),
+                bids: vec![Level {
+                    price: Price(Decimal::from(95)),
+                    size: Size(Decimal::from(10)),
+                }],
+                asks: vec![Level {
+                    price: Price(Decimal::from(96)),
+                    size: Size(Decimal::from(10)),
+                }],
+                ts: Timestamp(1_000),
+            },
+        };
+        let venue = MockVenue::finite(vec![book]);
+        let (_tx, rx) = watch::channel(false);
+        let report = run_with_resume(
+            venue,
+            layered_grid(),
+            fill_sim(),
+            symbol,
+            rx,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(report.liquidations, 0, "mark above liq must not liquidate");
     }
 
     fn make_book_event(symbol: &Symbol, i: u64) -> MarketEvent {
@@ -2473,6 +2639,7 @@ mod tests {
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
             peak_position_usdt: Notional(Decimal::ZERO),
+            liquidations: 0,
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -2523,6 +2690,7 @@ mod tests {
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
             peak_position_usdt: Notional(Decimal::ZERO),
+            liquidations: 0,
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -2695,6 +2863,7 @@ mod tests {
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
+            liquidation: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -2789,6 +2958,7 @@ mod tests {
             max_position_pct: Decimal::ZERO,
             min_notional: Decimal::ZERO,
             max_expected_open_orders: 2,
+            liquidation: None,
         };
         let (_tx, rx) = watch::channel(false);
 

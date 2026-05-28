@@ -259,6 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_pct: Decimal::ZERO,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
+        liquidation: None,
     };
 
     let report = run_with_resume(

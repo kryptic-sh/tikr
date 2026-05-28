@@ -75,6 +75,12 @@ pub struct PaperReport {
     /// (`|size| × last_mid` sampled on every event). Shows how close
     /// the strategy came to its `max_position_usdt` cap.
     pub peak_position_usdt: Notional,
+    /// Number of forced liquidations triggered during the run. `0` when no
+    /// [`crate::runner::RunnerConfig::liquidation`] model was configured, or
+    /// when the mark never breached the position's liquidation price. A
+    /// non-zero value means the strategy blew through its margin — the
+    /// realized loss is already folded into `realized` / `net`.
+    pub liquidations: u64,
 }
 
 // --- serde wire format ---------------------------------------------------
@@ -112,6 +118,8 @@ struct PaperReportWire {
     sell_volume_usdt: String,
     #[serde(default)]
     peak_position_usdt: String,
+    #[serde(default)]
+    liquidations: u64,
 }
 
 impl Serialize for PaperReport {
@@ -137,6 +145,7 @@ impl Serialize for PaperReport {
             buy_volume_usdt: self.buy_volume_usdt.0.to_string(),
             sell_volume_usdt: self.sell_volume_usdt.0.to_string(),
             peak_position_usdt: self.peak_position_usdt.0.to_string(),
+            liquidations: self.liquidations,
         }
         .serialize(serializer)
     }
@@ -205,6 +214,7 @@ impl<'de> Deserialize<'de> for PaperReport {
             } else {
                 parse(&wire.peak_position_usdt)?
             },
+            liquidations: wire.liquidations,
         })
     }
 }

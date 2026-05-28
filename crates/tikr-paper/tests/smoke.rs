@@ -63,6 +63,7 @@ async fn paper_runner_against_testnet_5min() {
         max_position_pct: Decimal::ZERO,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
+        liquidation: None,
     };
 
     let (tx, rx) = watch::channel(false);

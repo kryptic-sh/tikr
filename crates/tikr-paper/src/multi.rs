@@ -81,6 +81,7 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
     let mut total_buy_volume = Decimal::ZERO;
     let mut total_sell_volume = Decimal::ZERO;
     let mut max_peak_position = Decimal::ZERO;
+    let mut total_liquidations = 0u64;
     let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in reports {
         realized += r.realized.0;
@@ -105,6 +106,7 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         if r.peak_position_usdt.0 > max_peak_position {
             max_peak_position = r.peak_position_usdt.0;
         }
+        total_liquidations += r.liquidations;
         if !r.base_asset.is_empty() {
             bases.insert(r.base_asset.as_str());
         }
@@ -138,5 +140,6 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         buy_volume_usdt: Notional(total_buy_volume),
         sell_volume_usdt: Notional(total_sell_volume),
         peak_position_usdt: Notional(max_peak_position),
+        liquidations: total_liquidations,
     }
 }
