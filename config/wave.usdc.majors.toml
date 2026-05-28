@@ -1,6 +1,6 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, BCHUSDC. Wave = frozen fixed-step
+# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC. Wave = frozen fixed-step
 # lattice + round-trip refill. USDC promo (0 bps maker).
 #
 # Lineup rotated 2026-05-28: SOL/BNB/DOGE (low vol, weak performers) swapped
@@ -90,11 +90,12 @@ grid_levels = 10
 refill_threshold = 5
 step_bps = 5
 
-# ─── BCHUSDC ──────────────────────────────────────────────────────────────
-# Replaces BNBUSDC. ~17% 24h range, ~$23M vol. High unit price (~$300) but $5
-# floor + lot sizing keeps orders ~$6. Unvalidated.
+# ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
+# Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
+# little wave oscillation). SUI: ZEC-like vol (~12% range) + strong liquidity
+# (~$19M). Unvalidated.
 [[bot]]
-symbol = "BCHUSDC"
+symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 10
