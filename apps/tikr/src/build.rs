@@ -12,7 +12,7 @@ use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig,
     MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
-    TideConfig,
+    TideConfig, WaveConfig,
 };
 use tokio::sync::watch;
 
@@ -78,9 +78,10 @@ pub fn to_spec(
         "tide" | "td" => build_tide(cfg, &symbol, venue, default_notional)?,
         "joker" | "jk" => build_joker(cfg, &symbol, venue, default_notional)?,
         "rsi-mr" | "rsimr" => build_rsi_mr(cfg, &symbol, venue, default_notional)?,
+        "wave" | "wv" => build_wave(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave)"
             ));
         }
     };
@@ -180,6 +181,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "tide" | "td" => Ok(cfg.tide.as_ref().and_then(|p| p.notional)),
         "joker" | "jk" => Ok(cfg.joker.as_ref().and_then(|p| p.notional)),
         "rsi-mr" | "rsimr" => Ok(cfg.rsi_mr.as_ref().and_then(|p| p.notional)),
+        "wave" | "wv" => Ok(cfg.wave.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -207,7 +209,9 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "joker"
         | "jk"
         | "rsi-mr"
-        | "rsimr" => None,
+        | "rsimr"
+        | "wave"
+        | "wv" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -225,6 +229,7 @@ fn max_open_orders_for(cfg: &BotConfig) -> usize {
         "tide" | "td" => 0,
         "joker" | "jk" => 0,
         "rsi-mr" | "rsimr" => 0,
+        "wave" | "wv" => 0,
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
@@ -479,6 +484,42 @@ fn build_rsi_mr(
         atr_sl_mult: rsi_mr.atr_sl_mult,
         atr_tp_mult: rsi_mr.atr_tp_mult,
         max_hold_bars: rsi_mr.max_hold_bars,
+    }))
+}
+
+fn build_wave(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let wave = cfg.wave.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("bot {} strategy=wave but [bot.wave] missing", cfg.symbol)
+    })?;
+    let notional =
+        autobump_notional(wave.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::Wave(WaveConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        grid_levels: wave.grid_levels,
+        min_self_spread_bps: wave.min_self_spread_bps,
+        min_self_spread_ticks: wave.min_self_spread_ticks,
+        grid_step_bps: wave.grid_step_bps,
+        grid_step_ticks: wave.grid_step_ticks,
+        recenter_drain_slots: wave.recenter_drain_slots,
+        skew_max_pct: wave.skew_max_pct,
+        max_position_usdt: Decimal::ZERO,
+        bar_interval_secs: wave.bar_interval_secs,
+        max_bars: wave.max_bars,
+        atr_period: wave.atr_period,
+        step_atr_mult: wave.step_atr_mult,
+        bar_warmup_bars: wave.bar_warmup_bars,
+        relattice_every_n_recenters: wave.relattice_every_n_recenters,
     }))
 }
 

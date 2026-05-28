@@ -1,0 +1,84 @@
+# ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
+#
+# 4 bots: BTCUSDC, ETHUSDC, DOGEUSDC, ZECUSDC. Wave strategy = frozen
+# lattice + lazy recenter on inner-drain. Adaptive ATR step every 10
+# recenters. USDC promo (0 bps maker).
+#
+# Key behavior:
+#   - Init: wait for 14 closed 1m bars → seed lattice at ATR × 1.0 step
+#   - Each event: do nothing unless ≥ 4 of 12 slots drained one side
+#   - Recenter: emit missing slots on (skewed-by-inventory) new window
+#   - Every 10 recenters: recompute ATR + step, re-anchor lattice
+#   - Never cancel — old orders rest forever (queue priority preserved)
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/wave-usdc-majors"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+# ─── BTCUSDC (USDC promo, wide-tick at ~75k) ──────────────────────────────
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 12
+recenter_drain_slots = 4
+skew_max_pct = "0.25"
+# Adaptive step from ATR (per-symbol vol auto-detect).
+bar_interval_secs = 60
+atr_period = 14
+step_atr_mult = "1.0"
+bar_warmup_bars = 14
+relattice_every_n_recenters = 10
+# Tick / bps overrides ignored when step_atr_mult > 0.
+
+# ─── ETHUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ETHUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 12
+recenter_drain_slots = 4
+skew_max_pct = "0.25"
+bar_interval_secs = 60
+atr_period = 14
+step_atr_mult = "1.0"
+bar_warmup_bars = 14
+relattice_every_n_recenters = 10
+
+# ─── DOGEUSDC ─────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "DOGEUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 12
+recenter_drain_slots = 4
+skew_max_pct = "0.25"
+bar_interval_secs = 60
+atr_period = 14
+step_atr_mult = "1.0"
+bar_warmup_bars = 14
+relattice_every_n_recenters = 10
+
+# ─── ZECUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "ZECUSDC"
+strategy = "wave"
+[bot.wave]
+grid_levels = 12
+recenter_drain_slots = 4
+skew_max_pct = "0.25"
+bar_interval_secs = 60
+atr_period = 14
+step_atr_mult = "1.0"
+bar_warmup_bars = 14
+relattice_every_n_recenters = 10

@@ -267,6 +267,81 @@ pub struct BotConfig {
     /// RSI-MR params (only honored when `strategy = "rsi-mr"`).
     #[serde(default)]
     pub rsi_mr: Option<RsiMrParams>,
+    /// Wave params (only honored when `strategy = "wave"`).
+    #[serde(default)]
+    pub wave: Option<WaveParams>,
+}
+
+/// Wave — lazy-recenter lattice with ATR-adaptive step + skew-on-recenter.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct WaveParams {
+    /// Per-order notional. Account-derived if unset.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Lattice slots per side. Default 12.
+    #[serde(default = "wave_default_grid_levels")]
+    pub grid_levels: u32,
+    /// Min self-spread (bps). `0` = disabled.
+    #[serde(default)]
+    pub min_self_spread_bps: u32,
+    /// Tick override for min self-spread. `> 0` wins over bps.
+    #[serde(default)]
+    pub min_self_spread_ticks: u32,
+    /// Grid step (bps). `0` = 1-tick.
+    #[serde(default)]
+    pub grid_step_bps: u32,
+    /// Tick override for grid step. `> 0` wins over bps.
+    #[serde(default)]
+    pub grid_step_ticks: u32,
+    /// Recenter when ≥ N slots drained in current window (either side).
+    /// `0` = `grid_levels / 3` auto.
+    #[serde(default)]
+    pub recenter_drain_slots: u32,
+    /// Max skew on recenter (fraction of grid_levels). Default `0.25`.
+    #[serde(default = "wave_default_skew_max_pct")]
+    pub skew_max_pct: Decimal,
+    /// Bar interval (seconds) for ATR. Default 60.
+    #[serde(default = "wave_default_bar_interval_secs")]
+    pub bar_interval_secs: u64,
+    /// Max closed bars retained for ATR. Default 200.
+    #[serde(default = "wave_default_max_bars")]
+    pub max_bars: usize,
+    /// ATR period. Default 14.
+    #[serde(default = "wave_default_atr_period")]
+    pub atr_period: u32,
+    /// Step = ATR × mult when `> 0`. Default `0` (use ticks/bps).
+    #[serde(default)]
+    pub step_atr_mult: Decimal,
+    /// Wait this many bars before init when auto-step is on.
+    /// Default = `atr_period`.
+    #[serde(default = "wave_default_bar_warmup_bars")]
+    pub bar_warmup_bars: u32,
+    /// Relattice every Nth recenter (auto-step only). Default 10. `0` = never.
+    #[serde(default = "wave_default_relattice_every_n")]
+    pub relattice_every_n_recenters: u32,
+}
+
+fn wave_default_grid_levels() -> u32 {
+    12
+}
+fn wave_default_skew_max_pct() -> Decimal {
+    Decimal::new(25, 2)
+}
+fn wave_default_bar_interval_secs() -> u64 {
+    60
+}
+fn wave_default_max_bars() -> usize {
+    200
+}
+fn wave_default_atr_period() -> u32 {
+    14
+}
+fn wave_default_bar_warmup_bars() -> u32 {
+    14
+}
+fn wave_default_relattice_every_n() -> u32 {
+    10
 }
 
 /// RSI mean-reversion + KER regime gate, long-only.

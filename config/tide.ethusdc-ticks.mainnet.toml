@@ -29,10 +29,10 @@ leverage = 5
 symbol = "ETHUSDC"
 strategy = "tide"
 [bot.tide]
-grid_levels = 3
-min_self_spread_ticks = 10
-grid_step_ticks = 10
-close_profit_ticks = 50
+grid_levels = 1
+min_self_spread_ticks = 50
+grid_step_ticks = 50
+close_profit_ticks = 80
 prune_stragglers = false
 adaptive_bps_enabled = false
 
@@ -40,9 +40,9 @@ adaptive_bps_enabled = false
 symbol = "ZECUSDC"
 strategy = "tide"
 [bot.tide]
-grid_levels = 3
-min_self_spread_ticks = 10
-grid_step_ticks = 10
-close_profit_ticks = 50
+grid_levels = 1
+min_self_spread_ticks = 50
+grid_step_ticks = 50
+close_profit_ticks = 80
 prune_stragglers = false
 adaptive_bps_enabled = false

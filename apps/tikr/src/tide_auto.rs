@@ -239,6 +239,7 @@ fn spawn_one_bot(
         hydra: None,
         joker: None,
         rsi_mr: None,
+        wave: None,
     };
     shared_state.insert(
         symbol,

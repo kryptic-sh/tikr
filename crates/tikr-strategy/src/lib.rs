@@ -48,6 +48,7 @@ pub mod spread_scalp_old;
 pub mod static_grid;
 pub mod tide;
 pub mod top_of_book;
+pub mod wave;
 pub mod volatility;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
@@ -68,6 +69,7 @@ pub use spread_scalp_old::{SpreadScalpOld, SpreadScalpOldConfig};
 pub use static_grid::{StaticGrid, StaticGridConfig};
 pub use tide::{Tide, TideConfig};
 pub use top_of_book::{TopOfBook, TopOfBookConfig};
+pub use wave::{Wave, WaveConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
 
 use tikr_core::{
