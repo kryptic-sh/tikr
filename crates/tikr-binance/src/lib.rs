@@ -48,6 +48,7 @@ pub mod exchange_info;
 /// USD-M Futures REST endpoint wrappers (`/fapi/v1/...`).
 pub mod futs;
 pub mod liquidation_stream;
+pub mod mark_price_stream;
 pub mod sign;
 pub mod spot;
 pub mod trade_stream;

@@ -13,6 +13,7 @@ use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use polars::prelude::*;
+use tikr_binance::mark_price_stream::{self, MarkUpdate};
 use tikr_binance::{BinanceEnv, depth_stream, trade_stream};
 use tikr_core::{
     Asset, MarketEvent, MarketKind, Price, Side, Size, Snapshot, Symbol, Timestamp, VenueId,
@@ -167,6 +168,7 @@ async fn main() {
                     symbol = %sym,
                     books_total = stats.books,
                     trades_total = stats.trades,
+                    marks_total = stats.marks,
                     flushes = stats.flushes,
                     "recorder done",
                 );
@@ -184,6 +186,7 @@ async fn main() {
 struct RecorderStats {
     books: u64,
     trades: u64,
+    marks: u64,
     flushes: u64,
 }
 
@@ -202,6 +205,16 @@ async fn run_recorder(
     let mut trades = trade_stream::subscribe_trades(env, symbol.clone())
         .await
         .map_err(|e| format!("trade subscribe failed: {e}"))?;
+    // Mark price is futures-only. Subscribe when on a futures env; a failure
+    // (or spot env) downgrades to "no mark stream" rather than aborting the
+    // whole recording — book + trades still capture.
+    let mut mark = match mark_price_stream::subscribe_mark_price(env, symbol.clone()).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn!(symbol = %sym_label, error = %e, "mark-price subscribe failed; recording book + trades only");
+            None
+        }
+    };
 
     // ParquetReplay discovers `book_<BASE>_*.parquet` / `trades_<BASE>_*.parquet`
     // — keep just the base asset in filenames so the discovery matches.
@@ -245,6 +258,16 @@ async fn run_recorder(
                 Some(_) => {}
                 None => { warn!(symbol = %sym_label, "trade stream ended"); break; }
             },
+            // Mark stream is optional; pend forever when absent so this arm
+            // never fires. A mark stream that ends downgrades to None rather
+            // than killing the recorder (book + trades keep flowing).
+            mu = async { match mark.as_mut() {
+                Some(s) => s.next().await,
+                None => std::future::pending::<Option<MarkUpdate>>().await,
+            } } => match mu {
+                Some(u) => recorder.record_mark(&u),
+                None => { warn!(symbol = %sym_label, "mark stream ended"); mark = None; }
+            },
             _ = progress_tick.tick() => {
                 recorder.log_progress(&sym_label);
                 if let Err(e) = recorder.flush_if_stale(FLUSH_INTERVAL) {
@@ -270,6 +293,7 @@ async fn run_recorder(
     Ok(RecorderStats {
         books: recorder.books_written,
         trades: recorder.trades_written,
+        marks: recorder.marks_written,
         flushes: recorder.flush_count,
     })
 }
@@ -308,18 +332,26 @@ struct TradeRow {
     taker_side: i64,
     trade_id: u64,
 }
+struct MarkRow {
+    ts_ns: u64,
+    mark_price: f64,
+    funding_rate: f64,
+    next_funding_ts_ns: u64,
+}
 
 struct Recorder {
     symbol: String,
     out_dir: PathBuf,
     book_buf: Vec<BookRow>,
     trade_buf: Vec<TradeRow>,
+    mark_buf: Vec<MarkRow>,
     seq: u64,
     trade_id: u64,
     flush_count: u64,
     last_flush: Instant,
     books_written: u64,
     trades_written: u64,
+    marks_written: u64,
 }
 
 impl Recorder {
@@ -329,12 +361,14 @@ impl Recorder {
             out_dir,
             book_buf: Vec::new(),
             trade_buf: Vec::new(),
+            mark_buf: Vec::new(),
             seq: 0,
             trade_id: 0,
             flush_count: 0,
             last_flush: Instant::now(),
             books_written: 0,
             trades_written: 0,
+            marks_written: 0,
         }
     }
 
@@ -373,8 +407,17 @@ impl Recorder {
         });
     }
 
+    fn record_mark(&mut self, u: &MarkUpdate) {
+        self.mark_buf.push(MarkRow {
+            ts_ns: u.ts.0,
+            mark_price: decimal_to_f64(u.mark_price),
+            funding_rate: decimal_to_f64(u.funding_rate),
+            next_funding_ts_ns: u.next_funding_ts.0,
+        });
+    }
+
     fn row_count(&self) -> usize {
-        self.book_buf.len() + self.trade_buf.len()
+        self.book_buf.len() + self.trade_buf.len() + self.mark_buf.len()
     }
 
     fn log_progress(&self, sym_label: &str) {
@@ -384,6 +427,7 @@ impl Recorder {
             trades_pending = self.trade_buf.len(),
             books_total = self.books_written,
             trades_total = self.trades_written,
+            marks_total = self.marks_written,
             flushes = self.flush_count,
             "progress",
         );
@@ -397,7 +441,7 @@ impl Recorder {
     }
 
     fn flush(&mut self) -> Result<(), String> {
-        if self.book_buf.is_empty() && self.trade_buf.is_empty() {
+        if self.book_buf.is_empty() && self.trade_buf.is_empty() && self.mark_buf.is_empty() {
             return Ok(());
         }
         let stamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -419,6 +463,15 @@ impl Recorder {
                 .map_err(|e| format!("trades parquet write failed: {e}"))?;
             self.trades_written += self.trade_buf.len() as u64;
             self.trade_buf.clear();
+        }
+        if !self.mark_buf.is_empty() {
+            let path = self
+                .out_dir
+                .join(format!("mark_{}_{}.parquet", self.symbol, stamp));
+            write_mark_parquet(&path, &self.mark_buf)
+                .map_err(|e| format!("mark parquet write failed: {e}"))?;
+            self.marks_written += self.mark_buf.len() as u64;
+            self.mark_buf.clear();
         }
         self.flush_count += 1;
         self.last_flush = Instant::now();
@@ -443,6 +496,22 @@ fn write_book_parquet(path: &Path, rows: &[BookRow]) -> PolarsResult<()> {
         "price" => price,
         "size" => size,
         "seq" => seq,
+    )?;
+    let file = std::fs::File::create(path).map_err(PolarsError::from)?;
+    ParquetWriter::new(file).finish(&mut df)?;
+    Ok(())
+}
+
+fn write_mark_parquet(path: &Path, rows: &[MarkRow]) -> PolarsResult<()> {
+    let ts_ns: Vec<u64> = rows.iter().map(|r| r.ts_ns).collect();
+    let mark_price: Vec<f64> = rows.iter().map(|r| r.mark_price).collect();
+    let funding_rate: Vec<f64> = rows.iter().map(|r| r.funding_rate).collect();
+    let next_funding_ts_ns: Vec<u64> = rows.iter().map(|r| r.next_funding_ts_ns).collect();
+    let mut df = df!(
+        "ts_ns" => ts_ns,
+        "mark_price" => mark_price,
+        "funding_rate" => funding_rate,
+        "next_funding_ts_ns" => next_funding_ts_ns,
     )?;
     let file = std::fs::File::create(path).map_err(PolarsError::from)?;
     ParquetWriter::new(file).finish(&mut df)?;
