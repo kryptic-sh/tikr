@@ -519,6 +519,7 @@ fn build_wave(
         bar_warmup_bars: wave.bar_warmup_bars,
         relattice_every_n_recenters: wave.relattice_every_n_recenters,
         recenter_cooldown_ms: wave.recenter_cooldown_ms,
+        prune_trail: wave.prune_trail,
     }))
 }
 

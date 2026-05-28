@@ -174,6 +174,9 @@ struct Args {
     /// Enables inventory skew on recenter when > 0.
     #[arg(long, default_value = "0")]
     wv_max_position: String,
+    /// Wave: disable window-shift trail pruning (prune is on by default).
+    #[arg(long, default_value_t = false)]
+    wv_no_prune_trail: bool,
     /// Wave: per-order notional.
     #[arg(long, default_value = "10")]
     wv_notional: String,
@@ -419,6 +422,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bar_warmup_bars: args.wv_bar_warmup_bars,
                 relattice_every_n_recenters: args.wv_relattice_every_n,
                 recenter_cooldown_ms: args.wv_recenter_cooldown_ms,
+                prune_trail: !args.wv_no_prune_trail,
             });
             run_with_resume(
                 venue,

@@ -90,6 +90,12 @@ pub struct WaveConfig {
     /// recenters every event → re-emit cascade → inventory explosion.
     /// Default `1000`. `0` = no cooldown (unsafe with tight params).
     pub recenter_cooldown_ms: u64,
+    /// When `true` (default), cancel any resting order that falls
+    /// OUTSIDE the active window after a recenter. Bounds inventory to
+    /// ~grid_levels per side — without this the window-shift trail
+    /// accumulates unbounded as price travels. Trade-off: loses queue
+    /// priority + reversion-catch on the cancelled far orders.
+    pub prune_trail: bool,
 }
 
 /// Closed OHLCV bar.
@@ -437,6 +443,46 @@ impl Wave {
         (to_u32(bid_dec), to_u32(ask_dec))
     }
 
+    /// Cancel any open order on `side` whose price lies OUTSIDE the
+    /// active window's price band. Bounds the window-shift trail.
+    ///
+    /// BID window `[low_k, high_k]` → price band
+    /// `[origin - high_k·step, origin - low_k·step]` (high_k = deeper =
+    /// lower price). ASK → `[origin + low_k·step, origin + high_k·step]`.
+    fn prune_outside_window(
+        &self,
+        ctx: &StrategyContext<'_>,
+        side: Side,
+        window: WindowRange,
+        actions: &mut Vec<Action>,
+    ) {
+        let (lo, hi) = match side {
+            Side::Bid => {
+                let Some(deep) = self.bid_price(window.high_k) else {
+                    return;
+                };
+                let Some(shallow) = self.bid_price(window.low_k) else {
+                    return;
+                };
+                (deep, shallow)
+            }
+            Side::Ask => {
+                let Some(shallow) = self.ask_price(window.low_k) else {
+                    return;
+                };
+                let Some(deep) = self.ask_price(window.high_k) else {
+                    return;
+                };
+                (shallow, deep)
+            }
+        };
+        for (id, q) in ctx.open_quotes {
+            if q.side == side && (q.price.0 < lo || q.price.0 > hi) {
+                actions.push(Action::Cancel(*id));
+            }
+        }
+    }
+
     /// Issue Quote actions for every slot in `[low_k, high_k]` on `side`
     /// that's not already present in `ctx.open_quotes`. Updates the
     /// in-event dedupe set as it emits.
@@ -708,6 +754,12 @@ impl Strategy for Wave {
         };
         self.bid_window = Some(new_bw);
         self.ask_window = Some(new_aw);
+        // Prune the window-shift trail: cancel resting orders now outside
+        // the new window. Skipped on relattice (CancelAll already wiped).
+        if self.config.prune_trail && !did_relattice {
+            self.prune_outside_window(ctx, Side::Bid, new_bw, &mut actions);
+            self.prune_outside_window(ctx, Side::Ask, new_aw, &mut actions);
+        }
         // After CancelAll the ctx.open_quotes view is stale → force emit.
         self.emit_window_slots(ctx, Side::Bid, new_bw, did_relattice, &mut actions);
         self.emit_window_slots(ctx, Side::Ask, new_aw, did_relattice, &mut actions);
@@ -775,6 +827,7 @@ mod tests {
             bar_warmup_bars: 14,
             relattice_every_n_recenters: 10,
             recenter_cooldown_ms: 1000,
+            prune_trail: true,
         }
     }
 

@@ -323,10 +323,18 @@ pub struct WaveParams {
     /// Min ms between recenters. Default 1000. `0` = no cooldown (unsafe).
     #[serde(default = "wave_default_recenter_cooldown_ms")]
     pub recenter_cooldown_ms: u64,
+    /// Cancel resting orders outside the active window on recenter,
+    /// bounding the window-shift trail. Default `true`. `false` = never
+    /// cancel (unbounded inventory).
+    #[serde(default = "wave_default_prune_trail")]
+    pub prune_trail: bool,
 }
 
 fn wave_default_recenter_cooldown_ms() -> u64 {
     1000
+}
+fn wave_default_prune_trail() -> bool {
+    true
 }
 
 fn wave_default_grid_levels() -> u32 {
