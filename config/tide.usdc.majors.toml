@@ -1,7 +1,13 @@
 # ─── Tide on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 4 bots: SOLUSDC, ZECUSDC, DOGEUSDC, BNBUSDC. Tide = single-touch wide-step
+# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, BCHUSDC. Tide = single-touch wide-step
 # spread scalp. USDC promo (0 bps maker).
+#
+# Lineup rotated 2026-05-28 to match wave.usdc.majors.toml: SOL/BNB/DOGE
+# swapped for higher-volatility USDC perps (NEAR/BCH/WLD) closer to ZEC's
+# profile. Selected by realized volatility + volume. NONE backtested on these
+# names — unvalidated; higher vol means a single-touch lvl1 grid (no hard cap)
+# can build more inventory on one-way moves than the SOL figures below.
 #
 # Config from the 54h SOL snapshot sweep (2026-05-28): single level (lvl1) +
 # wide 20 bps inner/step was by far the best tide variant — on SOL it printed
@@ -34,9 +40,10 @@ order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-# ─── SOLUSDC ($5 floor) ───────────────────────────────────────────────────
+# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
+# Replaces SOLUSDC. ~19% 24h range, ~$42M vol — most ZEC-like. Unvalidated.
 [[bot]]
-symbol = "SOLUSDC"
+symbol = "NEARUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
@@ -53,18 +60,22 @@ grid_levels = 1
 step_bps = 20
 prune_stragglers = true
 
-# ─── DOGEUSDC ─────────────────────────────────────────────────────────────
+# ─── WLDUSDC ──────────────────────────────────────────────────────────────
+# Replaces DOGEUSDC. Highest vol of the set (~28% range, ~$21M vol) → highest
+# reward but highest pile risk on one-way moves; watch closely. Unvalidated.
 [[bot]]
-symbol = "DOGEUSDC"
+symbol = "WLDUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
 step_bps = 20
 prune_stragglers = true
 
-# ─── BNBUSDC ──────────────────────────────────────────────────────────────
+# ─── BCHUSDC ──────────────────────────────────────────────────────────────
+# Replaces BNBUSDC. ~17% range, ~$23M vol. High unit price (~$300) but $5
+# floor + lot sizing keeps orders ~$6. Unvalidated.
 [[bot]]
-symbol = "BNBUSDC"
+symbol = "BCHUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 1
