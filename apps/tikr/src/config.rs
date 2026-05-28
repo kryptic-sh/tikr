@@ -313,9 +313,6 @@ pub struct WaveParams {
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,
-    /// Take-profit on residual imbalance, in ticks. `0` (default) = off.
-    #[serde(default)]
-    pub take_profit_ticks: u32,
 }
 
 fn wave_default_refill_threshold() -> u32 {

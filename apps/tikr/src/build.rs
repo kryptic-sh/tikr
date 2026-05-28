@@ -515,7 +515,6 @@ fn build_wave(
         step_atr_mult: wave.step_atr_mult,
         bar_warmup_bars: wave.bar_warmup_bars,
         refill_threshold: wave.refill_threshold,
-        take_profit_ticks: wave.take_profit_ticks,
     }))
 }
 

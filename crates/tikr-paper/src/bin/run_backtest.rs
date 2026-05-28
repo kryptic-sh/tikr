@@ -161,9 +161,6 @@ struct Args {
     /// Wave: refill batching threshold (slots empty before refill).
     #[arg(long, default_value_t = 1u32)]
     wv_refill_threshold: u32,
-    /// Wave: take-profit on residual imbalance, in ticks. 0 = off.
-    #[arg(long, default_value_t = 0u32)]
-    wv_take_profit_ticks: u32,
     /// Wave: per-order notional.
     #[arg(long, default_value = "10")]
     wv_notional: String,
@@ -405,7 +402,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 step_atr_mult: Decimal::from_str(&args.wv_step_atr_mult)?,
                 bar_warmup_bars: args.wv_bar_warmup_bars,
                 refill_threshold: args.wv_refill_threshold,
-                take_profit_ticks: args.wv_take_profit_ticks,
             });
             run_with_resume(
                 venue,
