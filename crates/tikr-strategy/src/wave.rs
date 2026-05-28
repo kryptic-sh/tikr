@@ -1,24 +1,25 @@
 //! Wave: fixed-lattice band-refill market-making.
 //!
-//! A frozen price lattice (origin + step, set once at init). Each event
-//! the strategy keeps `grid_levels` slots filled on each side around the
-//! current touch. When a slot fills, it's re-emitted at its OWN lattice
-//! price next event (**refill in place**). The lattice never moves — no
-//! recenter, no relattice. Orders that drift outside the active band as
-//! price travels stay resting forever (**never cancelled**), so a
-//! reversion fills them.
+//! A frozen price lattice (origin + step, set once at init). The active
+//! `grid_levels`-slot band is a window over that fixed grid; it slides to
+//! track the touch but the grid prices never move (no recenter/relattice).
 //!
 //! ## Behavior
 //! 1. **Init (first usable book event):** freeze lattice. Step = `step_bps`
 //!    of mid (snapped to tick), else 1 tick. `step_bps` also sets the inner
 //!    self-spread, so origins sit `step_bps/2` off mid on each side.
-//! 2. **Band refill (every event):** for each side, compute the active
-//!    band = `grid_levels` lattice slots from the current cross-guarded
-//!    top. Emit any band slot not already resting in `open_quotes`.
-//!    Filled slots get refilled in place; far slots keep resting.
+//! 2. **Refill** fires when EITHER a both-sides round-trip completes (bid
+//!    AND ask each drained ≥ `refill_threshold` → captured spread) OR one
+//!    whole side is empty (re-arm after a one-sided sweep). On refill,
+//!    re-emit every empty band slot on each side and prune the tail (resting
+//!    orders that fell outside the slid window). Between refills: nothing.
+//! 3. **Position cap** (`max_position_usdt`, account-derived via
+//!    [`Strategy::on_max_position_updated`]): when over the cap, the adding
+//!    side stops emitting while resting orders stay to catch the reversion.
 //!
-//! Inventory is bounded only by per-order size (no position cap) — run
-//! on small-min-notional markets so accumulated fills stay survivable.
+//! Inventory is otherwise bounded by `step_bps` width (wider step = slower
+//! one-sided accumulation) and per-order size — run on small-min-notional
+//! markets so accumulated fills stay survivable.
 
 use std::collections::HashSet;
 
