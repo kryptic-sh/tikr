@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures::stream::{self, BoxStream};
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
+use tikr_backtest::liquidation::LiquidationConfig;
 use tikr_backtest::replay::{ParquetReplay, Replay, ReplayConfig};
 use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
@@ -104,6 +105,17 @@ struct Args {
     /// venue randomly drops). `0.0` (default) = off.
     #[arg(long, default_value_t = 0.0f64)]
     silent_cancel_rate_per_min: f64,
+
+    /// Isolated-margin leverage for forced liquidation. When `> 0`, the
+    /// backtest force-closes the position if the mark (book mid here, no mark
+    /// series) breaches the liquidation price. `0` (default) = liquidation
+    /// disabled (position rides any drawdown — optimistic).
+    #[arg(long, default_value = "0")]
+    leverage: String,
+    /// Maintenance-margin rate (fraction) for the liquidation trigger, e.g.
+    /// `0.005` = 0.5%. Only used when `--leverage > 0`.
+    #[arg(long, default_value = "0.005")]
+    maint_margin_rate: String,
 
     /// Balance-sim: initial wallet balance (USDT). When > 0 with
     /// order-balance-pct > 0, order notional + position cap compound off the
@@ -252,6 +264,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Isolated-margin liquidation: enabled when --leverage > 0. The forced
+    // close is a taker, so charge the taker fee on it.
+    let leverage = Decimal::from_str(&args.leverage)?;
+    let liquidation = if leverage > Decimal::ZERO {
+        Some(LiquidationConfig {
+            leverage,
+            maint_margin_rate: Decimal::from_str(&args.maint_margin_rate)?,
+            close_fee_bps: args.taker_bps,
+        })
+    } else {
+        None
+    };
     let runner_config = RunnerConfig {
         state_dir: args.state_dir.clone(),
         snapshot_every_n_events: 0, // backtest = no snapshots
@@ -269,7 +293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_position_pct: Decimal::from_str(&args.max_position_pct)?,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
-        liquidation: None,
+        liquidation,
         mark_series: None,
     };
 
