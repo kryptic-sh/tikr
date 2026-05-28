@@ -217,6 +217,9 @@ struct Args {
     /// Mantis: tick offset from touch. 0 = join, -1 = inside/outbid, +1 = outside.
     #[arg(long, default_value_t = 0i32)]
     mn_tick_offset: i32,
+    /// Mantis: ticks price must move from the last fill before reopening a pair.
+    #[arg(long, default_value_t = 1u32)]
+    mn_reopen_distance_ticks: u32,
     /// Mantis: per-order notional.
     #[arg(long, default_value = "10")]
     mn_notional: String,
@@ -558,6 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_notional: Decimal::from_str(&args.mn_min_notional)?,
                 min_spread_bps: Decimal::from_str(&args.mn_min_spread_bps)?,
                 tick_offset: args.mn_tick_offset,
+                reopen_distance_ticks: args.mn_reopen_distance_ticks,
                 max_position_usdt: match balance_max_position {
                     Some(cap) => cap,
                     None => Decimal::from_str(&args.mn_max_position_usdt)?,

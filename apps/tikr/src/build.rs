@@ -519,6 +519,7 @@ fn build_mantis(
         min_notional,
         min_spread_bps: mantis.min_spread_bps,
         tick_offset: mantis.tick_offset,
+        reopen_distance_ticks: mantis.reopen_distance_ticks,
         // Account-derived cap arrives via on_max_position_updated (live
         // channel); seed 0 = uncapped until the first update lands.
         max_position_usdt: Decimal::ZERO,

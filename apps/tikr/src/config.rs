@@ -315,10 +315,18 @@ pub struct MantisParams {
     /// `+1` = one tick outside.
     #[serde(default)]
     pub tick_offset: i32,
+    /// Ticks price must move from the last fill before reopening a pair.
+    /// Default 1.
+    #[serde(default = "mantis_default_reopen_distance_ticks")]
+    pub reopen_distance_ticks: u32,
 }
 
 fn mantis_default_min_spread_bps() -> Decimal {
     Decimal::ONE
+}
+
+fn mantis_default_reopen_distance_ticks() -> u32 {
+    1
 }
 
 /// RSI mean-reversion + KER regime gate, long-only.
