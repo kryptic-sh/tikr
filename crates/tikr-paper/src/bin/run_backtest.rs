@@ -255,6 +255,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let venue = BacktestVenue::new(replay);
     let size_per_quote = Size(Decimal::from_str(&args.size)?);
 
+    let leverage = Decimal::from_str(&args.leverage)?;
+    let initial_balance = Decimal::from_str(&args.initial_balance)?;
+    // Buying-power margin cap: with isolated margin, max position notional =
+    // balance × leverage. Wired into FillSim's synthetic Binance -2019 reject
+    // so the bot can't grow inventory past what the account can fund. Needs
+    // both a balance AND a leverage; otherwise unbounded (prior behaviour).
+    let buying_power = if initial_balance > Decimal::ZERO && leverage > Decimal::ZERO {
+        Some((initial_balance * leverage).round_dp(8))
+    } else {
+        None
+    };
+
+    // Balance-derived sizing (mirrors the live config's `order_balance_pct` /
+    // `max_position_pct`). When a balance + percent are set, the per-order
+    // notional and the strategy's position cap are computed from the balance
+    // up front (so they apply from event 1, not just after the runner's first
+    // post-fill compounding update). The runner's compounding watch then keeps
+    // them in sync as the balance grows.
+    let order_balance_pct = Decimal::from_str(&args.order_balance_pct)?;
+    let max_position_pct = Decimal::from_str(&args.max_position_pct)?;
+    let hundred = Decimal::from(100);
+    let balance_notional = if initial_balance > Decimal::ZERO && order_balance_pct > Decimal::ZERO {
+        Some((initial_balance * order_balance_pct / hundred).round_dp(8))
+    } else {
+        None
+    };
+    let balance_max_position =
+        if initial_balance > Decimal::ZERO && max_position_pct > Decimal::ZERO {
+            Some((initial_balance * max_position_pct / hundred).round_dp(8))
+        } else {
+            None
+        };
+
     let fill_sim = FillSim::new(FillSimConfig {
         submit_latency_ms: args.submit_latency_ms,
         cancel_latency_ms: args.submit_latency_ms,
@@ -262,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maker_bps: args.maker_bps,
             taker_bps: args.taker_bps,
         },
-        max_position_notional_usdt: None,
+        max_position_notional_usdt: buying_power,
         silent_cancel_rate_per_min: args.silent_cancel_rate_per_min,
         rng_seed: 0,
         latency_jitter_ms: args.submit_latency_jitter_ms,
@@ -279,7 +312,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Isolated-margin liquidation: enabled when --leverage > 0. The forced
     // close is a taker, so charge the taker fee on it.
-    let leverage = Decimal::from_str(&args.leverage)?;
     let liquidation = if leverage > Decimal::ZERO {
         Some(LiquidationConfig {
             leverage,
@@ -309,9 +341,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: args.equity_csv.clone(),
-        initial_balance: Decimal::from_str(&args.initial_balance)?,
-        order_balance_pct: Decimal::from_str(&args.order_balance_pct)?,
-        max_position_pct: Decimal::from_str(&args.max_position_pct)?,
+        initial_balance,
+        order_balance_pct,
+        max_position_pct,
         min_notional: Decimal::ZERO,
         max_expected_open_orders: 2,
         liquidation,
@@ -437,13 +469,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         StrategyArg::Tide => {
             let strategy = Tide::new(TideConfig {
-                notional_per_order: Decimal::from_str(&args.tr_notional)?,
+                notional_per_order: balance_notional
+                    .map(Ok)
+                    .unwrap_or_else(|| Decimal::from_str(&args.tr_notional))?,
                 tick_size: Decimal::from_str(&args.tick_size)?,
                 step_size: Decimal::from_str(&args.tr_step_size)?,
                 min_notional: Decimal::from_str(&args.tr_min_notional)?,
                 grid_levels: args.tr_grid_levels,
                 step_bps: args.tr_step_bps,
-                max_position_usdt: Decimal::ZERO,
+                max_position_usdt: balance_max_position.unwrap_or(Decimal::ZERO),
                 prune_stragglers: true,
             });
             run_with_resume(
@@ -463,14 +497,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         StrategyArg::Wave => {
             let strategy = Wave::new(WaveConfig {
-                notional_per_order: Decimal::from_str(&args.wv_notional)?,
+                notional_per_order: balance_notional
+                    .map(Ok)
+                    .unwrap_or_else(|| Decimal::from_str(&args.wv_notional))?,
                 tick_size: Decimal::from_str(&args.tick_size)?,
                 step_size: Decimal::from_str(&args.wv_step_size)?,
                 min_notional: Decimal::from_str(&args.wv_min_notional)?,
                 grid_levels: args.wv_grid_levels,
                 step_bps: args.wv_step_bps,
                 refill_threshold: args.wv_refill_threshold,
-                max_position_usdt: Decimal::from_str(&args.wv_max_position_usdt)?,
+                max_position_usdt: match balance_max_position {
+                    Some(cap) => cap,
+                    None => Decimal::from_str(&args.wv_max_position_usdt)?,
+                },
             });
             run_with_resume(
                 venue,
