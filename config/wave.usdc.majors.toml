@@ -43,8 +43,8 @@ symbol = "SOLUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 3
-recenter_drain_slots = 1
-skew_max_pct = "0.25"
+recenter_drain_slots = 2
+skew_max_pct = "0.0"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
@@ -58,8 +58,8 @@ symbol = "XRPUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 3
-recenter_drain_slots = 1
-skew_max_pct = "0.25"
+recenter_drain_slots = 2
+skew_max_pct = "0.0"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
@@ -73,8 +73,8 @@ symbol = "DOGEUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 3
-recenter_drain_slots = 1
-skew_max_pct = "0.25"
+recenter_drain_slots = 2
+skew_max_pct = "0.0"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"
@@ -88,8 +88,8 @@ symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 3
-recenter_drain_slots = 1
-skew_max_pct = "0.25"
+recenter_drain_slots = 2
+skew_max_pct = "0.0"
 bar_interval_secs = 1
 atr_period = 120
 step_atr_mult = "8.0"

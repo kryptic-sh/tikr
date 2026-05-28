@@ -1,26 +1,25 @@
-//! Wave: lazy-recenter lattice market-making.
+//! Wave: fixed-lattice band-refill market-making.
 //!
-//! Same frozen-lattice idea as [`crate::tide::Tide`] but the placement
-//! WINDOW only moves when the inner section of the lattice gets drained
-//! by fills. Between trigger events the strategy does NOTHING — no
-//! cancels, no refills, no re-emits. This preserves venue queue
-//! priority for every order that survives a recenter event.
+//! A frozen price lattice (origin + step, set once at init). Each event
+//! the strategy keeps `grid_levels` slots filled on each side around the
+//! current touch. When a slot fills, it's re-emitted at its OWN lattice
+//! price next event (**refill in place**). The lattice never moves — no
+//! recenter, no relattice. Orders that drift outside the active band as
+//! price travels stay resting forever (**never cancelled**), so a
+//! reversion fills them.
 //!
 //! ## Behavior
-//! 1. **Init (first usable book event):** freeze lattice (origin + step)
-//!    using the same `*_ticks` / `*_bps` knobs as Tide.
-//! 2. **Seed:** place the initial active window — `grid_levels` slots
-//!    per side around the current mid.
-//! 3. **Monitor:** each event, count how many slots in the current
-//!    active window are missing from `open_quotes` (= filled). When
-//!    `max(missing_bids, missing_asks) >= recenter_drain_slots`,
-//!    trigger a recenter.
-//! 4. **Recenter:** compute new center from current mid. Apply mild
-//!    inventory skew (more asks if long, more bids if short, capped
-//!    at `skew_max_pct`). Emit any slot in the new window that does
-//!    not already exist in `open_quotes`. Update tracked window.
-//!    **Never cancel** — old orders outside the new window stay
-//!    resting and will fill if price reverts.
+//! 1. **Init (first usable book event, after ATR warmup if enabled):**
+//!    freeze lattice. Step = `ATR × step_atr_mult` if set, else the
+//!    `*_ticks` / `*_bps` knobs, else 1 tick. Origins = current
+//!    top_bid / top_ask (after min_self_spread).
+//! 2. **Band refill (every event):** for each side, compute the active
+//!    band = `grid_levels` lattice slots from the current cross-guarded
+//!    top. Emit any band slot not already resting in `open_quotes`.
+//!    Filled slots get refilled in place; far slots keep resting.
+//!
+//! Inventory is bounded only by per-order size (no position cap) — run
+//! on small-min-notional markets so accumulated fills stay survivable.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -54,18 +53,6 @@ pub struct WaveConfig {
     /// Tick override for grid_step. `> 0` wins over bps.
     pub grid_step_ticks: u32,
 
-    /// Recenter when ≥ this many slots are missing from the active
-    /// window on either side. `0` = `grid_levels / 3` (auto).
-    pub recenter_drain_slots: u32,
-    /// Max ±skew on recenter as fraction of `grid_levels`. `0.25` =
-    /// long-100% → bid_count = grid_levels × 0.75, ask_count =
-    /// grid_levels × 1.25 (clamped to [1, grid_levels]).
-    pub skew_max_pct: Decimal,
-    /// Per-bot peak position cap in quote notional. Used as the
-    /// denominator for inventory_pct = position / cap. `0` =
-    /// inventory skew disabled (always symmetric).
-    pub max_position_usdt: Decimal,
-
     // ----- adaptive step sizing -----
     /// Bar interval (seconds) for ATR aggregation. Default 60 = 1m.
     pub bar_interval_secs: u64,
@@ -81,21 +68,11 @@ pub struct WaveConfig {
     /// when `step_atr_mult > 0`. Default = `atr_period`. Ignored when
     /// auto-step is disabled.
     pub bar_warmup_bars: u32,
-    /// Recompute lattice step from current ATR every Nth recenter
-    /// event. `0` = never (lattice frozen at init). Default `10`
-    /// (typical: relattice ~hourly if recenters are ~6/hour).
-    pub relattice_every_n_recenters: u32,
-    /// Minimum wall-clock gap (ms) between recenter events. Guards
-    /// against the runaway loop where a tight grid + low drain trigger
-    /// recenters every event → re-emit cascade → inventory explosion.
-    /// Default `1000`. `0` = no cooldown (unsafe with tight params).
-    pub recenter_cooldown_ms: u64,
-    /// When `true` (default), cancel any resting order that falls
-    /// OUTSIDE the active window after a recenter. Bounds inventory to
-    /// ~grid_levels per side — without this the window-shift trail
-    /// accumulates unbounded as price travels. Trade-off: loses queue
-    /// priority + reversion-catch on the cancelled far orders.
-    pub prune_trail: bool,
+    /// Refill batching: only refill a side once ≥ this many of its band
+    /// slots are empty (filled). `1` = refill on any single gap (most
+    /// reactive). Higher = wait for N fills then refill them together,
+    /// cutting re-emit churn. Default `1`.
+    pub refill_threshold: u32,
 }
 
 /// Closed OHLCV bar.
@@ -125,23 +102,14 @@ pub struct Wave {
     bid_lattice_origin: Option<Decimal>,
     ask_lattice_origin: Option<Decimal>,
     lattice_step: Option<Decimal>,
-    /// Active window per side. k indices: BID slot price =
-    /// `bid_origin - k × step`; ASK slot price = `ask_origin + k × step`.
-    bid_window: Option<WindowRange>,
-    ask_window: Option<WindowRange>,
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
-    // ----- adaptive step state -----
+    // ----- adaptive step state (ATR for one-shot lattice init) -----
     /// Bar buffer for ATR computation.
     closed_bars: VecDeque<Bar>,
     open_bar: Option<Bar>,
     current_bucket: Option<u64>,
-    /// Recenter events since last relattice. Used with
-    /// `relattice_every_n_recenters` to decide when to recompute step.
-    recenters_since_relattice: u32,
-    /// Timestamp (ns) of the last recenter, for cooldown gating.
-    last_recenter_ts: Option<u64>,
 }
 
 impl Wave {
@@ -373,25 +341,17 @@ impl Wave {
         k.to_string().parse::<i64>().ok()
     }
 
-    /// Configured (or auto) drain trigger threshold.
-    fn recenter_threshold(&self) -> u32 {
-        if self.config.recenter_drain_slots > 0 {
-            self.config.recenter_drain_slots
-        } else {
-            (self.config.grid_levels / 3).max(1)
-        }
-    }
-
-    /// Count slots in `window` whose price has no matching open quote
-    /// on `side` in `ctx.open_quotes`.
-    fn count_missing(&self, ctx: &StrategyContext<'_>, side: Side, window: WindowRange) -> u32 {
+    /// Count band slots on `side` with no matching resting order in
+    /// `ctx.open_quotes` (= empty/filled). Used to gate batched refill.
+    fn band_missing(&self, ctx: &StrategyContext<'_>, side: Side, band: WindowRange) -> u32 {
         let mut missing = 0u32;
-        for k in window.low_k..=window.high_k {
-            let price_opt = match side {
+        for k in band.low_k..=band.high_k {
+            let Some(p) = (match side {
                 Side::Bid => self.bid_price(k),
                 Side::Ask => self.ask_price(k),
+            }) else {
+                continue;
             };
-            let Some(p) = price_opt else { continue };
             let present = ctx
                 .open_quotes
                 .iter()
@@ -401,86 +361,6 @@ impl Wave {
             }
         }
         missing
-    }
-
-    /// Compute (bid_count, ask_count) for a recenter.
-    ///
-    /// When `max_position_usdt > 0`:
-    /// - **Hard cap:** once `|position notional| ≥ cap`, the
-    ///   accumulating side is suppressed entirely (bid_count = 0 when
-    ///   long-over-cap, ask_count = 0 when short-over-cap). Bounds
-    ///   inventory.
-    /// - **Mild skew below the cap:** long → fewer bids, more asks
-    ///   (drain bias), scaled by `skew_max_pct`.
-    ///
-    /// When `max_position_usdt == 0`: symmetric, no cap, no skew.
-    fn skewed_counts(&self, pos_notional: Decimal) -> (u32, u32) {
-        let levels = self.config.grid_levels.max(1);
-        let cap = self.config.max_position_usdt;
-        if cap <= Decimal::ZERO {
-            return (levels, levels);
-        }
-        // Hard cap: suppress the side that would grow the position past cap.
-        if pos_notional >= cap {
-            return (0, levels); // long-capped: asks only (drain)
-        }
-        if pos_notional <= -cap {
-            return (levels, 0); // short-capped: bids only (drain)
-        }
-        if self.config.skew_max_pct <= Decimal::ZERO {
-            return (levels, levels);
-        }
-        let raw_pct = pos_notional / cap;
-        let clamped = raw_pct.max(Decimal::from(-1)).min(Decimal::ONE);
-        let skew = clamped * self.config.skew_max_pct;
-        let levels_dec = Decimal::from(levels);
-        let bid_dec = (levels_dec * (Decimal::ONE - skew)).round();
-        let ask_dec = (levels_dec * (Decimal::ONE + skew)).round();
-        let to_u32 = |d: Decimal| -> u32 {
-            let n = d.to_string().parse::<f64>().unwrap_or(0.0) as i64;
-            n.clamp(0, levels as i64) as u32
-        };
-        (to_u32(bid_dec), to_u32(ask_dec))
-    }
-
-    /// Cancel any open order on `side` whose price lies OUTSIDE the
-    /// active window's price band. Bounds the window-shift trail.
-    ///
-    /// BID window `[low_k, high_k]` → price band
-    /// `[origin - high_k·step, origin - low_k·step]` (high_k = deeper =
-    /// lower price). ASK → `[origin + low_k·step, origin + high_k·step]`.
-    fn prune_outside_window(
-        &self,
-        ctx: &StrategyContext<'_>,
-        side: Side,
-        window: WindowRange,
-        actions: &mut Vec<Action>,
-    ) {
-        let (lo, hi) = match side {
-            Side::Bid => {
-                let Some(deep) = self.bid_price(window.high_k) else {
-                    return;
-                };
-                let Some(shallow) = self.bid_price(window.low_k) else {
-                    return;
-                };
-                (deep, shallow)
-            }
-            Side::Ask => {
-                let Some(shallow) = self.ask_price(window.low_k) else {
-                    return;
-                };
-                let Some(deep) = self.ask_price(window.high_k) else {
-                    return;
-                };
-                (shallow, deep)
-            }
-        };
-        for (id, q) in ctx.open_quotes {
-            if q.side == side && (q.price.0 < lo || q.price.0 > hi) {
-                actions.push(Action::Cancel(*id));
-            }
-        }
     }
 
     /// Issue Quote actions for every slot in `[low_k, high_k]` on `side`
@@ -577,15 +457,11 @@ impl Strategy for Wave {
             bid_lattice_origin: None,
             ask_lattice_origin: None,
             lattice_step: None,
-            bid_window: None,
-            ask_window: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
             closed_bars: VecDeque::new(),
             open_bar: None,
             current_bucket: None,
-            recenters_since_relattice: 0,
-            last_recenter_ts: None,
         }
     }
 
@@ -646,123 +522,68 @@ impl Strategy for Wave {
             return actions;
         }
 
-        // Position notional for skew calc.
-        let mid_for_pos = match (best_bid, best_ask) {
-            (Some(b), Some(a)) if a.0 > b.0 && b.0 > Decimal::ZERO => {
-                (b.0 + a.0) / Decimal::from(2)
-            }
-            _ => Decimal::ZERO,
-        };
-        let pos_notional = ctx.position.size.0 * mid_for_pos;
+        // 2) Band gap-fill on the FIXED lattice. The lattice never moves;
+        // we just keep `grid_levels` slots filled on each side around the
+        // current touch. A slot that fills is re-emitted at its OWN price
+        // next event (refill in place). Slots that drift outside the band
+        // as price travels stay resting forever — never cancelled — so a
+        // reversion fills them. No recenter, no relattice, no prune.
+        let levels = self.config.grid_levels.max(1) as i64;
 
-        // 2) Seed initial window if not yet placed.
-        if self.bid_window.is_none() || self.ask_window.is_none() {
-            let (bid_count, ask_count) = self.skewed_counts(pos_notional);
-            // BID window: k=0 (top) through k=bid_count-1 (deepest).
-            // We anchor at the actual current top (k = bid_k_at_or_below(top_b)).
-            let bid_top_k = self
-                .bid_k_at_or_below(top_b.map(|p| p.0).unwrap_or(Decimal::ZERO))
-                .unwrap_or(0);
-            let bw = WindowRange {
-                low_k: bid_top_k,
-                high_k: bid_top_k + (bid_count as i64) - 1,
-            };
-            let ask_top_k = self
-                .ask_k_at_or_above(top_a.map(|p| p.0).unwrap_or(Decimal::ZERO))
-                .unwrap_or(0);
-            let aw = WindowRange {
-                low_k: ask_top_k,
-                high_k: ask_top_k + (ask_count as i64) - 1,
-            };
-            self.bid_window = Some(bw);
-            self.ask_window = Some(aw);
-            self.emit_window_slots(ctx, Side::Bid, bw, false, &mut actions);
-            self.emit_window_slots(ctx, Side::Ask, aw, false, &mut actions);
-            return actions;
-        }
-
-        // 3) Trigger detection — count missing slots in current windows.
-        let bw = self.bid_window.unwrap();
-        let aw = self.ask_window.unwrap();
-        let missing_bids = self.count_missing(ctx, Side::Bid, bw);
-        let missing_asks = self.count_missing(ctx, Side::Ask, aw);
-        let threshold = self.recenter_threshold();
-        if missing_bids < threshold && missing_asks < threshold {
-            return actions; // quiet — do nothing
-        }
-
-        // Cooldown gate: refuse to recenter if the last recenter was
-        // within `recenter_cooldown_ms`. Prevents the every-event
-        // recenter cascade (tight grid + low drain → inventory blowup).
-        let now_ns = ctx.now.0;
-        if self.config.recenter_cooldown_ms > 0
-            && let Some(last) = self.last_recenter_ts
-        {
-            let gap_ms = now_ns.saturating_sub(last) / 1_000_000;
-            if gap_ms < self.config.recenter_cooldown_ms {
-                return actions; // still cooling down
-            }
-        }
-        self.last_recenter_ts = Some(now_ns);
-
-        // 4) Recenter — count event + maybe relattice.
-        self.recenters_since_relattice = self.recenters_since_relattice.saturating_add(1);
-        let relattice = self.config.relattice_every_n_recenters > 0
-            && self.recenters_since_relattice >= self.config.relattice_every_n_recenters
-            && self.config.step_atr_mult > Decimal::ZERO
-            && !self.warming_up();
-        let mut did_relattice = false;
-        if relattice
-            && let (Some(b), Some(a)) = (top_b, top_a)
-            && b.0 > Decimal::ZERO
-            && a.0 > b.0
+        // BID band: highest lattice slot ≤ placement top (cross-guarded),
+        // then `levels-1` deeper slots.
+        if let Some(top) = top_b
+            && top.0 > Decimal::ZERO
             && tick > Decimal::ZERO
         {
-            let mid = (b.0 + a.0) / Decimal::from(2);
-            if let Some(new_step) = self.compute_step(mid) {
-                self.lattice_step = Some(new_step);
-                self.bid_lattice_origin = Some(b.0);
-                self.ask_lattice_origin = Some(a.0);
-                self.recenters_since_relattice = 0;
-                did_relattice = true;
+            let mut cap = top.0;
+            if let Some(ap) = best_ask
+                && ap.0 > Decimal::ZERO
+            {
+                let max_bid = ap.0 - tick;
+                if cap > max_bid {
+                    cap = max_bid;
+                }
+            }
+            if let Some(top_k) = self.bid_k_at_or_below(cap) {
+                let band = WindowRange {
+                    low_k: top_k,
+                    high_k: top_k + levels - 1,
+                };
+                // Batched refill: only emit once ≥ refill_threshold band
+                // slots are empty.
+                if self.band_missing(ctx, Side::Bid, band) >= self.config.refill_threshold {
+                    self.emit_window_slots(ctx, Side::Bid, band, false, &mut actions);
+                }
             }
         }
 
-        // On relattice the lattice identity changed — every resting order
-        // is now on a dead lattice and can never be reused (count_missing
-        // keys off the new lattice's prices). Cancel them all so they
-        // don't accumulate as orphans, then force-seed the fresh window.
-        if did_relattice {
-            actions.push(Action::CancelAll);
+        // ASK band: lowest lattice slot ≥ placement top (cross-guarded),
+        // then `levels-1` higher slots.
+        if let Some(top) = top_a
+            && top.0 > Decimal::ZERO
+            && tick > Decimal::ZERO
+        {
+            let mut cap = top.0;
+            if let Some(bp) = best_bid
+                && bp.0 > Decimal::ZERO
+            {
+                let min_ask = bp.0 + tick;
+                if cap < min_ask {
+                    cap = min_ask;
+                }
+            }
+            if let Some(top_k) = self.ask_k_at_or_above(cap) {
+                let band = WindowRange {
+                    low_k: top_k,
+                    high_k: top_k + levels - 1,
+                };
+                if self.band_missing(ctx, Side::Ask, band) >= self.config.refill_threshold {
+                    self.emit_window_slots(ctx, Side::Ask, band, false, &mut actions);
+                }
+            }
         }
 
-        // Compute new windows around current top using (possibly new) lattice.
-        let (bid_count, ask_count) = self.skewed_counts(pos_notional);
-        let new_bid_top = self
-            .bid_k_at_or_below(top_b.map(|p| p.0).unwrap_or(Decimal::ZERO))
-            .unwrap_or(bw.low_k);
-        let new_ask_top = self
-            .ask_k_at_or_above(top_a.map(|p| p.0).unwrap_or(Decimal::ZERO))
-            .unwrap_or(aw.low_k);
-        let new_bw = WindowRange {
-            low_k: new_bid_top,
-            high_k: new_bid_top + (bid_count as i64) - 1,
-        };
-        let new_aw = WindowRange {
-            low_k: new_ask_top,
-            high_k: new_ask_top + (ask_count as i64) - 1,
-        };
-        self.bid_window = Some(new_bw);
-        self.ask_window = Some(new_aw);
-        // Prune the window-shift trail: cancel resting orders now outside
-        // the new window. Skipped on relattice (CancelAll already wiped).
-        if self.config.prune_trail && !did_relattice {
-            self.prune_outside_window(ctx, Side::Bid, new_bw, &mut actions);
-            self.prune_outside_window(ctx, Side::Ask, new_aw, &mut actions);
-        }
-        // After CancelAll the ctx.open_quotes view is stale → force emit.
-        self.emit_window_slots(ctx, Side::Bid, new_bw, did_relattice, &mut actions);
-        self.emit_window_slots(ctx, Side::Ask, new_aw, did_relattice, &mut actions);
         actions
     }
 
@@ -773,17 +594,6 @@ impl Strategy for Wave {
     ) -> Vec<Action> {
         if notional_per_order > Decimal::ZERO {
             self.config.notional_per_order = notional_per_order;
-        }
-        Vec::new()
-    }
-
-    fn on_max_position_updated(
-        &mut self,
-        _ctx: &StrategyContext<'_>,
-        max_position_usdt: Decimal,
-    ) -> Vec<Action> {
-        if max_position_usdt > Decimal::ZERO {
-            self.config.max_position_usdt = max_position_usdt;
         }
         Vec::new()
     }
@@ -817,17 +627,12 @@ mod tests {
             min_self_spread_ticks: 0,
             grid_step_bps: 0,
             grid_step_ticks: 2,
-            recenter_drain_slots: 2,
-            skew_max_pct: Decimal::new(25, 2),
-            max_position_usdt: Decimal::ZERO,
             bar_interval_secs: 60,
             max_bars: 64,
             atr_period: 14,
             step_atr_mult: Decimal::ZERO,
             bar_warmup_bars: 14,
-            relattice_every_n_recenters: 10,
-            recenter_cooldown_ms: 1000,
-            prune_trail: true,
+            refill_threshold: 1,
         }
     }
 
@@ -890,49 +695,29 @@ mod tests {
     }
 
     #[test]
-    fn quiet_event_emits_nothing_after_seed() {
+    fn quiet_event_emits_nothing_when_band_intact() {
         let mut w = Wave::new(cfg());
         let s = snap(Decimal::from(100), Decimal::new(1001, 1));
         let p = pos_flat();
         let sm = sym();
         let c = ctx(&sm, &s, &p, &[]);
-        // First event seeds.
-        let _ = w.on_event(
+        // First event seeds the band — capture every emitted quote.
+        let seeded = w.on_event(
             &c,
             &MarketEvent::BookUpdate {
                 snapshot: s.clone(),
             },
         );
-        // Build open_quotes from emitted-window state — full window alive.
-        let bw = w.bid_window.unwrap();
-        let aw = w.ask_window.unwrap();
-        let mut open: Vec<(QuoteId, QuoteIntent)> = Vec::new();
-        for k in bw.low_k..=bw.high_k {
-            open.push((
-                QuoteId::new(),
-                QuoteIntent {
-                    symbol: sm.clone(),
-                    side: Side::Bid,
-                    price: Price(w.bid_price(k).unwrap()),
-                    size: Size(Decimal::from(1)),
-                    tif: TimeInForce::PostOnly,
-                    kind: QuoteKind::Point,
-                },
-            ));
-        }
-        for k in aw.low_k..=aw.high_k {
-            open.push((
-                QuoteId::new(),
-                QuoteIntent {
-                    symbol: sm.clone(),
-                    side: Side::Ask,
-                    price: Price(w.ask_price(k).unwrap()),
-                    size: Size(Decimal::from(1)),
-                    tif: TimeInForce::PostOnly,
-                    kind: QuoteKind::Point,
-                },
-            ));
-        }
+        assert!(!seeded.is_empty(), "first event should place the band");
+        let open: Vec<(QuoteId, QuoteIntent)> = seeded
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some((QuoteId::new(), q.clone())),
+                _ => None,
+            })
+            .collect();
+        // Replay the same book with those orders resting → band is intact,
+        // refill should emit nothing (no slot is empty).
         let c2 = ctx(&sm, &s, &p, &open);
         let actions = w.on_event(
             &c2,
@@ -940,6 +725,6 @@ mod tests {
                 snapshot: s.clone(),
             },
         );
-        assert!(actions.is_empty(), "no churn when window intact");
+        assert!(actions.is_empty(), "no churn when band intact: {actions:?}");
     }
 }

@@ -146,12 +146,6 @@ struct Args {
     /// Wave: lattice slots per side.
     #[arg(long, default_value_t = 12u32)]
     wv_grid_levels: u32,
-    /// Wave: drain trigger (slots, either side).
-    #[arg(long, default_value_t = 4u32)]
-    wv_recenter_drain_slots: u32,
-    /// Wave: max skew on recenter (fraction).
-    #[arg(long, default_value = "0.25")]
-    wv_skew_max_pct: String,
     /// Wave: ATR step multiplier. 0 = use ticks/bps.
     #[arg(long, default_value = "1.0")]
     wv_step_atr_mult: String,
@@ -164,19 +158,9 @@ struct Args {
     /// Wave: bar warmup count.
     #[arg(long, default_value_t = 14u32)]
     wv_bar_warmup_bars: u32,
-    /// Wave: relattice every Nth recenter.
-    #[arg(long, default_value_t = 10u32)]
-    wv_relattice_every_n: u32,
-    /// Wave: min ms between recenters (cooldown).
-    #[arg(long, default_value_t = 1000u64)]
-    wv_recenter_cooldown_ms: u64,
-    /// Wave: per-bot max position (quote notional). 0 = uncapped.
-    /// Enables inventory skew on recenter when > 0.
-    #[arg(long, default_value = "0")]
-    wv_max_position: String,
-    /// Wave: disable window-shift trail pruning (prune is on by default).
-    #[arg(long, default_value_t = false)]
-    wv_no_prune_trail: bool,
+    /// Wave: refill batching threshold (slots empty before refill).
+    #[arg(long, default_value_t = 1u32)]
+    wv_refill_threshold: u32,
     /// Wave: per-order notional.
     #[arg(long, default_value = "10")]
     wv_notional: String,
@@ -412,17 +396,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_self_spread_ticks: 0,
                 grid_step_bps: 0,
                 grid_step_ticks: 0,
-                recenter_drain_slots: args.wv_recenter_drain_slots,
-                skew_max_pct: Decimal::from_str(&args.wv_skew_max_pct)?,
-                max_position_usdt: Decimal::from_str(&args.wv_max_position)?,
                 bar_interval_secs: args.wv_bar_interval_secs,
                 max_bars: 200,
                 atr_period: args.wv_atr_period,
                 step_atr_mult: Decimal::from_str(&args.wv_step_atr_mult)?,
                 bar_warmup_bars: args.wv_bar_warmup_bars,
-                relattice_every_n_recenters: args.wv_relattice_every_n,
-                recenter_cooldown_ms: args.wv_recenter_cooldown_ms,
-                prune_trail: !args.wv_no_prune_trail,
+                refill_threshold: args.wv_refill_threshold,
             });
             run_with_resume(
                 venue,

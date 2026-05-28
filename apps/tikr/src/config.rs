@@ -294,13 +294,6 @@ pub struct WaveParams {
     /// Tick override for grid step. `> 0` wins over bps.
     #[serde(default)]
     pub grid_step_ticks: u32,
-    /// Recenter when ≥ N slots drained in current window (either side).
-    /// `0` = `grid_levels / 3` auto.
-    #[serde(default)]
-    pub recenter_drain_slots: u32,
-    /// Max skew on recenter (fraction of grid_levels). Default `0.25`.
-    #[serde(default = "wave_default_skew_max_pct")]
-    pub skew_max_pct: Decimal,
     /// Bar interval (seconds) for ATR. Default 60.
     #[serde(default = "wave_default_bar_interval_secs")]
     pub bar_interval_secs: u64,
@@ -317,31 +310,17 @@ pub struct WaveParams {
     /// Default = `atr_period`.
     #[serde(default = "wave_default_bar_warmup_bars")]
     pub bar_warmup_bars: u32,
-    /// Relattice every Nth recenter (auto-step only). Default 10. `0` = never.
-    #[serde(default = "wave_default_relattice_every_n")]
-    pub relattice_every_n_recenters: u32,
-    /// Min ms between recenters. Default 1000. `0` = no cooldown (unsafe).
-    #[serde(default = "wave_default_recenter_cooldown_ms")]
-    pub recenter_cooldown_ms: u64,
-    /// Cancel resting orders outside the active window on recenter,
-    /// bounding the window-shift trail. Default `true`. `false` = never
-    /// cancel (unbounded inventory).
-    #[serde(default = "wave_default_prune_trail")]
-    pub prune_trail: bool,
+    /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
+    #[serde(default = "wave_default_refill_threshold")]
+    pub refill_threshold: u32,
 }
 
-fn wave_default_recenter_cooldown_ms() -> u64 {
-    1000
-}
-fn wave_default_prune_trail() -> bool {
-    true
+fn wave_default_refill_threshold() -> u32 {
+    1
 }
 
 fn wave_default_grid_levels() -> u32 {
     12
-}
-fn wave_default_skew_max_pct() -> Decimal {
-    Decimal::new(25, 2)
 }
 fn wave_default_bar_interval_secs() -> u64 {
     60
@@ -354,9 +333,6 @@ fn wave_default_atr_period() -> u32 {
 }
 fn wave_default_bar_warmup_bars() -> u32 {
     14
-}
-fn wave_default_relattice_every_n() -> u32 {
-    10
 }
 
 /// RSI mean-reversion + KER regime gate, long-only.
