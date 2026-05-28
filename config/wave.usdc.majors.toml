@@ -37,12 +37,12 @@ order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
 
-# ─── BTCUSDC ──────────────────────────────────────────────────────────────
+# ─── SOLUSDC ($5 floor) ───────────────────────────────────────────────────
 [[bot]]
-symbol = "BTCUSDC"
+symbol = "SOLUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 12
+grid_levels = 4
 recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
@@ -52,12 +52,12 @@ bar_warmup_bars = 120
 relattice_every_n_recenters = 5
 recenter_cooldown_ms = 1000
 
-# ─── ETHUSDC ──────────────────────────────────────────────────────────────
+# ─── XRPUSDC ($5 floor) ───────────────────────────────────────────────────
 [[bot]]
-symbol = "ETHUSDC"
+symbol = "XRPUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 12
+grid_levels = 4
 recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
@@ -72,7 +72,7 @@ recenter_cooldown_ms = 1000
 symbol = "DOGEUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 12
+grid_levels = 4
 recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
@@ -87,7 +87,7 @@ recenter_cooldown_ms = 1000
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 12
+grid_levels = 4
 recenter_drain_slots = 1
 skew_max_pct = "0.25"
 bar_interval_secs = 1
