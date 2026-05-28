@@ -1,27 +1,28 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
-# 4 bots: BTCUSDC, ETHUSDC, DOGEUSDC, ZECUSDC. Wave strategy = frozen
-# lattice + lazy recenter on inner-drain. Adaptive ATR step. USDC promo
-# (0 bps maker).
+# 4 bots: SOLUSDC, ETHUSDC, DOGEUSDC, BNBUSDC. Wave = frozen lattice +
+# round-trip refill (refill only when BOTH sides drain ≥ refill_threshold
+# slots = a completed bid+ask round-trip). USDC promo (0 bps maker).
 #
-# Tuned from 2h ETHUSDT sweep (2026-05-28): 1-second bars + atr_period=120
-# + step_atr_mult=8 was the top net (+$1.60 vs +$0.62 for 1m/atr14/mult0.5),
-# and warms up in ~2 min instead of ~15 min. atr_mult must scale ~8× on
-# 1s bars because per-bar ATR shrinks ~√(60) vs 1m bars. drain=2 +
-# cooldown=1000ms is safe (cooldown prevents the tight-grid recenter
-# cascade that blew inventory to $810k without it).
+# Tuned via 2h fixed-step sweep (2026-05-28): inner 0 bps / step 1 bps /
+# levels 10 / refill_threshold 5 was the top net AND best risk-adjusted of
+# 12 configs — ex-BTC +$5.39/2h, all 4 markets green. Key findings:
+#   - Edge lives in STEP width, not inner. Keep inner (min_self_spread) at 0
+#     so origins sit at top-of-book; widening it just starves fills.
+#   - refill_threshold ≈ levels/2 is the all-green sweet spot. Lower (rt1) =
+#     directional gamble + runaway inventory; higher batches deeper.
+#   - Tight 1bps step is safe ONLY under the round-trip threshold (rt5);
+#     rt1 at the same step blows inventory to $500+.
+#   - step_atr_mult=0 → fixed bps step (no ATR warmup). Replaces the old
+#     ATR/recenter/skew machinery (deleted).
 #
-# NOTE: warmup is event-driven (a 1s bar only closes when an event lands
-# in a new second). On quiet symbols (ZEC/DOGE) real warmup may exceed
-# 120s. Keep atr_period ≤ 120 on 1s bars — atr_period=300 never warmed
-# up in the 2h test.
+# BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
+# $600 @ 5x account's capacity. Do not add BTCUSDC here.
 #
-# Key behavior:
-#   - Init: wait ~120 closed 1s bars → seed lattice at ATR × 8 step
-#   - Each event: do nothing unless ≥ 2 of 12 slots drained one side
-#   - Recenter (≥1s since last): emit missing slots on skewed window
-#   - Every 10 recenters: recompute ATR + step, re-anchor lattice
-#   - Never cancel — old orders rest forever (queue priority preserved)
+# RISK ($600 @ 5x): worst per-market inventory peak in backtest ~$631 (at
+# $10/order) → ~$126 margin; a ~19% adverse move ≈ $120 loss. wave has NO
+# position cap and keeps adding into a trend — watch a sustained one-way
+# move. Size orders so summed peaks stay well under buying power.
 #
 # Pre-flight:
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
@@ -42,57 +43,41 @@ leverage = 5
 symbol = "SOLUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-recenter_drain_slots = 2
-skew_max_pct = "0.0"
-bar_interval_secs = 1
-atr_period = 120
-step_atr_mult = "8.0"
-bar_warmup_bars = 120
-relattice_every_n_recenters = 5
-recenter_cooldown_ms = 1000
+grid_levels = 10
+refill_threshold = 5
+min_self_spread_bps = 0
+grid_step_bps = 1
+step_atr_mult = "0.0"
 
-# ─── XRPUSDC ($5 floor) ───────────────────────────────────────────────────
+# ─── ETHUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
-symbol = "XRPUSDC"
+symbol = "ETHUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-recenter_drain_slots = 2
-skew_max_pct = "0.0"
-bar_interval_secs = 1
-atr_period = 120
-step_atr_mult = "8.0"
-bar_warmup_bars = 120
-relattice_every_n_recenters = 5
-recenter_cooldown_ms = 1000
+grid_levels = 10
+refill_threshold = 5
+min_self_spread_bps = 0
+grid_step_bps = 1
+step_atr_mult = "0.0"
 
 # ─── DOGEUSDC ─────────────────────────────────────────────────────────────
 [[bot]]
 symbol = "DOGEUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-recenter_drain_slots = 2
-skew_max_pct = "0.0"
-bar_interval_secs = 1
-atr_period = 120
-step_atr_mult = "8.0"
-bar_warmup_bars = 120
-relattice_every_n_recenters = 5
-recenter_cooldown_ms = 1000
+grid_levels = 10
+refill_threshold = 5
+min_self_spread_bps = 0
+grid_step_bps = 1
+step_atr_mult = "0.0"
 
-# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
+# ─── BNBUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
-symbol = "NEARUSDC"
+symbol = "BNBUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-recenter_drain_slots = 2
-skew_max_pct = "0.0"
-bar_interval_secs = 1
-atr_period = 120
-step_atr_mult = "8.0"
-bar_warmup_bars = 120
-relattice_every_n_recenters = 5
-recenter_cooldown_ms = 1000
+grid_levels = 10
+refill_threshold = 5
+min_self_spread_bps = 0
+grid_step_bps = 1
+step_atr_mult = "0.0"

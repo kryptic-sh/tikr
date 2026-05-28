@@ -161,6 +161,15 @@ struct Args {
     /// Wave: refill batching threshold (slots empty before refill).
     #[arg(long, default_value_t = 1u32)]
     wv_refill_threshold: u32,
+    /// Wave: minimum self-spread in bps (used when atr-mult = 0). 0 = off.
+    #[arg(long, default_value_t = 0u32)]
+    wv_min_self_spread_bps: u32,
+    /// Wave: minimum self-spread in ticks (wins over bps when > 0).
+    #[arg(long, default_value_t = 0u32)]
+    wv_min_self_spread_ticks: u32,
+    /// Wave: grid step in bps (used when atr-mult = 0). 0 = 1-tick lattice.
+    #[arg(long, default_value_t = 0u32)]
+    wv_grid_step_bps: u32,
     /// Wave: per-order notional.
     #[arg(long, default_value = "10")]
     wv_notional: String,
@@ -392,9 +401,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 step_size: Decimal::from_str(&args.wv_step_size)?,
                 min_notional: Decimal::from_str(&args.wv_min_notional)?,
                 grid_levels: args.wv_grid_levels,
-                min_self_spread_bps: 0,
-                min_self_spread_ticks: 0,
-                grid_step_bps: 0,
+                min_self_spread_bps: args.wv_min_self_spread_bps,
+                min_self_spread_ticks: args.wv_min_self_spread_ticks,
+                grid_step_bps: args.wv_grid_step_bps,
                 grid_step_ticks: 0,
                 bar_interval_secs: args.wv_bar_interval_secs,
                 max_bars: 200,
