@@ -24,8 +24,9 @@ use tikr_core::{
 };
 use tikr_paper::{FundingConfig, RunnerConfig, run_with_resume};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, MicroPrice,
-    MicroPriceConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, Mantis, MantisConfig,
+    MicroPrice, MicroPriceConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave,
+    WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -45,6 +46,8 @@ enum StrategyArg {
     Tide,
     #[value(name = "wave", alias = "wv")]
     Wave,
+    #[value(name = "mantis", alias = "mn")]
+    Mantis,
 }
 
 #[derive(Parser, Debug)]
@@ -207,6 +210,25 @@ struct Args {
     /// Wave: min notional.
     #[arg(long, default_value = "5")]
     wv_min_notional: String,
+
+    /// Mantis: min book spread (bps) required to quote.
+    #[arg(long, default_value = "1")]
+    mn_min_spread_bps: String,
+    /// Mantis: tick offset from touch. 0 = join, -1 = inside/outbid, +1 = outside.
+    #[arg(long, default_value_t = 0i32)]
+    mn_tick_offset: i32,
+    /// Mantis: per-order notional.
+    #[arg(long, default_value = "10")]
+    mn_notional: String,
+    /// Mantis: step size.
+    #[arg(long, default_value = "0.001")]
+    mn_step_size: String,
+    /// Mantis: min notional.
+    #[arg(long, default_value = "5")]
+    mn_min_notional: String,
+    /// Mantis: position cap in quote notional (suppress deepening side). 0 = off.
+    #[arg(long, default_value = "0")]
+    mn_max_position_usdt: String,
 
     /// Heartbeat synthesis cadence (ms) injected during quiet stretches.
     #[arg(long, default_value_t = 1000u64)]
@@ -509,6 +531,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_position_usdt: match balance_max_position {
                     Some(cap) => cap,
                     None => Decimal::from_str(&args.wv_max_position_usdt)?,
+                },
+            });
+            run_with_resume(
+                venue,
+                strategy,
+                fill_sim,
+                symbol,
+                shutdown_rx,
+                runner_config,
+                None,
+                None,
+                None,
+                external_fills,
+                None,
+            )
+            .await
+        }
+        StrategyArg::Mantis => {
+            let strategy = Mantis::new(MantisConfig {
+                notional_per_order: balance_notional
+                    .map(Ok)
+                    .unwrap_or_else(|| Decimal::from_str(&args.mn_notional))?,
+                tick_size: Decimal::from_str(&args.tick_size)?,
+                step_size: Decimal::from_str(&args.mn_step_size)?,
+                min_notional: Decimal::from_str(&args.mn_min_notional)?,
+                min_spread_bps: Decimal::from_str(&args.mn_min_spread_bps)?,
+                tick_offset: args.mn_tick_offset,
+                max_position_usdt: match balance_max_position {
+                    Some(cap) => cap,
+                    None => Decimal::from_str(&args.mn_max_position_usdt)?,
                 },
             });
             run_with_resume(

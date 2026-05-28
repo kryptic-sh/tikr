@@ -270,6 +270,9 @@ pub struct BotConfig {
     /// Wave params (only honored when `strategy = "wave"`).
     #[serde(default)]
     pub wave: Option<WaveParams>,
+    /// Mantis params (only honored when `strategy = "mantis"`).
+    #[serde(default)]
+    pub mantis: Option<MantisParams>,
 }
 
 /// Wave — frozen fixed-step lattice with round-trip refill.
@@ -296,6 +299,26 @@ fn wave_default_refill_threshold() -> u32 {
 
 fn wave_default_grid_levels() -> u32 {
     12
+}
+
+/// Mantis — symmetric touch scalper; rests a bid+ask at the touch.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct MantisParams {
+    /// Per-order notional. Account-derived if unset.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Minimum book spread (bps) required to quote. Default 1.
+    #[serde(default = "mantis_default_min_spread_bps")]
+    pub min_spread_bps: Decimal,
+    /// Tick offset from touch. `0` = join (default), `-1` = inside/outbid,
+    /// `+1` = one tick outside.
+    #[serde(default)]
+    pub tick_offset: i32,
+}
+
+fn mantis_default_min_spread_bps() -> Decimal {
+    Decimal::ONE
 }
 
 /// RSI mean-reversion + KER regime gate, long-only.

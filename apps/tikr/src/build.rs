@@ -10,7 +10,7 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
-    HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig,
+    HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MantisConfig,
     MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
     TideConfig, WaveConfig,
 };
@@ -79,9 +79,10 @@ pub fn to_spec(
         "joker" | "jk" => build_joker(cfg, &symbol, venue, default_notional)?,
         "rsi-mr" | "rsimr" => build_rsi_mr(cfg, &symbol, venue, default_notional)?,
         "wave" | "wv" => build_wave(cfg, &symbol, venue, default_notional)?,
+        "mantis" | "mn" => build_mantis(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, mantis)"
             ));
         }
     };
@@ -185,6 +186,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "joker" | "jk" => Ok(cfg.joker.as_ref().and_then(|p| p.notional)),
         "rsi-mr" | "rsimr" => Ok(cfg.rsi_mr.as_ref().and_then(|p| p.notional)),
         "wave" | "wv" => Ok(cfg.wave.as_ref().and_then(|p| p.notional)),
+        "mantis" | "mn" => Ok(cfg.mantis.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -214,7 +216,9 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "rsi-mr"
         | "rsimr"
         | "wave"
-        | "wv" => None,
+        | "wv"
+        | "mantis"
+        | "mn" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -486,6 +490,35 @@ fn build_wave(
         grid_levels: wave.grid_levels,
         step_bps: wave.step_bps,
         refill_threshold: wave.refill_threshold,
+        // Account-derived cap arrives via on_max_position_updated (live
+        // channel); seed 0 = uncapped until the first update lands.
+        max_position_usdt: Decimal::ZERO,
+    }))
+}
+
+fn build_mantis(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let mantis = cfg.mantis.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=mantis but [bot.mantis] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(mantis.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::Mantis(MantisConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        min_spread_bps: mantis.min_spread_bps,
+        tick_offset: mantis.tick_offset,
         // Account-derived cap arrives via on_max_position_updated (live
         // channel); seed 0 = uncapped until the first update lands.
         max_position_usdt: Decimal::ZERO,

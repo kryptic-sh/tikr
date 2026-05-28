@@ -14,9 +14,9 @@ use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, Hydra, HydraConfig, Joker,
     JokerConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade,
-    LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig, RsiMr, RsiMrConfig, SimpleGap,
-    SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, Tide,
-    TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
+    LiqFadeConfig, Mantis, MantisConfig, MicroMeanReversion, MicroMeanReversionConfig, RsiMr,
+    RsiMrConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
+    StaticGridConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -64,6 +64,8 @@ pub enum StrategyChoice {
     RsiMr(RsiMrConfig),
     /// [`Wave`] — lazy-recenter lattice, ATR-adaptive step.
     Wave(WaveConfig),
+    /// [`Mantis`] — symmetric touch scalper; rests bid+ask at the touch.
+    Mantis(MantisConfig),
 }
 
 impl StrategyChoice {
@@ -85,6 +87,7 @@ impl StrategyChoice {
             Self::Joker(_) => "joker",
             Self::RsiMr(_) => "rsi-mr",
             Self::Wave(_) => "wave",
+            Self::Mantis(_) => "mantis",
         }
     }
 }
@@ -424,6 +427,23 @@ where
                 }
                 StrategyChoice::Wave(cfg) => {
                     let strategy = Wave::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
+                    )
+                    .await
+                }
+                StrategyChoice::Mantis(cfg) => {
+                    let strategy = Mantis::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,
