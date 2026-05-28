@@ -73,6 +73,13 @@ pub struct WaveConfig {
     /// reactive). Higher = wait for N fills then refill them together,
     /// cutting re-emit churn. Default `1`.
     pub refill_threshold: u32,
+    /// Take-profit on an imbalanced residual position, in ticks. When
+    /// `> 0` and the band is waiting (asymmetric fills left an open
+    /// position), maintain a post-only close limit at
+    /// `avg_entry ± take_profit_ticks × tick` sized to flatten — locks a
+    /// fixed minimum profit when price retraces. A TP fill force-triggers
+    /// a refill that cycle. `0` (default) = disabled.
+    pub take_profit_ticks: u32,
 }
 
 /// Closed OHLCV bar.
@@ -110,6 +117,10 @@ pub struct Wave {
     closed_bars: VecDeque<Bar>,
     open_bar: Option<Bar>,
     current_bucket: Option<u64>,
+    /// Position size seen on the previous event — used to detect a
+    /// take-profit fill (|position| shrank toward flat) so we can
+    /// force a refill that cycle.
+    last_pos_size: Decimal,
 }
 
 impl Wave {
@@ -138,6 +149,19 @@ impl Wave {
             side,
             price,
             size: self.quote_size(price),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        })
+    }
+
+    /// Post-only quote with an explicit size (used for the take-profit
+    /// close, sized to the residual position rather than per-order).
+    fn make_quote_sized(&self, symbol: &Symbol, side: Side, price: Price, size: Decimal) -> Action {
+        Action::Quote(QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price,
+            size: Size(size),
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
@@ -501,6 +525,7 @@ impl Strategy for Wave {
             closed_bars: VecDeque::new(),
             open_bar: None,
             current_bucket: None,
+            last_pos_size: Decimal::ZERO,
         }
     }
 
@@ -576,6 +601,66 @@ impl Strategy for Wave {
         // outside the new band). Between refills: do nothing.
         let levels = self.config.grid_levels.max(1) as i64;
 
+        // 1.5) Take-profit on an imbalanced residual position. When the
+        // band is waiting (one side filled more than the other → open
+        // position) and TP is enabled, maintain a post-only close at
+        // `avg ± take_profit_ticks·tick` sized to flatten. Post-only +
+        // fixed-profit: it only fills once price retraces in our favor,
+        // never at a loss. A TP fill shows up as the position shrinking,
+        // which force-triggers a refill below.
+        let pos = ctx.position.size.0;
+        let avg = ctx.position.avg_entry.0;
+        if self.config.take_profit_ticks > 0
+            && pos != Decimal::ZERO
+            && avg > Decimal::ZERO
+            && tick > Decimal::ZERO
+        {
+            let tp_dist = Decimal::from(self.config.take_profit_ticks) * tick;
+            if pos > Decimal::ZERO {
+                // Long → close ASK at avg + tp (sell higher). Post-only
+                // valid only if strictly above best_bid.
+                let tp_price = (avg + tp_dist) / tick;
+                let tp_price = tp_price.ceil() * tick;
+                let valid = best_bid.is_none_or(|b| tp_price > b.0);
+                let resting = ctx
+                    .open_quotes
+                    .iter()
+                    .any(|(_, q)| q.side == Side::Ask && q.price.0 == tp_price);
+                if valid && !resting {
+                    actions.push(self.make_quote_sized(
+                        ctx.symbol,
+                        Side::Ask,
+                        Price(tp_price),
+                        pos,
+                    ));
+                }
+            } else {
+                // Short → close BID at avg − tp (buy lower). Post-only
+                // valid only if strictly below best_ask.
+                let tp_price = (avg - tp_dist) / tick;
+                let tp_price = tp_price.floor() * tick;
+                let valid = best_ask.is_none_or(|a| tp_price < a.0);
+                let resting = ctx
+                    .open_quotes
+                    .iter()
+                    .any(|(_, q)| q.side == Side::Bid && q.price.0 == tp_price);
+                if valid && tp_price > Decimal::ZERO && !resting {
+                    actions.push(self.make_quote_sized(
+                        ctx.symbol,
+                        Side::Bid,
+                        Price(tp_price),
+                        -pos,
+                    ));
+                }
+            }
+        }
+
+        // Force a refill this cycle if the position shrank toward flat
+        // since last event (a take-profit or band exit filled → profit
+        // banked → round-trip complete).
+        let force_refill = pos.abs() < self.last_pos_size.abs();
+        self.last_pos_size = pos;
+
         // Compute both bands around the cross-guarded touch.
         let bid_band = top_b.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
             let mut cap = top.0;
@@ -608,8 +693,10 @@ impl Strategy for Wave {
             let bid_drained = self.band_missing(ctx, Side::Bid, bb);
             let ask_drained = self.band_missing(ctx, Side::Ask, ab);
             let thr = self.config.refill_threshold.max(1);
-            // Both-sides round-trip trigger.
-            if bid_drained >= thr && ask_drained >= thr {
+            // Refill when a round-trip completed: either both sides
+            // drained ≥ threshold, OR a take-profit/exit just banked
+            // profit (force_refill).
+            if force_refill || (bid_drained >= thr && ask_drained >= thr) {
                 self.emit_window_slots(ctx, Side::Bid, bb, false, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, false, &mut actions);
                 self.prune_outside_band(ctx, Side::Bid, bb, &mut actions);
@@ -666,6 +753,7 @@ mod tests {
             step_atr_mult: Decimal::ZERO,
             bar_warmup_bars: 14,
             refill_threshold: 1,
+            take_profit_ticks: 0,
         }
     }
 
