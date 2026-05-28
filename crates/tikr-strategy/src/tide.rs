@@ -435,8 +435,8 @@ impl Strategy for Tide {
         // Tick mode (`min_self_spread_ticks > 0`): required_spread =
         // `ticks × tick_size` — exact, no bps math.
         // Bps mode (default): required_spread = `bps × mid / 10000`.
-        let spread_active = self.config.min_self_spread_ticks > 0
-            || self.config.min_self_spread_bps > 0;
+        let spread_active =
+            self.config.min_self_spread_ticks > 0 || self.config.min_self_spread_bps > 0;
         let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
             (best_bid, best_ask)
             && bp.0 > Decimal::ZERO

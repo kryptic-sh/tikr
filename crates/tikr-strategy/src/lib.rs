@@ -48,8 +48,8 @@ pub mod spread_scalp_old;
 pub mod static_grid;
 pub mod tide;
 pub mod top_of_book;
-pub mod wave;
 pub mod volatility;
+pub mod wave;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
 pub use glft::{Glft, GlftConfig};
@@ -69,8 +69,8 @@ pub use spread_scalp_old::{SpreadScalpOld, SpreadScalpOldConfig};
 pub use static_grid::{StaticGrid, StaticGridConfig};
 pub use tide::{Tide, TideConfig};
 pub use top_of_book::{TopOfBook, TopOfBookConfig};
-pub use wave::{Wave, WaveConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
+pub use wave::{Wave, WaveConfig};
 
 use tikr_core::{
     Decimal, Fill, LiqEvent, MarketEvent, Position, Price, QuoteKind, Side, Size, Snapshot, Symbol,

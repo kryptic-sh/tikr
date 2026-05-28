@@ -31,7 +31,9 @@
 
 use std::collections::VecDeque;
 
-use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp};
+use tikr_core::{
+    Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp,
+};
 use tikr_venue::{QuoteId, QuoteIntent};
 
 use crate::{Action, Strategy, StrategyContext};
@@ -482,12 +484,7 @@ impl Strategy for RsiMr {
             let tp_offset = atr_at_entry * self.config.atr_tp_mult;
             let target = entry_price + tp_offset;
             let tp_price = Price(self.snap_to_tick(target, true));
-            actions.push(self.make_quote(
-                ctx.symbol,
-                Side::Ask,
-                tp_price,
-                TimeInForce::PostOnly,
-            ));
+            actions.push(self.make_quote(ctx.symbol, Side::Ask, tp_price, TimeInForce::PostOnly));
             // Placeholder QuoteId — runner assigns the real one; our
             // tracking is best-effort. Cleanup happens via the ASK-fill
             // path or on the next event's RSI-exit branch.
@@ -530,7 +527,9 @@ impl Strategy for RsiMr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{Asset, Level, MarketKind, Notional, Position as CorePos, SignedSize, Snapshot, VenueId};
+    use tikr_core::{
+        Asset, Level, MarketKind, Notional, Position as CorePos, SignedSize, Snapshot, VenueId,
+    };
 
     fn sym() -> Symbol {
         Symbol {
@@ -612,7 +611,12 @@ mod tests {
         let p = pos_flat();
         let sym_ = sym();
         let ctx = ctx_for(&sym_, &snap, &p, &[], Timestamp(0));
-        let actions = s.on_event(&ctx, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions = s.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         assert!(actions.is_empty());
     }
 
@@ -624,11 +628,21 @@ mod tests {
         let sym_ = sym();
         // First event at t=0 → start bar.
         let ctx0 = ctx_for(&sym_, &snap, &p, &[], Timestamp(0));
-        s.on_event(&ctx0, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        s.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         assert_eq!(s.closed.len(), 0);
         // Event 61s later → cross bucket → bar should close.
         let ctx1 = ctx_for(&sym_, &snap, &p, &[], Timestamp(61_000_000_000));
-        s.on_event(&ctx1, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        s.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         assert_eq!(s.closed.len(), 1);
     }
 }

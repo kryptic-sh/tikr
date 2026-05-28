@@ -243,7 +243,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             recent_liqs: &[],
         };
         // Emit BookUpdate + Trade to drive bar aggregation + indicators.
-        let actions_book = strat.on_event(&ctx, &MarketEvent::BookUpdate { snapshot: snap.clone() });
+        let actions_book = strat.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
         let trade = MarketEvent::Trade {
             symbol: symbol.clone(),
             price: Price(close),
@@ -364,8 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tikr_core::Side::Bid => {
                         let new_size = pos_size + effective_size;
                         if new_size > Decimal::ZERO {
-                            pos_avg =
-                                (pos_avg * pos_size + fill_price * effective_size) / new_size;
+                            pos_avg = (pos_avg * pos_size + fill_price * effective_size) / new_size;
                         }
                         pos_size = new_size;
                         entries += 1;
@@ -474,9 +478,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let new_id = QuoteId::new();
                                 let key_side = intent.side;
                                 let key_price = intent.price.0;
-                                resting.retain(|_, r| {
-                                    !(r.side == key_side && r.price == key_price)
-                                });
+                                resting
+                                    .retain(|_, r| !(r.side == key_side && r.price == key_price));
                                 resting.insert(
                                     new_id,
                                     Resting {

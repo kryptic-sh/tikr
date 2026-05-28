@@ -461,8 +461,7 @@ fn build_rsi_mr(
             cfg.symbol
         )
     })?;
-    let notional =
-        autobump_notional(rsi_mr.notional.unwrap_or(default_notional), symbol, venue)?;
+    let notional = autobump_notional(rsi_mr.notional.unwrap_or(default_notional), symbol, venue)?;
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
@@ -496,8 +495,7 @@ fn build_wave(
     let wave = cfg.wave.as_ref().ok_or_else(|| {
         anyhow::anyhow!("bot {} strategy=wave but [bot.wave] missing", cfg.symbol)
     })?;
-    let notional =
-        autobump_notional(wave.notional.unwrap_or(default_notional), symbol, venue)?;
+    let notional = autobump_notional(wave.notional.unwrap_or(default_notional), symbol, venue)?;
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);

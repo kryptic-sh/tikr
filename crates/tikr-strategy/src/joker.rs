@@ -233,9 +233,7 @@ impl Strategy for Joker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tikr_core::{
-        Asset, Level, MarketKind, Position, SignedSize, Snapshot, Timestamp, VenueId,
-    };
+    use tikr_core::{Asset, Level, MarketKind, Position, SignedSize, Snapshot, Timestamp, VenueId};
     use tikr_venue::QuoteId;
 
     fn sym() -> Symbol {
