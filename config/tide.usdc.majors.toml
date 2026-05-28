@@ -1,0 +1,82 @@
+# ─── Tide on USDC majors — MAINNET ────────────────────────────────────────
+#
+# 4 bots: SOLUSDC, ZECUSDC, DOGEUSDC, BNBUSDC. Tide = single-touch wide-step
+# spread scalp. USDC promo (0 bps maker).
+#
+# Config from the 54h SOL snapshot sweep (2026-05-28): single level (lvl1) +
+# wide 20 bps inner/step was by far the best tide variant — on SOL it printed
+# net +$1,786 / 53.8h ($20k bal, $200/order, queue-priority-respected),
+# extrapolating to ~+119%/mo. The single-level wide scalp keeps almost no
+# standing inventory (peak was mostly turnover, clean unrealized) — the
+# opposite of deep grids, which bury capital and bleed.
+#
+# Key tuning facts:
+#   - lvl1 ≫ lvl10: single-touch keeps inventory lean; deep grids accumulate.
+#   - Tide needs a WIDE step. step≤10 bps churns into losses (step5/lvl10 =
+#     −28%/mo); the edge only appears at 15-20 bps.
+#   - close_profit_bps = 0 → falls back to min_self_spread_bps (20).
+#   - adaptive_bps_enabled = false: pin the fixed 20 bps (default is TRUE,
+#     which would override the tuned spread — must be set false to match).
+#
+# CAVEATS: single 54h window, one symbol tuned (SOL). +119%/mo is one
+# regime's extrapolation, NOT a forecast — validate live and across windows.
+# BTC excluded (0.001 lot ≈ $100/order, too large for a small account).
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in Futures wallet
+#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tide-usdc-majors"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"
+leverage = 5
+
+# ─── SOLUSDC ($5 floor) ───────────────────────────────────────────────────
+[[bot]]
+symbol = "SOLUSDC"
+strategy = "tide"
+[bot.tide]
+grid_levels = 1
+min_self_spread_bps = 20
+grid_step_bps = 20
+adaptive_bps_enabled = false
+prune_stragglers = true
+
+# ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
+# NOT backtested — no ZEC snapshot; running on the winning params unvalidated.
+[[bot]]
+symbol = "ZECUSDC"
+strategy = "tide"
+[bot.tide]
+grid_levels = 1
+min_self_spread_bps = 20
+grid_step_bps = 20
+adaptive_bps_enabled = false
+prune_stragglers = true
+
+# ─── DOGEUSDC ─────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "DOGEUSDC"
+strategy = "tide"
+[bot.tide]
+grid_levels = 1
+min_self_spread_bps = 20
+grid_step_bps = 20
+adaptive_bps_enabled = false
+prune_stragglers = true
+
+# ─── BNBUSDC ──────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BNBUSDC"
+strategy = "tide"
+[bot.tide]
+grid_levels = 1
+min_self_spread_bps = 20
+grid_step_bps = 20
+adaptive_bps_enabled = false
+prune_stragglers = true
