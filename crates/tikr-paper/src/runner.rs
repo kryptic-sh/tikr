@@ -596,6 +596,16 @@ where
     } else {
         (None, None)
     };
+    // Runner-side wallet inventory cap (USDT notional). Mirrors what an
+    // inventory-aware strategy (e.g. Wave) self-limits, but enforced centrally
+    // so it binds for ANY algo — strategies with no inventory logic (SimpleGap,
+    // MMR) otherwise run to the venue margin backstop. Seeded from the initial
+    // `max_position_rx` value, refreshed whenever that channel ticks. `0` =
+    // disabled (no cap configured).
+    let mut current_max_position = max_position_rx
+        .as_ref()
+        .map(|rx| *rx.borrow())
+        .unwrap_or(Decimal::ZERO);
     let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
@@ -752,6 +762,7 @@ where
                             live_mode,
                             &mut side_fails,
                             config.min_notional,
+                            current_max_position,
                         ).await;
                     }
                 }
@@ -766,6 +777,7 @@ where
                     && let Some(rx) = max_position_rx.as_ref()
                 {
                     let next_max_pos = *rx.borrow();
+                    current_max_position = next_max_pos;
                     let pos = tracker.snapshot();
                     let open_quotes = fill_sim.live_quotes_for(&symbol);
                     let liqs = liq_window.observe(last_event_ts.unwrap_or(Timestamp(0)).0);
@@ -793,6 +805,7 @@ where
                             live_mode,
                             &mut side_fails,
                             config.min_notional,
+                            current_max_position,
                         ).await;
                     }
                 }
@@ -922,8 +935,27 @@ where
                 // arrive via a separate select arm), so doing it up-front
                 // lets the dispatch loop below batch quotes without
                 // re-entering the gate per action.
+                // Wallet inventory cap valuation (same gate as
+                // dispatch_post_fill_actions, applied to the primary on_event
+                // order flow). Value the position at mark, falling back to
+                // book mid then last mid.
+                let cap_price = if last_mark.0 > Decimal::ZERO {
+                    last_mark.0
+                } else {
+                    snapshot_mid(&current_book).unwrap_or(last_mid.0)
+                };
+                let cap_signed_notional = pos.size.0 * cap_price;
                 let mut filtered: Vec<tikr_strategy::Action> = Vec::with_capacity(actions.len());
                 for action in actions {
+                    if let tikr_strategy::Action::Quote(intent) = &action
+                        && quote_breaches_position_cap(
+                            intent,
+                            cap_signed_notional,
+                            current_max_position,
+                        )
+                    {
+                        continue;
+                    }
                     if let Some(gate) = risk_gate.as_mut() {
                         let pnl_now = tracker.report(last_mark);
                         let risk_ctx = RiskContext {
@@ -1226,6 +1258,7 @@ where
                             false,
                             &mut side_fails,
                             config.min_notional,
+                            current_max_position,
                         )
                         .await;
                     }
@@ -1555,6 +1588,7 @@ where
                     true,
                     &mut side_fails,
                     config.min_notional,
+                    current_max_position,
                 )
                 .await;
                 // Publish AFTER local mirror has dropped the filled order and
@@ -1822,6 +1856,32 @@ where
     report
 }
 
+/// Best-effort valuation price (top-of-book mid) from a snapshot, for position
+/// notional checks. `None` when either side is empty.
+fn snapshot_mid(book: &tikr_core::Snapshot) -> Option<Decimal> {
+    let bid = book.bids.first()?.price.0;
+    let ask = book.asks.first()?.price.0;
+    Some((bid + ask) / Decimal::from(2))
+}
+
+/// Runner-side wallet inventory cap. Returns true if placing `intent` should be
+/// suppressed because the signed position notional already sits at/beyond `cap`
+/// on the side this order would grow (Bid grows long, Ask grows short).
+/// Reducing-side orders and a non-positive `cap` always pass.
+fn quote_breaches_position_cap(
+    intent: &QuoteIntent,
+    signed_pos_notional: Decimal,
+    cap: Decimal,
+) -> bool {
+    if cap <= Decimal::ZERO {
+        return false;
+    }
+    match intent.side {
+        Side::Bid => signed_pos_notional >= cap,
+        Side::Ask => signed_pos_notional <= -cap,
+    }
+}
+
 /// Dispatch a list of post-fill strategy actions into `fill_sim` and,
 /// optionally, the live venue.
 ///
@@ -1847,10 +1907,29 @@ async fn dispatch_post_fill_actions<V, S>(
     live_mode: bool,
     side_fails: &mut HashMap<String, (u32, u32)>,
     min_notional: Decimal,
+    max_position: Decimal,
 ) where
     V: Venue,
     S: Strategy,
 {
+    // Runner-side inventory cap: drop add-side quotes once |position| is at/
+    // beyond the wallet cap, so accumulation strategies (SimpleGap/MMR refill
+    // through this path) stay bounded like an inventory-aware strategy would.
+    let actions: Vec<tikr_strategy::Action> = match snapshot_mid(current_book) {
+        Some(mid) if max_position > Decimal::ZERO => {
+            let signed_notional = post_fill_pos.size.0 * mid;
+            actions
+                .into_iter()
+                .filter(|a| match a {
+                    tikr_strategy::Action::Quote(intent) => {
+                        !quote_breaches_position_cap(intent, signed_notional, max_position)
+                    }
+                    _ => true,
+                })
+                .collect()
+        }
+        _ => actions,
+    };
     if !live_mode {
         // Paper mode: pipe all actions straight into FillSim.
         for action in actions {
