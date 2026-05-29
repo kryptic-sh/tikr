@@ -261,6 +261,17 @@ impl LoadedReplayData {
         self.events.len()
     }
 
+    /// `(first_ts_ns, last_ts_ns)` of the loaded (sorted) event stream, or
+    /// `None` when empty. The wall-clock span this backtest actually covers —
+    /// guards against trusting a directory name (`72h/`) that contains far
+    /// less data.
+    pub fn ts_span_ns(&self) -> Option<(u64, u64)> {
+        match (self.events.first(), self.events.last()) {
+            (Some(f), Some(l)) => Some((f.ts_ns, l.ts_ns)),
+            _ => None,
+        }
+    }
+
     /// True if no events were loaded.
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()

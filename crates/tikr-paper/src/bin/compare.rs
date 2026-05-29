@@ -1360,9 +1360,14 @@ async fn run_sweep_collect(
         tick_size: tick,
         allow_seq_gaps: true,
     })?;
+    let span_hours = shared_data
+        .ts_span_ns()
+        .map(|(f, l)| (l.saturating_sub(f)) as f64 / 1e9 / 3600.0)
+        .unwrap_or(0.0);
     info!(
         events = shared_data.len(),
         elapsed_ms = load_start.elapsed().as_millis() as u64,
+        data_span_hours = format!("{span_hours:.2}"),
         "parquet load done"
     );
 
