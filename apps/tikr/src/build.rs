@@ -148,6 +148,8 @@ pub fn to_spec(
         silent_cancel_rate_per_min: 0.0,
         rng_seed: 0,
         latency_jitter_ms: 0,
+        // Paper-mode sim mirrors the live venue's per-symbol open-order filter.
+        max_open_orders: Some(tikr_backtest::fill_sim::BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL),
     });
 
     Ok(BotSpec {

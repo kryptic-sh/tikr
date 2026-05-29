@@ -109,6 +109,12 @@ struct Args {
     #[arg(long, default_value_t = 0.0f64)]
     silent_cancel_rate_per_min: f64,
 
+    /// Max simultaneously-resting orders per symbol (Binance `MAX_NUM_ORDERS`
+    /// filter). Default matches the live venue; a Place past the cap is
+    /// rejected like `-1015`. `0` = unlimited.
+    #[arg(long, default_value_t = tikr_backtest::fill_sim::BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL)]
+    max_open_orders: u32,
+
     /// Isolated-margin leverage for forced liquidation. When `> 0`, the
     /// backtest force-closes the position if the mark (book mid here, no mark
     /// series) breaches the liquidation price. `0` (default) = liquidation
@@ -324,6 +330,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         silent_cancel_rate_per_min: args.silent_cancel_rate_per_min,
         rng_seed: 0,
         latency_jitter_ms: args.submit_latency_jitter_ms,
+        max_open_orders: if args.max_open_orders > 0 {
+            Some(args.max_open_orders)
+        } else {
+            None
+        },
     });
 
     let funding_rate = Decimal::from_str(&args.funding_bps)?;

@@ -708,6 +708,12 @@ struct Args {
     #[arg(long, default_value_t = 0u64)]
     sim_latency_jitter_ms: u64,
 
+    /// FillSim: max simultaneously-resting orders per symbol (Binance
+    /// `MAX_NUM_ORDERS` filter). Default matches the live venue; a Place
+    /// past the cap is rejected like `-1015`. `0` = unlimited.
+    #[arg(long, default_value_t = tikr_backtest::fill_sim::BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL)]
+    sim_max_open_orders: u32,
+
     /// Comma-separated list of strategy categories to run. Empty
     /// (default) runs the full suite. Categories: avellaneda-stoikov,
     /// glft, top-of-book, micro-price, layered-grid, simple-gap,
@@ -1234,6 +1240,14 @@ async fn run_sweep_collect(
         silent_cancel_rate_per_min: args.sim_silent_cancel_rate_per_min,
         rng_seed: args.sim_rng_seed,
         latency_jitter_ms: args.sim_latency_jitter_ms,
+        // Mirror the live venue's per-symbol open-order filter so sweeps stay
+        // realistic and place-and-never-cancel presets can't accumulate orders
+        // unboundedly (which previously hung the suite). `0` disables.
+        max_open_orders: if args.sim_max_open_orders > 0 {
+            Some(args.sim_max_open_orders)
+        } else {
+            None
+        },
     };
     let simple_gap_notional = Decimal::from_str(&args.simple_gap_notional)?;
     let ladder_reentry_notional = Decimal::from_str(&args.ladder_reentry_notional)?;

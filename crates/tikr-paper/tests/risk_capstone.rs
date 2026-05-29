@@ -198,6 +198,7 @@ fn fill_sim_with_zero_latency() -> FillSim {
         silent_cancel_rate_per_min: 0.0,
         rng_seed: 0,
         latency_jitter_ms: 0,
+        max_open_orders: None,
     })
 }
 

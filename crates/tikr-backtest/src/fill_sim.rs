@@ -22,6 +22,14 @@ pub struct VenueFees {
     pub taker_bps: u32,
 }
 
+/// Binance's per-symbol `MAX_NUM_ORDERS` exchange filter: the maximum number
+/// of simultaneously-open (resting) orders allowed on a single symbol. 200 on
+/// both USD-M Futures and Spot. Used as the default open-order cap so paper
+/// backtests reject the 201st resting order exactly as the live venue does —
+/// without it, grid/ladder strategies that never cancel can accumulate orders
+/// unboundedly and turn the per-event open-order scan into an O(events²) hang.
+pub const BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL: u32 = 200;
+
 /// Configuration for [`FillSim`].
 #[derive(Debug, Clone)]
 pub struct FillSimConfig {
@@ -58,6 +66,15 @@ pub struct FillSimConfig {
     /// `rng_seed`, so runs stay reproducible. `0` (default) = no jitter
     /// (fixed latency, fully deterministic).
     pub latency_jitter_ms: u64,
+    /// Max simultaneously-resting orders per symbol. `None` = unlimited.
+    /// When set, a Place that would push the symbol's resting-order count
+    /// past this cap is rejected with a synthetic Binance `-1015`
+    /// ("too many orders") reason, routed through `on_quote_rejected` like
+    /// other paper rejections. Defaults to
+    /// [`BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL`] on the live-shaped backtest
+    /// entry points; mirrors the venue's `MAX_NUM_ORDERS` filter and bounds
+    /// runaway open-order accumulation.
+    pub max_open_orders: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,6 +616,28 @@ impl FillSim {
         ts: Timestamp,
         override_id: Option<QuoteId>,
     ) -> Option<Fill> {
+        // Synthetic Binance `-1015` (too many orders). Resting orders count
+        // against the venue's per-symbol `MAX_NUM_ORDERS` filter; a Place that
+        // would exceed the cap is rejected before it can rest. Only orders that
+        // actually rest count — IOC/FOK fill-or-cancel immediately and never
+        // occupy a slot, so they bypass this gate (checked below). Without the
+        // cap, strategies that place-and-never-cancel grow `live_quotes`
+        // unboundedly → the O(open_orders) per-event scan degrades to
+        // O(events²) and the backtest effectively hangs.
+        if let Some(cap) = self.cfg.max_open_orders
+            && !matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK)
+        {
+            let resting = self
+                .live_quotes
+                .iter()
+                .filter(|q| q.symbol == intent.symbol)
+                .count();
+            if resting >= cap as usize {
+                self.pending_rejections
+                    .push((intent.clone(), "too many orders (paper -1015)".to_string()));
+                return None;
+            }
+        }
         if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
             self.pending_rejections.push((
                 intent.clone(),
@@ -1168,6 +1207,7 @@ mod tests {
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
+            max_open_orders: None,
         }
     }
 
@@ -1200,6 +1240,67 @@ mod tests {
 
         assert!(fills.is_empty(), "rejected post-only must not fill");
         assert_eq!(sim.live_quotes.len(), 0, "rejected quote not in book");
+    }
+
+    #[test]
+    fn max_open_orders_rejects_beyond_cap() {
+        let sym = make_symbol();
+        let mut cfg = default_cfg();
+        cfg.submit_latency_ms = 0;
+        cfg.max_open_orders = Some(3);
+        let mut sim = FillSim::new(cfg);
+
+        // Seed book: bid=100, ask=101. Resting bids below 100 never cross.
+        let book = MarketEvent::BookUpdate {
+            snapshot: make_book(&sym, 100, 101),
+        };
+        let _ = sim.on_market_event(&book, Timestamp(0));
+
+        // Submit 5 resting post-only bids; only the first 3 may rest.
+        for (i, px) in [90, 89, 88, 87, 86].into_iter().enumerate() {
+            sim.on_action(
+                Action::Quote(make_intent(&sym, Side::Bid, px, 1, TimeInForce::PostOnly)),
+                Timestamp(i as u64),
+            );
+        }
+        // Promote the pending Places (latency 0 → all due immediately).
+        let _ = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(1_000_000),
+            },
+            Timestamp(1_000_000),
+        );
+
+        assert_eq!(
+            sim.live_quotes.len(),
+            3,
+            "cap must bound resting orders at 3"
+        );
+        let rejections = sim.drain_rejections();
+        assert_eq!(rejections.len(), 2, "2 places beyond the cap rejected");
+        assert!(
+            rejections.iter().all(|(_, r)| r.contains("-1015")),
+            "rejection reason is the synthetic too-many-orders code"
+        );
+
+        // IOC orders bypass the cap (they never rest). One that crosses fills;
+        // resting count is unchanged.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 200, 1, TimeInForce::IOC)),
+            Timestamp(2_000_000),
+        );
+        let fills = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(3_000_000),
+            },
+            Timestamp(3_000_000),
+        );
+        assert_eq!(fills.len(), 1, "IOC crosses and fills despite full book");
+        assert_eq!(
+            sim.live_quotes.len(),
+            3,
+            "IOC does not occupy a resting slot"
+        );
     }
 
     #[test]
@@ -1479,6 +1580,7 @@ mod tests {
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
+            max_open_orders: None,
         };
         let mut sim = FillSim::new(cfg);
 
@@ -1521,6 +1623,7 @@ mod tests {
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
+            max_open_orders: None,
         };
         let mut sim = FillSim::new(cfg);
         // Seed the book via a snapshot: best_bid=99, best_ask=101.
@@ -1578,6 +1681,7 @@ mod tests {
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 42,
             latency_jitter_ms: 50,
+            max_open_orders: None,
         };
         let base_ns = base_ms * 1_000_000;
         let mut sim = FillSim::new(cfg.clone());
