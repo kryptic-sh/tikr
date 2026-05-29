@@ -194,6 +194,34 @@ pub struct AccountConfig {
     /// precedence; this field covers the fixed-bot-list case.
     #[serde(default = "default_account_asset")]
     pub asset: String,
+    /// Inventory-aware order-size boost: extra size at full inventory
+    /// (|position| == per-bot cap), as a percent of the base order size.
+    /// `0` (default) disables. `100` ≈ up to 2× base size when maxed. Scales
+    /// only the *inventory-reducing* side (short → buys, long → sells), so the
+    /// book leans harder toward flattening as inventory builds. Applies to
+    /// every strategy (runner-side, like the position cap).
+    #[serde(default = "default_inventory_boost_pct")]
+    pub inventory_boost_pct: Decimal,
+    /// Curve exponent on the inventory ratio (|pos|/cap, clamped `0..=1`) used
+    /// by `inventory_boost_pct`. `1` (default) = linear; `>1` = slow start
+    /// then steep (boost concentrated near the cap); `<1` = fast early ramp.
+    #[serde(default = "default_inventory_boost_curve")]
+    pub inventory_boost_curve: Decimal,
+}
+
+impl AccountConfig {
+    /// Build the runner-side inventory boost config, or `None` when the boost
+    /// percent is non-positive (feature off).
+    pub fn inventory_boost(&self) -> Option<tikr_paper::InventoryBoostConfig> {
+        if self.inventory_boost_pct > Decimal::ZERO {
+            Some(tikr_paper::InventoryBoostConfig {
+                max_boost_pct: self.inventory_boost_pct,
+                curve_exponent: self.inventory_boost_curve,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 fn default_state_dir() -> PathBuf {
@@ -215,6 +243,12 @@ fn default_order_balance_pct() -> Decimal {
 }
 fn default_account_asset() -> String {
     "USDT".to_string()
+}
+fn default_inventory_boost_pct() -> Decimal {
+    Decimal::ZERO
+}
+fn default_inventory_boost_curve() -> Decimal {
+    Decimal::ONE
 }
 
 fn default_leverage() -> u32 {

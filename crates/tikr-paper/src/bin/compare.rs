@@ -25,7 +25,9 @@ use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
     VenueId,
 };
-use tikr_paper::{FundingConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume};
+use tikr_paper::{
+    FundingConfig, InventoryBoostConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume,
+};
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, Hawk, HawkConfig,
     Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig,
@@ -42,12 +44,17 @@ use tracing::info;
 /// max_position_pct)`. Set once in `main` from CLI args; read by every spawn
 /// helper. Default = all zeros → compounding disabled, static notional path.
 static BALANCE_COMPOUNDING: OnceLock<(Decimal, Decimal, Decimal)> = OnceLock::new();
+static INVENTORY_BOOST: OnceLock<Option<InventoryBoostConfig>> = OnceLock::new();
 
 fn balance_compounding() -> (Decimal, Decimal, Decimal) {
     BALANCE_COMPOUNDING
         .get()
         .copied()
         .unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))
+}
+
+fn inventory_boost() -> Option<InventoryBoostConfig> {
+    INVENTORY_BOOST.get().copied().flatten()
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -729,6 +736,15 @@ struct Args {
     /// wallet notional. Pushed to the strategy as the soft inventory cap.
     #[arg(long, default_value = "100")]
     sim_max_position_pct: String,
+    /// Inventory-aware order-size boost: extra size on the reducing side at
+    /// full inventory (|pos| == cap), as a percent of base size. `0` (default)
+    /// disables. Applies to every preset (runner-side, like the cap).
+    #[arg(long, default_value = "0")]
+    sim_inventory_boost_pct: String,
+    /// Curve exponent for the inventory boost (|pos|/cap ratio). `1` = linear,
+    /// `>1` = slow start then steep, `<1` = fast early ramp.
+    #[arg(long, default_value = "1")]
+    sim_inventory_boost_curve: String,
 
     /// Account leverage. Like the live bot, leverage does NOT affect order
     /// sizing or the position cap (those are wallet-relative) — it only sets
@@ -748,10 +764,18 @@ struct Args {
     sim_rng_seed: u64,
 
     /// FillSim: mean exponential latency jitter (ms) added per op on top of
-    /// `--sim-submit-latency-ms`. `0` (default) = fixed latency. Note sweeps
-    /// are easier to compare with jitter off (deterministic fills).
+    /// `--sim-submit-latency-ms`. `0` = fixed latency (deterministic sweeps).
+    /// Overridden when `--measure-latency` is on (default).
     #[arg(long, default_value_t = 0u64)]
     sim_latency_jitter_ms: u64,
+
+    /// Measure real round-trip latency to Binance USD-M (10 pings) at startup
+    /// and use the mean as submit/cancel latency and the stddev as jitter,
+    /// OVERRIDING the --sim-*-latency flags. On by default so sweeps reflect
+    /// this machine's actual link. `--no-measure-latency` keeps the static
+    /// flags (offline / fully-deterministic sweeps).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    measure_latency: bool,
 
     /// FillSim: max simultaneously-resting orders per symbol (Binance
     /// `MAX_NUM_ORDERS` filter). Default matches the live venue; a Place
@@ -947,7 +971,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // flag — clap's last-wins gives CLI the final say.
         argv.splice(1..1, toml_args);
     }
-    let args = Args::parse_from(argv);
+    let mut args = Args::parse_from(argv);
+
+    // Measure real round-trip latency to Binance USD-M once at startup and use
+    // mean → submit/cancel latency, stddev → jitter (overriding the --sim-*
+    // flags). Keeps the fill sim honest about in-flight/cancel staleness. One
+    // probe applies to every preset. Falls back to the CLI flags on failure.
+    if args.measure_latency {
+        match tikr_paper::probe::measure_api_latency("https://fapi.binance.com", true, 10).await {
+            Some((mean_ms, jitter_ms)) => {
+                info!(
+                    mean_ms,
+                    jitter_ms,
+                    samples = 10,
+                    "measured venue latency (mean → submit/cancel, stddev → jitter)"
+                );
+                args.sim_submit_latency_ms = mean_ms;
+                args.sim_cancel_latency_ms = mean_ms;
+                args.sim_latency_jitter_ms = jitter_ms;
+            }
+            None => {
+                eprintln!(
+                    "warning: latency probe failed; using static --sim-submit-latency-ms {} \
+                     / --sim-cancel-latency-ms {} / jitter {}. Pass --no-measure-latency to silence.",
+                    args.sim_submit_latency_ms,
+                    args.sim_cancel_latency_ms,
+                    args.sim_latency_jitter_ms
+                );
+            }
+        }
+    }
 
     // Lock the balance-compounding config before any spawn fires.
     let initial = Decimal::from_str(&args.sim_initial_balance)?;
@@ -957,6 +1010,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // margin backstop below.
     let max_pct = Decimal::from_str(&args.sim_max_position_pct)?;
     let _ = BALANCE_COMPOUNDING.set((initial, order_pct, max_pct));
+    let inv_boost_pct = Decimal::from_str(&args.sim_inventory_boost_pct)?;
+    let inv_boost = if inv_boost_pct > Decimal::ZERO {
+        Some(InventoryBoostConfig {
+            max_boost_pct: inv_boost_pct,
+            curve_exponent: Decimal::from_str(&args.sim_inventory_boost_curve)?,
+        })
+    } else {
+        None
+    };
+    let _ = INVENTORY_BOOST.set(inv_boost);
 
     if !args.data_root.is_empty() {
         return run_basket(args).await;
@@ -1324,7 +1387,7 @@ async fn run_sweep_collect(
     // on subsequent balance *changes*, so the initial value must be correct at
     // construction — otherwise strategies would trade their static `--notional`
     // until the balance drifted enough to trigger an update). Mirrors how
-    // run_backtest seeds `notional_per_order`.
+    // backtest seeds `notional_per_order`.
     let (nbc_initial, nbc_order_pct, nbc_max_pct) = balance_compounding();
     let notional = if nbc_initial > Decimal::ZERO && nbc_order_pct > Decimal::ZERO {
         (nbc_initial * nbc_order_pct / Decimal::from(100)).round_dp(8)
@@ -2482,6 +2545,7 @@ async fn run_one<S: Strategy>(
         max_expected_open_orders: 2,
         liquidation: None,
         mark_series: None,
+        inventory_boost: inventory_boost(),
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -2571,6 +2635,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            inventory_boost: inventory_boost(),
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");
@@ -3008,7 +3073,7 @@ fn split_symbol(sym: &str) -> (&str, &str) {
 }
 
 // ---------------------------------------------------------------------------
-// BacktestVenue (mirrors run_backtest.rs)
+// BacktestVenue (mirrors backtest.rs)
 // ---------------------------------------------------------------------------
 
 struct BacktestVenue {

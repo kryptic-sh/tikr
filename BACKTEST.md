@@ -6,7 +6,7 @@ plus what the simulator models and where it still approximates.
 ## Pipeline
 
 ```
-record_binance  ──►  *.parquet         ──►  run_backtest                    ──►  PaperReport (JSON)
+record_binance  ──►  *.parquet         ──►  backtest                           ──►  PaperReport (JSON)
 (live WS capture)    book_/trades_/mark_     ParquetReplay → FillSim → PnL        + optional equity CSV
 ```
 
@@ -54,7 +54,7 @@ and funding (see Realism model).
 
 ## 2. Running a backtest
 
-`run_backtest` points at **one symbol's** data dir and runs **one strategy**.
+`backtest` points at **one symbol's** data dir and runs **one strategy**.
 File discovery is by `book_<BASE>_` / `trades_<BASE>_` / `mark_<BASE>_` prefix,
 where `<BASE>` is the symbol minus its quote suffix (`SOLUSDT` → `SOL`).
 
@@ -62,7 +62,7 @@ where `<BASE>` is the symbol minus its quote suffix (`SOLUSDT` → `SOL`).
 
 ```bash
 # Optimistic (infinite capital, no leverage) — sanity check only
-cargo run --release -p tikr-paper --bin run_backtest -- \
+cargo run --release -p tikr-paper --bin backtest -- \
   --data-dir data/72h/SOLUSDT --symbol SOLUSDT \
   --strategy tide --tr-step-bps 20 --tr-grid-levels 1
 ```
@@ -74,7 +74,7 @@ buying-power margin reject, and forced liquidation — mirroring the live config
 (`config/wave.usdc.majors.toml`: $600 @ 5×, 1%/order, 100% cap).
 
 ```bash
-cargo run --release -p tikr-paper --bin run_backtest -- \
+cargo run --release -p tikr-paper --bin backtest -- \
   --data-dir data/72h/SOLUSDT --symbol SOLUSDT \
   --strategy wave --wv-grid-levels 10 --wv-refill-threshold 5 --wv-step-bps 5 \
   --maker-bps 0 --taker-bps 5 \

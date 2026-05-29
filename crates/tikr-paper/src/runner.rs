@@ -16,6 +16,7 @@ use crate::live::LiveSnapshot;
 use crate::report::{PaperReport, SCHEMA_VERSION};
 use crate::state;
 use futures::StreamExt;
+use rust_decimal::MathematicalOps;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -159,6 +160,34 @@ pub struct RunnerConfig {
     /// behaviour). Loaded from `mark_<BASE>_*.parquet` via
     /// [`tikr_backtest::mark::MarkSeries`].
     pub mark_series: Option<tikr_backtest::mark::MarkSeries>,
+    /// Optional inventory-aware order-size boost (runner-side, applies to
+    /// every strategy). When `Some`, the reducing side's order size is scaled
+    /// up on a curve as inventory approaches the per-bot cap. `None` (default)
+    /// = no boost; sizes pass through untouched. See [`InventoryBoostConfig`].
+    pub inventory_boost: Option<InventoryBoostConfig>,
+}
+
+/// Inventory-aware order-size boost. Scales the *inventory-reducing* side's
+/// order size up on a curve as |position| approaches the cap, so the book
+/// leans harder toward flattening when inventory is heavy. The inventory-
+/// *growing* side is never boosted (and stays bounded by the worst-case gate
+/// in [`apply_bot_inventory_cap`]). Example: short → buys (Bid) are boosted;
+/// long → sells (Ask) are boosted.
+///
+/// The multiplier on the reducing side is
+/// `1 + (max_boost_pct/100) × (|pos_notional|/cap)^curve_exponent`,
+/// clamping the inventory ratio to `[0, 1]`. The denominator is the live
+/// per-bot cap (`max_position_usdt`); when the cap is non-positive the boost
+/// is disabled (no reference to scale against).
+#[derive(Debug, Clone, Copy)]
+pub struct InventoryBoostConfig {
+    /// Extra order size at full inventory (|pos| == cap), as a percent of the
+    /// base size. `100` ≈ up to 2× the base size when maxed; `0` disables.
+    pub max_boost_pct: Decimal,
+    /// Curve exponent applied to the inventory ratio (clamped `0..=1`).
+    /// `1` = linear; `>1` = slow start then steep (boost concentrated near the
+    /// cap); `<1` = fast early ramp. Non-positive is treated as `1`.
+    pub curve_exponent: Decimal,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -213,6 +242,7 @@ impl Default for RunnerConfig {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            inventory_boost: None,
         }
     }
 }
@@ -606,6 +636,9 @@ where
         .as_ref()
         .map(|rx| *rx.borrow())
         .unwrap_or(Decimal::ZERO);
+    // Runner-side inventory-aware order-size boost (applies to every
+    // strategy). Static config; the live cap above is the curve denominator.
+    let inventory_boost = config.inventory_boost;
     let mut last_funding_ts: Option<Timestamp> = None;
     let run_id = make_run_id(&symbol);
 
@@ -763,6 +796,7 @@ where
                             &mut side_fails,
                             config.min_notional,
                             current_max_position,
+                            inventory_boost,
                         ).await;
                     }
                 }
@@ -806,6 +840,7 @@ where
                             &mut side_fails,
                             config.min_notional,
                             current_max_position,
+                            inventory_boost,
                         ).await;
                     }
                 }
@@ -944,9 +979,22 @@ where
                 } else {
                     snapshot_mid(&current_book).unwrap_or(last_mid.0)
                 };
+                let signed_pos_notional = pos.size.0 * cap_price;
+                // Inventory-aware order-size boost runs BEFORE the cap: it only
+                // enlarges the reducing side, which the cap never blocks, so
+                // the worst-case growing-side bound below is unaffected.
+                let actions = match inventory_boost {
+                    Some(boost) => apply_inventory_size_boost(
+                        actions,
+                        signed_pos_notional,
+                        current_max_position,
+                        boost,
+                    ),
+                    None => actions,
+                };
                 let actions = apply_bot_inventory_cap(
                     actions,
-                    pos.size.0 * cap_price,
+                    signed_pos_notional,
                     resting_bid_notional,
                     resting_ask_notional,
                     current_max_position,
@@ -1262,6 +1310,7 @@ where
                             &mut side_fails,
                             config.min_notional,
                             current_max_position,
+                            inventory_boost,
                         )
                         .await;
                     }
@@ -1592,6 +1641,7 @@ where
                     &mut side_fails,
                     config.min_notional,
                     current_max_position,
+                    inventory_boost,
                 )
                 .await;
                 // Publish AFTER local mirror has dropped the filled order and
@@ -1913,6 +1963,66 @@ fn apply_bot_inventory_cap(
     out
 }
 
+/// Scale the inventory-*reducing* side's Quote sizes up on a curve as the
+/// signed position approaches the per-bot cap, leaving the growing side and
+/// all non-Quote actions untouched. See [`InventoryBoostConfig`].
+///
+/// `signed_pos_notional` is the current signed position notional (+ = long);
+/// `cap` is the per-bot position cap (the same value fed to
+/// [`apply_bot_inventory_cap`]). A non-positive cap or `max_boost_pct`
+/// disables the boost. The boosted size is rounded back to the original
+/// size's decimal scale to stay on the venue lot grid, and never shrinks a
+/// quote below its original size.
+fn apply_inventory_size_boost(
+    actions: Vec<tikr_strategy::Action>,
+    signed_pos_notional: Decimal,
+    cap: Decimal,
+    cfg: InventoryBoostConfig,
+) -> Vec<tikr_strategy::Action> {
+    if cfg.max_boost_pct <= Decimal::ZERO || cap <= Decimal::ZERO {
+        return actions;
+    }
+    // Reducing side: a long (+) is reduced by Ask sells; a short (-) by Bid
+    // buys. Flat → nothing to reduce, pass through.
+    let reducing_side = match signed_pos_notional.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Greater => Side::Ask,
+        std::cmp::Ordering::Less => Side::Bid,
+        std::cmp::Ordering::Equal => return actions,
+    };
+    let ratio = (signed_pos_notional.abs() / cap).min(Decimal::ONE);
+    let exponent = if cfg.curve_exponent > Decimal::ZERO {
+        cfg.curve_exponent
+    } else {
+        Decimal::ONE
+    };
+    let curved = if exponent == Decimal::ONE {
+        ratio
+    } else {
+        ratio.powd(exponent)
+    };
+    let mult = Decimal::ONE + (cfg.max_boost_pct / Decimal::from(100)) * curved;
+    if mult <= Decimal::ONE {
+        return actions;
+    }
+    actions
+        .into_iter()
+        .map(|action| {
+            if let tikr_strategy::Action::Quote(mut intent) = action {
+                if intent.side == reducing_side {
+                    let scale = intent.size.0.scale();
+                    let boosted = (intent.size.0 * mult).round_dp(scale);
+                    if boosted > intent.size.0 {
+                        intent.size = tikr_core::Size(boosted);
+                    }
+                }
+                tikr_strategy::Action::Quote(intent)
+            } else {
+                action
+            }
+        })
+        .collect()
+}
+
 /// Dispatch a list of post-fill strategy actions into `fill_sim` and,
 /// optionally, the live venue.
 ///
@@ -1939,21 +2049,30 @@ async fn dispatch_post_fill_actions<V, S>(
     side_fails: &mut HashMap<String, (u32, u32)>,
     min_notional: Decimal,
     max_position: Decimal,
+    inventory_boost: Option<InventoryBoostConfig>,
 ) where
     V: Venue,
     S: Strategy,
 {
-    // Bot-side worst-case inventory cap: SimpleGap/MMR-style refills flow
-    // through this path, so apply the same order-placement gate as the main
-    // loop. Resting same-side exposure comes from FillSim's live quotes; sum
-    // it before dispatching (drops the borrow before the `&mut fill_sim` use
+    // Inventory-aware order-size boost + bot-side worst-case inventory cap:
+    // SimpleGap/MMR-style refills flow through this path, so apply the same
+    // size boost (reducing side) and order-placement gate as the main loop.
+    // Resting same-side exposure comes from FillSim's live quotes; sum it
+    // before dispatching (drops the borrow before the `&mut fill_sim` use
     // below).
     let actions: Vec<tikr_strategy::Action> = match snapshot_mid(current_book) {
         Some(mid) if max_position > Decimal::ZERO => {
+            let signed_pos_notional = post_fill_pos.size.0 * mid;
+            let actions = match inventory_boost {
+                Some(boost) => {
+                    apply_inventory_size_boost(actions, signed_pos_notional, max_position, boost)
+                }
+                None => actions,
+            };
             let (resting_bid, resting_ask) = fill_sim.committed_notional_by_side(symbol);
             apply_bot_inventory_cap(
                 actions,
-                post_fill_pos.size.0 * mid,
+                signed_pos_notional,
                 resting_bid,
                 resting_ask,
                 max_position,
@@ -2484,6 +2603,96 @@ mod tests {
         assert_eq!(count_quotes(&out), 10);
     }
 
+    fn quote_size(action: &tikr_strategy::Action) -> Decimal {
+        match action {
+            tikr_strategy::Action::Quote(q) => q.size.0,
+            _ => Decimal::ZERO,
+        }
+    }
+
+    // Quote with an explicit scale-3 lot size (1.000), so the boost's
+    // round-to-original-scale leaves it on a 0.001 grid (realistic lot step).
+    fn boost_quote(side: Side) -> tikr_strategy::Action {
+        tikr_strategy::Action::Quote(QuoteIntent {
+            symbol: cap_test_symbol(),
+            side,
+            price: Price(Decimal::from(100)),
+            size: Size(Decimal::new(1000, 3)), // 1.000
+            tif: tikr_core::TimeInForce::PostOnly,
+            kind: tikr_core::QuoteKind::Point,
+        })
+    }
+
+    #[test]
+    fn inventory_boost_scales_reducing_side_only() {
+        // Short -$300 against a $600 cap → ratio 0.5, linear, 100% max boost
+        // → reducing side (Bid) ×1.5; growing side (Ask) untouched.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::ONE,
+        };
+        let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(-300), Decimal::from(600), boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(1500, 3)); // 1.000 × 1.5
+        assert_eq!(quote_size(&out[1]), Decimal::new(1000, 3)); // ask unchanged
+    }
+
+    #[test]
+    fn inventory_boost_long_scales_sells() {
+        // Long at full cap → ratio 1.0, 50% boost → Ask ×1.5, Bid untouched.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(50),
+            curve_exponent: Decimal::ONE,
+        };
+        let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(600), Decimal::from(600), boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(1000, 3)); // bid unchanged
+        assert_eq!(quote_size(&out[1]), Decimal::new(1500, 3)); // 1.000 × 1.5
+    }
+
+    #[test]
+    fn inventory_boost_curve_exponent_dampens_midrange() {
+        // Ratio 0.5, exponent 2 → curve = 0.25, 100% max → ×1.25 (vs ×1.5
+        // linear). Verifies the curve concentrates boost near the cap.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::from(2),
+        };
+        let actions = vec![boost_quote(Side::Bid)];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(-300), Decimal::from(600), boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(1250, 3)); // 1.000 × 1.25
+    }
+
+    #[test]
+    fn inventory_boost_flat_and_disabled_are_noops() {
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::ONE,
+        };
+        // Flat position: nothing to reduce.
+        let flat = apply_inventory_size_boost(
+            vec![boost_quote(Side::Bid)],
+            Decimal::ZERO,
+            Decimal::from(600),
+            boost,
+        );
+        assert_eq!(quote_size(&flat[0]), Decimal::new(1000, 3));
+        // Zero max_boost_pct disables.
+        let off = apply_inventory_size_boost(
+            vec![boost_quote(Side::Bid)],
+            Decimal::from(-600),
+            Decimal::from(600),
+            InventoryBoostConfig {
+                max_boost_pct: Decimal::ZERO,
+                curve_exponent: Decimal::ONE,
+            },
+        );
+        assert_eq!(quote_size(&off[0]), Decimal::new(1000, 3));
+    }
+
     struct MockVenue {
         events: Mutex<Option<Vec<MarketEvent>>>,
         infinite: bool,
@@ -2626,6 +2835,7 @@ mod tests {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            inventory_boost: None,
         }
     }
 
@@ -3211,6 +3421,7 @@ mod tests {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            inventory_boost: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -3309,6 +3520,7 @@ mod tests {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            inventory_boost: None,
         };
         let (_tx, rx) = watch::channel(false);
 

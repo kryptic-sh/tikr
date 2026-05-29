@@ -32,6 +32,71 @@ use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
 use tracing::info;
 
+/// Venue environment for `--autodetect-filters` exchangeInfo lookups. Local
+/// (not `tikr_binance::BinanceEnv`) because tikr-binance depends on tikr-paper,
+/// so this crate can't depend back on it — the fetch is done inline here.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EnvArg {
+    #[value(name = "spot-mainnet")]
+    SpotMainnet,
+    #[value(name = "futures-mainnet")]
+    FuturesMainnet,
+    #[value(name = "spot-testnet")]
+    SpotTestnet,
+    #[value(name = "futures-testnet")]
+    FuturesTestnet,
+}
+
+impl EnvArg {
+    fn base_url(self) -> &'static str {
+        match self {
+            EnvArg::SpotMainnet => "https://api.binance.com",
+            EnvArg::FuturesMainnet => "https://fapi.binance.com",
+            EnvArg::SpotTestnet => "https://testnet.binance.vision",
+            EnvArg::FuturesTestnet => "https://testnet.binancefuture.com",
+        }
+    }
+    fn is_futures(self) -> bool {
+        matches!(self, EnvArg::FuturesMainnet | EnvArg::FuturesTestnet)
+    }
+}
+
+/// Fetch `exchangeInfo` for `env` and return `(tick_size, step_size,
+/// min_notional)` strings for `symbol`, or `None` if the symbol isn't listed
+/// or the fetch/parse fails. Inline (no tikr-binance dep — see [`EnvArg`]).
+async fn autodetect_filters(env: EnvArg, symbol: &str) -> Option<(String, String, String)> {
+    let path = if env.is_futures() {
+        "/fapi/v1/exchangeInfo"
+    } else {
+        "/api/v3/exchangeInfo"
+    };
+    let url = format!("{}{}", env.base_url(), path);
+    let resp = reqwest::Client::new().get(&url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let want = symbol.to_uppercase();
+    let syms = json.get("symbols")?.as_array()?;
+    let s = syms
+        .iter()
+        .find(|s| s.get("symbol").and_then(|v| v.as_str()) == Some(want.as_str()))?;
+    let filters = s.get("filters")?.as_array()?;
+    let mut tick = None;
+    let mut step = None;
+    let mut min_notional = None;
+    for f in filters {
+        match f.get("filterType").and_then(|v| v.as_str()) {
+            Some("PRICE_FILTER") => {
+                tick = f.get("tickSize").and_then(|v| v.as_str()).map(String::from)
+            }
+            Some("LOT_SIZE") => step = f.get("stepSize").and_then(|v| v.as_str()).map(String::from),
+            Some("MIN_NOTIONAL") | Some("NOTIONAL") => {
+                min_notional = f.get("notional").and_then(|v| v.as_str()).map(String::from)
+            }
+            _ => {}
+        }
+    }
+    Some((tick?, step?, min_notional?))
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum StrategyArg {
     #[value(name = "avellaneda-stoikov", alias = "as")]
@@ -52,7 +117,7 @@ enum StrategyArg {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "run_backtest",
+    name = "backtest",
     about = "Replay recorded parquet data through a strategy and emit a P&L report"
 )]
 struct Args {
@@ -69,6 +134,18 @@ struct Args {
     #[arg(long, value_enum, default_value = "avellaneda-stoikov")]
     strategy: StrategyArg,
 
+    /// Auto-detect price tick / lot step / min-notional from Binance
+    /// `exchangeInfo` for `--symbol` (overrides --tick-size and the per-
+    /// strategy step/min-notional flags). On by default; needs network. Use
+    /// `--no-autodetect-filters` to rely purely on the CLI values (offline).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    autodetect_filters: bool,
+
+    /// Venue env used only for `--autodetect-filters` exchangeInfo lookup.
+    /// Default `futures-mainnet` (USDC/USDT perps).
+    #[arg(long, value_enum, default_value = "futures-mainnet")]
+    venue_env: EnvArg,
+
     /// Order size per quote.
     #[arg(long, default_value = "0.001")]
     size: String,
@@ -84,16 +161,26 @@ struct Args {
 
     /// Order submit (and cancel) latency in ms. Models the book moving
     /// while an order is in flight: a post-only that crosses the touch on
-    /// arrival is rejected (Binance -5022), exercising on_quote_rejected.
-    /// `0` (default) = instant placement (optimistic).
-    #[arg(long, default_value_t = 0u64)]
+    /// arrival is rejected (Binance -5022), exercising on_quote_rejected, and
+    /// a cancel that lands late can still get filled. Default `100` — a
+    /// realistic retail WS→decision→REST round-trip to Binance; passing `0`
+    /// gives the optimistic instant-fill model (not recommended).
+    #[arg(long, default_value_t = 100u64)]
     submit_latency_ms: u64,
 
     /// Mean exponential latency jitter (ms) added per op on top of
     /// `--submit-latency-ms`. Models network jitter + occasional spikes
-    /// (the exponential tail). `0` (default) = fixed latency, deterministic.
-    #[arg(long, default_value_t = 0u64)]
+    /// (the exponential tail). Default `50`; `0` = fixed latency, deterministic.
+    #[arg(long, default_value_t = 50u64)]
     submit_latency_jitter_ms: u64,
+
+    /// Measure real round-trip latency to the venue at startup (10 pings) and
+    /// use the mean as submit/cancel latency and the stddev as jitter,
+    /// OVERRIDING --submit-latency-ms / --submit-latency-jitter-ms. On by
+    /// default so a run always reflects this machine's actual link to Binance.
+    /// `--no-measure-latency` keeps the static CLI values (offline runs).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    measure_latency: bool,
 
     /// Funding rate per interval as a fraction (e.g. 0.0001 = 1bp/8h).
     /// Positive = longs pay shorts. `0` (default) = funding off. Charged on
@@ -139,6 +226,14 @@ struct Args {
     /// (0-100). `0` = uncapped.
     #[arg(long, default_value = "0")]
     max_position_pct: String,
+    /// Inventory-aware order-size boost: extra size on the reducing side at
+    /// full inventory, as a percent of base size. `0` (default) disables.
+    #[arg(long, default_value = "0")]
+    inventory_boost_pct: String,
+    /// Curve exponent for the inventory boost (|pos|/cap ratio). `1` = linear,
+    /// `>1` = slow start then steep, `<1` = fast early ramp.
+    #[arg(long, default_value = "1")]
+    inventory_boost_curve: String,
 
     // --- A-S / GLFT spread ---
     /// Half-spread in bps (used by A-S + GLFT).
@@ -276,7 +371,72 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Auto-detect tick/step/min-notional from the venue's exchangeInfo so the
+    // backtest geometry matches the live market without hand-passing filters.
+    // Overrides --tick-size + the per-strategy step/min-notional flags. Falls
+    // back to the CLI values (with a warning) if the lookup fails.
+    if args.autodetect_filters {
+        match autodetect_filters(args.venue_env, &args.symbol).await {
+            Some((tick, step, min_notional)) => {
+                info!(
+                    symbol = %args.symbol,
+                    tick = %tick,
+                    step = %step,
+                    min_notional = %min_notional,
+                    "autodetected filters from exchangeInfo"
+                );
+                args.tick_size = tick.clone();
+                args.wv_step_size = step.clone();
+                args.tr_step_size = step.clone();
+                args.mn_step_size = step.clone();
+                args.wv_min_notional = min_notional.clone();
+                args.tr_min_notional = min_notional.clone();
+                args.mn_min_notional = min_notional;
+            }
+            None => {
+                eprintln!(
+                    "warning: could not autodetect filters for {} on {:?}; using CLI values \
+                     (--tick-size {}, step/min per strategy). Pass --no-autodetect-filters to silence.",
+                    args.symbol, args.venue_env, args.tick_size
+                );
+            }
+        }
+    }
+
+    // Measure this machine's real round-trip latency to the venue (10 pings)
+    // and use mean → submit/cancel latency, stddev → jitter. Keeps the fill
+    // sim honest about how long orders are in flight (and how stale a cancel
+    // is) instead of a guessed constant. Falls back to the CLI values on
+    // failure.
+    if args.measure_latency {
+        match tikr_paper::probe::measure_api_latency(
+            args.venue_env.base_url(),
+            args.venue_env.is_futures(),
+            10,
+        )
+        .await
+        {
+            Some((mean_ms, jitter_ms)) => {
+                info!(
+                    mean_ms,
+                    jitter_ms,
+                    samples = 10,
+                    "measured venue latency (mean → submit/cancel, stddev → jitter)"
+                );
+                args.submit_latency_ms = mean_ms;
+                args.submit_latency_jitter_ms = jitter_ms;
+            }
+            None => {
+                eprintln!(
+                    "warning: latency probe to {:?} failed; using static --submit-latency-ms {} \
+                     / jitter {}. Pass --no-measure-latency to silence.",
+                    args.venue_env, args.submit_latency_ms, args.submit_latency_jitter_ms
+                );
+            }
+        }
+    }
 
     let (base_str, quote_str) = split_symbol(&args.symbol);
     let symbol = Symbol {
@@ -317,6 +477,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // them in sync as the balance grows.
     let order_balance_pct = Decimal::from_str(&args.order_balance_pct)?;
     let max_position_pct = Decimal::from_str(&args.max_position_pct)?;
+    let inventory_boost_pct = Decimal::from_str(&args.inventory_boost_pct)?;
+    let inventory_boost = if inventory_boost_pct > Decimal::ZERO {
+        Some(tikr_paper::InventoryBoostConfig {
+            max_boost_pct: inventory_boost_pct,
+            curve_exponent: Decimal::from_str(&args.inventory_boost_curve)?,
+        })
+    } else {
+        None
+    };
     let hundred = Decimal::from(100);
     let balance_notional = if initial_balance > Decimal::ZERO && order_balance_pct > Decimal::ZERO {
         Some((initial_balance * order_balance_pct / hundred).round_dp(8))
@@ -395,6 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_expected_open_orders: 2,
         liquidation,
         mark_series: None,
+        inventory_boost,
     };
 
     // No shutdown trigger — replay ends naturally when events exhaust.

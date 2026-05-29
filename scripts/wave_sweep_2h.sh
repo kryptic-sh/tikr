@@ -6,7 +6,7 @@ DATA="${1:-./data/2h/ETHUSDT}"
 SYM="${2:-ETHUSDT}"
 TICK="${3:-0.01}"
 STEP="${4:-0.001}"
-BIN="./target/release/run_backtest"
+BIN="./target/release/backtest"
 
 echo -e "levels\tdrain\tatr_mult\tatr_p\tbar_s\trelat_n\tskew\tnet\tfills\tunrl\tpeak"
 for LV in 8 12 16; do

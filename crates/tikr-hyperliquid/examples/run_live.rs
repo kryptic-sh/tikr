@@ -242,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_expected_open_orders: 2,
         liquidation: None,
         mark_series: None,
+        inventory_boost: None,
     };
 
     let report = run_with_resume(

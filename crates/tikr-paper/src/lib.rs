@@ -38,6 +38,7 @@ pub mod alerts;
 pub mod live;
 pub mod metrics;
 pub mod multi;
+pub mod probe;
 pub mod report;
 pub mod runner;
 pub mod spawn;
@@ -50,6 +51,8 @@ pub use live::LiveSnapshot;
 pub use metrics::MetricRegistry;
 pub use multi::{MultiPaperReport, MultiSymbolRun, run_multi};
 pub use report::{PaperReport, SCHEMA_VERSION};
-pub use runner::{FundingConfig, RunnerConfig, SkimConfig, run, run_with_resume};
+pub use runner::{
+    FundingConfig, InventoryBoostConfig, RunnerConfig, SkimConfig, run, run_with_resume,
+};
 pub use spawn::{BotHandle, BotSpec, StrategyChoice, live_runner_config, spawn_bot};
 pub use state::write_snapshot;

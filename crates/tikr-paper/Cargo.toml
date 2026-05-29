@@ -14,6 +14,7 @@ readme.workspace = true
 
 [dependencies]
 tikr-core = "0.1"
+rust_decimal = { version = "1", features = ["maths"] }
 tikr-venue = "0.1"
 tikr-strategy = "0.1"
 tikr-hyperliquid = "0.1"
@@ -43,8 +44,8 @@ name = "supervisor"
 path = "src/bin/supervisor.rs"
 
 [[bin]]
-name = "run_backtest"
-path = "src/bin/run_backtest.rs"
+name = "backtest"
+path = "src/bin/backtest.rs"
 
 [[bin]]
 name = "compare"

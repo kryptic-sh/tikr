@@ -8,7 +8,7 @@ use std::str::FromStr;
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
-use tikr_paper::{BotSpec, RunnerConfig, StrategyChoice};
+use tikr_paper::{BotSpec, InventoryBoostConfig, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MantisConfig,
     MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
@@ -32,6 +32,7 @@ pub fn to_spec(
     notional_rx: Option<watch::Receiver<Decimal>>,
     max_position_rx: Option<watch::Receiver<Decimal>>,
     max_position_usdt_default: Decimal,
+    inventory_boost: Option<InventoryBoostConfig>,
 ) -> Result<BotSpec> {
     let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
@@ -134,6 +135,9 @@ pub fn to_spec(
         max_expected_open_orders: max_open_orders_for(cfg),
         liquidation: None,
         mark_series: None,
+        // Inventory-aware order-size boost — account-level, applied to every
+        // strategy by the runner (scales the reducing side up on a curve).
+        inventory_boost,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

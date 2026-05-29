@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use rust_decimal::Decimal;
 use tikr_binance::BinanceClient;
-use tikr_paper::BotHandle;
+use tikr_paper::{BotHandle, InventoryBoostConfig};
 use tikr_venue::Venue;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -42,6 +42,9 @@ pub struct SupervisorCtx {
     /// Drives `max_position_usdt` defaults handed to strategies that don't set
     /// their own cap in TOML.
     pub max_position_pct: Decimal,
+    /// Optional account-level inventory-aware order-size boost, forwarded to
+    /// every bot's `RunnerConfig`. `None` = disabled.
+    pub inventory_boost: Option<InventoryBoostConfig>,
     /// Live per-bot notional updates from the account balance poller.
     pub notional_rx: watch::Receiver<Decimal>,
     /// Live per-bot position-cap updates from the account balance poller.
@@ -255,6 +258,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         Some(ctx.notional_rx.clone()),
         Some(ctx.max_position_rx.clone()),
         max_pos_default,
+        ctx.inventory_boost,
     )?;
 
     // Resume path (--clear OFF): seed the strategy's local position

@@ -4,7 +4,7 @@
 set -euo pipefail
 DATA="./data/2h/ETHUSDT"
 SYM="ETHUSDT"
-BIN="./target/release/run_backtest"
+BIN="./target/release/backtest"
 TICK="0.01"
 NOTIONAL="10"
 STEP="0.001"

@@ -32,6 +32,9 @@ pub struct RotationAccountCtx {
     /// Wallet percent for per-bot peak-position cap (used by
     /// strategies that don't set their own `max_position_usdt`).
     pub max_position_pct: Decimal,
+    /// Optional account-level inventory-aware order-size boost, forwarded to
+    /// every spawned bot.
+    pub inventory_boost: Option<tikr_paper::InventoryBoostConfig>,
     /// Account-derived notional updates.
     pub notional_rx: watch::Receiver<Decimal>,
     /// Account-derived per-bot position cap updates.
@@ -245,6 +248,7 @@ fn spawn_one_bot(
             order_balance_pct: account.order_balance_pct,
             leverage: account.leverage,
             max_position_pct: account.max_position_pct,
+            inventory_boost: account.inventory_boost,
             notional_rx: account.notional_rx.clone(),
             max_position_rx: account.max_position_rx.clone(),
             bnb_price_rx: account.bnb_price_rx.clone(),
