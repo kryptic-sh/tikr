@@ -55,6 +55,12 @@ asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
+# Inventory-aware order-size boost (off). Scales the inventory-reducing side's
+# order size up on a curve as |pos| nears the cap: 1 + (pct/100)·(|pos|/cap)^curve.
+# OFF by default — latency-on backtests show it cuts net in normal regimes and
+# barely moves peak (the cap already binds); it's a trend hedge, not an edge.
+inventory_boost_pct = "0"
+inventory_boost_curve = "1"
 
 # ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
 # Replaces SOLUSDC. ~19% 24h range, ~$42M vol — most ZEC-like (high vol +

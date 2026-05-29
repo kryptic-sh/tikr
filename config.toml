@@ -60,6 +60,18 @@ asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5
+# Inventory-aware order-size boost (runner-side, every strategy). Scales the
+# inventory-REDUCING side's order size up on a curve as |position| approaches
+# the per-bot cap: multiplier = 1 + (pct/100)·(|pos|/cap)^curve.
+#   inventory_boost_pct:   extra size at full inventory, % of base (0 = off).
+#   inventory_boost_curve: 1 = linear, >1 = concentrated near the cap.
+# OFF by default: latency-on backtests show it's a tail-risk hedge, NOT a
+# profit enhancer — it cuts net in ranging/normal regimes (over-trades the
+# reducing side) and barely moves peak once fills are realistic (the cap
+# already binds). Only raise it when deliberately hedging a known one-way
+# trend; re-backtest the value on frozen data + fixed latency before trusting.
+inventory_boost_pct = "0"
+inventory_boost_curve = "1"
 
 # ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
 # Replaces SOLUSDC. ~19% 24h range, ~$42M vol — most ZEC-like (high vol +
@@ -99,15 +111,15 @@ refill_threshold = 2
 inner_bps = 5
 step_bps = 5
 
-# ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
-# Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
-# little wave oscillation). SUI: ZEC-like vol (~12% range) + strong liquidity
-# (~$19M). Unvalidated.
-[[bot]]
-symbol = "SUIUSDC"
-strategy = "wave"
-[bot.wave]
-grid_levels = 4
-refill_threshold = 2
-inner_bps = 5
-step_bps = 5
+# # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
+# # Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
+# # little wave oscillation). SUI: ZEC-like vol (~12% range) + strong liquidity
+# # (~$19M). Unvalidated.
+# [[bot]]
+# symbol = "SUIUSDC"
+# strategy = "wave"
+# [bot.wave]
+# grid_levels = 4
+# refill_threshold = 2
+# inner_bps = 5
+# step_bps = 5
