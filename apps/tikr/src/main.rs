@@ -62,7 +62,7 @@ struct Args {
     minutes: u32,
 
     /// Override [account].order_balance_pct for computed per-order notional.
-    /// Split evenly across configured bots. Example: 10 with 2 bots = 5% each.
+    /// Per-bot, NOT split: every bot orders this percent of wallet.
     #[arg(long)]
     order_balance_pct: Option<Decimal>,
 
@@ -126,7 +126,6 @@ struct AccountPollerConfig {
     api_key: String,
     key_material: Arc<tikr_binance::BinanceKeyMaterial>,
     symbols: Vec<String>,
-    bot_count: usize,
     order_balance_pct: Decimal,
     /// Margin asset polled for wallet balance + displayed in TUI.
     /// Typically "USDT" for USDT-M perps, "USDC" for USDC-M.
@@ -300,7 +299,6 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     } else {
                         symbols
                     };
-                    let bot_count = Decimal::from(cfg.bot_count.max(1) as u64);
                     // Total balance for sizing = USDT wallet + BNB value
                     // (when BNB-fee mode is on). BNB held in the futures
                     // wallet for fee payment IS spendable capital — count
@@ -314,10 +312,11 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                         Decimal::ZERO
                     };
                     let total_balance = balance.wallet_balance + bnb_value_usdt;
-                    // Sizing is purely wallet-relative — leverage only
-                    // affects the Binance POST /fapi/v1/leverage call.
-                    let notional =
-                        total_balance * cfg.order_balance_pct / Decimal::from(100) / bot_count;
+                    // Sizing is purely wallet-relative and per-bot (NOT split
+                    // across bots) — mirrors max_position_pct below: 1% means
+                    // each bot orders 1% of wallet. Leverage only affects the
+                    // Binance POST /fapi/v1/leverage call.
+                    let notional = total_balance * cfg.order_balance_pct / Decimal::from(100);
                     if notional != *cfg.notional_tx.borrow() {
                         let _ = cfg.notional_tx.send(notional);
                     }
@@ -502,19 +501,6 @@ async fn main() -> anyhow::Result<()> {
     // Subscribers (user_stream parser, refill task) read latest via `borrow()`.
     let (bnb_price_tx, bnb_price_rx) = watch::channel(Decimal::ZERO);
 
-    let total_slots = cfg
-        .scalp_rotation
-        .as_ref()
-        .filter(|r| r.enabled)
-        .map(|r| r.slots)
-        .unwrap_or(0)
-        + cfg
-            .static_grid_rotation
-            .as_ref()
-            .filter(|r| r.enabled)
-            .map(|r| r.slots)
-            .unwrap_or(0);
-
     // Margin asset priority:
     // 1. tide_auto.quote_asset (when auto-rotation enabled)
     // 2. account.asset (explicit override for fixed-bot configs)
@@ -534,7 +520,6 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         key_material: key_material.clone(),
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
-        bot_count: total_slots.max(1),
         order_balance_pct: cfg.account.order_balance_pct,
         wallet_asset,
         shutdown: global_shutdown_rx.clone(),
@@ -639,7 +624,6 @@ async fn main() -> anyhow::Result<()> {
                 order_balance_pct: cfg.account.order_balance_pct,
                 leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
-                bot_count: cfg.bots.len(),
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
                 bnb_price_rx: bnb_price_rx.clone(),

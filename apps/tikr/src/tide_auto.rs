@@ -252,11 +252,6 @@ fn spawn_one_bot(
             order_balance_pct: account.order_balance_pct,
             leverage: account.leverage,
             max_position_pct: account.max_position_pct,
-            // bot_count: best-effort estimate. Real per-bot notional
-            // comes from notional_rx which is wallet-derived divided
-            // by total_slots in main.rs; for auto-mode we lean on
-            // the per-bot cap rather than precise notional sizing.
-            bot_count: 1,
             notional_rx: account.notional_rx.clone(),
             max_position_rx: account.max_position_rx.clone(),
             bnb_price_rx: account.bnb_price_rx.clone(),

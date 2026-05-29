@@ -38,12 +38,10 @@ pub struct SupervisorCtx {
     pub order_balance_pct: Decimal,
     /// Per-symbol Binance leverage, sent at venue build time.
     pub leverage: u32,
-    /// Wallet percent for the per-bot peak-position cap (split by
-    /// `bot_count`). Drives `max_position_usdt` defaults handed to
-    /// strategies that don't set their own cap in TOML.
+    /// Wallet percent for the per-bot peak-position cap (per-bot, NOT split).
+    /// Drives `max_position_usdt` defaults handed to strategies that don't set
+    /// their own cap in TOML.
     pub max_position_pct: Decimal,
-    /// Number of configured bots sharing the account allocation.
-    pub bot_count: usize,
     /// Live per-bot notional updates from the account balance poller.
     pub notional_rx: watch::Receiver<Decimal>,
     /// Live per-bot position-cap updates from the account balance poller.
@@ -240,8 +238,8 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     .await?;
 
     let default_notional = default_order_notional(&venue_for_run, ctx).await?;
-    // Derive max_pos from the same wallet × mult source as default_notional:
-    //   max_pos = wallet × mult × max_position_pct / 100 / bot_count
+    // Derive max_pos from the same wallet source as default_notional:
+    //   max_pos = wallet × max_position_pct / 100
     //          = default_notional × (max_position_pct / order_balance_pct)
     let max_pos_default = if ctx.order_balance_pct > Decimal::ZERO {
         default_notional * ctx.max_position_pct / ctx.order_balance_pct
@@ -335,8 +333,9 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
 
 async fn default_order_notional(venue: &BinanceClient, ctx: &SupervisorCtx) -> Result<Decimal> {
     let balance = venue.futures_balance("USDT").await?;
-    let bot_count = Decimal::from(ctx.bot_count.max(1) as u64);
-    Ok(balance.wallet_balance * ctx.order_balance_pct / Decimal::from(100) / bot_count)
+    // Per-bot, NOT split across bots — 1% means each bot orders 1% of wallet,
+    // mirroring max_position_pct. Leverage only sets the margin backstop.
+    Ok(balance.wallet_balance * ctx.order_balance_pct / Decimal::from(100))
 }
 
 pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {

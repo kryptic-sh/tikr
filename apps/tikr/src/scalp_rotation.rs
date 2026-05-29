@@ -165,7 +165,7 @@ async fn update_active_set(
         }
         bots.insert(
             symbol.clone(),
-            spawn_one_bot(template, symbol, account, shared_state, slots),
+            spawn_one_bot(template, symbol, account, shared_state),
         );
     }
     ActiveSet {
@@ -218,7 +218,6 @@ fn spawn_one_bot(
     symbol: &str,
     account: &RotationAccountCtx,
     shared_state: &SharedBotState,
-    slots: usize,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut cfg = template.clone();
@@ -246,7 +245,6 @@ fn spawn_one_bot(
             order_balance_pct: account.order_balance_pct,
             leverage: account.leverage,
             max_position_pct: account.max_position_pct,
-            bot_count: slots,
             notional_rx: account.notional_rx.clone(),
             max_position_rx: account.max_position_rx.clone(),
             bnb_price_rx: account.bnb_price_rx.clone(),

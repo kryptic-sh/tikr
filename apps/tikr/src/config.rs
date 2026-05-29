@@ -149,10 +149,11 @@ pub struct AccountConfig {
     /// snapshots under a subdir keyed by symbol.
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
-    /// Percent of wallet balance allocated to orders across all bots.
-    /// Split evenly by bot count when a bot's strategy does not set
-    /// `notional`. Strictly wallet-relative — leverage does NOT scale
-    /// this; set `leverage` separately for Binance-side margin
+    /// Percent of wallet balance each bot allocates to orders. PER-BOT,
+    /// NOT split across bots — `1` means every bot orders 1% of wallet
+    /// (mirrors `max_position_pct`). Applied when a bot's strategy does
+    /// not set `notional`. Strictly wallet-relative — leverage does NOT
+    /// scale this; set `leverage` separately for Binance-side margin
     /// configuration.
     #[serde(default = "default_order_balance_pct")]
     pub order_balance_pct: Decimal,
@@ -434,7 +435,7 @@ fn rsi_mr_default_max_hold_bars() -> u32 {
 pub struct JokerParams {
     /// Per-order notional in quote currency. When omitted, the
     /// account-derived default applies
-    /// (`account.order_balance_pct × wallet / bots`).
+    /// (`account.order_balance_pct × wallet`, per-bot).
     #[serde(default)]
     pub notional: Option<Decimal>,
     /// Cancel any open order older than this many seconds since its
@@ -464,7 +465,7 @@ fn joker_default_order_tick_tolerance() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TideParams {
     /// Per-order notional in USDT. When omitted, the account-derived
-    /// default applies (`account.order_balance_pct × wallet / bots`).
+    /// default applies (`account.order_balance_pct × wallet`, per-bot).
     #[serde(default)]
     pub notional: Option<Decimal>,
     /// Grid depth per side. `1` = single order at touch (classic),
@@ -721,7 +722,7 @@ fn hydra_default_dca_size_mult() -> Decimal {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SgParams {
-    /// Fiat notional per order. Defaults to account-level balance percent split.
+    /// Fiat notional per order. Defaults to account-level balance percent (per-bot).
     #[serde(default)]
     pub notional: Option<Decimal>,
     /// Levels per side (total orders = `2 × levels`).
