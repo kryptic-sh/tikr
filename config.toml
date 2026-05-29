@@ -71,9 +71,10 @@ leverage = 5
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 6
-refill_threshold = 3
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+inner_bps = 5
+step_bps = 2
 step_increment_bps = 0
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
@@ -84,9 +85,10 @@ step_increment_bps = 0
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 6
-refill_threshold = 3
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+inner_bps = 5
+step_bps = 2
 step_increment_bps = 0
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
@@ -97,9 +99,10 @@ step_increment_bps = 0
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 6
-refill_threshold = 3
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+inner_bps = 5
+step_bps = 2
 step_increment_bps = 0
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
@@ -110,7 +113,8 @@ step_increment_bps = 0
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 6
-refill_threshold = 3
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+inner_bps = 5
+step_bps = 2
 step_increment_bps = 0

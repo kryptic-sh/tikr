@@ -42,11 +42,18 @@ pub struct WaveConfig {
     /// Lattice slots per side. Default 12.
     pub grid_levels: u32,
 
-    /// Lattice geometry in bps of mid — drives BOTH the inner self-spread
-    /// (gap from mid to the first order on each side) AND the spacing
-    /// between levels. Snapped to tick (min 1 tick). `0` = 1-tick lattice
-    /// with no inner gap (origins at the touch).
+    /// Level spacing in bps of mid — the gap between consecutive lattice
+    /// levels. Snapped to tick (min 1 tick). `0` = 1-tick lattice. The inner
+    /// self-spread (mid → first order) is set by `inner_bps`, or, when that is
+    /// 0, defaults to `step_bps / 2` each side (legacy behavior).
     pub step_bps: u32,
+
+    /// Inner self-spread in bps of mid: the distance from mid to the FIRST
+    /// order on each side (where the frozen origins sit), independent of the
+    /// `step_bps` level spacing. e.g. `inner_bps=2, step_bps=5` → first order
+    /// 2bps off mid, then levels 5bps apart (2,7,12,…). `0` (default) = legacy
+    /// behavior: inner = `step_bps / 2` each side. Snapped to tick.
+    pub inner_bps: u32,
 
     /// Progressive lattice: extra bps added to each successive level's gap,
     /// so the lattice starts tight near the (frozen) origin and widens
@@ -146,7 +153,7 @@ impl Wave {
         best_ask: Option<Price>,
     ) -> (Option<Price>, Option<Price>) {
         let tick = self.config.tick_size;
-        let spread_active = self.config.step_bps > 0;
+        let spread_active = self.config.step_bps > 0 || self.config.inner_bps > 0;
         if let (Some(bp), Some(ap)) = (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
@@ -154,7 +161,13 @@ impl Wave {
             && spread_active
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
-            let required_half = mid * Decimal::from(self.config.step_bps) / Decimal::from(20_000);
+            // Distance from mid to the first order on each side. Explicit
+            // `inner_bps` when set, else legacy `step_bps / 2`.
+            let required_half = if self.config.inner_bps > 0 {
+                mid * Decimal::from(self.config.inner_bps) / Decimal::from(10_000)
+            } else {
+                mid * Decimal::from(self.config.step_bps) / Decimal::from(20_000)
+            };
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -503,8 +516,10 @@ impl Strategy for Wave {
                 mid = %mid,
                 tick = %self.config.tick_size,
                 step_bps = self.config.step_bps,
+                inner_bps = self.config.inner_bps,
                 step_increment_bps = self.config.step_increment_bps,
                 base_step = %base,
+                inner_offset = %(self.bid_lattice_origin.map(|o| mid - o).unwrap_or_default()),
                 increment = %inc,
                 progressive = inc > Decimal::ZERO,
                 "wave: lattice frozen"
@@ -654,6 +669,7 @@ mod tests {
             min_notional: Decimal::from(5),
             grid_levels: 6,
             step_bps: 10,
+            inner_bps: 0,
             step_increment_bps: 0,
             refill_threshold: 1,
             max_position_usdt: Decimal::ZERO,
@@ -797,6 +813,48 @@ mod tests {
         );
         // And the increment is at least one tick.
         assert!(g2 - g1 >= Decimal::new(1, 2));
+    }
+
+    #[test]
+    fn inner_bps_decouples_first_order_from_step_spacing() {
+        let s = snap(Decimal::from(100), Decimal::new(10002, 2)); // 100 / 100.02
+        let mid = Decimal::new(10001, 2);
+        let sm = sym();
+        let p = pos_flat();
+        let freeze = |c: WaveConfig| {
+            let mut w = Wave::new(c);
+            let _ = w.on_event(
+                &ctx(&sm, &s, &p, &[]),
+                &MarketEvent::BookUpdate {
+                    snapshot: s.clone(),
+                },
+            );
+            let b0 = w.bid_price(0).unwrap();
+            let b1 = w.bid_price(1).unwrap();
+            (mid - b0, b0 - b1) // (inner gap from mid, step gap)
+        };
+        // inner_bps=2 with step_bps=10: first order ~2bps off mid, levels ~10bps.
+        let mut tight = cfg();
+        tight.tick_size = Decimal::new(1, 2);
+        tight.step_bps = 10;
+        tight.inner_bps = 2;
+        let (inner_tight, step_tight) = freeze(tight);
+        // Legacy (inner_bps=0): first order at step_bps/2 = 5bps off mid.
+        let mut legacy = cfg();
+        legacy.tick_size = Decimal::new(1, 2);
+        legacy.step_bps = 10;
+        legacy.inner_bps = 0;
+        let (inner_legacy, step_legacy) = freeze(legacy);
+        // Explicit inner_bps puts the first order CLOSER to mid than step/2.
+        assert!(
+            inner_tight < inner_legacy,
+            "inner_bps=2 ({inner_tight}) must be tighter than step/2 ({inner_legacy})"
+        );
+        // Step spacing is unchanged by inner_bps (both == step_bps geometry).
+        assert_eq!(
+            step_tight, step_legacy,
+            "step spacing independent of inner_bps"
+        );
     }
 
     #[test]

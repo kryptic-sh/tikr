@@ -285,9 +285,13 @@ pub struct WaveParams {
     /// Lattice slots per side. Default 12.
     #[serde(default = "wave_default_grid_levels")]
     pub grid_levels: u32,
-    /// Lattice geometry in bps — inner gap AND level spacing. `0` = 1-tick.
+    /// Level spacing in bps — gap between consecutive levels. `0` = 1-tick.
     #[serde(default)]
     pub step_bps: u32,
+    /// Inner self-spread in bps (mid → first order each side), independent of
+    /// `step_bps` spacing. `0` (default) = legacy (step_bps/2).
+    #[serde(default)]
+    pub inner_bps: u32,
     /// Progressive lattice: extra bps added per successive level so the
     /// lattice widens outward (tight near mid, loose in the tail). `0` =
     /// uniform.

@@ -213,6 +213,11 @@ struct Args {
     /// `0` = uniform (off).
     #[arg(long, default_value_t = 0u32)]
     wv_step_increment_bps: u32,
+
+    /// Wave inner self-spread (bps from mid to the first order each side),
+    /// independent of `--wv-step-bps` spacing. `0` = legacy (step_bps/2).
+    #[arg(long, default_value_t = 0u32)]
+    wv_inner_bps: u32,
     /// Wave: hard position cap in quote notional (suppress add side). 0 = off.
     #[arg(long, default_value = "0")]
     wv_max_position_usdt: String,
@@ -553,6 +558,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_notional: Decimal::from_str(&args.wv_min_notional)?,
                 grid_levels: args.wv_grid_levels,
                 step_bps: args.wv_step_bps,
+                inner_bps: args.wv_inner_bps,
                 step_increment_bps: args.wv_step_increment_bps,
                 refill_threshold: args.wv_refill_threshold,
                 max_position_usdt: match balance_max_position {
