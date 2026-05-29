@@ -1259,15 +1259,13 @@ async fn run_sweep_collect(
         None
     };
 
-    // Hard venue margin backstop (synthetic -2019), mirroring the live note
-    // "Total risk capped by the Binance margin engine + leverage". The
-    // wallet-relative `max_position_pct` soft cap (pushed to the strategy via
-    // `on_max_position_updated`) is the intended binding limit; this hard cap
-    // = `balance × leverage` is what the venue actually enforces, so it still
-    // bounds accumulation strategies that ignore the soft cap (MMR,
-    // LadderReentry). Falls back to the explicit `--sim-max-position-notional`
-    // when compounding is off.
-    let (bc_initial, bc_order_pct, _bc_max_pct) = balance_compounding();
+    // EXCHANGE-layer hard cap (synthetic -2019), simulating the Binance margin
+    // engine: a position may not exceed `balance × leverage` (margin
+    // available). This is the venue backstop. The tighter BOT-layer wallet cap
+    // (`balance × max_position_pct / 100`) is enforced separately, at order
+    // placement, inside the runner. Falls back to the explicit
+    // `--sim-max-position-notional` when compounding is off.
+    let (bc_initial, bc_order_pct, bc_max_pct) = balance_compounding();
     let leverage = Decimal::from_str(&args.leverage)?;
     let hard_position_cap = if bc_initial > Decimal::ZERO && bc_order_pct > Decimal::ZERO {
         Some((bc_initial * leverage).round_dp(8))
@@ -1276,6 +1274,14 @@ async fn run_sweep_collect(
     } else {
         None
     };
+    info!(
+        initial_balance = %bc_initial,
+        order_balance_pct = %bc_order_pct,
+        bot_position_cap_usdt = %(bc_initial * bc_max_pct / Decimal::from(100)),
+        exchange_margin_cap_usdt = ?hard_position_cap,
+        leverage = %leverage,
+        "balance sizing (bot wallet cap enforced at order placement; exchange = balance×leverage)"
+    );
     let sim_cfg_template = FillSimConfig {
         submit_latency_ms: args.sim_submit_latency_ms,
         cancel_latency_ms: args.sim_cancel_latency_ms,
@@ -1293,8 +1299,21 @@ async fn run_sweep_collect(
             None
         },
     };
-    // All flat-notional strategies size from the single `--notional` knob.
-    let notional = Decimal::from_str(&args.notional)?;
+    // All flat-notional strategies size from the single `--notional` knob —
+    // EXCEPT when balance-compounding is on (the default), where the per-order
+    // notional is wallet-relative (`balance × order_balance_pct / 100`), just
+    // like the live bot. Seed the strategies with that value so they honor the
+    // order-size pct from the first order (the runner only republishes notional
+    // on subsequent balance *changes*, so the initial value must be correct at
+    // construction — otherwise strategies would trade their static `--notional`
+    // until the balance drifted enough to trigger an update). Mirrors how
+    // run_backtest seeds `notional_per_order`.
+    let (nbc_initial, nbc_order_pct, _) = balance_compounding();
+    let notional = if nbc_initial > Decimal::ZERO && nbc_order_pct > Decimal::ZERO {
+        (nbc_initial * nbc_order_pct / Decimal::from(100)).round_dp(8)
+    } else {
+        Decimal::from_str(&args.notional)?
+    };
     let simple_gap_notional = notional;
     let ladder_reentry_notional = notional;
     let micro_mean_reversion_notional = notional;

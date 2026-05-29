@@ -916,6 +916,11 @@ where
                 }
 
                 let pos = tracker.snapshot();
+                // Committed (resting + in-flight) same-side exposure for the
+                // bot inventory gate below — counts in-flight orders so submit
+                // latency can't let placements pile up past the cap.
+                let (resting_bid_notional, resting_ask_notional) =
+                    fill_sim.committed_notional_by_side(&symbol);
                 let open_quotes = fill_sim.open_quotes(&symbol);
                 let liqs = liq_window.observe(ts.0);
                 let ctx = StrategyContext {
@@ -930,32 +935,30 @@ where
 
                 let actions = strategy.on_event(&ctx, &event);
 
-                // Risk-gate filter — same `risk_ctx` for every action in this
-                // batch (tracker state can't change mid-loop since fills
-                // arrive via a separate select arm), so doing it up-front
-                // lets the dispatch loop below batch quotes without
-                // re-entering the gate per action.
-                // Wallet inventory cap valuation (same gate as
-                // dispatch_post_fill_actions, applied to the primary on_event
-                // order flow). Value the position at mark, falling back to
-                // book mid then last mid.
+                // Bot-side worst-case inventory cap (order-placement logic for
+                // the bot's own wallet limit; the exchange margin backstop is
+                // simulated separately in FillSim). Value the position at mark,
+                // falling back to book mid then last mid.
                 let cap_price = if last_mark.0 > Decimal::ZERO {
                     last_mark.0
                 } else {
                     snapshot_mid(&current_book).unwrap_or(last_mid.0)
                 };
-                let cap_signed_notional = pos.size.0 * cap_price;
+                let actions = apply_bot_inventory_cap(
+                    actions,
+                    pos.size.0 * cap_price,
+                    resting_bid_notional,
+                    resting_ask_notional,
+                    current_max_position,
+                );
+
+                // Risk-gate filter — same `risk_ctx` for every action in this
+                // batch (tracker state can't change mid-loop since fills
+                // arrive via a separate select arm), so doing it up-front
+                // lets the dispatch loop below batch quotes without
+                // re-entering the gate per action.
                 let mut filtered: Vec<tikr_strategy::Action> = Vec::with_capacity(actions.len());
                 for action in actions {
-                    if let tikr_strategy::Action::Quote(intent) = &action
-                        && quote_breaches_position_cap(
-                            intent,
-                            cap_signed_notional,
-                            current_max_position,
-                        )
-                    {
-                        continue;
-                    }
                     if let Some(gate) = risk_gate.as_mut() {
                         let pnl_now = tracker.report(last_mark);
                         let risk_ctx = RiskContext {
@@ -1864,22 +1867,50 @@ fn snapshot_mid(book: &tikr_core::Snapshot) -> Option<Decimal> {
     Some((bid + ask) / Decimal::from(2))
 }
 
-/// Runner-side wallet inventory cap. Returns true if placing `intent` should be
-/// suppressed because the signed position notional already sits at/beyond `cap`
-/// on the side this order would grow (Bid grows long, Ask grows short).
-/// Reducing-side orders and a non-positive `cap` always pass.
-fn quote_breaches_position_cap(
-    intent: &QuoteIntent,
+/// Bot-side worst-case inventory cap, applied at order placement (the same
+/// shape as the exchange margin check, but at the bot's own wallet limit
+/// rather than `balance × leverage`). For each add-side Quote, the worst-case
+/// fill is `current position + all resting same-side notional + everything
+/// accepted earlier in this batch + this order`. Drop the order if that would
+/// breach `cap`; reducing-side orders and Cancel/Requote/CancelAll always
+/// pass. Checking worst-case (not just current position) is what bounds the
+/// PEAK — otherwise a flat strategy can pre-place a deep ladder that later
+/// sweeps far past the cap before any single order looks over-limit.
+///
+/// `signed_pos_notional` is the current signed position notional (+ = long);
+/// `resting_bid`/`resting_ask` are the summed notionals of orders already
+/// resting on each side. A non-positive `cap` disables the gate.
+fn apply_bot_inventory_cap(
+    actions: Vec<tikr_strategy::Action>,
     signed_pos_notional: Decimal,
+    mut resting_bid: Decimal,
+    mut resting_ask: Decimal,
     cap: Decimal,
-) -> bool {
+) -> Vec<tikr_strategy::Action> {
     if cap <= Decimal::ZERO {
-        return false;
+        return actions;
     }
-    match intent.side {
-        Side::Bid => signed_pos_notional >= cap,
-        Side::Ask => signed_pos_notional <= -cap,
+    let mut out = Vec::with_capacity(actions.len());
+    for action in actions {
+        if let tikr_strategy::Action::Quote(intent) = &action {
+            let n = intent.price.0 * intent.size.0;
+            let breaches = match intent.side {
+                // Worst case: all bids fill → long grows by resting_bids + n.
+                Side::Bid => signed_pos_notional + resting_bid + n > cap,
+                // Worst case: all asks fill → short grows → must stay > -cap.
+                Side::Ask => signed_pos_notional - resting_ask - n < -cap,
+            };
+            if breaches {
+                continue;
+            }
+            match intent.side {
+                Side::Bid => resting_bid += n,
+                Side::Ask => resting_ask += n,
+            }
+        }
+        out.push(action);
     }
+    out
 }
 
 /// Dispatch a list of post-fill strategy actions into `fill_sim` and,
@@ -1912,21 +1943,21 @@ async fn dispatch_post_fill_actions<V, S>(
     V: Venue,
     S: Strategy,
 {
-    // Runner-side inventory cap: drop add-side quotes once |position| is at/
-    // beyond the wallet cap, so accumulation strategies (SimpleGap/MMR refill
-    // through this path) stay bounded like an inventory-aware strategy would.
+    // Bot-side worst-case inventory cap: SimpleGap/MMR-style refills flow
+    // through this path, so apply the same order-placement gate as the main
+    // loop. Resting same-side exposure comes from FillSim's live quotes; sum
+    // it before dispatching (drops the borrow before the `&mut fill_sim` use
+    // below).
     let actions: Vec<tikr_strategy::Action> = match snapshot_mid(current_book) {
         Some(mid) if max_position > Decimal::ZERO => {
-            let signed_notional = post_fill_pos.size.0 * mid;
-            actions
-                .into_iter()
-                .filter(|a| match a {
-                    tikr_strategy::Action::Quote(intent) => {
-                        !quote_breaches_position_cap(intent, signed_notional, max_position)
-                    }
-                    _ => true,
-                })
-                .collect()
+            let (resting_bid, resting_ask) = fill_sim.committed_notional_by_side(symbol);
+            apply_bot_inventory_cap(
+                actions,
+                post_fill_pos.size.0 * mid,
+                resting_bid,
+                resting_ask,
+                max_position,
+            )
         }
         _ => actions,
     };
@@ -2376,6 +2407,82 @@ mod tests {
     use tikr_strategy::{LayeredGrid, LayeredGridConfig, Strategy};
     use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
     use tokio::sync::watch;
+
+    fn cap_test_symbol() -> Symbol {
+        Symbol {
+            base: Asset::new("SOL"),
+            quote: Asset::new("USDT"),
+            venue: VenueId::new("test"),
+            kind: MarketKind::Perp,
+        }
+    }
+
+    fn cap_quote(side: Side, notional: i64) -> tikr_strategy::Action {
+        // price 100 × size = notional → size = notional / 100.
+        tikr_strategy::Action::Quote(QuoteIntent {
+            symbol: cap_test_symbol(),
+            side,
+            price: Price(Decimal::from(100)),
+            size: Size(Decimal::from(notional) / Decimal::from(100)),
+            tif: tikr_core::TimeInForce::PostOnly,
+            kind: tikr_core::QuoteKind::Point,
+        })
+    }
+
+    fn count_quotes(actions: &[tikr_strategy::Action]) -> usize {
+        actions
+            .iter()
+            .filter(|a| matches!(a, tikr_strategy::Action::Quote(_)))
+            .count()
+    }
+
+    #[test]
+    fn bot_inventory_cap_bounds_worst_case_batch() {
+        // Flat, no resting, cap 600: ten $100 bids → only 6 survive
+        // (6×100 = 600; the 7th would push worst-case to 700 > 600).
+        let actions: Vec<_> = (0..10).map(|_| cap_quote(Side::Bid, 100)).collect();
+        let out = apply_bot_inventory_cap(
+            actions,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::from(600),
+        );
+        assert_eq!(count_quotes(&out), 6);
+    }
+
+    #[test]
+    fn bot_inventory_cap_counts_resting_and_position() {
+        // Already long $400 with $150 resting bids: only $50 of new bid
+        // headroom remains (400 + 150 + 50 = 600), so one $100 bid is blocked
+        // but a $100 ASK (reducing) always passes.
+        let actions = vec![cap_quote(Side::Bid, 100), cap_quote(Side::Ask, 100)];
+        let out = apply_bot_inventory_cap(
+            actions,
+            Decimal::from(400),
+            Decimal::from(150),
+            Decimal::ZERO,
+            Decimal::from(600),
+        );
+        assert_eq!(count_quotes(&out), 1);
+        assert!(matches!(
+            out[0],
+            tikr_strategy::Action::Quote(ref q) if q.side == Side::Ask
+        ));
+    }
+
+    #[test]
+    fn bot_inventory_cap_disabled_when_zero() {
+        let actions: Vec<_> = (0..10).map(|_| cap_quote(Side::Bid, 100)).collect();
+        let out = apply_bot_inventory_cap(
+            actions,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
+        assert_eq!(count_quotes(&out), 10);
+    }
 
     struct MockVenue {
         events: Mutex<Option<Vec<MarketEvent>>>,

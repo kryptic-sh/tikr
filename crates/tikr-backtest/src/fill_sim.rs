@@ -383,6 +383,37 @@ impl FillSim {
         }
     }
 
+    /// Total committed order notional per side for `symbol` — both resting
+    /// (`live_quotes`) AND in-flight pending `Place` ops — as `(bids, asks)`.
+    /// The runner's order-placement inventory cap uses this so orders the bot
+    /// has already SENT but the venue hasn't acked yet (submit latency) still
+    /// count against the cap. Counting only resting orders lets a strategy
+    /// pile up unbounded in-flight orders during the latency window, which all
+    /// then promote and fill far past the intended cap.
+    pub fn committed_notional_by_side(&self, symbol: &Symbol) -> (Decimal, Decimal) {
+        let mut bid = Decimal::ZERO;
+        let mut ask = Decimal::ZERO;
+        for q in self.live_quotes.iter().filter(|q| &q.symbol == symbol) {
+            let n = q.price.0 * q.size_remaining.0;
+            match q.side {
+                Side::Bid => bid += n,
+                Side::Ask => ask += n,
+            }
+        }
+        for p in &self.pending {
+            if let Op::Place { intent, .. } = &p.op
+                && &intent.symbol == symbol
+            {
+                let n = intent.price.0 * intent.size.0;
+                match intent.side {
+                    Side::Bid => bid += n,
+                    Side::Ask => ask += n,
+                }
+            }
+        }
+        (bid, ask)
+    }
+
     /// 128-bit fingerprint of exactly the state [`Self::live_quotes_into`]
     /// reads to produce its output for `symbol`: the resting `live_quotes`
     /// (id, side, price, remaining size) plus in-flight `Place` ops carrying a
