@@ -597,6 +597,11 @@ struct Args {
     #[arg(long, default_value = "4,6,8")]
     mmr_exit_bps_list: String,
 
+    /// MicroMeanReversion sweep: comma-separated max simultaneous same-side
+    /// entry quotes.
+    #[arg(long, default_value = "1")]
+    mmr_max_entries_list: String,
+
     /// Tide sweep: comma-separated lattice geometry in bps (inner gap AND
     /// level spacing). Live USDC config uses 20.
     #[arg(long, default_value = "20")]
@@ -619,6 +624,12 @@ struct Args {
     /// config = 5.
     #[arg(long, default_value_t = 5u32)]
     wave_refill_threshold: u32,
+
+    /// Wave sweep: comma-separated inventory-skew slot counts. Shifts the
+    /// overloaded side's lattice band deeper as |position| nears the cap
+    /// (long → bids lower, short → asks higher). `0` = symmetric/off.
+    #[arg(long, default_value = "0")]
+    wave_inventory_skew_list: String,
 
     /// SpreadScalp notional per order.
     #[arg(long, default_value = "100")]
@@ -1308,11 +1319,19 @@ async fn run_sweep_collect(
     // construction — otherwise strategies would trade their static `--notional`
     // until the balance drifted enough to trigger an update). Mirrors how
     // run_backtest seeds `notional_per_order`.
-    let (nbc_initial, nbc_order_pct, _) = balance_compounding();
+    let (nbc_initial, nbc_order_pct, nbc_max_pct) = balance_compounding();
     let notional = if nbc_initial > Decimal::ZERO && nbc_order_pct > Decimal::ZERO {
         (nbc_initial * nbc_order_pct / Decimal::from(100)).round_dp(8)
     } else {
         Decimal::from_str(&args.notional)?
+    };
+    // Wallet position cap seeded into strategies that use it internally (Wave's
+    // inventory skew + own suppress logic need the cap value; the runner still
+    // enforces it centrally regardless). `0` when compounding is off.
+    let bot_position_cap = if nbc_initial > Decimal::ZERO && nbc_order_pct > Decimal::ZERO {
+        (nbc_initial * nbc_max_pct / Decimal::from(100)).round_dp(8)
+    } else {
+        Decimal::ZERO
     };
     let simple_gap_notional = notional;
     let ladder_reentry_notional = notional;
@@ -1784,28 +1803,33 @@ async fn run_sweep_collect(
         let mmr_trigger_sweep = parse_u32_list(&args.mmr_trigger_bps_list)?;
         let mmr_entry_sweep = parse_u32_list(&args.mmr_entry_bps_list)?;
         let mmr_exit_sweep = parse_u32_list(&args.mmr_exit_bps_list)?;
+        let mmr_max_entries_sweep = parse_u32_list(&args.mmr_max_entries_list)?;
         for &trigger in &mmr_trigger_sweep {
             for &entry in &mmr_entry_sweep {
                 for &exit in &mmr_exit_sweep {
-                    let label = format!("MMR trig={trigger} entry={entry} exit={exit}");
-                    spawn_preset(
-                        &mut handles,
-                        &shared_data,
-                        &symbol,
-                        &label,
-                        MicroMeanReversion::new(MicroMeanReversionConfig {
-                            notional_per_order: micro_mean_reversion_notional,
-                            trigger_bps: trigger,
-                            entry_bps: entry,
-                            exit_bps: exit,
-                            max_open_entries: 1,
-                        }),
-                        fees,
-                        skim_cfg,
-                        funding_cfg,
-                        sim_cfg_template.clone(),
-                        equity_csv_dir.clone(),
-                    );
+                    for &max_entries in &mmr_max_entries_sweep {
+                        let label = format!(
+                            "MMR trig={trigger} entry={entry} exit={exit} max={max_entries}"
+                        );
+                        spawn_preset(
+                            &mut handles,
+                            &shared_data,
+                            &symbol,
+                            &label,
+                            MicroMeanReversion::new(MicroMeanReversionConfig {
+                                notional_per_order: micro_mean_reversion_notional,
+                                trigger_bps: trigger,
+                                entry_bps: entry,
+                                exit_bps: exit,
+                                max_open_entries: max_entries,
+                            }),
+                            fees,
+                            skim_cfg,
+                            funding_cfg,
+                            sim_cfg_template.clone(),
+                            equity_csv_dir.clone(),
+                        );
+                    }
                 }
             }
         }
@@ -1850,33 +1874,37 @@ async fn run_sweep_collect(
     if included("wave", &allow) {
         let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
         let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
+        let wave_skew_sweep = parse_u32_list(&args.wave_inventory_skew_list)?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
-                let label = format!(
-                    "Wave lv={levels} step={step}bps rt={}",
-                    args.wave_refill_threshold
-                );
-                spawn_preset(
-                    &mut handles,
-                    &shared_data,
-                    &symbol,
-                    &label,
-                    Wave::new(WaveConfig {
-                        notional_per_order: wave_notional,
-                        tick_size: tick,
-                        step_size: lot_step,
-                        min_notional: Decimal::ZERO,
-                        grid_levels: levels,
-                        step_bps: step,
-                        refill_threshold: args.wave_refill_threshold,
-                        max_position_usdt: Decimal::ZERO,
-                    }),
-                    fees,
-                    skim_cfg,
-                    funding_cfg,
-                    sim_cfg_template.clone(),
-                    equity_csv_dir.clone(),
-                );
+                for &skew in &wave_skew_sweep {
+                    let label = format!(
+                        "Wave lv={levels} step={step}bps rt={} skew={skew}",
+                        args.wave_refill_threshold
+                    );
+                    spawn_preset(
+                        &mut handles,
+                        &shared_data,
+                        &symbol,
+                        &label,
+                        Wave::new(WaveConfig {
+                            notional_per_order: wave_notional,
+                            tick_size: tick,
+                            step_size: lot_step,
+                            min_notional: Decimal::ZERO,
+                            grid_levels: levels,
+                            step_bps: step,
+                            refill_threshold: args.wave_refill_threshold,
+                            max_position_usdt: bot_position_cap,
+                            inventory_skew_slots: skew,
+                        }),
+                        fees,
+                        skim_cfg,
+                        funding_cfg,
+                        sim_cfg_template.clone(),
+                        equity_csv_dir.clone(),
+                    );
+                }
             }
         }
     }

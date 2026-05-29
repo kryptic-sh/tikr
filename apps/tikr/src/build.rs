@@ -495,6 +495,7 @@ fn build_wave(
         // Account-derived cap arrives via on_max_position_updated (live
         // channel); seed 0 = uncapped until the first update lands.
         max_position_usdt: Decimal::ZERO,
+        inventory_skew_slots: wave.inventory_skew_slots,
     }))
 }
 

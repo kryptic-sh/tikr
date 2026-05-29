@@ -201,6 +201,12 @@ struct Args {
     /// Wave: refill batching threshold (slots empty before refill).
     #[arg(long, default_value_t = 1u32)]
     wv_refill_threshold: u32,
+
+    /// Wave inventory skew in lattice slots: shift the overloaded side's band
+    /// deeper as |position| approaches the cap (long → bids lower, short →
+    /// asks higher). `0` = symmetric (off). Requires a non-zero position cap.
+    #[arg(long, default_value_t = 0u32)]
+    wv_inventory_skew_slots: u32,
     /// Wave: hard position cap in quote notional (suppress add side). 0 = off.
     #[arg(long, default_value = "0")]
     wv_max_position_usdt: String,
@@ -546,6 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(cap) => cap,
                     None => Decimal::from_str(&args.wv_max_position_usdt)?,
                 },
+                inventory_skew_slots: args.wv_inventory_skew_slots,
             });
             run_with_resume(
                 venue,

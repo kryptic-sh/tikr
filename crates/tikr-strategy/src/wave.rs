@@ -60,6 +60,15 @@ pub struct WaveConfig {
     /// the reversion. Updated live via [`Strategy::on_max_position_updated`]
     /// from the account-derived cap. `0` (default) = uncapped.
     pub max_position_usdt: Decimal,
+
+    /// Inventory skew, in lattice slots. As `|position notional|` grows toward
+    /// `max_position_usdt`, the *overloaded* side's band is shifted to deeper
+    /// frozen slots — long → bids move lower (buy slower), short → asks move
+    /// higher (sell slower) — while the reducing side stays at the touch to
+    /// actively flatten. Offset scales linearly from 0 (flat) to this many
+    /// slots (at/over the cap). Requires `max_position_usdt > 0`. `0`
+    /// (default) = no skew (symmetric lattice, original behavior).
+    pub inventory_skew_slots: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -346,6 +355,43 @@ impl Wave {
             }
         }
     }
+
+    /// Per-side band slot offset from inventory skew: `(bid_skew, ask_skew)`.
+    /// Only the overloaded side is offset (long → bids deeper, short → asks
+    /// deeper); the reducing side stays at the touch. Offset scales linearly
+    /// from 0 (flat) to `inventory_skew_slots` (|position notional| ≥ cap).
+    /// Returns `(0, 0)` when skew is disabled or no cap is set.
+    fn inventory_skew(
+        &self,
+        ctx: &StrategyContext<'_>,
+        best_bid: Option<Price>,
+        best_ask: Option<Price>,
+    ) -> (i64, i64) {
+        let skew_max = self.config.inventory_skew_slots as i64;
+        let cap = self.config.max_position_usdt;
+        if skew_max <= 0 || cap <= Decimal::ZERO {
+            return (0, 0);
+        }
+        let mid = match (best_bid, best_ask) {
+            (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
+            _ => return (0, 0),
+        };
+        let pos_notional = ctx.position.size.0 * mid;
+        let ratio = (pos_notional.abs() / cap).min(Decimal::ONE);
+        let skew = (ratio * Decimal::from(skew_max))
+            .round()
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(0)
+            .clamp(0, skew_max);
+        if pos_notional > Decimal::ZERO {
+            (skew, 0)
+        } else if pos_notional < Decimal::ZERO {
+            (0, skew)
+        } else {
+            (0, 0)
+        }
+    }
 }
 
 impl Strategy for Wave {
@@ -411,6 +457,13 @@ impl Strategy for Wave {
         // outside the new band). Between refills: do nothing.
         let levels = self.config.grid_levels.max(1) as i64;
 
+        // Inventory skew: shift the overloaded side's band to deeper frozen
+        // slots so it quotes further from the touch (long → bids lower, short
+        // → asks higher), throttling the side that grows inventory while the
+        // reducing side stays at the touch to flatten. Offset scales 0..N
+        // slots by `|position notional| / cap`.
+        let (bid_skew, ask_skew) = self.inventory_skew(ctx, best_bid, best_ask);
+
         // Compute both bands around the cross-guarded touch.
         let bid_band = top_b.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
             let mut cap = top.0;
@@ -421,8 +474,8 @@ impl Strategy for Wave {
                 cap = cap.min(ap.0 - tick);
             }
             self.bid_k_at_or_below(cap).map(|top_k| WindowRange {
-                low_k: top_k,
-                high_k: top_k + levels - 1,
+                low_k: top_k + bid_skew,
+                high_k: top_k + bid_skew + levels - 1,
             })
         });
         let ask_band = top_a.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
@@ -434,8 +487,8 @@ impl Strategy for Wave {
                 cap = cap.max(bp.0 + tick);
             }
             self.ask_k_at_or_above(cap).map(|top_k| WindowRange {
-                low_k: top_k,
-                high_k: top_k + levels - 1,
+                low_k: top_k + ask_skew,
+                high_k: top_k + ask_skew + levels - 1,
             })
         });
 
@@ -527,6 +580,7 @@ mod tests {
             step_bps: 10,
             refill_threshold: 1,
             max_position_usdt: Decimal::ZERO,
+            inventory_skew_slots: 0,
         }
     }
 
@@ -569,6 +623,68 @@ mod tests {
             open_quotes: open,
             recent_liqs: &[],
         }
+    }
+
+    fn pos_size(size: i64) -> Position {
+        Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::from(size)),
+            avg_entry: Price(Decimal::ZERO),
+            realized_pnl: Notional(Decimal::ZERO),
+        }
+    }
+
+    #[test]
+    fn inventory_skew_offsets_overloaded_side() {
+        let mut c = cfg();
+        c.inventory_skew_slots = 8;
+        c.max_position_usdt = Decimal::from(600);
+        let w = Wave::new(c);
+        let s = snap(Decimal::from(100), Decimal::from(101)); // mid 100.5
+        let bb = s.bids.first().map(|l| l.price);
+        let ba = s.asks.first().map(|l| l.price);
+        let sy = sym();
+
+        // Flat → no skew either side.
+        let flat = pos_flat();
+        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &flat, &[]), bb, ba), (0, 0));
+
+        // Long at/over cap (6 × 100.5 = 603 ≥ 600) → full skew on bids only.
+        let long = pos_size(6);
+        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &long, &[]), bb, ba), (8, 0));
+
+        // Short at/over cap → full skew on asks only.
+        let short = pos_size(-6);
+        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &short, &[]), bb, ba), (0, 8));
+
+        // Half cap long (3 × 100.5 = 301.5 ≈ 0.5×600) → ~half skew on bids.
+        let half = pos_size(3);
+        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &half, &[]), bb, ba), (4, 0));
+    }
+
+    #[test]
+    fn inventory_skew_disabled_without_cap_or_slots() {
+        let s = snap(Decimal::from(100), Decimal::from(101));
+        let bb = s.bids.first().map(|l| l.price);
+        let ba = s.asks.first().map(|l| l.price);
+        let sy = sym();
+        let long = pos_size(6);
+        // slots=0 → off even with a cap.
+        let mut c1 = cfg();
+        c1.inventory_skew_slots = 0;
+        c1.max_position_usdt = Decimal::from(600);
+        assert_eq!(
+            Wave::new(c1).inventory_skew(&ctx(&sy, &s, &long, &[]), bb, ba),
+            (0, 0)
+        );
+        // cap=0 → off even with slots (no ratio to scale).
+        let mut c2 = cfg();
+        c2.inventory_skew_slots = 8;
+        c2.max_position_usdt = Decimal::ZERO;
+        assert_eq!(
+            Wave::new(c2).inventory_skew(&ctx(&sy, &s, &long, &[]), bb, ba),
+            (0, 0)
+        );
     }
 
     #[test]

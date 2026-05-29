@@ -291,6 +291,11 @@ pub struct WaveParams {
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,
+    /// Inventory skew in lattice slots: shift the overloaded side's band
+    /// deeper as |position| nears the account cap (long → bids lower, short →
+    /// asks higher). `0` (default) = symmetric/off.
+    #[serde(default)]
+    pub inventory_skew_slots: u32,
 }
 
 fn wave_default_refill_threshold() -> u32 {
