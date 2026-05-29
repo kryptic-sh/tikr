@@ -19,3 +19,4 @@ tikr-venue = "0.1"
 # the band-index Decimal → u32 cast. tikr-core re-exports `Decimal` but
 # not the prelude traits.
 rust_decimal = { version = "1", default-features = false }
+tracing = "0.1"

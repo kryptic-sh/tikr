@@ -184,14 +184,21 @@ impl Wave {
         tick
     }
 
-    /// Per-level gap increment = `step_increment_bps` of mid, snapped to tick.
-    /// `0` → uniform lattice (every gap equals the base step).
+    /// Per-level gap increment = `step_increment_bps` of mid, snapped UP to
+    /// tick with a 1-tick floor (mirrors `compute_step`). `0` → uniform
+    /// lattice. The floor matters on coarse-tick / low-priced symbols (NEAR,
+    /// SUI, WLD) where 1 bp of mid is sub-tick: without it the increment
+    /// rounds to 0 and the progression silently vanishes.
     fn compute_increment(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
         if self.config.step_increment_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
             let target =
                 mid * Decimal::from(self.config.step_increment_bps) / Decimal::from(10_000);
-            return (target / tick).round() * tick;
+            return if target > tick {
+                (target / tick).ceil() * tick
+            } else {
+                tick
+            };
         }
         Decimal::ZERO
     }
@@ -485,10 +492,23 @@ impl Strategy for Wave {
             && tick > Decimal::ZERO
         {
             let mid = (b.0 + a.0) / Decimal::from(2);
-            self.lattice_step = Some(self.compute_step(mid));
-            self.lattice_inc = Some(self.compute_increment(mid));
+            let base = self.compute_step(mid);
+            let inc = self.compute_increment(mid);
+            self.lattice_step = Some(base);
+            self.lattice_inc = Some(inc);
             self.bid_lattice_origin = Some(b.0);
             self.ask_lattice_origin = Some(a.0);
+            tracing::info!(
+                symbol = %ctx.symbol.base.0,
+                mid = %mid,
+                tick = %self.config.tick_size,
+                step_bps = self.config.step_bps,
+                step_increment_bps = self.config.step_increment_bps,
+                base_step = %base,
+                increment = %inc,
+                progressive = inc > Decimal::ZERO,
+                "wave: lattice frozen"
+            );
         }
 
         let lattice_ready = self.lattice_step.is_some()
@@ -747,6 +767,36 @@ mod tests {
         assert_eq!(w.bid_k_at_or_below(b[3]), Some(3));
         assert_eq!(w.ask_k_at_or_above(a[3]), Some(3));
         assert_eq!(w.bid_k_at_or_below(b[0]), Some(0));
+    }
+
+    #[test]
+    fn increment_floors_at_one_tick_on_coarse_tick_symbols() {
+        // Low-priced / coarse-tick symbol (mid ~5, tick 0.01): step_increment_bps=1
+        // → 1bp = 0.0005, sub-tick. Must NOT round to 0 (the live bug); a
+        // requested increment must produce ≥ 1 tick of progression.
+        let mut c = cfg();
+        c.tick_size = Decimal::new(1, 2); // 0.01
+        c.step_bps = 2;
+        c.step_increment_bps = 1;
+        let mut w = Wave::new(c);
+        let s = snap(Decimal::new(500, 2), Decimal::new(502, 2)); // 5.00 / 5.02
+        let p = pos_flat();
+        let sm = sym();
+        let _ = w.on_event(
+            &ctx(&sm, &s, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        // Gaps must strictly widen (progression alive despite sub-tick bps).
+        let b: Vec<Decimal> = (0..4).map(|k| w.bid_price(k).unwrap()).collect();
+        let (g1, g2) = (b[0] - b[1], b[1] - b[2]);
+        assert!(
+            g2 > g1,
+            "increment must survive coarse tick: g1={g1} g2={g2}"
+        );
+        // And the increment is at least one tick.
+        assert!(g2 - g1 >= Decimal::new(1, 2));
     }
 
     #[test]

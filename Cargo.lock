@@ -5693,6 +5693,7 @@ dependencies = [
  "rust_decimal",
  "tikr-core",
  "tikr-venue",
+ "tracing",
 ]
 
 [[package]]
