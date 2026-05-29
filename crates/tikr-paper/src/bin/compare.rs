@@ -31,7 +31,7 @@ use tikr_strategy::{
     Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig,
     LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig, MicroPrice,
     MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
-    StaticGridConfig, Strategy, TopOfBook, TopOfBookConfig,
+    StaticGridConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -577,17 +577,13 @@ struct Args {
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
 
-    /// SimpleGap notional per order.
+    /// Per-order notional (USDT) shared by the flat-notional strategies
+    /// (SimpleGap, LadderReentry, MicroMeanReversion, Tide, Wave). When
+    /// balance-compounding is enabled (`--sim-initial-balance` +
+    /// `--sim-order-balance-pct` > 0, the default) this is just the seed
+    /// notional before the first balance-driven update.
     #[arg(long, default_value = "100")]
-    simple_gap_notional: String,
-
-    /// LadderReentry notional per order.
-    #[arg(long, default_value = "100")]
-    ladder_reentry_notional: String,
-
-    /// MicroMeanReversion notional per order.
-    #[arg(long, default_value = "100")]
-    micro_mean_reversion_notional: String,
+    notional: String,
 
     /// MicroMeanReversion sweep: comma-separated trigger distances in bps.
     #[arg(long, default_value = "8,10,12")]
@@ -600,6 +596,29 @@ struct Args {
     /// MicroMeanReversion sweep: comma-separated exit distances from fill in bps.
     #[arg(long, default_value = "4,6,8")]
     mmr_exit_bps_list: String,
+
+    /// Tide sweep: comma-separated lattice geometry in bps (inner gap AND
+    /// level spacing). Live USDC config uses 20.
+    #[arg(long, default_value = "20")]
+    tide_step_bps_list: String,
+
+    /// Tide sweep: comma-separated grid depth per side. Live config = 1.
+    #[arg(long, default_value = "1")]
+    tide_grid_levels_list: String,
+
+    /// Wave sweep: comma-separated lattice geometry in bps. Live USDC
+    /// config uses 2.
+    #[arg(long, default_value = "2")]
+    wave_step_bps_list: String,
+
+    /// Wave sweep: comma-separated grid depth per side. Live config = 10.
+    #[arg(long, default_value = "10")]
+    wave_grid_levels_list: String,
+
+    /// Wave refill batching threshold (slots empty before refill). Live
+    /// config = 5.
+    #[arg(long, default_value_t = 5u32)]
+    wave_refill_threshold: u32,
 
     /// SpreadScalp notional per order.
     #[arg(long, default_value = "100")]
@@ -676,21 +695,21 @@ struct Args {
     /// tracks `balance = initial + realized − fees` per fill and pushes
     /// updated notional/cap to the strategy via the existing
     /// `on_notional_updated` / `on_max_position_updated` hooks.
-    #[arg(long, default_value = "0")]
+    #[arg(long, default_value = "600")]
     sim_initial_balance: String,
 
     /// Backtest compounding: percent of running balance allocated per
     /// order (0-100). Mirrors the live account poller in
     /// `apps/tikr/src/main.rs`. `0` = disabled even when initial
-    /// balance is set.
-    #[arg(long, default_value = "0")]
+    /// balance is set. Default 1% mirrors the live USDC bots.
+    #[arg(long, default_value = "1")]
     sim_order_balance_pct: String,
 
-    /// Backtest compounding: percent of running balance used as the
-    /// per-bot position cap (0-100). `0` keeps the static cap
-    /// (`--sim-max-position-notional`).
-    #[arg(long, default_value = "0")]
-    sim_max_position_pct: String,
+    /// Account leverage. The per-bot position cap is `balance × leverage`
+    /// (so 5× on a $600 balance = $3000 max position notional). Drives
+    /// `max_position_pct = leverage × 100` in the balance-compounding path.
+    #[arg(long, default_value = "5")]
+    leverage: String,
 
     /// FillSim: silent-cancel rate per minute per live quote (simulates
     /// venue cancel/expire events the WS misses; runner reconciliation
@@ -907,7 +926,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Lock the balance-compounding config before any spawn fires.
     let initial = Decimal::from_str(&args.sim_initial_balance)?;
     let order_pct = Decimal::from_str(&args.sim_order_balance_pct)?;
-    let max_pct = Decimal::from_str(&args.sim_max_position_pct)?;
+    // Leverage → position cap as a percent of balance: 5× = 500% of equity.
+    let max_pct = Decimal::from_str(&args.leverage)? * Decimal::from(100);
     let _ = BALANCE_COMPOUNDING.set((initial, order_pct, max_pct));
 
     if !args.data_root.is_empty() {
@@ -1228,15 +1248,26 @@ async fn run_sweep_collect(
         None
     };
 
+    // Hard venue margin cap (synthetic -2019). When balance-compounding is on,
+    // the venue would reserve margin against `balance × leverage`, so derive
+    // the hard cap from `initial × max_position_pct / 100` (== balance ×
+    // leverage). This BINDS regardless of whether a strategy honours the soft
+    // `on_max_position_updated` cap — without it, accumulation strategies
+    // (MMR, LadderReentry) blow far past the nominal leverage. Falls back to
+    // the explicit `--sim-max-position-notional` when compounding is off.
+    let (bc_initial, bc_order_pct, bc_max_pct) = balance_compounding();
+    let hard_position_cap = if bc_initial > Decimal::ZERO && bc_order_pct > Decimal::ZERO {
+        Some((bc_initial * bc_max_pct / Decimal::from(100)).round_dp(8))
+    } else if args.sim_max_position_notional > 0.0 {
+        Some(Decimal::try_from(args.sim_max_position_notional)?)
+    } else {
+        None
+    };
     let sim_cfg_template = FillSimConfig {
         submit_latency_ms: args.sim_submit_latency_ms,
         cancel_latency_ms: args.sim_cancel_latency_ms,
         fees,
-        max_position_notional_usdt: if args.sim_max_position_notional > 0.0 {
-            Some(Decimal::try_from(args.sim_max_position_notional)?)
-        } else {
-            None
-        },
+        max_position_notional_usdt: hard_position_cap,
         silent_cancel_rate_per_min: args.sim_silent_cancel_rate_per_min,
         rng_seed: args.sim_rng_seed,
         latency_jitter_ms: args.sim_latency_jitter_ms,
@@ -1249,9 +1280,13 @@ async fn run_sweep_collect(
             None
         },
     };
-    let simple_gap_notional = Decimal::from_str(&args.simple_gap_notional)?;
-    let ladder_reentry_notional = Decimal::from_str(&args.ladder_reentry_notional)?;
-    let micro_mean_reversion_notional = Decimal::from_str(&args.micro_mean_reversion_notional)?;
+    // All flat-notional strategies size from the single `--notional` knob.
+    let notional = Decimal::from_str(&args.notional)?;
+    let simple_gap_notional = notional;
+    let ladder_reentry_notional = notional;
+    let micro_mean_reversion_notional = notional;
+    let tide_notional = notional;
+    let wave_notional = notional;
     let spread_scalp_notional = Decimal::from_str(&args.spread_scalp_notional)?;
     let spread_scalp_max_pos = Decimal::from_str(&args.spread_scalp_max_pos_usdt)?;
     let spread_scalp_tp_usdt = Decimal::from_str(&args.spread_scalp_take_profit_usdt)?;
@@ -1740,6 +1775,76 @@ async fn run_sweep_collect(
                         equity_csv_dir.clone(),
                     );
                 }
+            }
+        }
+    }
+
+    // Tide — single-touch lattice with straggler pruning. Live USDC config:
+    // grid_levels=1, step_bps=20. Uncapped position here (max_position=0) for
+    // apples-to-apples ranking; re-run with a balance cap for realistic PnL.
+    if included("tide", &allow) {
+        let tide_steps = parse_u32_list(&args.tide_step_bps_list)?;
+        let tide_levels = parse_u32_list(&args.tide_grid_levels_list)?;
+        for &levels in &tide_levels {
+            for &step in &tide_steps {
+                let label = format!("Tide lv={levels} step={step}bps");
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    Tide::new(TideConfig {
+                        notional_per_order: tide_notional,
+                        tick_size: tick,
+                        step_size: lot_step,
+                        min_notional: Decimal::ZERO,
+                        grid_levels: levels,
+                        step_bps: step,
+                        max_position_usdt: Decimal::ZERO,
+                        prune_stragglers: true,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
+            }
+        }
+    }
+
+    // Wave — lattice + round-trip refill. Live USDC config: grid_levels=10,
+    // step_bps=2, refill_threshold=5. Uncapped position for ranking.
+    if included("wave", &allow) {
+        let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
+        let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
+        for &levels in &wave_levels {
+            for &step in &wave_steps {
+                let label = format!(
+                    "Wave lv={levels} step={step}bps rt={}",
+                    args.wave_refill_threshold
+                );
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    Wave::new(WaveConfig {
+                        notional_per_order: wave_notional,
+                        tick_size: tick,
+                        step_size: lot_step,
+                        min_notional: Decimal::ZERO,
+                        grid_levels: levels,
+                        step_bps: step,
+                        refill_threshold: args.wave_refill_threshold,
+                        max_position_usdt: Decimal::ZERO,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
             }
         }
     }
