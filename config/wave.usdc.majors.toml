@@ -16,21 +16,22 @@
 # a one-sided sweep — integral, not optional). Lattice never recenters; the
 # active window slides over the fixed grid and prunes the tail.
 #
-# `step_bps` is the single geometry knob — it sets BOTH the inner self-spread
-# (gap from mid to the first order each side) AND the spacing between levels.
+# Geometry knobs: `step_bps` = spacing between levels; `inner_bps` = distance
+# from mid to the first order each side (independent; 0 = legacy step_bps/2).
+# The lattice is UNIFORM (constant spacing); a progressive/widening lattice was
+# tried and removed (misaligns on trends once price leaves the frozen origin,
+# and the re-center fix destroys the grid's buy-low/sell-high edge).
 #
-# Tuned via 72h SOL snapshot (2026-05-28): step_bps=5 / levels=10 / rt=5 is
-# the best RISK-ADJUSTED config found. On the 72h SOL replay (maker 0 /
-# taker 5, $10/order): net +$17.50, peak inventory only ~$953, and ending
-# unrealized +$0.66 (near-flat — true lean MM, not held directional risk).
-# Key findings:
-#   - A WIDE step (5 bps) naturally bounds inventory: orders are spaced far
-#     apart, so a crash fills few slots per move → slow accumulation. This
-#     beats a hard position cap, which bounds inventory but kills net.
-#   - Tighter steps (1-2 bps) earn slightly more gross but pile 4-5x the
-#     inventory ($4-5k peak) — that "edge" is really leveraged dip-buying.
-#   - refill_threshold ≈ levels/2 is the sweet spot. Lower = runaway
-#     inventory; the side-empty re-arm keeps it live through one-way moves.
+# Tuned 2026-05-29/30 on the real ~54h DOGE + SOL snapshots (maker 0 / taker 0
+# USDC promo, $600 @ 1% ≈ $6/order, 5x). Current config:
+# levels=4 / refill_threshold=2 / step_bps=5 / inner_bps=5 (uniform).
+#   DOGE 54h: NET +3.59 (realized +7.15, unreal -3.30), peak ~$653
+#   SOL  54h: NET +3.86 (realized +6.21, unreal -1.98), peak ~$617
+# Findings:
+#   - FEWER levels + faster refill (4 / rt=2) concentrates capital in the
+#     high-fill inner band and banks more round-trips than the old 10 / rt=9.
+#   - CAVEAT: validated on DOGE + SOL only; the live names (NEAR/ZEC/WLD/SUI)
+#     are NOT backtested on this config. Watch first live sessions.
 #
 # BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
 # $600 @ 5x account's capacity. Do not add BTCUSDC here.
@@ -62,9 +63,10 @@ leverage = 5
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 2
+grid_levels = 4
+refill_threshold = 2
+step_bps = 5
+inner_bps = 5
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
@@ -74,9 +76,10 @@ step_bps = 2
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 2
+grid_levels = 4
+refill_threshold = 2
+step_bps = 5
+inner_bps = 5
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 # Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
@@ -86,9 +89,10 @@ step_bps = 2
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 2
+grid_levels = 4
+refill_threshold = 2
+step_bps = 5
+inner_bps = 5
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
 # Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
@@ -98,6 +102,7 @@ step_bps = 2
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 2
+grid_levels = 4
+refill_threshold = 2
+step_bps = 5
+inner_bps = 5
