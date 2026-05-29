@@ -19,18 +19,27 @@
 # `step_bps` is the single geometry knob — it sets BOTH the inner self-spread
 # (gap from mid to the first order each side) AND the spacing between levels.
 #
-# Tuned via 72h SOL snapshot (2026-05-28): step_bps=5 / levels=10 / rt=5 is
-# the best RISK-ADJUSTED config found. On the 72h SOL replay (maker 0 /
-# taker 5, $10/order): net +$17.50, peak inventory only ~$953, and ending
-# unrealized +$0.66 (near-flat — true lean MM, not held directional risk).
-# Key findings:
-#   - A WIDE step (5 bps) naturally bounds inventory: orders are spaced far
-#     apart, so a crash fills few slots per move → slow accumulation. This
-#     beats a hard position cap, which bounds inventory but kills net.
-#   - Tighter steps (1-2 bps) earn slightly more gross but pile 4-5x the
-#     inventory ($4-5k peak) — that "edge" is really leveraged dip-buying.
-#   - refill_threshold ≈ levels/2 is the sweet spot. Lower = runaway
-#     inventory; the side-empty re-arm keeps it live through one-way moves.
+# Tuned 2026-05-29 on the real ~54h DOGE + SOL snapshots (maker 0 / taker 0
+# USDC promo, $600 @ 1% ≈ $6/order, 5x). Winning config:
+# levels=4 / refill_threshold=2 / step_bps=2 / step_increment_bps=1.
+#   DOGE 54h: NET +4.32 (realized +5.15, unreal -0.66), peak ~$665
+#   SOL  54h: NET +7.04 (realized +8.37, unreal -1.20), peak ~$619
+# Key findings (this run):
+#   - PROGRESSIVE lattice (step_increment_bps=1) is the unlock: gaps widen
+#     outward (2,3,4,5 bps → cumulative 2,5,9,14), so the tight inner levels
+#     capture spread while the widening tail spans enough range that the
+#     limited $600 funds don't exhaust at the cap → unrealized bleed ≈ 0.
+#     Uniform step=2 (inc=0) LOST on both (DOGE -3.36, SOL -4.43, unreal ~-2.8).
+#   - FEWER levels + faster refill (4 / rt=2) beats 10 / rt=9: concentrates
+#     capital in the high-fill inner band and banks far more round-trips
+#     (SOL realized +0.9 → +8.4). The deep outer slots in lv=10 sat idle.
+#   - CAVEAT: validated on DOGE + SOL only (the two real ~54h datasets). NONE
+#     of the live names (NEAR/ZEC/WLD/SUI) are backtested on this config —
+#     NEAR/SUI snapshots are only ~4.5h, ZEC/WLD have none. Same unvalidated
+#     posture as before; watch the first live sessions. The profit surface is
+#     also noisy across (step,inc) — the bleed-elimination is robust, the exact
+#     optimum is not. Earlier note: a wide UNIFORM step bounds inventory but
+#     the progressive tail does it better while keeping the inner capture.
 #
 # BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
 # $600 @ 5x account's capacity. Do not add BTCUSDC here.
@@ -62,8 +71,8 @@ leverage = 5
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 3
+grid_levels = 4
+refill_threshold = 2
 step_bps = 2
 step_increment_bps = 1
 
@@ -75,8 +84,8 @@ step_increment_bps = 1
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 3
+grid_levels = 4
+refill_threshold = 2
 step_bps = 2
 step_increment_bps = 1
 
@@ -88,8 +97,8 @@ step_increment_bps = 1
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 3
+grid_levels = 4
+refill_threshold = 2
 step_bps = 2
 step_increment_bps = 1
 
@@ -101,7 +110,7 @@ step_increment_bps = 1
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 3
+grid_levels = 4
+refill_threshold = 2
 step_bps = 2
 step_increment_bps = 1
