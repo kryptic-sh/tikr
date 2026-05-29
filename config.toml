@@ -72,7 +72,7 @@ symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 4
-refill_threshold = 1
+refill_threshold = 2
 inner_bps = 5
 step_bps = 5
 step_increment_bps = 0
@@ -86,7 +86,7 @@ symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 4
-refill_threshold = 1
+refill_threshold = 2
 inner_bps = 5
 step_bps = 5
 step_increment_bps = 0
@@ -100,7 +100,7 @@ symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 4
-refill_threshold = 1
+refill_threshold = 2
 inner_bps = 5
 step_bps = 5
 step_increment_bps = 0
@@ -114,7 +114,7 @@ symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
 grid_levels = 4
-refill_threshold = 1
+refill_threshold = 2
 inner_bps = 5
 step_bps = 5
 step_increment_bps = 0
