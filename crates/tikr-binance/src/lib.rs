@@ -117,6 +117,49 @@ impl BinanceEnv {
     }
 }
 
+/// Fetch `exchangeInfo` for `env` and return the subset of `symbols` that are
+/// NOT listed on the exchange (case-insensitive). An empty result means every
+/// symbol is valid. Use this to fail fast before subscribing to streams /
+/// placing orders for a symbol that doesn't exist (e.g. a USDC perp that only
+/// trades as USDT-M). No credentials required — `exchangeInfo` is public.
+pub async fn invalid_symbols(
+    env: BinanceEnv,
+    symbols: &[String],
+) -> Result<Vec<String>, VenueError> {
+    let http = HttpClient::new();
+    let base_url = env.rest_base_url();
+    let resp = if env.is_futures() {
+        crate::futs::get_exchange_info(&http, base_url).await?
+    } else {
+        crate::spot::get_exchange_info(&http, base_url).await?
+    };
+    let cache = parse_exchange_info(&resp);
+    Ok(symbols
+        .iter()
+        .filter(|s| !cache.contains_key(&s.to_uppercase()))
+        .cloned()
+        .collect())
+}
+
+/// Fetch `exchangeInfo` for `env` and return the precision filters (tick size,
+/// lot step, min qty, min notional) for a single `symbol`, or `None` if the
+/// symbol isn't listed. Lets offline tools (backtests) auto-detect the real
+/// venue geometry instead of hard-coding it. No credentials required.
+pub async fn symbol_filters(
+    env: BinanceEnv,
+    symbol: &str,
+) -> Result<Option<exchange_info::SymbolFilters>, VenueError> {
+    let http = HttpClient::new();
+    let base_url = env.rest_base_url();
+    let resp = if env.is_futures() {
+        crate::futs::get_exchange_info(&http, base_url).await?
+    } else {
+        crate::spot::get_exchange_info(&http, base_url).await?
+    };
+    let cache = parse_exchange_info(&resp);
+    Ok(cache.get(&symbol.to_uppercase()).cloned())
+}
+
 // ---------------------------------------------------------------------------
 // BinanceClient
 // ---------------------------------------------------------------------------

@@ -103,6 +103,31 @@ async fn main() {
         MarketKind::Spot
     };
 
+    // Validate every requested symbol against the venue's exchangeInfo BEFORE
+    // creating dirs or subscribing — a symbol that doesn't exist (e.g. a USDC
+    // perp that only lists as USDT-M) silently records nothing otherwise.
+    // Refuse to start if ANY symbol is invalid so a typo can't quietly waste a
+    // recording run.
+    match tikr_binance::invalid_symbols(env, &args.symbols).await {
+        Ok(invalid) if invalid.is_empty() => {
+            info!(count = args.symbols.len(), "all symbols valid on {:?}", env);
+        }
+        Ok(invalid) => {
+            eprintln!(
+                "error: {} symbol(s) not listed on {:?}: {}",
+                invalid.len(),
+                env,
+                invalid.join(", ")
+            );
+            eprintln!("refusing to start — fix --symbols and retry");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: could not fetch exchangeInfo to validate symbols: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let label = args.label.clone().unwrap_or_else(|| {
         if args.hours == 0 {
             "unlimited".to_string()
