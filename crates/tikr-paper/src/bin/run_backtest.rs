@@ -208,12 +208,6 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     wv_inventory_skew_slots: u32,
 
-    /// Wave progressive lattice: extra bps added per successive level so the
-    /// lattice widens outward (gap to level k = step_bps + (k-1)·this).
-    /// `0` = uniform (off).
-    #[arg(long, default_value_t = 0u32)]
-    wv_step_increment_bps: u32,
-
     /// Wave inner self-spread (bps from mid to the first order each side),
     /// independent of `--wv-step-bps` spacing. `0` = legacy (step_bps/2).
     #[arg(long, default_value_t = 0u32)]
@@ -559,7 +553,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 grid_levels: args.wv_grid_levels,
                 step_bps: args.wv_step_bps,
                 inner_bps: args.wv_inner_bps,
-                step_increment_bps: args.wv_step_increment_bps,
                 refill_threshold: args.wv_refill_threshold,
                 max_position_usdt: match balance_max_position {
                     Some(cap) => cap,
