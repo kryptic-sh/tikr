@@ -705,9 +705,18 @@ struct Args {
     #[arg(long, default_value = "1")]
     sim_order_balance_pct: String,
 
-    /// Account leverage. The per-bot position cap is `balance × leverage`
-    /// (so 5× on a $600 balance = $3000 max position notional). Drives
-    /// `max_position_pct = leverage × 100` in the balance-compounding path.
+    /// Backtest compounding: per-bot position cap as a percent of WALLET
+    /// balance (NOT margin available). Mirrors the live poller —
+    /// `max_position = balance × max_position_pct / 100`. `100` (default,
+    /// matching the live USDC configs) = each bot may hold up to 100% of
+    /// wallet notional. Pushed to the strategy as the soft inventory cap.
+    #[arg(long, default_value = "100")]
+    sim_max_position_pct: String,
+
+    /// Account leverage. Like the live bot, leverage does NOT affect order
+    /// sizing or the position cap (those are wallet-relative) — it only sets
+    /// the venue margin backstop: the synthetic `-2019` reject fires when a
+    /// position would exceed `balance × leverage`. Default 5×.
     #[arg(long, default_value = "5")]
     leverage: String,
 
@@ -926,8 +935,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Lock the balance-compounding config before any spawn fires.
     let initial = Decimal::from_str(&args.sim_initial_balance)?;
     let order_pct = Decimal::from_str(&args.sim_order_balance_pct)?;
-    // Leverage → position cap as a percent of balance: 5× = 500% of equity.
-    let max_pct = Decimal::from_str(&args.leverage)? * Decimal::from(100);
+    // Position cap is wallet-relative (balance × pct/100), exactly like the
+    // live poller — NOT balance × leverage. Leverage only feeds the venue
+    // margin backstop below.
+    let max_pct = Decimal::from_str(&args.sim_max_position_pct)?;
     let _ = BALANCE_COMPOUNDING.set((initial, order_pct, max_pct));
 
     if !args.data_root.is_empty() {
@@ -1248,16 +1259,18 @@ async fn run_sweep_collect(
         None
     };
 
-    // Hard venue margin cap (synthetic -2019). When balance-compounding is on,
-    // the venue would reserve margin against `balance × leverage`, so derive
-    // the hard cap from `initial × max_position_pct / 100` (== balance ×
-    // leverage). This BINDS regardless of whether a strategy honours the soft
-    // `on_max_position_updated` cap — without it, accumulation strategies
-    // (MMR, LadderReentry) blow far past the nominal leverage. Falls back to
-    // the explicit `--sim-max-position-notional` when compounding is off.
-    let (bc_initial, bc_order_pct, bc_max_pct) = balance_compounding();
+    // Hard venue margin backstop (synthetic -2019), mirroring the live note
+    // "Total risk capped by the Binance margin engine + leverage". The
+    // wallet-relative `max_position_pct` soft cap (pushed to the strategy via
+    // `on_max_position_updated`) is the intended binding limit; this hard cap
+    // = `balance × leverage` is what the venue actually enforces, so it still
+    // bounds accumulation strategies that ignore the soft cap (MMR,
+    // LadderReentry). Falls back to the explicit `--sim-max-position-notional`
+    // when compounding is off.
+    let (bc_initial, bc_order_pct, _bc_max_pct) = balance_compounding();
+    let leverage = Decimal::from_str(&args.leverage)?;
     let hard_position_cap = if bc_initial > Decimal::ZERO && bc_order_pct > Decimal::ZERO {
-        Some((bc_initial * bc_max_pct / Decimal::from(100)).round_dp(8))
+        Some((bc_initial * leverage).round_dp(8))
     } else if args.sim_max_position_notional > 0.0 {
         Some(Decimal::try_from(args.sim_max_position_notional)?)
     } else {
