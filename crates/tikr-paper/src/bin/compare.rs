@@ -631,6 +631,11 @@ struct Args {
     #[arg(long, default_value = "0")]
     wave_inventory_skew_list: String,
 
+    /// Wave sweep: comma-separated progressive-lattice increments (bps added
+    /// per successive level so the lattice widens outward). `0` = uniform.
+    #[arg(long, default_value = "0")]
+    wave_step_increment_list: String,
+
     /// SpreadScalp notional per order.
     #[arg(long, default_value = "100")]
     spread_scalp_notional: String,
@@ -1880,35 +1885,39 @@ async fn run_sweep_collect(
         let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
         let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
         let wave_skew_sweep = parse_u32_list(&args.wave_inventory_skew_list)?;
+        let wave_inc_sweep = parse_u32_list(&args.wave_step_increment_list)?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &skew in &wave_skew_sweep {
-                    let label = format!(
-                        "Wave lv={levels} step={step}bps rt={} skew={skew}",
-                        args.wave_refill_threshold
-                    );
-                    spawn_preset(
-                        &mut handles,
-                        &shared_data,
-                        &symbol,
-                        &label,
-                        Wave::new(WaveConfig {
-                            notional_per_order: wave_notional,
-                            tick_size: tick,
-                            step_size: lot_step,
-                            min_notional: Decimal::ZERO,
-                            grid_levels: levels,
-                            step_bps: step,
-                            refill_threshold: args.wave_refill_threshold,
-                            max_position_usdt: bot_position_cap,
-                            inventory_skew_slots: skew,
-                        }),
-                        fees,
-                        skim_cfg,
-                        funding_cfg,
-                        sim_cfg_template.clone(),
-                        equity_csv_dir.clone(),
-                    );
+                    for &inc in &wave_inc_sweep {
+                        let label = format!(
+                            "Wave lv={levels} step={step}bps inc={inc} rt={} skew={skew}",
+                            args.wave_refill_threshold
+                        );
+                        spawn_preset(
+                            &mut handles,
+                            &shared_data,
+                            &symbol,
+                            &label,
+                            Wave::new(WaveConfig {
+                                notional_per_order: wave_notional,
+                                tick_size: tick,
+                                step_size: lot_step,
+                                min_notional: Decimal::ZERO,
+                                grid_levels: levels,
+                                step_bps: step,
+                                step_increment_bps: inc,
+                                refill_threshold: args.wave_refill_threshold,
+                                max_position_usdt: bot_position_cap,
+                                inventory_skew_slots: skew,
+                            }),
+                            fees,
+                            skim_cfg,
+                            funding_cfg,
+                            sim_cfg_template.clone(),
+                            equity_csv_dir.clone(),
+                        );
+                    }
                 }
             }
         }

@@ -491,6 +491,7 @@ fn build_wave(
         min_notional,
         grid_levels: wave.grid_levels,
         step_bps: wave.step_bps,
+        step_increment_bps: wave.step_increment_bps,
         refill_threshold: wave.refill_threshold,
         // Account-derived cap arrives via on_max_position_updated (live
         // channel); seed 0 = uncapped until the first update lands.

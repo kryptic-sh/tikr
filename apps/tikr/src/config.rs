@@ -288,6 +288,11 @@ pub struct WaveParams {
     /// Lattice geometry in bps — inner gap AND level spacing. `0` = 1-tick.
     #[serde(default)]
     pub step_bps: u32,
+    /// Progressive lattice: extra bps added per successive level so the
+    /// lattice widens outward (tight near mid, loose in the tail). `0` =
+    /// uniform.
+    #[serde(default)]
+    pub step_increment_bps: u32,
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,

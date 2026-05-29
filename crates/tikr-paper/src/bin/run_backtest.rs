@@ -207,6 +207,12 @@ struct Args {
     /// asks higher). `0` = symmetric (off). Requires a non-zero position cap.
     #[arg(long, default_value_t = 0u32)]
     wv_inventory_skew_slots: u32,
+
+    /// Wave progressive lattice: extra bps added per successive level so the
+    /// lattice widens outward (gap to level k = step_bps + (k-1)·this).
+    /// `0` = uniform (off).
+    #[arg(long, default_value_t = 0u32)]
+    wv_step_increment_bps: u32,
     /// Wave: hard position cap in quote notional (suppress add side). 0 = off.
     #[arg(long, default_value = "0")]
     wv_max_position_usdt: String,
@@ -547,6 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 min_notional: Decimal::from_str(&args.wv_min_notional)?,
                 grid_levels: args.wv_grid_levels,
                 step_bps: args.wv_step_bps,
+                step_increment_bps: args.wv_step_increment_bps,
                 refill_threshold: args.wv_refill_threshold,
                 max_position_usdt: match balance_max_position {
                     Some(cap) => cap,

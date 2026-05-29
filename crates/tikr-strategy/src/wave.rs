@@ -48,6 +48,16 @@ pub struct WaveConfig {
     /// with no inner gap (origins at the touch).
     pub step_bps: u32,
 
+    /// Progressive lattice: extra bps added to each successive level's gap,
+    /// so the lattice starts tight near the (frozen) origin and widens
+    /// outward. Gap to level `k` = `step_bps + (k-1)·step_increment_bps` bps;
+    /// e.g. `step_bps=2, step_increment_bps=1` → level gaps 2,3,4,5… (slots
+    /// at cumulative 2,5,9,14… bps). Tight inner levels capture small moves in
+    /// calm markets; the widening tail spans a large range so limited funds
+    /// survive a trend without exhausting at the position cap. `0` (default) =
+    /// uniform lattice (original behavior).
+    pub step_increment_bps: u32,
+
     /// Refill batching: only refill a side once ≥ this many of its band
     /// slots are empty (filled). `1` = refill on any single gap (most
     /// reactive). Higher = wait for N fills then refill them together,
@@ -85,7 +95,10 @@ pub struct Wave {
     /// Frozen on first usable book event.
     bid_lattice_origin: Option<Decimal>,
     ask_lattice_origin: Option<Decimal>,
+    /// Base gap (price) — the first level's distance from origin.
     lattice_step: Option<Decimal>,
+    /// Per-level gap increment (price). `0` = uniform lattice.
+    lattice_inc: Option<Decimal>,
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
@@ -155,8 +168,9 @@ impl Wave {
         }
     }
 
-    /// Lattice step = `step_bps` of mid, snapped up to tick (min 1 tick).
-    /// `step_bps = 0` → 1-tick lattice.
+    /// Base lattice gap = `step_bps` of mid, snapped up to tick (min 1 tick).
+    /// `step_bps = 0` → 1-tick gap. This is the distance from origin to the
+    /// first level.
     fn compute_step(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
         if self.config.step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
@@ -170,45 +184,85 @@ impl Wave {
         tick
     }
 
-    /// BID slot price at index k (k=0 is the top, increases descending).
+    /// Per-level gap increment = `step_increment_bps` of mid, snapped to tick.
+    /// `0` → uniform lattice (every gap equals the base step).
+    fn compute_increment(&self, mid: Decimal) -> Decimal {
+        let tick = self.config.tick_size;
+        if self.config.step_increment_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
+            let target =
+                mid * Decimal::from(self.config.step_increment_bps) / Decimal::from(10_000);
+            return (target / tick).round() * tick;
+        }
+        Decimal::ZERO
+    }
+
+    /// Cumulative price offset of the `n`-th level out from origin (`n >= 0`):
+    /// `O(n) = n·base + inc·n(n-1)/2`. With `inc = 0` this is the uniform
+    /// `n·base`. `O(0) = 0`.
+    fn cum_offset(&self, n: i64) -> Decimal {
+        let base = self.lattice_step.unwrap_or(Decimal::ZERO);
+        let inc = self.lattice_inc.unwrap_or(Decimal::ZERO);
+        let n = n.max(0);
+        let nd = Decimal::from(n);
+        nd * base + inc * nd * Decimal::from(n - 1) / Decimal::from(2)
+    }
+
+    /// Signed offset from origin for slot `k`: deeper (further from mid) as
+    /// `|k|` grows; `k > 0` = away from mid on this side, `k < 0` = back across
+    /// the origin. Monotonically increasing in `k`.
+    fn offset_at(&self, k: i64) -> Decimal {
+        let o = self.cum_offset(k.abs());
+        if k < 0 { -o } else { o }
+    }
+
+    /// Smallest slot index `k` with `offset_at(k) >= x` (binary search over the
+    /// monotonic offset). Single inverse shared by both sides.
+    fn smallest_k_with_offset_ge(&self, x: Decimal) -> Option<i64> {
+        if self.lattice_step? <= Decimal::ZERO {
+            return None;
+        }
+        // Bound generously; real moves keep |k| in the hundreds.
+        let mut lo: i64 = -(1 << 20);
+        let mut hi: i64 = 1 << 20;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.offset_at(mid) >= x {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Some(lo)
+    }
+
+    /// BID slot price at index k (k=0 is the top/origin, larger k = lower).
     fn bid_price(&self, k: i64) -> Option<Decimal> {
         let origin = self.bid_lattice_origin?;
-        let step = self.lattice_step?;
-        let p = origin - Decimal::from(k) * step;
+        self.lattice_step?;
+        let p = origin - self.offset_at(k);
         if p > Decimal::ZERO { Some(p) } else { None }
     }
 
-    /// ASK slot price at index k (k=0 is the top, increases ascending).
+    /// ASK slot price at index k (k=0 is the top/origin, larger k = higher).
     fn ask_price(&self, k: i64) -> Option<Decimal> {
         let origin = self.ask_lattice_origin?;
-        let step = self.lattice_step?;
-        let p = origin + Decimal::from(k) * step;
+        self.lattice_step?;
+        let p = origin + self.offset_at(k);
         if p > Decimal::ZERO { Some(p) } else { None }
     }
 
-    /// k index of the BID slot at or below the given price.
+    /// k index of the BID slot at or below `price`.
+    /// `bid_price(k) <= price  ⟺  offset_at(k) >= origin - price`.
     fn bid_k_at_or_below(&self, price: Decimal) -> Option<i64> {
         let origin = self.bid_lattice_origin?;
-        let step = self.lattice_step?;
-        if step <= Decimal::ZERO {
-            return None;
-        }
-        // k = ceil((origin - price) / step). If price >= origin then k <= 0.
-        let raw = (origin - price) / step;
-        let k = raw.ceil();
-        k.to_string().parse::<i64>().ok()
+        self.smallest_k_with_offset_ge(origin - price)
     }
 
-    /// k index of the ASK slot at or above the given price.
+    /// k index of the ASK slot at or above `price`.
+    /// `ask_price(k) >= price  ⟺  offset_at(k) >= price - origin`.
     fn ask_k_at_or_above(&self, price: Decimal) -> Option<i64> {
         let origin = self.ask_lattice_origin?;
-        let step = self.lattice_step?;
-        if step <= Decimal::ZERO {
-            return None;
-        }
-        let raw = (price - origin) / step;
-        let k = raw.ceil();
-        k.to_string().parse::<i64>().ok()
+        self.smallest_k_with_offset_ge(price - origin)
     }
 
     /// Cancel resting orders on `side` whose price is outside the band's
@@ -403,6 +457,7 @@ impl Strategy for Wave {
             bid_lattice_origin: None,
             ask_lattice_origin: None,
             lattice_step: None,
+            lattice_inc: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
         }
@@ -431,6 +486,7 @@ impl Strategy for Wave {
         {
             let mid = (b.0 + a.0) / Decimal::from(2);
             self.lattice_step = Some(self.compute_step(mid));
+            self.lattice_inc = Some(self.compute_increment(mid));
             self.bid_lattice_origin = Some(b.0);
             self.ask_lattice_origin = Some(a.0);
         }
@@ -578,6 +634,7 @@ mod tests {
             min_notional: Decimal::from(5),
             grid_levels: 6,
             step_bps: 10,
+            step_increment_bps: 0,
             refill_threshold: 1,
             max_position_usdt: Decimal::ZERO,
             inventory_skew_slots: 0,
@@ -660,6 +717,53 @@ mod tests {
         // Half cap long (3 × 100.5 = 301.5 ≈ 0.5×600) → ~half skew on bids.
         let half = pos_size(3);
         assert_eq!(w.inventory_skew(&ctx(&sy, &s, &half, &[]), bb, ba), (4, 0));
+    }
+
+    #[test]
+    fn progressive_lattice_widens_outward_and_inverts() {
+        let mut c = cfg();
+        c.step_increment_bps = 10; // progressive (base step_bps=10)
+        let mut w = Wave::new(c);
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1)); // 100 / 100.1
+        let p = pos_flat();
+        let sm = sym();
+        let _ = w.on_event(
+            &ctx(&sm, &s, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        // Successive bid-slot gaps must strictly widen (tight → loose).
+        let b: Vec<Decimal> = (0..5).map(|k| w.bid_price(k).unwrap()).collect();
+        let (g1, g2, g3) = (b[0] - b[1], b[1] - b[2], b[2] - b[3]);
+        assert!(
+            g1 > Decimal::ZERO && g2 > g1 && g3 > g2,
+            "bid gaps must widen: {g1} {g2} {g3}"
+        );
+        // Ask side mirrors.
+        let a: Vec<Decimal> = (0..4).map(|k| w.ask_price(k).unwrap()).collect();
+        assert!(a[1] - a[0] < a[2] - a[1], "ask gaps must widen");
+        // Inverse round-trips exactly.
+        assert_eq!(w.bid_k_at_or_below(b[3]), Some(3));
+        assert_eq!(w.ask_k_at_or_above(a[3]), Some(3));
+        assert_eq!(w.bid_k_at_or_below(b[0]), Some(0));
+    }
+
+    #[test]
+    fn uniform_lattice_has_equal_gaps() {
+        let mut w = Wave::new(cfg()); // step_increment_bps defaults 0
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos_flat();
+        let sm = sym();
+        let _ = w.on_event(
+            &ctx(&sm, &s, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let b: Vec<Decimal> = (0..4).map(|k| w.bid_price(k).unwrap()).collect();
+        assert_eq!(b[0] - b[1], b[1] - b[2], "uniform gaps must be equal");
+        assert_eq!(b[1] - b[2], b[2] - b[3]);
     }
 
     #[test]
