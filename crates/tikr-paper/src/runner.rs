@@ -532,9 +532,9 @@ where
         .unwrap_or(Decimal::ZERO);
 
     let mut current_book = empty_snapshot(&symbol);
-    // Reused per-event buffer for the strategy's open-quote view, so the hot
-    // path refills one allocation instead of allocating a fresh Vec each event.
-    let mut open_quotes_buf: Vec<(tikr_venue::QuoteId, tikr_venue::QuoteIntent)> = Vec::new();
+    // The strategy's open-quote view comes from `fill_sim.open_quotes(&symbol)`,
+    // which serves a borrowed slice from an internal cache that only rebuilds
+    // (and re-clones symbols) when the resting-order set actually changes.
     let mut last_mid = Price(Decimal::ZERO);
     // Perp mark price for unrealized PnL, funding, and liquidation. Sourced
     // from `config.mark_series` when present; otherwise falls back to
@@ -903,8 +903,7 @@ where
                 }
 
                 let pos = tracker.snapshot();
-                fill_sim.live_quotes_into(&symbol, &mut open_quotes_buf);
-                let open_quotes = open_quotes_buf.as_slice();
+                let open_quotes = fill_sim.open_quotes(&symbol);
                 let liqs = liq_window.observe(ts.0);
                 let ctx = StrategyContext {
                     symbol: &symbol,
@@ -912,7 +911,7 @@ where
                     position: &pos,
                     recent_fills: &[],
                     latest_book: &current_book,
-                    open_quotes: &open_quotes,
+                    open_quotes,
                     recent_liqs: liqs,
                 };
 

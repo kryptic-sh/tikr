@@ -8,11 +8,19 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+// Concurrent preset sweeps are allocation-heavy (Decimal ops, per-event Vec
+// churn, Symbol clones across many tasks). The default system allocator
+// serializes under that contention — a single Hawk preset runs in ~5s solo
+// but ~70s when 6 run concurrently (15x). mimalloc's per-thread heaps remove
+// the global-lock bottleneck so per-preset cost stays near its solo time.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use async_trait::async_trait;
 use clap::Parser;
 use futures::stream::{self, BoxStream};
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
-use tikr_backtest::replay::{LoadedReplayData, ParquetReplay, ReplayConfig};
+use tikr_backtest::replay::{LoadedReplayData, ParquetReplay, ReplayConfig, deep_clone_symbol};
 use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
     VenueId,
@@ -2327,7 +2335,8 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
     equity_csv_dir: Option<PathBuf>,
 ) {
     let sd = Arc::clone(shared_data);
-    let sym = symbol.clone();
+    // Per-preset deep copy — see note in `spawn_preset`.
+    let sym = deep_clone_symbol(symbol);
     let display = name.to_string();
     let state_id = name
         .chars()
@@ -2433,7 +2442,10 @@ fn spawn_preset<S: Strategy + Send + 'static>(
     equity_csv_dir: Option<PathBuf>,
 ) {
     let sd = Arc::clone(shared_data);
-    let sym = symbol.clone();
+    // Per-preset deep copy: distinct `Arc<str>` so the runner's per-event
+    // symbol clones (into every QuoteIntent) stay thread-local instead of
+    // ping-ponging one shared refcount across concurrent presets.
+    let sym = deep_clone_symbol(symbol);
     let display = name.to_string();
     let state_id = name
         .chars()

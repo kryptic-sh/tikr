@@ -11,7 +11,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use polars::prelude::*;
 use thiserror::Error;
-use tikr_core::{Decimal, Level, MarketEvent, Price, Side, Size, Snapshot, Symbol, Timestamp};
+use tikr_core::{
+    Asset, Decimal, Level, MarketEvent, Price, Side, Size, Snapshot, Symbol, Timestamp, VenueId,
+};
 
 /// Forward iterator over historical market events. Sim time advances per event.
 #[async_trait]
@@ -183,29 +185,28 @@ impl LoadedReplayData {
                 .unwrap_or(4)
                 .min(tasks.len().max(1));
             let chunk = tasks.len().div_ceil(nthreads).max(1);
-            let results: Vec<Result<Vec<LoadedEvent>, ReplayError>> =
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = tasks
-                        .chunks(chunk)
-                        .map(|c| {
-                            s.spawn(move || {
-                                let mut local = Vec::new();
-                                for (path, is_book, idx) in c {
-                                    if *is_book {
-                                        load_book_parquet(path, *idx, tick, &mut local)?;
-                                    } else {
-                                        load_trades_parquet(path, *idx, &mut local)?;
-                                    }
+            let results: Vec<Result<Vec<LoadedEvent>, ReplayError>> = std::thread::scope(|s| {
+                let handles: Vec<_> = tasks
+                    .chunks(chunk)
+                    .map(|c| {
+                        s.spawn(move || {
+                            let mut local = Vec::new();
+                            for (path, is_book, idx) in c {
+                                if *is_book {
+                                    load_book_parquet(path, *idx, tick, &mut local)?;
+                                } else {
+                                    load_trades_parquet(path, *idx, &mut local)?;
                                 }
-                                Ok(local)
-                            })
+                            }
+                            Ok(local)
                         })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("parquet load thread panicked"))
-                        .collect()
-                });
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("parquet load thread panicked"))
+                    .collect()
+            });
             for r in results {
                 events.extend(r?);
             }
@@ -352,9 +353,37 @@ impl LoadedReplayData {
 /// when datasets outgrow RAM.
 pub struct ParquetReplay {
     data: Arc<LoadedReplayData>,
+    /// Per-instance deep copy of the configured symbols. Each replay owns
+    /// distinct `Arc<str>` allocations rather than cloning the ones inside the
+    /// shared `Arc<LoadedReplayData>`. The hot path clones a `Symbol` into
+    /// every emitted `MarketEvent` (~once per event); cloning the *shared*
+    /// `Arc<str>` made all concurrent `compare` presets bump the same refcount
+    /// cache lines, which ping-ponged across cores and dropped aggregate
+    /// throughput below a single thread's. Owning per-instance copies keeps
+    /// those refcount atomics thread-local.
+    symbols: Vec<Symbol>,
     books: Vec<BookState>,
     cursor: usize,
     last_emitted_ts: Option<u64>,
+}
+
+/// Deep-clone a `Symbol` so the result owns fresh `Arc<str>` allocations
+/// instead of sharing the input's. Copies the exact interned bytes (no
+/// re-normalization) so the result is byte-identical and replay stays
+/// deterministic.
+///
+/// Public so multi-preset sweeps (`compare`) can give each preset's runner a
+/// distinct `Symbol`: the per-event hot path clones the symbol into every
+/// `QuoteIntent` (see `FillSim::live_quotes_into`), and sharing one `Arc<str>`
+/// across concurrent presets turns those clones into cross-core refcount
+/// ping-pong that drops aggregate throughput below a single thread's.
+pub fn deep_clone_symbol(s: &Symbol) -> Symbol {
+    Symbol {
+        base: Asset(Arc::from(&*s.base.0)),
+        quote: Asset(Arc::from(&*s.quote.0)),
+        venue: VenueId(Arc::from(&*s.venue.0)),
+        kind: s.kind,
+    }
 }
 
 impl ParquetReplay {
@@ -375,8 +404,10 @@ impl ParquetReplay {
         for _ in 0..data.cfg.symbols.len() {
             books.push(BookState::default());
         }
+        let symbols: Vec<Symbol> = data.cfg.symbols.iter().map(deep_clone_symbol).collect();
         Self {
             data,
+            symbols,
             books,
             cursor: 0,
             last_emitted_ts: None,
@@ -621,7 +652,7 @@ impl Replay for ParquetReplay {
         self.last_emitted_ts = Some(next_event_ts);
         let ev = &self.data.events[cursor];
         let ts = Timestamp(ev.ts_ns);
-        let symbol = self.data.cfg.symbols[ev.symbol_idx].clone();
+        let symbol = self.symbols[ev.symbol_idx].clone();
 
         match &ev.payload {
             EventPayload::BookDelta {

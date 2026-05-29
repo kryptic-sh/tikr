@@ -241,6 +241,20 @@ pub struct FillSim {
     /// Last `on_market_event` timestamp, in nanoseconds. Used to compute
     /// the elapsed window for `silent_cancel_rate_per_min`.
     last_event_ts_ns: Option<u64>,
+    /// Cache backing [`Self::open_quotes`]. The per-event runner loop rebuilds
+    /// the open-quote list on every market event, and each entry clones a
+    /// `Symbol` (3× `Arc<str>` refcount atomics) — under a concurrent
+    /// `compare` sweep those `lock`-prefixed atomics dominate the profile.
+    /// Most events (pure book updates) leave the resting-order set untouched,
+    /// so we fingerprint it and only rebuild (and re-clone) when the
+    /// fingerprint changes.
+    open_quotes_cache: Vec<(QuoteId, QuoteIntent)>,
+    /// Fingerprint of the live + in-flight order set the cache was built from.
+    /// `None` forces a rebuild on first use.
+    open_quotes_cache_sig: Option<u128>,
+    /// Symbol the cache was built for; a mismatch forces a rebuild (defends
+    /// the cache against multi-symbol callers).
+    open_quotes_cache_symbol: Option<Symbol>,
 }
 
 impl FillSim {
@@ -264,6 +278,9 @@ impl FillSim {
             rng_state,
             latency_rng_state,
             last_event_ts_ns: None,
+            open_quotes_cache: Vec::new(),
+            open_quotes_cache_sig: None,
+            open_quotes_cache_symbol: None,
         }
     }
 
@@ -347,6 +364,82 @@ impl FillSim {
                 out.push((*qid, intent.clone()));
             }
         }
+    }
+
+    /// 128-bit fingerprint of exactly the state [`Self::live_quotes_into`]
+    /// reads to produce its output for `symbol`: the resting `live_quotes`
+    /// (id, side, price, remaining size) plus in-flight `Place` ops carrying a
+    /// venue id. Cheap (integer folds, no allocation, no `Symbol` clone) so it
+    /// can run every event to gate the expensive rebuild. `price`/`side` never
+    /// mutate in place — only `size_remaining` does, and entries are
+    /// added/removed wholesale — so this captures every change that can alter
+    /// the output. Order is stable (both loops iterate `Vec`s in place), so
+    /// the fold is deterministic.
+    fn open_quotes_signature(&self, symbol: &Symbol) -> u128 {
+        // Two independent FNV-1a-style accumulators → 128-bit combined width,
+        // making an aliasing collision (which would deterministically return a
+        // stale set for one event) astronomically unlikely.
+        let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut h2: u64 = 0x1000_0000_01b3_27d4;
+        #[inline]
+        fn mix(h: &mut u64, x: u64) {
+            *h = (*h ^ x).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut count: u64 = 0;
+        for q in self.live_quotes.iter().filter(|q| &q.symbol == symbol) {
+            count += 1;
+            let id = q.id.0.as_u128();
+            mix(&mut h1, id as u64);
+            mix(&mut h2, (id >> 64) as u64);
+            let side = match q.side {
+                Side::Bid => 0,
+                Side::Ask => 1,
+            };
+            mix(&mut h1, q.price.0.mantissa() as u64);
+            mix(&mut h2, (q.price.0.scale() as u64) << 1 | side);
+            mix(&mut h1, q.size_remaining.0.mantissa() as u64);
+            mix(&mut h2, q.size_remaining.0.scale() as u64);
+        }
+        for p in &self.pending {
+            if let Op::Place {
+                intent,
+                override_id: Some(qid),
+            } = &p.op
+                && &intent.symbol == symbol
+            {
+                count += 1;
+                let id = qid.0.as_u128();
+                mix(&mut h1, id as u64);
+                mix(&mut h2, (id >> 64) as u64);
+                mix(&mut h1, intent.price.0.mantissa() as u64);
+                mix(&mut h2, intent.size.0.mantissa() as u64);
+            }
+        }
+        mix(&mut h1, count);
+        mix(&mut h2, count);
+        ((h1 as u128) << 64) | (h2 as u128)
+    }
+
+    /// Resting + in-flight open quotes for `symbol`, as the per-event strategy
+    /// loop consumes them. Returns a borrowed slice from an internal cache that
+    /// is rebuilt only when the order set actually changes (see
+    /// [`Self::open_quotes_signature`]); on the common pure-book-update event
+    /// the cached slice is returned without re-cloning any `Symbol`. Bit-for-
+    /// bit equivalent to [`Self::live_quotes_for`].
+    pub fn open_quotes(&mut self, symbol: &Symbol) -> &[(QuoteId, QuoteIntent)] {
+        let sig = self.open_quotes_signature(symbol);
+        let fresh = self.open_quotes_cache_sig == Some(sig)
+            && self.open_quotes_cache_symbol.as_ref() == Some(symbol);
+        if !fresh {
+            // Take the cache out so `live_quotes_into` can borrow `&self`
+            // alongside `&mut buf`, then put it back.
+            let mut buf = std::mem::take(&mut self.open_quotes_cache);
+            self.live_quotes_into(symbol, &mut buf);
+            self.open_quotes_cache = buf;
+            self.open_quotes_cache_sig = Some(sig);
+            self.open_quotes_cache_symbol = Some(symbol.clone());
+        }
+        &self.open_quotes_cache
     }
 
     /// Schedule a strategy action for venue submission at `now + appropriate_latency_ms`.

@@ -88,7 +88,6 @@ struct Args {
 #[derive(Debug, Clone, Copy)]
 struct Candle {
     open_ts_ms: u64,
-    open: f64,
     high: f64,
     low: f64,
     close: f64,
@@ -98,7 +97,6 @@ struct Candle {
 fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error>> {
     let df = LazyFrame::scan_parquet(path, ScanArgsParquet::default())?.collect()?;
     let ts = df.column("open_ts_ms")?.u64()?;
-    let o = df.column("open")?.f64()?;
     let h = df.column("high")?.f64()?;
     let l = df.column("low")?.f64()?;
     let c = df.column("close")?.f64()?;
@@ -107,7 +105,6 @@ fn load_candles(path: &PathBuf) -> Result<Vec<Candle>, Box<dyn std::error::Error
     for i in 0..df.height() {
         out.push(Candle {
             open_ts_ms: ts.get(i).ok_or("ts")?,
-            open: o.get(i).ok_or("o")?,
             high: h.get(i).ok_or("h")?,
             low: l.get(i).ok_or("l")?,
             close: c.get(i).ok_or("c")?,
@@ -198,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let close = dec(c.close);
         let bid_p = close - half_tick;
         let ask_p = close + half_tick;
-        let ts_ns = c.open_ts_ms.saturating_mul(1_000_000) as u64;
+        let ts_ns = c.open_ts_ms.saturating_mul(1_000_000);
         let snap = Snapshot {
             symbol: symbol.clone(),
             bids: vec![Level {
@@ -259,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let actions_trade = strat.on_event(&ctx, &trade);
 
         // Apply new actions: book updates resting set; cancels remove; quotes added.
-        for action in actions_book.into_iter().chain(actions_trade.into_iter()) {
+        for action in actions_book.into_iter().chain(actions_trade) {
             match action {
                 Action::Quote(intent) => {
                     let id = QuoteId::new();
@@ -332,7 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(next) = candles.get(i + 1) {
             let next_high = dec(next.high);
             let next_low = dec(next.low);
-            let next_ts_ns = next.open_ts_ms.saturating_mul(1_000_000) as u64;
+            let next_ts_ns = next.open_ts_ms.saturating_mul(1_000_000);
             let mut filled: Vec<(QuoteId, Resting)> = Vec::new();
             // Strategy is long-only — BID = entry, ASK = exit. Process BIDs
             // before ASKs so an entry+exit in the same candle is ordered correctly.
@@ -425,17 +422,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                     })
                     .collect();
+                let fill_event = MarketEvent::Fill(fill_ev.clone());
                 let ctx_fill = StrategyContext {
                     symbol: &symbol,
                     now: Timestamp(next_ts_ns),
                     position: &position_after,
-                    recent_fills: &[fill_ev.clone()],
+                    recent_fills: std::slice::from_ref(&fill_ev),
                     latest_book: &snap,
                     open_quotes: &open_quotes_after,
                     recent_liqs: &[],
                 };
                 // Strategy's Fill handling may emit follow-up TP/Exit ASKs.
-                let post_actions = strat.on_event(&ctx_fill, &MarketEvent::Fill(fill_ev));
+                let post_actions = strat.on_event(&ctx_fill, &fill_event);
                 for a in post_actions {
                     match a {
                         Action::Quote(intent) => {
