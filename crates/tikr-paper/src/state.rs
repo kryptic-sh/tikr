@@ -41,6 +41,9 @@ mod tests {
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
             peak_position_usdt: Notional(Decimal::ZERO),
+            mean_position_usdt: Notional(Decimal::ZERO),
+            full_fills: 0,
+            partial_fills: 0,
             liquidations: 0,
         }
     }

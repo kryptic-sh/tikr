@@ -527,6 +527,9 @@ where
     // to PaperReport — resume always starts these at 0.
     let mut buy_fills: u64 = 0;
     let mut sell_fills: u64 = 0;
+    // Full vs partial fill split (Fill.is_full). fills_emitted = full + partial.
+    let mut full_fills: u64 = 0;
+    let mut partial_fills: u64 = 0;
     let mut buy_volume: Decimal = Decimal::ZERO;
     let mut sell_volume: Decimal = Decimal::ZERO;
     // Peak absolute position notional (|size| × mid) seen during the
@@ -534,6 +537,11 @@ where
     // cap then traded out still shows the high-water mark in the
     // final report.
     let mut peak_position_usdt: Decimal = Decimal::ZERO;
+    // Running accumulators for MEAN absolute position notional (same sample
+    // cadence as the peak). Mean shows typical inventory load, not just the
+    // high-water mark — a lower mean at equal net = the algo carried less risk.
+    let mut position_usdt_sum: Decimal = Decimal::ZERO;
+    let mut position_samples: u64 = 0;
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
     let resumed_sim_duration_secs: u64 = resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
 
@@ -679,6 +687,10 @@ where
                 buy_volume,
                 sell_volume,
                 peak_position_usdt,
+                position_usdt_sum,
+                position_samples,
+                full_fills,
+                partial_fills,
                 liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
             );
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
@@ -875,6 +887,8 @@ where
                         if pos_notional > peak_position_usdt {
                             peak_position_usdt = pos_notional;
                         }
+                        position_usdt_sum += pos_notional;
+                        position_samples += 1;
                     }
                 }
 
@@ -939,6 +953,8 @@ where
                             &mut tracker,
                             &mut risk_gate,
                             &mut fills_emitted,
+                            &mut full_fills,
+                            &mut partial_fills,
                             &mut buy_fills,
                             &mut sell_fills,
                             &mut buy_volume,
@@ -1224,6 +1240,8 @@ where
                             &mut tracker,
                             &mut risk_gate,
                             &mut fills_emitted,
+                            &mut full_fills,
+                            &mut partial_fills,
                             &mut buy_fills,
                             &mut sell_fills,
                             &mut buy_volume,
@@ -1449,6 +1467,10 @@ where
                         buy_volume,
                         sell_volume,
                         peak_position_usdt,
+                        position_usdt_sum,
+                        position_samples,
+                        full_fills,
+                        partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
@@ -1540,6 +1562,8 @@ where
                     &mut tracker,
                     &mut risk_gate,
                     &mut fills_emitted,
+                    &mut full_fills,
+                    &mut partial_fills,
                     &mut buy_fills,
                     &mut sell_fills,
                     &mut buy_volume,
@@ -1577,6 +1601,10 @@ where
                         buy_volume,
                         sell_volume,
                         peak_position_usdt,
+                        position_usdt_sum,
+                        position_samples,
+                        full_fills,
+                        partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
@@ -1706,6 +1734,10 @@ where
                         buy_volume,
                         sell_volume,
                         peak_position_usdt,
+                        position_usdt_sum,
+                        position_samples,
+                        full_fills,
+                        partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                     );
                     heartbeat.runtime_secs =
@@ -1887,6 +1919,10 @@ where
         buy_volume,
         sell_volume,
         peak_position_usdt,
+        position_usdt_sum,
+        position_samples,
+        full_fills,
+        partial_fills,
         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
@@ -2306,6 +2342,8 @@ async fn apply_fill(
     tracker: &mut PositionTracker,
     risk_gate: &mut Option<Box<dyn RiskGate>>,
     fills_emitted: &mut u64,
+    full_fills: &mut u64,
+    partial_fills: &mut u64,
     buy_fills: &mut u64,
     sell_fills: &mut u64,
     buy_volume: &mut Decimal,
@@ -2328,6 +2366,11 @@ async fn apply_fill(
     }
     // Display/report fill counters track every execution, including partials.
     *fills_emitted += 1;
+    if fill.is_full {
+        *full_fills += 1;
+    } else {
+        *partial_fills += 1;
+    }
     match fill.side {
         tikr_core::Side::Bid => {
             *buy_fills += 1;
@@ -2369,6 +2412,10 @@ fn finalize(
     buy_volume: Decimal,
     sell_volume: Decimal,
     peak_position_usdt: Decimal,
+    position_usdt_sum: Decimal,
+    position_samples: u64,
+    full_fills: u64,
+    partial_fills: u64,
     liquidations: u64,
 ) -> PaperReport {
     let base = tracker.report(last_mark);
@@ -2384,6 +2431,11 @@ fn finalize(
         None => Decimal::ZERO,
     };
     let final_base_value = base_stacked * last_mark.0;
+    let mean_position_usdt = if position_samples > 0 {
+        (position_usdt_sum / Decimal::from(position_samples)).round_dp(8)
+    } else {
+        Decimal::ZERO
+    };
     PaperReport {
         schema_version: SCHEMA_VERSION,
         realized: base.realized,
@@ -2409,6 +2461,9 @@ fn finalize(
         buy_volume_usdt: Notional(buy_volume),
         sell_volume_usdt: Notional(sell_volume),
         peak_position_usdt: Notional(peak_position_usdt),
+        mean_position_usdt: Notional(mean_position_usdt),
+        full_fills,
+        partial_fills,
         liquidations,
     }
 }
@@ -3193,6 +3248,9 @@ mod tests {
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
             peak_position_usdt: Notional(Decimal::ZERO),
+            mean_position_usdt: Notional(Decimal::ZERO),
+            full_fills: 0,
+            partial_fills: 0,
             liquidations: 0,
         };
         let venue = MockVenue::finite(Vec::new());
@@ -3244,6 +3302,9 @@ mod tests {
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
             peak_position_usdt: Notional(Decimal::ZERO),
+            mean_position_usdt: Notional(Decimal::ZERO),
+            full_fills: 0,
+            partial_fills: 0,
             liquidations: 0,
         };
         let venue = MockVenue::finite(Vec::new());

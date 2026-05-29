@@ -75,6 +75,18 @@ pub struct PaperReport {
     /// (`|size| × last_mid` sampled on every event). Shows how close
     /// the strategy came to its `max_position_usdt` cap.
     pub peak_position_usdt: Notional,
+    /// Mean absolute position value over the run, in USDT (`|size| × mark`
+    /// averaged over every sample point, same cadence as `peak_position_usdt`).
+    /// Unlike the peak, this shows the strategy's *typical* inventory load —
+    /// a lower mean at similar net means the algo carried less risk on
+    /// average (e.g. inventory-skew shrinks this; a flat market keeps it low).
+    pub mean_position_usdt: Notional,
+    /// Count of fully-filled resting orders (`Fill.is_full == true`).
+    pub full_fills: u64,
+    /// Count of partial fills (`Fill.is_full == false`). `fills_emitted` =
+    /// `full_fills + partial_fills`; comparing strategies by raw `fills_emitted`
+    /// is misleading because larger orders fragment into more partials.
+    pub partial_fills: u64,
     /// Number of forced liquidations triggered during the run. `0` when no
     /// [`crate::runner::RunnerConfig::liquidation`] model was configured, or
     /// when the mark never breached the position's liquidation price. A
@@ -119,6 +131,12 @@ struct PaperReportWire {
     #[serde(default)]
     peak_position_usdt: String,
     #[serde(default)]
+    mean_position_usdt: String,
+    #[serde(default)]
+    full_fills: u64,
+    #[serde(default)]
+    partial_fills: u64,
+    #[serde(default)]
     liquidations: u64,
 }
 
@@ -145,6 +163,9 @@ impl Serialize for PaperReport {
             buy_volume_usdt: self.buy_volume_usdt.0.to_string(),
             sell_volume_usdt: self.sell_volume_usdt.0.to_string(),
             peak_position_usdt: self.peak_position_usdt.0.to_string(),
+            mean_position_usdt: self.mean_position_usdt.0.to_string(),
+            full_fills: self.full_fills,
+            partial_fills: self.partial_fills,
             liquidations: self.liquidations,
         }
         .serialize(serializer)
@@ -214,6 +235,13 @@ impl<'de> Deserialize<'de> for PaperReport {
             } else {
                 parse(&wire.peak_position_usdt)?
             },
+            mean_position_usdt: if wire.mean_position_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.mean_position_usdt)?
+            },
+            full_fills: wire.full_fills,
+            partial_fills: wire.partial_fills,
             liquidations: wire.liquidations,
         })
     }
