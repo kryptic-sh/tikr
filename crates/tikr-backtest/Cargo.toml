@@ -12,69 +12,11 @@ rust-version.workspace = true
 homepage.workspace = true
 readme.workspace = true
 
-[[bin]]
-name = "record"
-path = "src/bin/record.rs"
-
-[[bin]]
-name = "record_binance"
-path = "src/bin/record_binance.rs"
-
-[[bin]]
-name = "download_klines"
-path = "src/bin/download_klines.rs"
-
-[[bin]]
-name = "backtest_klines"
-path = "src/bin/backtest_klines.rs"
-
-[[bin]]
-name = "backtest_rsi_mr"
-path = "src/bin/backtest_rsi_mr.rs"
-
-[[bin]]
-name = "backtest_bands"
-path = "src/bin/backtest_bands.rs"
-
-[[bin]]
-name = "backtest_dca_bands"
-path = "src/bin/backtest_dca_bands.rs"
-
-[[bin]]
-name = "backtest_layered_grid"
-path = "src/bin/backtest_layered_grid.rs"
-
-[[bin]]
-name = "backtest_donchian"
-path = "src/bin/backtest_donchian.rs"
-
-[[bin]]
-name = "backtest_naive_rolling"
-path = "src/bin/backtest_naive_rolling.rs"
-
-[[bin]]
-name = "backtest_atr_grid"
-path = "src/bin/backtest_atr_grid.rs"
-
-[[bin]]
-name = "backtest_bollinger"
-path = "src/bin/backtest_bollinger.rs"
-
-[[bin]]
-name = "backtest_pairs"
-path = "src/bin/backtest_pairs.rs"
-
-[[bin]]
-name = "record_liquidations"
-path = "src/bin/record_liquidations.rs"
-
-[[bin]]
-name = "gen_synthetic_liqs"
-path = "src/bin/gen_synthetic_liqs.rs"
-
-[[bin]]
-name = "backtest_liquidation_cascade"
-path = "src/bin/backtest_liquidation_cascade.rs"
+# This crate is now library-only: the parquet replay engine + FillSim +
+# P&L accounting consumed by tikr-paper's `compare` runner and apps/tikr.
+# The recorder moved to the `tikr-record` crate; the one-off strategy
+# experiment bins were removed (the strategy registry is the source of
+# truth now).
 
 [dependencies]
 tikr-core = "0.1"
@@ -83,26 +25,11 @@ tikr-venue = "0.1"
 # conversion (tikr-core re-exports the type but not the prelude traits).
 rust_decimal = { version = "1", default-features = false }
 tikr-strategy = "0.1"
-tikr-hyperliquid = "0.1"
-tikr-binance = "0.1"
 polars = { version = "0.43", default-features = false, features = ["parquet", "lazy", "polars-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 async-trait = "0.1"
-futures = "0.3"
 thiserror = "2"
-clap = { version = "4", features = ["derive"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
-# Direct dep so the recorder bins can install a CryptoProvider before any TLS
-# use — reqwest's rustls-tls + tokio-tungstenite's rustls-tls-webpki-roots
-# pull conflicting provider defaults, leaving rustls 0.23 ambiguous at runtime.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# Direct dep so download_klines can pull historical kline data from the
-# Binance REST API.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-serde = { version = "1", features = ["derive"] }
-rand = { version = "0.9", default-features = false, features = ["std", "std_rng"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

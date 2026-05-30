@@ -324,7 +324,7 @@ pub struct WaveParams {
     #[serde(default)]
     pub step_bps: u32,
     /// Inner self-spread in bps (mid → first order each side), independent of
-    /// `step_bps` spacing. `0` (default) = legacy (step_bps/2).
+    /// `step_bps` spacing. Optional — `0`/unset defaults to `step_bps`.
     #[serde(default)]
     pub inner_bps: u32,
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).

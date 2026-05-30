@@ -154,6 +154,8 @@ pub fn to_spec(
         latency_jitter_ms: 0,
         // Paper-mode sim mirrors the live venue's per-symbol open-order filter.
         max_open_orders: Some(tikr_backtest::fill_sim::BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL),
+        // Live mode discards FillSim; backtest-only queue model stays off here.
+        queue_cancel_decay_per_sec: 0.0,
     });
 
     Ok(BotSpec {

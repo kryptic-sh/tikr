@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::stream::{self, BoxStream};
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
 use tikr_backtest::replay::{LoadedReplayData, ParquetReplay, ReplayConfig, deep_clone_symbol};
@@ -38,19 +38,94 @@ use tikr_strategy::{
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Venue environment for `--autodetect-filters` exchangeInfo lookups. Local
+/// (not `tikr_binance::BinanceEnv`) because tikr-binance depends on tikr-paper,
+/// so this crate can't depend back on it — the fetch is done inline here.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EnvArg {
+    #[value(name = "spot-mainnet")]
+    SpotMainnet,
+    #[value(name = "futures-mainnet")]
+    FuturesMainnet,
+    #[value(name = "spot-testnet")]
+    SpotTestnet,
+    #[value(name = "futures-testnet")]
+    FuturesTestnet,
+}
+
+impl EnvArg {
+    fn base_url(self) -> &'static str {
+        match self {
+            EnvArg::SpotMainnet => "https://api.binance.com",
+            EnvArg::FuturesMainnet => "https://fapi.binance.com",
+            EnvArg::SpotTestnet => "https://testnet.binance.vision",
+            EnvArg::FuturesTestnet => "https://testnet.binancefuture.com",
+        }
+    }
+    fn is_futures(self) -> bool {
+        matches!(self, EnvArg::FuturesMainnet | EnvArg::FuturesTestnet)
+    }
+}
+
+/// Fetch `exchangeInfo` for `env` and return `(tick_size, step_size,
+/// min_notional)` strings for `symbol`, or `None` if the symbol isn't listed
+/// or the fetch/parse fails. Inline (no tikr-binance dep — see [`EnvArg`]).
+async fn autodetect_filters(env: EnvArg, symbol: &str) -> Option<(String, String, String)> {
+    let path = if env.is_futures() {
+        "/fapi/v1/exchangeInfo"
+    } else {
+        "/api/v3/exchangeInfo"
+    };
+    let url = format!("{}{}", env.base_url(), path);
+    let resp = reqwest::Client::new().get(&url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let want = symbol.to_uppercase();
+    let syms = json.get("symbols")?.as_array()?;
+    let s = syms
+        .iter()
+        .find(|s| s.get("symbol").and_then(|v| v.as_str()) == Some(want.as_str()))?;
+    let filters = s.get("filters")?.as_array()?;
+    let mut tick = None;
+    let mut step = None;
+    let mut min_notional = None;
+    for f in filters {
+        match f.get("filterType").and_then(|v| v.as_str()) {
+            Some("PRICE_FILTER") => {
+                tick = f.get("tickSize").and_then(|v| v.as_str()).map(String::from)
+            }
+            Some("LOT_SIZE") => step = f.get("stepSize").and_then(|v| v.as_str()).map(String::from),
+            Some("MIN_NOTIONAL") | Some("NOTIONAL") => {
+                min_notional = f.get("notional").and_then(|v| v.as_str()).map(String::from)
+            }
+            _ => {}
+        }
+    }
+    Some((tick?, step?, min_notional?))
+}
 
 /// Backtest balance-compounding config: `(initial_balance, order_balance_pct,
 /// max_position_pct)`. Set once in `main` from CLI args; read by every spawn
 /// helper. Default = all zeros → compounding disabled, static notional path.
 static BALANCE_COMPOUNDING: OnceLock<(Decimal, Decimal, Decimal)> = OnceLock::new();
 static INVENTORY_BOOST: OnceLock<Option<InventoryBoostConfig>> = OnceLock::new();
+/// Per-symbol venue `min_notional` (from exchangeInfo autodetect), read by the
+/// `run_one` / `spawn_preset_with_liqs` RunnerConfig builders. Settable (not a
+/// `OnceLock`) because basket mode resolves a different value per symbol; safe
+/// because basket runs symbols sequentially and presets within a symbol only
+/// read it at spawn time after it's been set.
+static RUNNER_MIN_NOTIONAL: Mutex<Decimal> = Mutex::new(Decimal::ZERO);
 
 fn balance_compounding() -> (Decimal, Decimal, Decimal) {
     BALANCE_COMPOUNDING
         .get()
         .copied()
         .unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))
+}
+
+fn runner_min_notional() -> Decimal {
+    *RUNNER_MIN_NOTIONAL.lock().unwrap()
 }
 
 fn inventory_boost() -> Option<InventoryBoostConfig> {
@@ -94,6 +169,16 @@ struct Args {
     /// commit messages or Github discussions.
     #[arg(long, default_value = "table")]
     output: String,
+
+    /// Optional path to dump the full per-preset `PaperReport` list as
+    /// JSON (array of `{ "strategy": <name>, "report": <PaperReport> }`).
+    /// Complements the human-readable `--output` table — use this for a
+    /// single-preset run (one-element sweep list) to get the same
+    /// machine-readable report the old `backtest` binary emitted, or for
+    /// a full sweep to post-process results programmatically. Empty
+    /// (default) skips the dump.
+    #[arg(long, default_value = "")]
+    report_json: String,
 
     /// Sort rows by NET descending before printing (best-first). Set
     /// `false` to keep spawn-order (the original behaviour) — useful
@@ -149,11 +234,26 @@ struct Args {
     #[arg(long, default_value_t = 1000u64)]
     heartbeat_ms: u64,
 
+    /// Auto-detect price tick / lot step / min-notional from Binance
+    /// `exchangeInfo` for `--symbol`. On by default; needs network. When it
+    /// succeeds it OVERRIDES `--tick-size` / `--step-size` and supplies the
+    /// venue `min_notional` (the data-derived sniff has no min-notional
+    /// source). On failure it falls back to the data-derived tick/step with a
+    /// zero min-notional. Use `--no-autodetect-filters` for fully offline /
+    /// deterministic runs against the CLI values.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    autodetect_filters: bool,
+
+    /// Venue env used only for the `--autodetect-filters` exchangeInfo lookup.
+    /// Default `futures-mainnet` (matches the live USDC/USDT perp bots).
+    #[arg(long, value_enum, default_value = "futures-mainnet")]
+    venue_env: EnvArg,
+
     /// Venue tick size (price increment). Defaults to `auto` — detected
     /// from a static map of known Binance USD-M perps, falling back to
     /// sniffing the first `book_*.parquet` for the smallest non-zero
     /// price gap. Pass an explicit decimal (`0.1`, `0.00001`, etc.) to
-    /// override.
+    /// override. Ignored when `--autodetect-filters` succeeds.
     #[arg(long, default_value = "auto")]
     tick_size: String,
 
@@ -639,8 +739,8 @@ struct Args {
     wave_inventory_skew_list: String,
 
     /// Wave sweep: comma-separated inner self-spread values (bps from mid to
-    /// the first order each side), independent of step spacing. `0` = legacy
-    /// (step_bps/2).
+    /// the first order each side), independent of step spacing. `0` = use
+    /// step_bps.
     #[arg(long, default_value = "0")]
     wave_inner_bps_list: String,
 
@@ -768,6 +868,12 @@ struct Args {
     /// Overridden when `--measure-latency` is on (default).
     #[arg(long, default_value_t = 0u64)]
     sim_latency_jitter_ms: u64,
+
+    /// FillSim front-of-queue cancellation decay rate (per second). Models
+    /// orders ahead cancel-replacing over time (invisible in L2 net-depth).
+    /// `0` (default) = off. See backtest --queue-cancel-decay-per-sec.
+    #[arg(long, default_value_t = 0.0f64)]
+    sim_queue_cancel_decay_per_sec: f64,
 
     /// Measure real round-trip latency to Binance USD-M (10 pings) at startup
     /// and use the mean as submit/cancel latency and the stddev as jitter,
@@ -1291,18 +1397,51 @@ async fn run_sweep_collect(
     } else {
         (None, None)
     };
-    let tick = if args.tick_size == "auto" {
+    let base_tick = if args.tick_size == "auto" {
         auto_tick.unwrap()
     } else {
         Decimal::from_str(&args.tick_size)?
     };
-    let lot_step = if args.step_size == "auto" {
+    let base_lot_step = if args.step_size == "auto" {
         auto_step.unwrap()
     } else if args.step_size.trim().is_empty() {
-        tick
+        base_tick
     } else {
         Decimal::from_str(args.step_size.trim())?
     };
+    // exchangeInfo autodetect (authoritative venue filters). When on and the
+    // fetch succeeds it OVERRIDES the data-derived tick/step and supplies the
+    // venue min_notional (which the parquet sniff cannot provide), mirroring
+    // the live bot's per-symbol filters. On failure, fall back to the
+    // data-derived tick/step with a zero min_notional.
+    let (tick, lot_step, min_notional) = if args.autodetect_filters {
+        match autodetect_filters(args.venue_env, &args.symbol).await {
+            Some((t, s, mn)) => {
+                let t = Decimal::from_str(&t)?;
+                let s = Decimal::from_str(&s)?;
+                let mn = Decimal::from_str(&mn)?;
+                info!(
+                    tick = %t, step = %s, min_notional = %mn, symbol = %args.symbol,
+                    env = ?args.venue_env,
+                    "autodetected filters from exchangeInfo (overrides data-derived tick/step)"
+                );
+                (t, s, mn)
+            }
+            None => {
+                warn!(
+                    symbol = %args.symbol, env = ?args.venue_env,
+                    "exchangeInfo autodetect failed; using data-derived tick/step + zero min_notional"
+                );
+                (base_tick, base_lot_step, Decimal::ZERO)
+            }
+        }
+    } else {
+        (base_tick, base_lot_step, Decimal::ZERO)
+    };
+    // Publish the resolved min_notional for the RunnerConfig builders (run_one
+    // / spawn_preset_with_liqs) — they mirror the live bot's runner-level
+    // below-min suppression. Set per-symbol; basket runs symbols serially.
+    *RUNNER_MIN_NOTIONAL.lock().unwrap() = min_notional;
     let fees = VenueFees {
         maker_bps: args.maker_bps,
         taker_bps: args.taker_bps,
@@ -1378,6 +1517,7 @@ async fn run_sweep_collect(
         } else {
             None
         },
+        queue_cancel_decay_per_sec: args.sim_queue_cancel_decay_per_sec,
     };
     // All flat-notional strategies size from the single `--notional` knob —
     // EXCEPT when balance-compounding is on (the default), where the per-order
@@ -1927,7 +2067,7 @@ async fn run_sweep_collect(
                         notional_per_order: tide_notional,
                         tick_size: tick,
                         step_size: lot_step,
-                        min_notional: Decimal::ZERO,
+                        min_notional,
                         grid_levels: levels,
                         step_bps: step,
                         max_position_usdt: Decimal::ZERO,
@@ -1967,7 +2107,7 @@ async fn run_sweep_collect(
                                 notional_per_order: wave_notional,
                                 tick_size: tick,
                                 step_size: lot_step,
-                                min_notional: Decimal::ZERO,
+                                min_notional,
                                 grid_levels: levels,
                                 step_bps: step,
                                 inner_bps: inner,
@@ -2006,7 +2146,7 @@ async fn run_sweep_collect(
                         notional_per_order: spread_scalp_notional,
                         tick_size: tick,
                         step_size: lot_step,
-                        min_notional: Decimal::ZERO,
+                        min_notional,
                         min_spread_bps,
                         requote_interval_ms: 1000,
                         max_position_usdt: spread_scalp_max_pos,
@@ -2065,7 +2205,7 @@ async fn run_sweep_collect(
                         // value (tp_bps × cap × 1e-4) so OLD has SOMETHING
                         // closing positions on the cap-hit scenario.
                         step_size: lot_step,
-                        min_notional: Decimal::ZERO,
+                        min_notional,
                         min_spread_bps,
                         requote_interval_ms: 1000,
                         max_position_usdt: spread_scalp_max_pos,
@@ -2139,7 +2279,7 @@ async fn run_sweep_collect(
                                             inner_bps: inner,
                                             step_bps: step,
                                             step_size: lot_step,
-                                            min_notional: Decimal::ZERO,
+                                            min_notional,
                                             target_fills_per_min: fpm_target,
                                             fillrate_window_secs: fpm_window,
                                             scale_min: sc_min,
@@ -2197,7 +2337,7 @@ async fn run_sweep_collect(
                                 notional_per_order: hawk_notional,
                                 tick_size: tick,
                                 step_size: lot_step,
-                                min_notional: Decimal::ZERO,
+                                min_notional,
                                 levels_per_side: levels,
                                 inner_bps: inner,
                                 step_bps: step,
@@ -2251,7 +2391,7 @@ async fn run_sweep_collect(
                             notional_per_order: hydra_notional,
                             tick_size: tick,
                             step_size: lot_step,
-                            min_notional: Decimal::ZERO,
+                            min_notional,
                             entry_offset_bps: entry_off,
                             pyramid_step_bps: pyr_step,
                             pyramid_max_adds: args.hydra_pyramid_max_adds,
@@ -2308,7 +2448,7 @@ async fn run_sweep_collect(
                     tikr_strategy::Ratchet::new(tikr_strategy::RatchetConfig {
                         tick_size: tick,
                         step_size: lot_step,
-                        min_notional: Decimal::ZERO,
+                        min_notional,
                         notional_per_order: r_notional,
                         tp_bps,
                         initial_offset_bps: args.ratchet_initial_offset_bps,
@@ -2353,7 +2493,7 @@ async fn run_sweep_collect(
                 notional_per_entry: liq_notional,
                 tick_size: tick,
                 step_size: lot_step,
-                min_notional: Decimal::ZERO,
+                min_notional,
                 max_position_usdt: liq_max_pos,
                 arm_threshold_usdt: liq_arm_threshold,
                 arm_dominance: liq_arm_dominance,
@@ -2505,6 +2645,16 @@ async fn run_sweep_collect(
             eprintln!("  [{}] {msg}", i + 1);
         }
     }
+    if !args.report_json.is_empty() {
+        let payload: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(name, report)| serde_json::json!({ "strategy": name, "report": report }))
+            .collect();
+        let json = serde_json::to_string_pretty(&payload)?;
+        std::fs::write(&args.report_json, json)
+            .map_err(|e| format!("write --report-json {}: {e}", args.report_json))?;
+        info!(path = %args.report_json, presets = results.len(), "wrote JSON report");
+    }
     Ok(results)
 }
 
@@ -2541,7 +2691,7 @@ async fn run_one<S: Strategy>(
         initial_balance: balance_compounding().0,
         order_balance_pct: balance_compounding().1,
         max_position_pct: balance_compounding().2,
-        min_notional: Decimal::ZERO,
+        min_notional: runner_min_notional(),
         max_expected_open_orders: 2,
         liquidation: None,
         mark_series: None,
@@ -2631,7 +2781,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             initial_balance: balance_compounding().0,
             order_balance_pct: balance_compounding().1,
             max_position_pct: balance_compounding().2,
-            min_notional: Decimal::ZERO,
+            min_notional: runner_min_notional(),
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,

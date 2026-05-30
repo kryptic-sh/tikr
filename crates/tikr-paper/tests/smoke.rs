@@ -47,6 +47,7 @@ async fn paper_runner_against_testnet_5min() {
         rng_seed: 0,
         latency_jitter_ms: 0,
         max_open_orders: None,
+        queue_cancel_decay_per_sec: 0.0,
     });
     let config = RunnerConfig {
         state_dir: temp.path().to_path_buf(),

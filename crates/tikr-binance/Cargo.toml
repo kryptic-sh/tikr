@@ -50,7 +50,3 @@ base64 = "0.22"
 [[example]]
 name = "run_spot"
 path = "examples/run_spot.rs"
-
-[[example]]
-name = "run_perp"
-path = "examples/run_perp.rs"

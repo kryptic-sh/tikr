@@ -43,16 +43,15 @@ pub struct WaveConfig {
     pub grid_levels: u32,
 
     /// Level spacing in bps of mid — the gap between consecutive lattice
-    /// levels. Snapped to tick (min 1 tick). `0` = 1-tick lattice. The inner
-    /// self-spread (mid → first order) is set by `inner_bps`, or, when that is
-    /// 0, defaults to `step_bps / 2` each side (legacy behavior).
+    /// levels. Snapped to tick (min 1 tick). `0` = 1-tick lattice. Required;
+    /// also the default for `inner_bps` when that is unset.
     pub step_bps: u32,
 
     /// Inner self-spread in bps of mid: the distance from mid to the FIRST
     /// order on each side (where the frozen origins sit), independent of the
     /// `step_bps` level spacing. e.g. `inner_bps=2, step_bps=5` → first order
-    /// 2bps off mid, then levels 5bps apart (2,7,12,…). `0` (default) = legacy
-    /// behavior: inner = `step_bps / 2` each side. Snapped to tick.
+    /// 2bps off mid, then levels 5bps apart (2,7,12,…). `0` (default/unset) =
+    /// inner defaults to the full `step_bps` each side. Snapped to tick.
     pub inner_bps: u32,
 
     /// Refill batching: only refill a side once ≥ this many of its band
@@ -150,12 +149,14 @@ impl Wave {
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
             // Distance from mid to the first order on each side. Explicit
-            // `inner_bps` when set, else legacy `step_bps / 2`.
-            let required_half = if self.config.inner_bps > 0 {
-                mid * Decimal::from(self.config.inner_bps) / Decimal::from(10_000)
+            // `inner_bps` when set (>0); otherwise default to the full
+            // `step_bps` each side (step_bps is required, inner_bps optional).
+            let inner_bps = if self.config.inner_bps > 0 {
+                self.config.inner_bps
             } else {
-                mid * Decimal::from(self.config.step_bps) / Decimal::from(20_000)
+                self.config.step_bps
             };
+            let required_half = mid * Decimal::from(inner_bps) / Decimal::from(10_000);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -718,16 +719,17 @@ mod tests {
         tight.step_bps = 10;
         tight.inner_bps = 2;
         let (inner_tight, step_tight) = freeze(tight);
-        // Legacy (inner_bps=0): first order at step_bps/2 = 5bps off mid.
+        // Default (inner_bps=0): first order defaults to full step_bps = 10bps off mid.
         let mut legacy = cfg();
         legacy.tick_size = Decimal::new(1, 2);
         legacy.step_bps = 10;
         legacy.inner_bps = 0;
         let (inner_legacy, step_legacy) = freeze(legacy);
-        // Explicit inner_bps puts the first order CLOSER to mid than step/2.
+        // Explicit inner_bps=2 puts the first order CLOSER to mid than the
+        // step_bps default (10bps).
         assert!(
             inner_tight < inner_legacy,
-            "inner_bps=2 ({inner_tight}) must be tighter than step/2 ({inner_legacy})"
+            "inner_bps=2 ({inner_tight}) must be tighter than the step_bps default ({inner_legacy})"
         );
         // Step spacing is unchanged by inner_bps (both == step_bps geometry).
         assert_eq!(

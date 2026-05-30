@@ -75,6 +75,15 @@ pub struct FillSimConfig {
     /// entry points; mirrors the venue's `MAX_NUM_ORDERS` filter and bounds
     /// runaway open-order accumulation.
     pub max_open_orders: Option<u32>,
+    /// Front-of-queue cancellation decay rate, per second. Models the orders
+    /// resting AHEAD of ours getting cancel-replaced over time — invisible in
+    /// L2 data (we only see net level depth, never gross adds vs cancels), so
+    /// a net-growing level otherwise freezes our `queue_ahead` forever and
+    /// starves the resting side (the ask-in-a-dump peg). Each event decays
+    /// every live order's `queue_ahead` by `exp(-rate · dt_secs)`, on top of
+    /// the trade + level-shrink decrements. `0.0` (default) = no time decay
+    /// (prior behaviour). Calibrate to live fill rates.
+    pub queue_cancel_decay_per_sec: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,10 +241,33 @@ impl BookState {
 // FillSim
 // ---------------------------------------------------------------------------
 
+/// Audit counters (TEMP, behind `TIKR_FILLSIM_DIAG` env): per-side tally of
+/// how often a resting quote was eligible for an incoming trade, how much of
+/// the trade got absorbed by `queue_ahead` before reaching us, and how much
+/// actually filled. Lets us see if the queue model starves one side.
+#[derive(Default)]
+struct FillDiag {
+    bid_eligible: u64,
+    ask_eligible: u64,
+    bid_queue_eaten: Decimal,
+    ask_queue_eaten: Decimal,
+    bid_filled_qty: Decimal,
+    ask_filled_qty: Decimal,
+    bid_fills: u64,
+    ask_fills: u64,
+    // Raw recorded trade flow by taker side (independent of our orders) — tells
+    // us if the window was genuinely sell-dominated (real dump) vs balanced.
+    taker_buy_trades: u64,
+    taker_sell_trades: u64,
+    taker_buy_qty: Decimal,
+    taker_sell_qty: Decimal,
+}
+
 /// Trade-through fill simulator with configurable latency, post-only
 /// correctness, partial fills, and maker-rebate fees.
 pub struct FillSim {
     cfg: FillSimConfig,
+    diag: FillDiag,
     pending: Vec<PendingOp>,
     live_quotes: Vec<LiveQuote>,
     book_state: HashMap<Symbol, BookState>,
@@ -287,6 +319,7 @@ impl FillSim {
         let latency_rng_state = rng_state ^ 0xA5A5_A5A5_A5A5_A5A5;
         Self {
             cfg,
+            diag: FillDiag::default(),
             pending: Vec::new(),
             live_quotes: Vec::new(),
             book_state: HashMap::new(),
@@ -554,6 +587,9 @@ impl FillSim {
     /// taken out by the trade-through model. Also emits taker fills for any
     /// pending IOC/FOK ops that became eligible this tick.
     pub fn on_market_event(&mut self, ev: &MarketEvent, now: Timestamp) -> Vec<Fill> {
+        // Front-cancel queue decay must read the prior event ts BEFORE
+        // silent_cancel_tick advances `last_event_ts_ns`.
+        self.decay_queue_ahead(now);
         self.silent_cancel_tick(now);
         let mut fills = self.apply_pending(now);
         match ev {
@@ -583,6 +619,37 @@ impl FillSim {
     /// catches these via the `Venue::open_orders` reconciliation tick).
     /// The strategy is NOT notified — runner reconciliation eventually
     /// purges the stale ids from its view, mirroring live behaviour.
+    /// Decay every live order's `queue_ahead` by `exp(-rate · dt_secs)` to
+    /// model front-of-queue cancellations that L2 net-depth can't reveal.
+    /// Reads `last_event_ts_ns` for dt; does NOT advance it (silent_cancel_tick
+    /// owns that, and runs right after).
+    fn decay_queue_ahead(&mut self, now: Timestamp) {
+        let lambda = self.cfg.queue_cancel_decay_per_sec;
+        if lambda <= 0.0 || self.live_quotes.is_empty() {
+            return;
+        }
+        let Some(prev) = self.last_event_ts_ns else {
+            return;
+        };
+        let dt_ns = now.0.saturating_sub(prev);
+        if dt_ns == 0 {
+            return;
+        }
+        let dt_secs = dt_ns as f64 / 1_000_000_000.0;
+        let factor = (-lambda * dt_secs).exp();
+        if factor >= 1.0 {
+            return;
+        }
+        let Some(f) = Decimal::from_f64_retain(factor) else {
+            return;
+        };
+        for q in &mut self.live_quotes {
+            if q.queue_ahead > Decimal::ZERO {
+                q.queue_ahead *= f;
+            }
+        }
+    }
+
     fn silent_cancel_tick(&mut self, now: Timestamp) {
         let rate = self.cfg.silent_cancel_rate_per_min;
         if rate <= 0.0 {
@@ -1038,6 +1105,16 @@ impl FillSim {
         if trade_price.0 <= Decimal::ZERO || trade_size.0 <= Decimal::ZERO {
             return Vec::new();
         }
+        match taker_side {
+            Side::Bid => {
+                self.diag.taker_buy_trades += 1;
+                self.diag.taker_buy_qty += trade_size.0;
+            }
+            Side::Ask => {
+                self.diag.taker_sell_trades += 1;
+                self.diag.taker_sell_qty += trade_size.0;
+            }
+        }
         let mut out = Vec::new();
         let mut trade_remaining = trade_size.0;
 
@@ -1049,6 +1126,10 @@ impl FillSim {
             if !eligible {
                 i += 1;
                 continue;
+            }
+            match q.side {
+                Side::Bid => self.diag.bid_eligible += 1,
+                Side::Ask => self.diag.ask_eligible += 1,
             }
 
             // Queue priority: trade consumes the orders RESTING AHEAD of us
@@ -1064,6 +1145,10 @@ impl FillSim {
             let q_price = q.price;
             let ate = q.queue_ahead.min(trade_remaining);
             if ate > Decimal::ZERO {
+                match q_side {
+                    Side::Bid => self.diag.bid_queue_eaten += ate,
+                    Side::Ask => self.diag.ask_queue_eaten += ate,
+                }
                 q.queue_ahead -= ate;
                 trade_remaining -= ate;
                 // Decrement book aggregate at our level so the next
@@ -1079,6 +1164,18 @@ impl FillSim {
             let q = &mut self.live_quotes[i];
 
             let fill_amount = q.size_remaining.0.min(trade_remaining);
+            if fill_amount > Decimal::ZERO {
+                match q_side {
+                    Side::Bid => {
+                        self.diag.bid_filled_qty += fill_amount;
+                        self.diag.bid_fills += 1;
+                    }
+                    Side::Ask => {
+                        self.diag.ask_filled_qty += fill_amount;
+                        self.diag.ask_fills += 1;
+                    }
+                }
+            }
             let fill_price = q.price;
             // fee_amount is signed; positive = paid, negative = rebated.
             let fee_amount = (fill_price.0.round_dp(8)
@@ -1121,6 +1218,45 @@ impl FillSim {
         }
 
         out
+    }
+}
+
+impl Drop for FillSim {
+    fn drop(&mut self) {
+        // TEMP audit: dump per-side eligible/queue/fill tallies when the env
+        // flag is set, to diagnose queue-model fill asymmetry.
+        if std::env::var("TIKR_FILLSIM_DIAG").is_ok() {
+            let d = &self.diag;
+            let rate = |filled: Decimal, queue: Decimal| -> f64 {
+                use rust_decimal::prelude::ToPrimitive;
+                let tot = (filled + queue).to_f64().unwrap_or(0.0);
+                if tot > 0.0 {
+                    filled.to_f64().unwrap_or(0.0) / tot * 100.0
+                } else {
+                    0.0
+                }
+            };
+            eprintln!(
+                "FILLSIM_DIAG bid: eligible={} queue_eaten={} filled={} fills={} fill_share={:.1}%",
+                d.bid_eligible,
+                d.bid_queue_eaten,
+                d.bid_filled_qty,
+                d.bid_fills,
+                rate(d.bid_filled_qty, d.bid_queue_eaten)
+            );
+            eprintln!(
+                "FILLSIM_DIAG ask: eligible={} queue_eaten={} filled={} fills={} fill_share={:.1}%",
+                d.ask_eligible,
+                d.ask_queue_eaten,
+                d.ask_filled_qty,
+                d.ask_fills,
+                rate(d.ask_filled_qty, d.ask_queue_eaten)
+            );
+            eprintln!(
+                "FILLSIM_DIAG raw-trades: taker_BUY={} (qty {}) taker_SELL={} (qty {})  [BUY lifts asks, SELL hits bids]",
+                d.taker_buy_trades, d.taker_buy_qty, d.taker_sell_trades, d.taker_sell_qty
+            );
+        }
     }
 }
 
@@ -1239,6 +1375,7 @@ mod tests {
             rng_seed: 0,
             latency_jitter_ms: 0,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         }
     }
 
@@ -1612,6 +1749,7 @@ mod tests {
             rng_seed: 0,
             latency_jitter_ms: 0,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         };
         let mut sim = FillSim::new(cfg);
 
@@ -1655,6 +1793,7 @@ mod tests {
             rng_seed: 0,
             latency_jitter_ms: 0,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         };
         let mut sim = FillSim::new(cfg);
         // Seed the book via a snapshot: best_bid=99, best_ask=101.
@@ -1713,6 +1852,7 @@ mod tests {
             rng_seed: 42,
             latency_jitter_ms: 50,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         };
         let base_ns = base_ms * 1_000_000;
         let mut sim = FillSim::new(cfg.clone());

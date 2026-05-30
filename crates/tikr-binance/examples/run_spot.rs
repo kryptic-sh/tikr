@@ -242,6 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rng_seed: 0,
         latency_jitter_ms: 0,
         max_open_orders: None,
+        queue_cancel_decay_per_sec: 0.0,
     });
 
     let runner_config = RunnerConfig {

@@ -1,0 +1,35 @@
+[package]
+name = "tikr-record"
+description = "Market-data recorder for the tikr engine: Binance WS depth + trades → parquet (SCHEMA.md shape)"
+keywords = ["trading", "market-making", "recorder", "parquet"]
+categories = ["finance"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "record_binance"
+path = "src/main.rs"
+
+[dependencies]
+tikr-core = "0.1"
+tikr-binance = "0.1"
+# `ToPrimitive` for the parquet f64 conversion (tikr-core re-exports the
+# Decimal type but not the num-traits prelude).
+rust_decimal = { version = "1", default-features = false }
+polars = { version = "0.43", default-features = false, features = ["parquet", "lazy", "polars-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+# Direct dep so the recorder can install a CryptoProvider before any TLS
+# use — reqwest's rustls-tls + tokio-tungstenite's rustls-tls-webpki-roots
+# pull conflicting provider defaults, leaving rustls 0.23 ambiguous at runtime.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

@@ -2867,6 +2867,7 @@ mod tests {
             rng_seed: 0,
             latency_jitter_ms: 0,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         })
     }
 
@@ -3460,6 +3461,7 @@ mod tests {
             rng_seed: 0,
             latency_jitter_ms: 0,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         });
 
         let temp = TempDir::new().unwrap();
@@ -3559,6 +3561,7 @@ mod tests {
             rng_seed: 0,
             latency_jitter_ms: 0,
             max_open_orders: None,
+            queue_cancel_decay_per_sec: 0.0,
         });
 
         let temp = TempDir::new().unwrap();
