@@ -975,10 +975,6 @@ pub struct MicroMeanReversionParams {
     /// hundred ms. `0` disables.
     #[serde(default = "mmr_default_entry_cooldown_ms")]
     pub entry_cooldown_ms: u64,
-    /// Hard same-side net-position ceiling in quote notional. Suppresses
-    /// same-side adds once `|position| * mid >= max_net_usdt`. `0` disables.
-    #[serde(default = "mmr_default_max_net_usdt")]
-    pub max_net_usdt: Decimal,
 }
 
 fn mmr_default_trigger_bps() -> u32 {
@@ -1007,9 +1003,6 @@ fn mmr_default_add_block_bps() -> u32 {
 }
 fn mmr_default_entry_cooldown_ms() -> u64 {
     0
-}
-fn mmr_default_max_net_usdt() -> Decimal {
-    Decimal::ZERO
 }
 
 /// SpreadScalp configuration.

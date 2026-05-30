@@ -87,6 +87,13 @@ pub struct PaperReport {
     /// `full_fills + partial_fills`; comparing strategies by raw `fills_emitted`
     /// is misleading because larger orders fragment into more partials.
     pub partial_fills: u64,
+    /// Peak fills in any trailing 60s sim-time window (a sliding-window max
+    /// over fill timestamps). Unlike the average rate (`fills_emitted` /
+    /// `sim_duration_secs`), this exposes the worst-case burst — the metric
+    /// that matters for rate-limit and inventory-pile risk, since a strategy
+    /// can sit near-idle for hours then machine-gun dozens of fills in one
+    /// fast move.
+    pub peak_fills_per_min: u64,
     /// Number of forced liquidations triggered during the run. `0` when no
     /// [`crate::runner::RunnerConfig::liquidation`] model was configured, or
     /// when the mark never breached the position's liquidation price. A
@@ -138,6 +145,8 @@ struct PaperReportWire {
     partial_fills: u64,
     #[serde(default)]
     liquidations: u64,
+    #[serde(default)]
+    peak_fills_per_min: u64,
 }
 
 impl Serialize for PaperReport {
@@ -167,6 +176,7 @@ impl Serialize for PaperReport {
             full_fills: self.full_fills,
             partial_fills: self.partial_fills,
             liquidations: self.liquidations,
+            peak_fills_per_min: self.peak_fills_per_min,
         }
         .serialize(serializer)
     }
@@ -243,6 +253,7 @@ impl<'de> Deserialize<'de> for PaperReport {
             full_fills: wire.full_fills,
             partial_fills: wire.partial_fills,
             liquidations: wire.liquidations,
+            peak_fills_per_min: wire.peak_fills_per_min,
         })
     }
 }

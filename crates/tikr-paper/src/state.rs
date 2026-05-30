@@ -45,6 +45,7 @@ mod tests {
             full_fills: 0,
             partial_fills: 0,
             liquidations: 0,
+            peak_fills_per_min: 0,
         }
     }
 

@@ -561,7 +561,6 @@ fn build_micro_mean_reversion(
             tp_relax_floor_bps: mmr.tp_relax_floor_bps,
             add_block_bps: mmr.add_block_bps,
             entry_cooldown_ms: mmr.entry_cooldown_ms,
-            max_net_usdt: mmr.max_net_usdt,
         },
     ))
 }

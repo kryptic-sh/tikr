@@ -27,15 +27,14 @@
 #   tp_relax_trigger_bps = 20     relax TP toward break-even past 20bps adverse
 #   tp_relax_floor_bps   = 3      … to avg_entry + 3bps (maker-safe, no cross)
 #   add_block_bps        = 15     suppress same-side adds once 15bps adverse
-# Live-safety governors (NOT exercised by sim — sim has no rate limit and the
-# runner's own position cap binds there; these protect the live account):
+# Live-safety governor (NOT exercised by sim — sim has no rate limit; the
+# runner's own two-layer position cap bounds inventory there and live):
 #   entry_cooldown_ms = 1000      ≥1s between same-side entries — kills the
 #                                 trade-print burst that piled inventory in
 #                                 seconds (max_open_entries caps RESTING quotes
-#                                 only, useless for fill-on-contact entries)
-#   max_net_usdt      = 150       hard same-side notional ceiling; binds from
-#                                 the first fill (add_block only engages after
-#                                 the position is already adverse)
+#                                 only, useless for fill-on-contact entries).
+#                                 The runner position cap already bounds total
+#                                 inventory, so no strategy-level net cap here.
 # (Losing-iter knobs — IOC stop-loss, skew, IOC give-up, size scaling — were
 # removed from the strategy entirely; they only ever hurt.)
 #
@@ -71,7 +70,6 @@ tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
 entry_cooldown_ms = 1000
-max_net_usdt = "150"
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -87,7 +85,6 @@ tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
 entry_cooldown_ms = 1000
-max_net_usdt = "150"
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -103,7 +100,6 @@ tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
 entry_cooldown_ms = 1000
-max_net_usdt = "150"
 
 # ─── SUIUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -119,4 +115,3 @@ tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
 entry_cooldown_ms = 1000
-max_net_usdt = "150"

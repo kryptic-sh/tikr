@@ -59,12 +59,6 @@ pub struct MicroMeanReversionConfig {
     /// a fast move machine-guns dozens of fills in seconds. This gate caps
     /// entry velocity per side. `0` disables (no throttle).
     pub entry_cooldown_ms: u64,
-    /// Hard same-side net-position ceiling in quote notional. New same-side
-    /// entries are suppressed once `|position| * mid >= max_net_usdt`. Unlike
-    /// `add_block_bps` (which only engages after the position is already
-    /// adverse), this binds from the first fill, as a runaway safety ceiling.
-    /// `0` disables.
-    pub max_net_usdt: Decimal,
 }
 
 /// Micro mean-reversion strategy state.
@@ -168,16 +162,12 @@ impl MicroMeanReversion {
         }
     }
 
-    /// True when adding to `side` would breach the hard net-position ceiling.
-    /// Only caps adds on the side we already hold inventory on.
-    fn net_cap_reached(&self, ctx: &StrategyContext<'_>, mid: Price, side: Side) -> bool {
-        if self.config.max_net_usdt <= Decimal::ZERO {
-            return false;
+    /// Record the timestamp of an entry post on `side` (feeds the throttle).
+    fn record_entry(&mut self, now_ns: u64, side: Side) {
+        match side {
+            Side::Ask => self.last_ask_entry_ns = Some(now_ns),
+            Side::Bid => self.last_bid_entry_ns = Some(now_ns),
         }
-        if Self::position_side(ctx) != Some(side) {
-            return false;
-        }
-        ctx.position.size.0.abs() * mid.0 >= self.config.max_net_usdt
     }
 
     /// True when adverse bps from avg_entry exceeds tp_relax_trigger_bps.
@@ -335,10 +325,6 @@ impl Strategy for MicroMeanReversion {
                     {
                         return Vec::new();
                     }
-                    // Hard net-position ceiling (runaway safety).
-                    if self.net_cap_reached(ctx, mid, Side::Ask) {
-                        return Vec::new();
-                    }
                     // Velocity throttle: cap entries-per-second per side.
                     if self.entry_throttled(ctx.now.0, Side::Ask) {
                         return Vec::new();
@@ -346,7 +332,7 @@ impl Strategy for MicroMeanReversion {
                     if self.open_entries(ctx, Side::Ask) >= self.config.max_open_entries {
                         return Vec::new();
                     }
-                    self.last_ask_entry_ns = Some(ctx.now.0);
+                    self.record_entry(ctx.now.0, Side::Ask);
                     vec![self.entry_quote(ctx, mid, Side::Ask)]
                 } else if move_bps <= -trigger {
                     // Dislocation-confirmation gate: require the print to be
@@ -367,10 +353,6 @@ impl Strategy for MicroMeanReversion {
                     {
                         return Vec::new();
                     }
-                    // Hard net-position ceiling (runaway safety).
-                    if self.net_cap_reached(ctx, mid, Side::Bid) {
-                        return Vec::new();
-                    }
                     // Velocity throttle: cap entries-per-second per side.
                     if self.entry_throttled(ctx.now.0, Side::Bid) {
                         return Vec::new();
@@ -378,7 +360,7 @@ impl Strategy for MicroMeanReversion {
                     if self.open_entries(ctx, Side::Bid) >= self.config.max_open_entries {
                         return Vec::new();
                     }
-                    self.last_bid_entry_ns = Some(ctx.now.0);
+                    self.record_entry(ctx.now.0, Side::Bid);
                     vec![self.entry_quote(ctx, mid, Side::Bid)]
                 } else {
                     Vec::new()
@@ -409,18 +391,23 @@ impl Strategy for MicroMeanReversion {
         intent: &QuoteIntent,
         reason: &str,
     ) -> Vec<Action> {
-        // Post-only would-cross (Binance -5022): the order priced off a
-        // snapshot raced the moved book. Re-quoting immediately just re-crosses
-        // → reject storm on live. Drop and wait for the next dislocation.
-        // FillSim now emits the same -5022 string, so backtest and live share
-        // this behaviour (no sim-only recovery path that can't exist on the
-        // exchange).
-        if reason.contains("-5022") || reason.contains("could not be executed as maker") {
-            return Vec::new();
-        }
         let Some(mid) = compute_mid_strict(ctx.latest_book) else {
             return Vec::new();
         };
+        // Post-only would-cross (Binance -5022): the order priced off a
+        // snapshot raced the moved book. Re-attempt the entry, but throttled by
+        // the per-side cooldown so repeated crosses during a fast move retry at
+        // most once per cooldown instead of storming the rate limit. Without a
+        // cooldown configured there is nothing to throttle an immediate
+        // re-cross, so drop. FillSim emits the same -5022 string, so backtest
+        // and live share this behaviour.
+        if reason.contains("-5022") || reason.contains("could not be executed as maker") {
+            if self.config.entry_cooldown_ms == 0 || self.entry_throttled(ctx.now.0, intent.side) {
+                return Vec::new();
+            }
+            self.record_entry(ctx.now.0, intent.side);
+            return vec![self.entry_quote(ctx, mid, intent.side)];
+        }
         // Re-quote on other rejections.
         vec![self.entry_quote(ctx, mid, intent.side)]
     }
@@ -507,7 +494,6 @@ mod tests {
             tp_relax_floor_bps: 0,
             add_block_bps: 0,
             entry_cooldown_ms: 0,
-            max_net_usdt: Decimal::ZERO,
         })
     }
 

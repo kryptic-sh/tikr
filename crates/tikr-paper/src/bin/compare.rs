@@ -741,13 +741,6 @@ struct Args {
     #[arg(long, default_value_t = 0u64)]
     mmr_entry_cooldown_ms: u64,
 
-    /// MicroMeanReversion hard same-side net-position ceiling in quote
-    /// notional. Suppresses same-side adds once `|position| * mid >= cap`.
-    /// `0` disables. Default `0` (the runner position cap binds in sim;
-    /// live config sets this as a runaway safety ceiling).
-    #[arg(long, default_value = "0")]
-    mmr_max_net_usdt: String,
-
     /// Tide sweep: comma-separated lattice geometry in bps (inner gap AND
     /// level spacing). Live USDC config uses 20.
     #[arg(long, default_value = "20")]
@@ -2062,7 +2055,6 @@ async fn run_sweep_collect(
         let mmr_tp_relax_floor_bps = args.mmr_tp_relax_floor_bps;
         let mmr_add_block_bps = args.mmr_add_block_bps;
         let mmr_entry_cooldown_ms = args.mmr_entry_cooldown_ms;
-        let mmr_max_net_usdt = Decimal::from_str(&args.mmr_max_net_usdt)?;
         for &trigger in &mmr_trigger_sweep {
             for &entry in &mmr_entry_sweep {
                 for &exit in &mmr_exit_sweep {
@@ -2086,7 +2078,6 @@ async fn run_sweep_collect(
                                 tp_relax_floor_bps: mmr_tp_relax_floor_bps,
                                 add_block_bps: mmr_add_block_bps,
                                 entry_cooldown_ms: mmr_entry_cooldown_ms,
-                                max_net_usdt: mmr_max_net_usdt,
                             }),
                             fees,
                             skim_cfg,
@@ -2955,7 +2946,7 @@ fn format_eta(secs: f64) -> String {
 /// basket-mode CSV streams stay row-addressable when concatenated.
 fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
     println!(
-        "symbol,preset,fills,fills_per_min,volume_usdt,peak_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
+        "symbol,preset,fills,fills_per_min,peak_fills_per_min,volume_usdt,peak_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -2983,8 +2974,18 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             name.clone()
         };
         println!(
-            "{symbol},{safe_name},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
-            r.fills_emitted, fpm, volume, peak, realized, unrealized, fees, net, per_fill, roi,
+            "{symbol},{safe_name},{},{:.4},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            r.fills_emitted,
+            fpm,
+            r.peak_fills_per_min,
+            volume,
+            peak,
+            realized,
+            unrealized,
+            fees,
+            net,
+            per_fill,
+            roi,
         );
     }
 }
@@ -2996,10 +2997,10 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!("### {symbol}");
     println!();
     println!(
-        "| preset | fills | fills/min | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |"
+        "| preset | fills | fills/min | peak/min | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |"
     );
     println!(
-        "|--------|------:|----------:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|"
+        "|--------|------:|----------:|---------:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -3027,8 +3028,8 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
         // Markdown escape: pipes inside cell text break the row.
         let safe_name = name.replace('|', "\\|");
         println!(
-            "| {safe_name} | {} | {:.2} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
-            r.fills_emitted, fpm, realized, unrealized, fees, net, per_fill,
+            "| {safe_name} | {} | {:.2} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
+            r.fills_emitted, fpm, r.peak_fills_per_min, realized, unrealized, fees, net, per_fill,
         );
     }
     println!();
@@ -3155,6 +3156,7 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             "preset",
             "fills",
             "fills/min",
+            "peak/min",
             "volume",
             "peak_pos",
             "realized",
@@ -3195,6 +3197,7 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
                 name.clone(),
                 r.fills_emitted.to_string(),
                 format!("{fpm:.2}"),
+                r.peak_fills_per_min.to_string(),
                 format!("{volume:.0}"),
                 format!("{peak:.0}"),
                 format!("{:.4}", decimal_to_f64(&r.realized.0)),

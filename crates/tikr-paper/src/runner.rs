@@ -596,6 +596,12 @@ where
     // high-water mark — a lower mean at equal net = the algo carried less risk.
     let mut position_usdt_sum: Decimal = Decimal::ZERO;
     let mut position_samples: u64 = 0;
+    // Peak fills-per-minute via a 60s sliding window. The window state itself
+    // can't carry across a resume, but the high-water mark does.
+    let mut fill_rate = FillRateTracker {
+        peak_per_min: resume.as_ref().map(|r| r.peak_fills_per_min).unwrap_or(0),
+        ..FillRateTracker::default()
+    };
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
     let resumed_sim_duration_secs: u64 = resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
 
@@ -753,6 +759,7 @@ where
                 full_fills,
                 partial_fills,
                 liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
+                fill_rate.peak_per_min,
             );
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
@@ -1020,7 +1027,7 @@ where
                             &mut sell_fills,
                             &mut buy_volume,
                             &mut sell_volume,
-                            alert_sink.as_deref(),
+                            &mut fill_rate,                            alert_sink.as_deref(),
                             &symbol,
                         )
                         .await;
@@ -1307,7 +1314,7 @@ where
                             &mut sell_fills,
                             &mut buy_volume,
                             &mut sell_volume,
-                            alert_sink.as_deref(),
+                            &mut fill_rate,                            alert_sink.as_deref(),
                             &symbol,
                         )
                         .await;
@@ -1533,6 +1540,7 @@ where
                         full_fills,
                         partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
+                fill_rate.peak_per_min,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1644,7 +1652,7 @@ where
                     &mut sell_fills,
                     &mut buy_volume,
                     &mut sell_volume,
-                    alert_sink.as_deref(),
+                    &mut fill_rate,                    alert_sink.as_deref(),
                     &symbol,
                 )
                 .await;
@@ -1682,6 +1690,7 @@ where
                         full_fills,
                         partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
+                fill_rate.peak_per_min,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1815,6 +1824,7 @@ where
                         full_fills,
                         partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
+                fill_rate.peak_per_min,
                     );
                     heartbeat.runtime_secs =
                         resumed_runtime_secs.saturating_add(heartbeat.runtime_secs);
@@ -1906,7 +1916,7 @@ where
                                 &mut sell_fills,
                                 &mut buy_volume,
                                 &mut sell_volume,
-                                alert_sink.as_deref(),
+                                &mut fill_rate,                                alert_sink.as_deref(),
                                 &symbol,
                             )
                             .await;
@@ -2074,6 +2084,7 @@ where
         full_fills,
         partial_fills,
         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
+        fill_rate.peak_per_min,
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
@@ -2481,6 +2492,37 @@ async fn dispatch_post_fill_actions<V, S>(
     }
 }
 
+/// Tracks the peak fills-per-minute via a 60s sliding window over fill
+/// sim-timestamps (nanoseconds). The average rate (`fills_emitted` /
+/// `sim_duration_secs`) hides bursts; this exposes the worst-case minute.
+#[derive(Default)]
+struct FillRateTracker {
+    /// Fill timestamps (ns) within the trailing 60s window, oldest first.
+    window: std::collections::VecDeque<u64>,
+    /// Largest window size seen = peak fills in any 60s span.
+    peak_per_min: u64,
+}
+
+impl FillRateTracker {
+    /// Record a fill at `ts_ns` and update the running peak.
+    fn observe(&mut self, ts_ns: u64) {
+        const WINDOW_NS: u64 = 60 * 1_000_000_000;
+        self.window.push_back(ts_ns);
+        let cutoff = ts_ns.saturating_sub(WINDOW_NS);
+        while let Some(&front) = self.window.front() {
+            if front < cutoff {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+        let n = self.window.len() as u64;
+        if n > self.peak_per_min {
+            self.peak_per_min = n;
+        }
+    }
+}
+
 /// Apply a fill to the tracker, update the risk gate, emit alerts.
 ///
 /// Shared by paper mode (FillSim-synthesized fills) and live mode (external
@@ -2498,6 +2540,7 @@ async fn apply_fill(
     sell_fills: &mut u64,
     buy_volume: &mut Decimal,
     sell_volume: &mut Decimal,
+    fill_rate: &mut FillRateTracker,
     alert_sink: Option<&dyn AlertSink>,
     symbol: &Symbol,
 ) {
@@ -2516,6 +2559,7 @@ async fn apply_fill(
     }
     // Display/report fill counters track every execution, including partials.
     *fills_emitted += 1;
+    fill_rate.observe(fill.ts.0);
     if fill.is_full {
         *full_fills += 1;
     } else {
@@ -2567,6 +2611,7 @@ fn finalize(
     full_fills: u64,
     partial_fills: u64,
     liquidations: u64,
+    peak_fills_per_min: u64,
 ) -> PaperReport {
     let base = tracker.report(last_mark);
     let sim_duration_secs = match (first_event_ts, last_event_ts) {
@@ -2615,6 +2660,7 @@ fn finalize(
         full_fills,
         partial_fills,
         liquidations,
+        peak_fills_per_min,
     }
 }
 
@@ -3429,6 +3475,7 @@ mod tests {
             full_fills: 0,
             partial_fills: 0,
             liquidations: 0,
+            peak_fills_per_min: 0,
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -3483,6 +3530,7 @@ mod tests {
             full_fills: 0,
             partial_fills: 0,
             liquidations: 0,
+            peak_fills_per_min: 0,
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
