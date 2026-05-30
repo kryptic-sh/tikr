@@ -488,7 +488,11 @@ impl Strategy for Tide {
                         top_cap = max_bid;
                     }
                 }
-                let n_top = ((top_cap - bid_origin) / step).floor();
+                // MUST match the emit clamp (.min(0)) — otherwise when price is
+                // above the origin the prune window sits above the (clamped)
+                // emitted bids and cancels them every event, fighting the emit
+                // in a cancel/create storm at the grid edge.
+                let n_top = ((top_cap - bid_origin) / step).floor().min(Decimal::ZERO);
                 let slot_top = bid_origin + n_top * step;
                 let window_low = slot_top - outward;
                 for (id, q) in ctx.open_quotes {
@@ -509,7 +513,8 @@ impl Strategy for Tide {
                         top_cap = min_ask;
                     }
                 }
-                let n_top = ((top_cap - ask_origin) / step).ceil();
+                // MUST match the emit clamp (.max(0)) — see the bid side above.
+                let n_top = ((top_cap - ask_origin) / step).ceil().max(Decimal::ZERO);
                 let slot_top = ask_origin + n_top * step;
                 let window_high = slot_top + outward;
                 for (id, q) in ctx.open_quotes {
