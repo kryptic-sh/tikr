@@ -3050,7 +3050,7 @@ fn format_eta(secs: f64) -> String {
 /// basket-mode CSV streams stay row-addressable when concatenated.
 fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
     println!(
-        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
+        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,mean_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -3070,6 +3070,7 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
         };
         let volume = decimal_to_f64(&r.buy_volume_usdt.0) + decimal_to_f64(&r.sell_volume_usdt.0);
         let peak = decimal_to_f64(&r.peak_position_usdt.0);
+        let mean_pos = decimal_to_f64(&r.mean_position_usdt.0);
         let roi = if peak > 0.0 { net / peak * 100.0 } else { 0.0 };
         // CSV escape: wrap preset name in quotes if it contains a comma.
         let safe_name = if name.contains(',') {
@@ -3078,7 +3079,7 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             name.clone()
         };
         println!(
-            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
@@ -3086,6 +3087,7 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             r.liquidations,
             volume,
             peak,
+            mean_pos,
             realized,
             unrealized,
             fees,
