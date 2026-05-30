@@ -9,46 +9,57 @@
 # Account mirrors config.toml: $600 @ 5x, order_balance_pct 1 (~$6/order),
 # max_position_pct 100, inventory boost off.
 #
-# ⚠ THIN EDGE / SHORT WINDOW — WATCH THE FIRST MAINNET SESSION ⚠
-# BARE snapback + velocity cooldown. The iter4 "improvement" machinery
-# (confirm_touch / tp_relax / add_block) is OFF — it backtested as a net LOSER
-# (+3.71) once FillSim was made faithful to the real Binance -5022 post-only
-# reject; the bare strategy is the winner.
+# ⚠ TUNED ON A SHORT WINDOW — WATCH THE FIRST MAINNET SESSION ⚠
+# BARE snapback + velocity cooldown, geometry tuned by grid sweep. The iter4
+# machinery (confirm_touch / tp_relax / add_block) is OFF — it backtested as a
+# net LOSER once FillSim emitted the real Binance -5022 reject; the bare
+# strategy is the winner. Tighter trigger (3bps) captures the small
+# dislocations and balances profit across all four symbols (no longer
+# NEAR-carried).
 #
-# Honest backtest (4 symbols, ONLY ~13.07h of frozen data each, 76/27ms
-# latency, faithful -5022 reject, $600 @ 5x, entry_cooldown 1000ms):
-#   sum NET +19.53   NEAR +15.40   SUI +0.15   WLD +2.55   ZEC +1.43
-#   peak inventory ≤ ~$324   peak fills/min ≤ ~7 (cooldown caps the burst)
-# Bare WITHOUT the cooldown is +31.47 but pins inventory at the $600 cap and
-# bursts to ~117 fills/min — that is the profile that blew up live, so we keep
-# the cooldown. CAVEATS: 13h is a tiny window that happened to REVERT; a
-# trending month can look very different (the same symbols ran -297 in an
-# earlier iter), and ~94% of this NET is NEAR alone. Treat as directional only.
+# Backtest (4 symbols, ONLY ~13.07h frozen each, 76/27ms latency, faithful
+# -5022 reject, $600 @ 5x, cooldown 1000ms, max_position_pct 80):
+#   sum NET +57.39   NEAR +7.54   SUI +7.83   WLD +22.18   ZEC +19.84
+#   peak inventory ≤ ~$499   peak fills/min ≤ ~20
+# max_position_pct sweep (risk/return knee): 100%→+61.15/$627, 80%→+57.39/$499,
+# 50%→+34.52/$310, 30%→+17.44/$185 (all all-symbol-positive). 80% is the best
+# return-on-inventory; drop to 50% for a more conservative first run.
 #
-# Strategy params: trigger 12 / entry 2 / exit 8 / max_open 1 (bare snapback).
-# Live-safety = the velocity cooldown (the non-redundant lever; the runner's
-# two-layer position cap already bounds total inventory, so no net cap here):
+# ⚠ REJECT RATE ~34%: a third of orders cross the moving book and get -5022
+# rejected even in sim — so LIVE you will see constant -5022 warnings and fills
+# arrive slowly/lumpily. That is EXPECTED for a tight-trigger maker, not a bug;
+# the drop-on-5022 + cooldown keep it from storming. Be patient for fills.
+#
+# CAVEATS: 13h is a tiny window that happened to REVERT; a trending stretch can
+# look very different (the same symbols ran -297 in an earlier iter). The +57
+# is directional, NOT a forecast. No jitter in the backtest — real latency
+# wobble (worst at this tight trigger) is untested.
+#
+# Strategy params: trigger 3 / entry 1 / exit 10 / max_open 1 (bare, mid-anchor).
+# Live-safety = the velocity cooldown (the runner's two-layer position cap
+# bounds total inventory, so no strategy net cap):
 #   entry_cooldown_ms = 1000   ≥1s between same-side entries. Caps entry burst
 #                              rate (max_open_entries only caps RESTING quotes,
 #                              useless for fill-on-contact entries). Also gates
 #                              the -5022 requote so a cross can't reject-storm.
-# (Losing knobs — IOC stop-loss, net cap, skew, IOC give-up, size scaling,
-# confirm_touch/tp_relax/add_block — all off or removed; none helped.)
+#   entry_from_touch  = false  price entries entry_bps from mid (mid-anchor won
+#                              the sweep; touch-anchor fills more but doesn't
+#                              cut the -5022 rate — flip to true to try it live).
 #
 # Pre-flight (mainnet):
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
 #   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
 #   3. Funded USDC balance in Futures wallet
 #   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
-#   5. WATCH the first session, do not leave unattended, and stop on the first
-#      sign of sustained one-sided inventory piling (a trending regime).
+#   5. WATCH the first session, do not leave unattended, expect frequent -5022
+#      (normal), and stop on sustained one-sided inventory piling (a trend).
 
 [account]
 env = "futures-mainnet"
 state_dir = "./state/mmr-usdc-majors"
 asset = "USDC"
 order_balance_pct = "1"
-max_position_pct = "100"
+max_position_pct = "80"
 leverage = 5
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
@@ -58,57 +69,61 @@ inventory_boost_curve = "1"
 symbol = "NEARUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 12
-entry_bps = 2
-exit_bps = 8
+trigger_bps = 3
+entry_bps = 1
+exit_bps = 10
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
 entry_cooldown_ms = 1000
+entry_from_touch = false
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
 symbol = "ZECUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 12
-entry_bps = 2
-exit_bps = 8
+trigger_bps = 3
+entry_bps = 1
+exit_bps = 10
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
 entry_cooldown_ms = 1000
+entry_from_touch = false
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
 symbol = "WLDUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 12
-entry_bps = 2
-exit_bps = 8
+trigger_bps = 3
+entry_bps = 1
+exit_bps = 10
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
 entry_cooldown_ms = 1000
+entry_from_touch = false
 
 # ─── SUIUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
 symbol = "SUIUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 12
-entry_bps = 2
-exit_bps = 8
+trigger_bps = 3
+entry_bps = 1
+exit_bps = 10
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
 entry_cooldown_ms = 1000
+entry_from_touch = false
