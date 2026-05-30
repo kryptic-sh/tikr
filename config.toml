@@ -57,7 +57,7 @@
 env = "futures-mainnet"
 state_dir = "./state/wave-usdc-majors"
 asset = "USDC"
-order_balance_pct = "1"
+order_balance_pct = "0.5"
 max_position_pct = "100"
 leverage = 5
 # Inventory-aware order-size boost (runner-side, every strategy). Scales the
@@ -80,10 +80,10 @@ inventory_boost_curve = "1"
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-refill_threshold = 2
-inner_bps = 3
-step_bps = 2
+grid_levels = 10
+refill_threshold = 5
+inner_bps = 5
+step_bps = 5
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
@@ -93,10 +93,10 @@ step_bps = 2
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-refill_threshold = 2
-inner_bps = 3
-step_bps = 2
+grid_levels = 10
+refill_threshold = 5
+inner_bps = 5
+step_bps = 5
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 # Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
@@ -106,10 +106,10 @@ step_bps = 2
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-refill_threshold = 2
-inner_bps = 3
-step_bps = 2
+grid_levels = 10
+refill_threshold = 5
+inner_bps = 5
+step_bps = 5
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
 # Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
@@ -119,7 +119,7 @@ step_bps = 2
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 3
-refill_threshold = 2
-inner_bps = 3
-step_bps = 2
+grid_levels = 10
+refill_threshold = 5
+inner_bps = 5
+step_bps = 5
