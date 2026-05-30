@@ -1089,10 +1089,21 @@ impl FillSim {
                 // no impact on queue_ahead.
                 continue;
             }
-            // Aggregate dropped without explanation — assume cancels
-            // uniformly distributed. Scale queue_ahead proportionally.
-            // Note: if the level vanished (new_agg == 0), queue_ahead → 0
-            // (everyone ahead of us cancelled; we're sole resting quote).
+            if new_agg <= Decimal::ZERO {
+                // Level VANISHED from the L2 snapshot. This is ambiguous and
+                // almost never means "everyone ahead of us cancelled" — far
+                // more often price ticked past the level, or the depth simply
+                // fell out of the capped/throttled top-N snapshot. The L2 feed
+                // under-represents true book depth, so zeroing queue_ahead here
+                // would falsely promote us to front-of-queue and systematically
+                // OVER-FILL — catastrophic for dense grids whose levels empty
+                // and refill on every wiggle (sim churned 50x the live fill
+                // count). Preserve queue_ahead; only an OBSERVABLE partial
+                // shrink (new_agg > 0, below) is credited as cancels-ahead.
+                continue;
+            }
+            // Partial shrink with the level still present — observable cancels
+            // ahead of us. Scale queue_ahead proportionally (uniform-cancel).
             let new_queue = q.queue_ahead * new_agg / prev_agg;
             q.queue_ahead = new_queue;
         }
@@ -1703,6 +1714,60 @@ mod tests {
         };
         let _ = sim.on_market_event(&book2, Timestamp(25_000_000));
         assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(4));
+    }
+
+    /// A level VANISHING from the L2 snapshot (new_agg == 0) is ambiguous —
+    /// usually price moved past it, not a full cancel-out — so queue_ahead is
+    /// PRESERVED, not zeroed. Zeroing here would falsely promote a resting
+    /// order to front-of-queue and over-fill dense grids.
+    #[test]
+    fn vanished_level_preserves_queue_ahead() {
+        let sym = make_symbol();
+        let mut sim = FillSim::new(default_cfg());
+
+        // Best bid 100 with 10 resting. Place JOIN bid → queue_ahead = 10.
+        let book1 = MarketEvent::BookUpdate {
+            snapshot: make_book_with_size(&sym, 100, 10, 102, 1),
+        };
+        let _ = sim.on_market_event(&book1, Timestamp(0));
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 100, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let hb = MarketEvent::Heartbeat {
+            ts: Timestamp(20_000_000),
+        };
+        let _ = sim.on_market_event(&hb, Timestamp(20_000_000));
+        assert_eq!(sim.live_quotes[0].queue_ahead, Decimal::from(10));
+
+        // New book brackets 100 (bids 101 / 99) but has NO order AT 100 →
+        // level_size(Bid, 100) == 0, yet 100 is still in-window (>= deepest 99).
+        let book2 = MarketEvent::BookUpdate {
+            snapshot: Snapshot {
+                symbol: sym.clone(),
+                bids: vec![
+                    Level {
+                        price: Price(Decimal::from(101)),
+                        size: Size(Decimal::from(1)),
+                    },
+                    Level {
+                        price: Price(Decimal::from(99)),
+                        size: Size(Decimal::from(1)),
+                    },
+                ],
+                asks: vec![Level {
+                    price: Price(Decimal::from(102)),
+                    size: Size(Decimal::from(1)),
+                }],
+                ts: Timestamp(25_000_000),
+            },
+        };
+        let _ = sim.on_market_event(&book2, Timestamp(25_000_000));
+        assert_eq!(
+            sim.live_quotes[0].queue_ahead,
+            Decimal::from(10),
+            "vanished level must preserve queue_ahead, not zero it"
+        );
     }
 
     /// Trade-shrinkage at our level must NOT be double-counted as cancels:
