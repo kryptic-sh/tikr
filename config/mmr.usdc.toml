@@ -18,12 +18,15 @@
 # NEAR-carried).
 #
 # Backtest (4 symbols, ONLY ~13.07h frozen each, 76/27ms latency, faithful
-# -5022 reject, $600 @ 5x, cooldown 1000ms, max_position_pct 80):
-#   sum NET +57.39   NEAR +7.54   SUI +7.83   WLD +22.18   ZEC +19.84
-#   peak inventory ≤ ~$499   peak fills/min ≤ ~20
-# max_position_pct sweep (risk/return knee): 100%→+61.15/$627, 80%→+57.39/$499,
-# 50%→+34.52/$310, 30%→+17.44/$185 (all all-symbol-positive). 80% is the best
-# return-on-inventory; drop to 50% for a more conservative first run.
+# -5022 reject, $600 @ 5x, cooldown 500ms, tp 6bps, max_position_pct 80):
+#   sum NET +72.13   NEAR +13.92   SUI +9.28   WLD +27.62   ZEC +21.31
+#   peak inventory ≤ ~$495   peak fills/min ≤ ~24
+# tp×cooldown sweep picked cd=500/tp=6 (+72.13) over cd=1000/tp=10 (+57.39):
+# a shorter 500ms cooldown captures more fills (2 entries/sec/side ceiling vs
+# 1/sec) and the tight 6bps TP banks more round-trips. max_position_pct sweep
+# (risk/return knee): 100%→+61/$627, 80%→+57/$499, 50%→+35/$310, 30%→+17/$185
+# (all all-symbol-positive). 80% is the best return-on-inventory; drop to 50%
+# for a more conservative first run.
 #
 # ⚠ REJECT RATE ~34%: a third of orders cross the moving book and get -5022
 # rejected even in sim — so LIVE you will see constant -5022 warnings and fills
@@ -35,10 +38,10 @@
 # is directional, NOT a forecast. No jitter in the backtest — real latency
 # wobble (worst at this tight trigger) is untested.
 #
-# Strategy params: trigger 3 / entry 1 / exit 10 / max_open 1 (bare, mid-anchor).
+# Strategy params: trigger 3 / entry 1 / exit 6 / max_open 1 (bare, mid-anchor).
 # Live-safety = the velocity cooldown (the runner's two-layer position cap
 # bounds total inventory, so no strategy net cap):
-#   entry_cooldown_ms = 1000   ≥1s between same-side entries. Caps entry burst
+#   entry_cooldown_ms = 500    ≥0.5s between same-side entries. Caps entry burst
 #                              rate (max_open_entries only caps RESTING quotes,
 #                              useless for fill-on-contact entries). Also gates
 #                              the -5022 requote so a cross can't reject-storm.
@@ -71,13 +74,13 @@ strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
 trigger_bps = 3
 entry_bps = 1
-exit_bps = 10
+exit_bps = 6
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 1000
+entry_cooldown_ms = 500
 entry_from_touch = false
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
@@ -87,13 +90,13 @@ strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
 trigger_bps = 3
 entry_bps = 1
-exit_bps = 10
+exit_bps = 6
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 1000
+entry_cooldown_ms = 500
 entry_from_touch = false
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
@@ -103,13 +106,13 @@ strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
 trigger_bps = 3
 entry_bps = 1
-exit_bps = 10
+exit_bps = 6
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 1000
+entry_cooldown_ms = 500
 entry_from_touch = false
 
 # ─── SUIUSDC ──────────────────────────────────────────────────────────────
@@ -119,11 +122,11 @@ strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
 trigger_bps = 3
 entry_bps = 1
-exit_bps = 10
+exit_bps = 6
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 1000
+entry_cooldown_ms = 500
 entry_from_touch = false
