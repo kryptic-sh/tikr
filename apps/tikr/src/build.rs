@@ -404,6 +404,16 @@ fn build_tide(
         step_bps,
         max_position_usdt: Decimal::ZERO,
         prune_stragglers,
+        recenter_bps: cfg.tide.as_ref().map(|t| t.recenter_bps).unwrap_or(0),
+        recenter_secs: cfg.tide.as_ref().map(|t| t.recenter_secs).unwrap_or(0),
+        inner_steps: cfg.tide.as_ref().map(|t| t.inner_steps).unwrap_or(0),
+        chase: cfg.tide.as_ref().map(|t| t.chase).unwrap_or(false),
+        chase_to_avg: cfg.tide.as_ref().map(|t| t.chase_to_avg).unwrap_or(false),
+        relattice_timeout_secs: cfg
+            .tide
+            .as_ref()
+            .map(|t| t.relattice_timeout_secs)
+            .unwrap_or(300),
     }))
 }
 

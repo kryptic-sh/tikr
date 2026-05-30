@@ -63,6 +63,43 @@ pub struct TideConfig {
     /// far-side stragglers stay resting forever — they may catch a
     /// future reversion fill but pin margin in the meantime.
     pub prune_stragglers: bool,
+    /// Recenter threshold, in bps. When the lattice center drifts more than
+    /// this from our `avg_entry` (cost basis) while holding inventory, move the
+    /// grid onto avg_entry — asks just above cost (exit at a profit), bids just
+    /// below (average in). avg_entry only moves on OUR fills, so this anchor is
+    /// stable (no per-tick chasing, unlike recentering to the touch). `0`
+    /// (default) = never recenter (pure frozen lattice).
+    pub recenter_bps: u32,
+    /// Time-based recenter interval, in seconds. When > 0, every `recenter_secs`
+    /// the lattice is abandoned (cancel all) and re-frozen around the current
+    /// touch. Unlike drift-based recentering it fires on a clock, not on price
+    /// moving, so it doesn't chase a move as it happens. `0` (default) = off.
+    pub recenter_secs: u32,
+    /// Skip the inner rungs: the top order on each side is held at least
+    /// `inner_steps × lattice_step` away from the current mid (a dead zone
+    /// around mid). `0` (default) = legacy (top order at the self-spread).
+    /// Set `2` to keep the first buy/sell `2 × step_bps` from mid, widening
+    /// the minimum round-trip so each completed pair clears a guaranteed gap.
+    pub inner_steps: u32,
+    /// When `true`, the lattice CHASES price in both directions — bids follow
+    /// price up, asks follow price down (the window slides past the origin both
+    /// ways). When `false` (default), the lattice is one-sided/frozen: bids
+    /// only extend at/below the origin, asks at/above, so it never buys high or
+    /// sells low (the +118 baseline). Chasing keeps the grid active across a
+    /// trend but can sell held inventory below cost.
+    pub chase: bool,
+    /// Chase the reducing side, but only as far as our cost basis. When long,
+    /// asks chase DOWN to follow price but are floored at `avg_entry + gap` —
+    /// they sell inventory near cost on a small bounce, but never below what we
+    /// paid. When short, bids chase UP but are ceilinged at `avg_entry − gap`.
+    /// Combines the chase's staying-active with the frozen grid's no-realized-
+    /// loss invariant. `gap = max(inner_steps,1) × step`. `false` = off.
+    pub chase_to_avg: bool,
+    /// Idle re-lattice timeout, in seconds. When the lattice has gone this long
+    /// without a fill (price stranded the grid), abandon it and re-freeze around
+    /// the current touch. Unlike `recenter_secs` (fires on a clock regardless of
+    /// activity) this only fires when the grid is dead. `300` (default).
+    pub relattice_timeout_secs: u32,
 }
 
 /// Strategy state. Tracks intents emitted but not yet confirmed via
@@ -87,6 +124,8 @@ pub struct Tide {
     bid_lattice_origin: Option<Decimal>,
     ask_lattice_origin: Option<Decimal>,
     lattice_step: Option<Decimal>,
+    /// Nanosecond timestamp of the last time-based recenter (for `recenter_secs`).
+    last_recenter_ns: Option<u64>,
     /// Quote intents the venue rejected (typically -5022 post-only
     /// would-cross). Held forever and re-emitted on the next event
     /// whose book makes a post-only at that price safe (BID < best_ask
@@ -219,6 +258,7 @@ impl Strategy for Tide {
             ask_lattice_origin: None,
             lattice_step: None,
             pending_retries: Vec::new(),
+            last_recenter_ns: None,
         }
     }
 
@@ -301,6 +341,7 @@ impl Strategy for Tide {
 
         // Per-side cap: when long notional > cap, no more BID emits.
         let pos_size = ctx.position.size.0;
+        let avg_entry = ctx.position.avg_entry.0;
         let cap = self.config.max_position_usdt;
         let mid_for_pos = match (best_bid, best_ask) {
             (Some(b), Some(a)) if a.0 > Decimal::ZERO && b.0 > Decimal::ZERO => {
@@ -341,6 +382,71 @@ impl Strategy for Tide {
             (best_bid, best_ask)
         };
 
+        // Time-based recenter (opt-in): every `recenter_secs`, abandon the grid
+        // and re-freeze around the current touch. Fires on a clock, not on price
+        // moving. Reset the origins to None so the freeze block below re-anchors
+        // this event; the freeze resets the recenter timer.
+        if self.config.recenter_secs > 0
+            && self.lattice_step.is_some()
+            && let (Some(top_b), Some(top_a)) = (top_bid_override, top_ask_override)
+            && top_b.0 > Decimal::ZERO
+            && top_a.0 > top_b.0
+        {
+            let due = match self.last_recenter_ns {
+                Some(last) => {
+                    ctx.now.0.saturating_sub(last)
+                        >= u64::from(self.config.recenter_secs) * 1_000_000_000
+                }
+                None => false,
+            };
+            if due {
+                actions.push(Action::CancelAll);
+                self.lattice_step = None;
+                self.bid_lattice_origin = None;
+                self.ask_lattice_origin = None;
+                self.pending_bid_prices.clear();
+                self.pending_ask_prices.clear();
+                self.pending_retries.clear();
+            }
+        }
+
+        // Recenter on our COST BASIS (opt-in). When the lattice center has
+        // drifted more than `recenter_bps` from our average entry price, move
+        // the grid onto avg_entry: asks just above our cost (exit inventory at
+        // a profit), bids just below (average in at better prices). Unlike
+        // recentering to the touch — which chases price and buys high — avg_entry
+        // only moves when WE fill, so the anchor is stable and tracks our
+        // position, not the market tick. Only active while holding inventory;
+        // flat = leave the lattice put. `recenter_bps = 0` disables.
+        if self.config.recenter_bps > 0
+            && let (Some(bo), Some(ao)) = (self.bid_lattice_origin, self.ask_lattice_origin)
+            && self.lattice_step.is_some()
+            && tick > Decimal::ZERO
+        {
+            let pos = ctx.position.size.0;
+            let avg = ctx.position.avg_entry.0;
+            if pos != Decimal::ZERO && avg > Decimal::ZERO {
+                let center = (bo + ao) / Decimal::from(2);
+                let drift_bps = (center - avg).abs() / avg * Decimal::from(10_000);
+                if drift_bps > Decimal::from(self.config.recenter_bps) {
+                    // Re-anchor origins around avg_entry with the same
+                    // self-spread the freeze uses (step_bps/2 each side),
+                    // snapped to tick. lattice_step is unchanged.
+                    let half = avg * Decimal::from(self.config.step_bps) / Decimal::from(20_000);
+                    let new_bid = ((avg - half) / tick).floor() * tick;
+                    let new_ask = ((avg + half) / tick).ceil() * tick;
+                    if new_bid > Decimal::ZERO && new_ask > new_bid {
+                        actions.push(Action::CancelAll);
+                        self.bid_lattice_origin = Some(new_bid);
+                        self.ask_lattice_origin = Some(new_ask);
+                        self.pending_bid_prices.clear();
+                        self.pending_ask_prices.clear();
+                        self.pending_retries.clear();
+                    }
+                }
+            }
+        }
+
         // Freeze the lattice on the first event with both tops known.
         // Step (bps mode): `max(1 tick, ceil(bps × mid / 10000 / tick) × tick)`.
         // Default (0): 1 tick.
@@ -364,6 +470,8 @@ impl Strategy for Tide {
             self.lattice_step = Some(step);
             self.bid_lattice_origin = Some(top_b.0);
             self.ask_lattice_origin = Some(top_a.0);
+            // Start (or restart, on a time-based recenter) the recenter timer.
+            self.last_recenter_ns = Some(ctx.now.0);
         }
 
         let lattice_ready = self.lattice_step.is_some()
@@ -398,9 +506,31 @@ impl Strategy for Tide {
                     top_cap = max_bid;
                 }
             }
-            // floor((top_cap - origin) / step), clamped ≤ 0 so the top bid
-            // never sits above bid_origin (no chasing up / buying high).
-            let n_top = ((top_cap - bid_origin) / step).floor().min(Decimal::ZERO);
+            // Skip inner rungs: hold the top bid at least `inner_steps × step`
+            // below the current mid (dead zone around mid).
+            if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
+                let inner = Decimal::from(self.config.inner_steps) * step;
+                top_cap = top_cap.min(mid_for_pos - inner);
+            }
+            // chase_to_avg: when SHORT, bids chase up to cover but never above
+            // avg_entry − gap (never buy back the short above what we sold for).
+            if self.config.chase_to_avg && pos_size < Decimal::ZERO && avg_entry > Decimal::ZERO {
+                let gap = Decimal::from(self.config.inner_steps.max(1)) * step;
+                top_cap = top_cap.min(avg_entry - gap);
+            }
+            // floor((top_cap - origin) / step). One-sided (default) clamps ≤ 0 so
+            // the top bid never sits above bid_origin; `chase`/`chase_to_avg`
+            // remove the clamp and let bids follow price up.
+            let raw_n = ((top_cap - bid_origin) / step).floor();
+            // Bids un-clamp only when chasing, or when SHORT under chase_to_avg
+            // (bids are the reducing side then). When long, keep bids one-sided
+            // so they don't chase up and buy high / over-accumulate.
+            let n_top =
+                if self.config.chase || (self.config.chase_to_avg && pos_size < Decimal::ZERO) {
+                    raw_n
+                } else {
+                    raw_n.min(Decimal::ZERO)
+                };
             let mut price = bid_origin + n_top * step;
             for _ in 0..levels {
                 if price <= Decimal::ZERO {
@@ -441,9 +571,31 @@ impl Strategy for Tide {
                     top_cap = min_ask;
                 }
             }
-            // ceil((top_cap - origin) / step), clamped ≥ 0 so the top ask
-            // never sits below ask_origin (no chasing down / selling low).
-            let n_top = ((top_cap - ask_origin) / step).ceil().max(Decimal::ZERO);
+            // Skip inner rungs: hold the top ask at least `inner_steps × step`
+            // above the current mid.
+            if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
+                let inner = Decimal::from(self.config.inner_steps) * step;
+                top_cap = top_cap.max(mid_for_pos + inner);
+            }
+            // chase_to_avg: when LONG, asks chase down to follow price but never
+            // below avg_entry + gap (never sell inventory below cost).
+            if self.config.chase_to_avg && pos_size > Decimal::ZERO && avg_entry > Decimal::ZERO {
+                let gap = Decimal::from(self.config.inner_steps.max(1)) * step;
+                top_cap = top_cap.max(avg_entry + gap);
+            }
+            // ceil((top_cap - origin) / step). One-sided (default) clamps ≥ 0 so
+            // the top ask never sits below ask_origin; `chase`/`chase_to_avg`
+            // remove the clamp and let asks follow price down.
+            let raw_n = ((top_cap - ask_origin) / step).ceil();
+            // Asks un-clamp only when chasing, or when LONG under chase_to_avg
+            // (asks are the reducing side then). When short, keep asks one-sided
+            // so they don't chase down and sell low / over-accumulate.
+            let n_top =
+                if self.config.chase || (self.config.chase_to_avg && pos_size > Decimal::ZERO) {
+                    raw_n
+                } else {
+                    raw_n.max(Decimal::ZERO)
+                };
             let mut price = ask_origin + n_top * step;
             for _ in 0..levels {
                 if price <= Decimal::ZERO {
@@ -488,11 +640,26 @@ impl Strategy for Tide {
                         top_cap = max_bid;
                     }
                 }
-                // MUST match the emit clamp (.min(0)) — otherwise when price is
-                // above the origin the prune window sits above the (clamped)
-                // emitted bids and cancels them every event, fighting the emit
-                // in a cancel/create storm at the grid edge.
-                let n_top = ((top_cap - bid_origin) / step).floor().min(Decimal::ZERO);
+                // MUST match the emit (inner_steps cap + chase clamp) — else the
+                // prune window misaligns with the emitted bids and cancels them
+                // every event in a cancel/create storm at the grid edge.
+                if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
+                    top_cap =
+                        top_cap.min(mid_for_pos - Decimal::from(self.config.inner_steps) * step);
+                }
+                if self.config.chase_to_avg && pos_size < Decimal::ZERO && avg_entry > Decimal::ZERO
+                {
+                    top_cap = top_cap
+                        .min(avg_entry - Decimal::from(self.config.inner_steps.max(1)) * step);
+                }
+                let raw_n = ((top_cap - bid_origin) / step).floor();
+                let n_top = if self.config.chase
+                    || (self.config.chase_to_avg && pos_size < Decimal::ZERO)
+                {
+                    raw_n
+                } else {
+                    raw_n.min(Decimal::ZERO)
+                };
                 let slot_top = bid_origin + n_top * step;
                 let window_low = slot_top - outward;
                 for (id, q) in ctx.open_quotes {
@@ -513,8 +680,24 @@ impl Strategy for Tide {
                         top_cap = min_ask;
                     }
                 }
-                // MUST match the emit clamp (.max(0)) — see the bid side above.
-                let n_top = ((top_cap - ask_origin) / step).ceil().max(Decimal::ZERO);
+                // MUST match the emit (inner_steps cap + chase clamp) — see bid.
+                if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
+                    top_cap =
+                        top_cap.max(mid_for_pos + Decimal::from(self.config.inner_steps) * step);
+                }
+                if self.config.chase_to_avg && pos_size > Decimal::ZERO && avg_entry > Decimal::ZERO
+                {
+                    top_cap = top_cap
+                        .max(avg_entry + Decimal::from(self.config.inner_steps.max(1)) * step);
+                }
+                let raw_n = ((top_cap - ask_origin) / step).ceil();
+                let n_top = if self.config.chase
+                    || (self.config.chase_to_avg && pos_size > Decimal::ZERO)
+                {
+                    raw_n
+                } else {
+                    raw_n.max(Decimal::ZERO)
+                };
                 let slot_top = ask_origin + n_top * step;
                 let window_high = slot_top + outward;
                 for (id, q) in ctx.open_quotes {
@@ -628,6 +811,12 @@ mod tests {
             step_bps: 0,
             max_position_usdt: Decimal::ZERO,
             prune_stragglers: true,
+            recenter_bps: 0,
+            recenter_secs: 0,
+            inner_steps: 0,
+            chase: false,
+            chase_to_avg: false,
+            relattice_timeout_secs: 300,
         }
     }
 

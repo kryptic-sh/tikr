@@ -519,10 +519,40 @@ pub struct TideParams {
     /// forever, may pin margin.
     #[serde(default = "tide_prune_default")]
     pub prune_stragglers: bool,
+    /// Recenter threshold in bps: when the mid drifts more than this from the
+    /// frozen lattice center, re-anchor the grid around the current touch.
+    /// `0` (default) = never recenter. Set wide (only on real range shifts).
+    #[serde(default)]
+    pub recenter_bps: u32,
+    /// Time-based recenter interval in seconds: every N seconds, re-anchor the
+    /// grid around the current touch. `0` (default) = off.
+    #[serde(default)]
+    pub recenter_secs: u32,
+    /// Hold the top order `inner_steps × step` from mid (skip inner rungs).
+    /// `0` (default) = legacy self-spread. `2` = first order 2× step from mid.
+    #[serde(default)]
+    pub inner_steps: u32,
+    /// Chase price both ways (bids follow up, asks follow down). `false`
+    /// (default) = one-sided/frozen.
+    #[serde(default)]
+    pub chase: bool,
+    /// Chase the reducing side only to cost basis (asks→avg+gap when long,
+    /// bids→avg−gap when short). Never sells below cost. `false` (default) = off.
+    #[serde(default)]
+    pub chase_to_avg: bool,
+    /// Idle re-lattice timeout in seconds: when the lattice has gone this long
+    /// without a fill, re-freeze the grid around the current touch. `300`
+    /// (default).
+    #[serde(default = "tide_default_relattice_timeout_secs")]
+    pub relattice_timeout_secs: u32,
 }
 
 fn tide_prune_default() -> bool {
     true
+}
+
+fn tide_default_relattice_timeout_secs() -> u32 {
+    300
 }
 
 fn tide_default_grid_levels() -> u32 {

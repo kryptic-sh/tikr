@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
 use futures::stream::{self, BoxStream};
 use tikr_backtest::fill_sim::{FillSim, FillSimConfig, VenueFees};
+use tikr_backtest::liquidation::LiquidationConfig;
 use tikr_backtest::replay::{LoadedReplayData, ParquetReplay, ReplayConfig, deep_clone_symbol};
 use tikr_core::{
     Asset, Decimal, Fill, MarketEvent, MarketKind, Position, SignedSize, Size, Snapshot, Symbol,
@@ -110,6 +111,11 @@ async fn autodetect_filters(env: EnvArg, symbol: &str) -> Option<(String, String
 /// helper. Default = all zeros → compounding disabled, static notional path.
 static BALANCE_COMPOUNDING: OnceLock<(Decimal, Decimal, Decimal)> = OnceLock::new();
 static INVENTORY_BOOST: OnceLock<Option<InventoryBoostConfig>> = OnceLock::new();
+/// Isolated-margin liquidation model, set once in `main` from `--liquidation`
+/// and `--leverage`. `None` (default) disables forced-close modeling so a
+/// backtest rides drawdowns a real leveraged account would be liquidated out
+/// of. Read by the `run_one` / `spawn_preset_with_liqs` RunnerConfig builders.
+static LIQUIDATION: OnceLock<Option<LiquidationConfig>> = OnceLock::new();
 /// Per-symbol venue `min_notional` (from exchangeInfo autodetect), read by the
 /// `run_one` / `spawn_preset_with_liqs` RunnerConfig builders. Settable (not a
 /// `OnceLock`) because basket mode resolves a different value per symbol; safe
@@ -130,6 +136,17 @@ fn runner_min_notional() -> Decimal {
 
 fn inventory_boost() -> Option<InventoryBoostConfig> {
     INVENTORY_BOOST.get().copied().flatten()
+}
+
+fn liquidation() -> Option<LiquidationConfig> {
+    LIQUIDATION.get().copied().flatten()
+}
+
+/// `true` when `--liquidation` armed the forced-close model — used to decide
+/// whether the table prints a `liq` column (a column of zeros confirms the
+/// run was modeled and survived; absent column means it was never checked).
+fn liquidation_modeled() -> bool {
+    liquidation().is_some()
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -757,6 +774,40 @@ struct Args {
     #[arg(long, default_value = "1")]
     tide_grid_levels_list: String,
 
+    /// Tide recenter threshold in bps: when the mid drifts more than this from
+    /// the frozen lattice center, re-anchor the grid around the current touch.
+    /// `0` (default) = never recenter (pure frozen lattice). Set WIDE.
+    #[arg(long, default_value_t = 0u32)]
+    tide_recenter_bps: u32,
+
+    /// Tide time-based recenter interval in seconds: every N seconds, re-anchor
+    /// the grid around the current touch. `0` (default) = off.
+    #[arg(long, default_value_t = 0u32)]
+    tide_recenter_secs: u32,
+
+    /// Tide idle re-lattice timeout in seconds: when the lattice has gone this
+    /// long without a fill, re-freeze the grid around the current touch.
+    /// `300` (default).
+    #[arg(long, default_value_t = 300u32)]
+    tide_relattice_timeout_secs: u32,
+
+    /// Tide: hold the top order `inner_steps × step` from mid (skip inner
+    /// rungs). `0` (default) = legacy self-spread. Set 2 for first order at
+    /// 2× step from mid.
+    #[arg(long, default_value_t = 0u32)]
+    tide_inner_steps: u32,
+
+    /// Tide: when set, the lattice chases price both ways (bids follow up, asks
+    /// follow down). Default off = one-sided/frozen (the +118 baseline).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    tide_chase: bool,
+
+    /// Tide: chase the reducing side only to cost basis — asks chase down to
+    /// avg_entry+gap when long, bids up to avg_entry−gap when short. Never sells
+    /// below cost. Default off.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    tide_chase_to_avg: bool,
+
     /// Wave sweep: comma-separated lattice geometry in bps. Live USDC
     /// config uses 2.
     #[arg(long, default_value = "2")]
@@ -891,6 +942,29 @@ struct Args {
     /// position would exceed `balance × leverage`. Default 5×.
     #[arg(long, default_value = "5")]
     leverage: String,
+
+    /// Model isolated-margin forced liquidation. When set, a position is
+    /// force-closed (realizing the loss + `--liq-close-fee-bps`) the moment
+    /// the book mid breaches its liquidation price for `--leverage` /
+    /// `--liq-maint-margin-rate`. Off (default) lets the backtest ride
+    /// drawdowns a real leveraged account would never survive — turn ON to
+    /// stress-test survivability at high leverage / position caps. The
+    /// `liq` column then reports the forced-close count per preset (0 =
+    /// modeled + survived).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    liquidation: bool,
+
+    /// Maintenance-margin rate (fraction) for the liquidation model. Binance
+    /// USD-M tier-1 majors ~0.004; small-caps 0.01+. Only used when
+    /// `--liquidation` is on.
+    #[arg(long, default_value = "0.005")]
+    liq_maint_margin_rate: String,
+
+    /// Taker fee (bps) charged on a forced close, approximating the
+    /// liquidation-clearance fee + slippage. Only used when `--liquidation`
+    /// is on.
+    #[arg(long, default_value_t = 5u32)]
+    liq_close_fee_bps: u32,
 
     /// FillSim: silent-cancel rate per minute per live quote (simulates
     /// venue cancel/expire events the WS misses; runner reconciliation
@@ -1165,6 +1239,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let _ = INVENTORY_BOOST.set(inv_boost);
+
+    // Isolated-margin liquidation model. Leverage drives the liq distance
+    // (1/lev below entry for longs); off unless explicitly armed so the
+    // default backtest keeps its no-liquidation behaviour.
+    let liq_cfg = if args.liquidation {
+        let leverage = Decimal::from_str(&args.leverage)?;
+        Some(LiquidationConfig {
+            leverage,
+            maint_margin_rate: Decimal::from_str(&args.liq_maint_margin_rate)?,
+            close_fee_bps: args.liq_close_fee_bps,
+        })
+    } else {
+        None
+    };
+    let _ = LIQUIDATION.set(liq_cfg);
 
     if !args.data_root.is_empty() {
         return run_basket(args).await;
@@ -2123,6 +2212,12 @@ async fn run_sweep_collect(
                         step_bps: step,
                         max_position_usdt: Decimal::ZERO,
                         prune_stragglers: true,
+                        recenter_bps: args.tide_recenter_bps,
+                        recenter_secs: args.tide_recenter_secs,
+                        inner_steps: args.tide_inner_steps,
+                        chase: args.tide_chase,
+                        chase_to_avg: args.tide_chase_to_avg,
+                        relattice_timeout_secs: args.tide_relattice_timeout_secs,
                     }),
                     fees,
                     skim_cfg,
@@ -2744,7 +2839,7 @@ async fn run_one<S: Strategy>(
         max_position_pct: balance_compounding().2,
         min_notional: runner_min_notional(),
         max_expected_open_orders: 2,
-        liquidation: None,
+        liquidation: liquidation(),
         mark_series: None,
         inventory_boost: inventory_boost(),
     };
@@ -2834,7 +2929,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             max_position_pct: balance_compounding().2,
             min_notional: runner_min_notional(),
             max_expected_open_orders: 2,
-            liquidation: None,
+            liquidation: liquidation(),
             mark_series: None,
             inventory_boost: inventory_boost(),
         };
@@ -2955,7 +3050,7 @@ fn format_eta(secs: f64) -> String {
 /// basket-mode CSV streams stay row-addressable when concatenated.
 fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
     println!(
-        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,volume_usdt,peak_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
+        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -2983,11 +3078,12 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             name.clone()
         };
         println!(
-            "{symbol},{safe_name},{},{:.4},{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
             r.rejected_orders,
+            r.liquidations,
             volume,
             peak,
             realized,
@@ -3007,10 +3103,10 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!("### {symbol}");
     println!();
     println!(
-        "| preset | fills | fills/min | peak/min | rej | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |"
+        "| preset | fills | fills/min | peak/min | rej | liq | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |"
     );
     println!(
-        "|--------|------:|----------:|---------:|----:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|"
+        "|--------|------:|----------:|---------:|----:|----:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -3038,11 +3134,12 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
         // Markdown escape: pipes inside cell text break the row.
         let safe_name = name.replace('|', "\\|");
         println!(
-            "| {safe_name} | {} | {:.2} | {} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
+            "| {safe_name} | {} | {:.2} | {} | {} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
             r.rejected_orders,
+            r.liquidations,
             realized,
             unrealized,
             fees,
@@ -3170,12 +3267,11 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             ]);
         }
     } else {
+        headers.extend(["preset", "fills", "fills/min", "peak/min", "rej"]);
+        if liquidation_modeled() {
+            headers.push("liq");
+        }
         headers.extend([
-            "preset",
-            "fills",
-            "fills/min",
-            "peak/min",
-            "rej",
             "volume",
             "peak_pos",
             "realized",
@@ -3227,6 +3323,10 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
                 format!("{dpf:.5}"),
                 roi,
             ];
+            // `liq` slots right after `rej` (index 5) to match the header.
+            if liquidation_modeled() {
+                row.insert(5, r.liquidations.to_string());
+            }
             if let Some(bn) = baseline_net {
                 let delta = net - bn;
                 // Prefix `+` on positive deltas so the sign is immediately
