@@ -91,6 +91,8 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
     // is the MAX single-symbol burst, not the sum (symbols rarely burst in
     // lockstep), consistent with peak_position_usdt.
     let mut max_peak_fills_per_min = 0u64;
+    // Rejections sum across symbols (counts, unlike the peak rate).
+    let mut total_rejected_orders = 0u64;
     let mut bases: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in reports {
         realized += r.realized.0;
@@ -120,6 +122,7 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         total_partial_fills += r.partial_fills;
         total_liquidations += r.liquidations;
         max_peak_fills_per_min = max_peak_fills_per_min.max(r.peak_fills_per_min);
+        total_rejected_orders += r.rejected_orders;
         if !r.base_asset.is_empty() {
             bases.insert(r.base_asset.as_str());
         }
@@ -158,5 +161,6 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         partial_fills: total_partial_fills,
         liquidations: total_liquidations,
         peak_fills_per_min: max_peak_fills_per_min,
+        rejected_orders: total_rejected_orders,
     }
 }

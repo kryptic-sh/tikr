@@ -975,6 +975,11 @@ pub struct MicroMeanReversionParams {
     /// hundred ms. `0` disables.
     #[serde(default = "mmr_default_entry_cooldown_ms")]
     pub entry_cooldown_ms: u64,
+    /// Entry-price anchor. `false` (default) prices entries `entry_bps` from
+    /// mid; `true` prices off the live touch (improve the near best by
+    /// `entry_bps`) — fills better and avoids the stale-mid `-5022` cross.
+    #[serde(default = "mmr_default_entry_from_touch")]
+    pub entry_from_touch: bool,
 }
 
 fn mmr_default_trigger_bps() -> u32 {
@@ -1003,6 +1008,9 @@ fn mmr_default_add_block_bps() -> u32 {
 }
 fn mmr_default_entry_cooldown_ms() -> u64 {
     0
+}
+fn mmr_default_entry_from_touch() -> bool {
+    false
 }
 
 /// SpreadScalp configuration.

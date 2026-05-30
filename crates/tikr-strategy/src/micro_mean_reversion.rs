@@ -59,6 +59,14 @@ pub struct MicroMeanReversionConfig {
     /// a fast move machine-guns dozens of fills in seconds. This gate caps
     /// entry velocity per side. `0` disables (no throttle).
     pub entry_cooldown_ms: u64,
+    /// Entry-price anchor. When `false` (legacy), entries are priced
+    /// `entry_bps` from **mid** — which lags the touch on a fast move, so the
+    /// order can cross and get rejected `-5022` live (or rest too deep to
+    /// fill). When `true`, entries are priced off the **live touch**: improve
+    /// the near best by `entry_bps` (join at/near the front of the queue),
+    /// clamped to stay a non-crossing maker. Far more fill-friendly and robust
+    /// to a stale mid.
+    pub entry_from_touch: bool,
 }
 
 /// Micro mean-reversion strategy state.
@@ -85,36 +93,58 @@ impl MicroMeanReversion {
 
     fn entry_quote(&self, ctx: &StrategyContext<'_>, mid: Price, side: Side) -> Action {
         let gap = Decimal::from(self.config.entry_bps) / Decimal::from(10_000);
-        let mut price = match side {
-            Side::Bid => mid.0 * (Decimal::ONE - gap),
-            Side::Ask => mid.0 * (Decimal::ONE + gap),
+        let best_bid = ctx.latest_book.bids.first().map(|l| l.price.0);
+        let best_ask = ctx.latest_book.asks.first().map(|l| l.price.0);
+
+        let price = if self.config.entry_from_touch {
+            // Touch-anchored: improve the near best by `entry_bps` so the order
+            // joins at/near the front of the queue and fills, priced off the
+            // LIVE touch (not a latency-stale mid). The clamp keeps it a
+            // non-crossing maker when the spread is tighter than the improve.
+            match side {
+                Side::Ask => match (best_ask, best_bid) {
+                    (Some(ask), Some(bid)) => {
+                        let improved = ask * (Decimal::ONE - gap);
+                        if improved > bid { improved } else { ask }
+                    }
+                    _ => mid.0 * (Decimal::ONE + gap),
+                },
+                Side::Bid => match (best_ask, best_bid) {
+                    (Some(ask), Some(bid)) => {
+                        let improved = bid * (Decimal::ONE + gap);
+                        if improved < ask { improved } else { bid }
+                    }
+                    _ => mid.0 * (Decimal::ONE - gap),
+                },
+            }
+        } else {
+            // Mid-anchored (legacy): `entry_bps` from mid. During a fast move
+            // mid lags the touch, so clamp a would-be crosser onto the same-side
+            // touch (guaranteed maker). Only activates in the cross case.
+            let mut price = match side {
+                Side::Bid => mid.0 * (Decimal::ONE - gap),
+                Side::Ask => mid.0 * (Decimal::ONE + gap),
+            };
+            match side {
+                Side::Ask => {
+                    if let Some(bid) = best_bid
+                        && price <= bid
+                        && let Some(ask) = best_ask
+                    {
+                        price = ask;
+                    }
+                }
+                Side::Bid => {
+                    if let Some(ask) = best_ask
+                        && price >= ask
+                        && let Some(bid) = best_bid
+                    {
+                        price = bid;
+                    }
+                }
+            }
+            price
         };
-        // Maker-safe clamp: during a fast move, `mid` lags the touch and the
-        // computed price can land on the wrong side of the book — submitting it
-        // post-only would be rejected `-5022` on live (and dropped). Instead of
-        // crossing, join the same-side touch (guaranteed maker, still passive),
-        // so the order rests and fills. Only activates in the cross case;
-        // normal in-spread entries are untouched.
-        match side {
-            Side::Ask => {
-                // An ask crosses if it sits at/below the best bid.
-                if let Some(bid) = ctx.latest_book.bids.first().map(|l| l.price.0)
-                    && price <= bid
-                    && let Some(ask) = ctx.latest_book.asks.first().map(|l| l.price.0)
-                {
-                    price = ask;
-                }
-            }
-            Side::Bid => {
-                // A bid crosses if it sits at/above the best ask.
-                if let Some(ask) = ctx.latest_book.asks.first().map(|l| l.price.0)
-                    && price >= ask
-                    && let Some(bid) = ctx.latest_book.bids.first().map(|l| l.price.0)
-                {
-                    price = bid;
-                }
-            }
-        }
         self.make_quote(ctx.symbol, side, Price(price))
     }
 
@@ -494,6 +524,7 @@ mod tests {
             tp_relax_floor_bps: 0,
             add_block_bps: 0,
             entry_cooldown_ms: 0,
+            entry_from_touch: false,
         })
     }
 

@@ -602,6 +602,8 @@ where
         peak_per_min: resume.as_ref().map(|r| r.peak_fills_per_min).unwrap_or(0),
         ..FillRateTracker::default()
     };
+    // Order rejections observed (predominantly post-only -5022 would-cross).
+    let mut rejected_orders: u64 = resume.as_ref().map(|r| r.rejected_orders).unwrap_or(0);
     let resumed_runtime_secs: u64 = resume.as_ref().map(|r| r.runtime_secs).unwrap_or(0);
     let resumed_sim_duration_secs: u64 = resume.as_ref().map(|r| r.sim_duration_secs).unwrap_or(0);
 
@@ -760,6 +762,7 @@ where
                 partial_fills,
                 liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                 fill_rate.peak_per_min,
+                rejected_orders,
             );
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
@@ -1428,6 +1431,7 @@ where
                             break;
                         }
                         round += 1;
+                        rejected_orders += rejections.len() as u64;
                         let rec_pos = tracker.snapshot();
                         for (rej_intent, rej_reason) in rejections {
                             // Skip recovery for margin-insufficient rejections.
@@ -1541,6 +1545,7 @@ where
                         partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                 fill_rate.peak_per_min,
+                rejected_orders,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1691,6 +1696,7 @@ where
                         partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                 fill_rate.peak_per_min,
+                rejected_orders,
                     );
                     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
                     report.sim_duration_secs =
@@ -1825,6 +1831,7 @@ where
                         partial_fills,
                         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
                 fill_rate.peak_per_min,
+                rejected_orders,
                     );
                     heartbeat.runtime_secs =
                         resumed_runtime_secs.saturating_add(heartbeat.runtime_secs);
@@ -2085,6 +2092,7 @@ where
         partial_fills,
         liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
         fill_rate.peak_per_min,
+        rejected_orders,
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
@@ -2612,6 +2620,7 @@ fn finalize(
     partial_fills: u64,
     liquidations: u64,
     peak_fills_per_min: u64,
+    rejected_orders: u64,
 ) -> PaperReport {
     let base = tracker.report(last_mark);
     let sim_duration_secs = match (first_event_ts, last_event_ts) {
@@ -2661,6 +2670,7 @@ fn finalize(
         partial_fills,
         liquidations,
         peak_fills_per_min,
+        rejected_orders,
     }
 }
 
@@ -3476,6 +3486,7 @@ mod tests {
             partial_fills: 0,
             liquidations: 0,
             peak_fills_per_min: 0,
+            rejected_orders: 0,
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -3531,6 +3542,7 @@ mod tests {
             partial_fills: 0,
             liquidations: 0,
             peak_fills_per_min: 0,
+            rejected_orders: 0,
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);

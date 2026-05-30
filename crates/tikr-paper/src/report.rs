@@ -94,6 +94,13 @@ pub struct PaperReport {
     /// can sit near-idle for hours then machine-gun dozens of fills in one
     /// fast move.
     pub peak_fills_per_min: u64,
+    /// Count of order rejections observed during the run — predominantly
+    /// post-only would-cross (`-5022`) for maker strategies, plus any
+    /// margin / too-many-orders rejects. In backtest this is every FillSim
+    /// rejection drained through the recovery loop; a high count means the
+    /// strategy's quotes are racing the book and the realized fill rate is
+    /// well below the order rate (live, you'd "wait longer" for fills).
+    pub rejected_orders: u64,
     /// Number of forced liquidations triggered during the run. `0` when no
     /// [`crate::runner::RunnerConfig::liquidation`] model was configured, or
     /// when the mark never breached the position's liquidation price. A
@@ -147,6 +154,8 @@ struct PaperReportWire {
     liquidations: u64,
     #[serde(default)]
     peak_fills_per_min: u64,
+    #[serde(default)]
+    rejected_orders: u64,
 }
 
 impl Serialize for PaperReport {
@@ -177,6 +186,7 @@ impl Serialize for PaperReport {
             partial_fills: self.partial_fills,
             liquidations: self.liquidations,
             peak_fills_per_min: self.peak_fills_per_min,
+            rejected_orders: self.rejected_orders,
         }
         .serialize(serializer)
     }
@@ -254,6 +264,7 @@ impl<'de> Deserialize<'de> for PaperReport {
             partial_fills: wire.partial_fills,
             liquidations: wire.liquidations,
             peak_fills_per_min: wire.peak_fills_per_min,
+            rejected_orders: wire.rejected_orders,
         })
     }
 }
