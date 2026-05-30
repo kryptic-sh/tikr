@@ -41,7 +41,7 @@
 # Strategy params: trigger 3 / entry 1 / exit 6 / max_open 1 (bare, mid-anchor).
 # Live-safety = the velocity cooldown (the runner's two-layer position cap
 # bounds total inventory, so no strategy net cap):
-#   entry_cooldown_ms = 500    ≥0.5s between same-side entries. Caps entry burst
+#   entry_cooldown_ms = 0    ≥0.5s between same-side entries. Caps entry burst
 #                              rate (max_open_entries only caps RESTING quotes,
 #                              useless for fill-on-contact entries). Also gates
 #                              the -5022 requote so a cross can't reject-storm.
@@ -72,15 +72,15 @@ inventory_boost_curve = "1"
 symbol = "NEARUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 3
+trigger_bps = 2
 entry_bps = 1
-exit_bps = 6
+exit_bps = 3
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 500
+entry_cooldown_ms = 0
 entry_from_touch = false
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
@@ -88,15 +88,15 @@ entry_from_touch = false
 symbol = "ZECUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 3
+trigger_bps = 2
 entry_bps = 1
-exit_bps = 6
+exit_bps = 3
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 500
+entry_cooldown_ms = 0
 entry_from_touch = false
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
@@ -104,15 +104,15 @@ entry_from_touch = false
 symbol = "WLDUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 3
+trigger_bps = 2
 entry_bps = 1
-exit_bps = 6
+exit_bps = 3
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 500
+entry_cooldown_ms = 0
 entry_from_touch = false
 
 # ─── SUIUSDC ──────────────────────────────────────────────────────────────
@@ -120,13 +120,13 @@ entry_from_touch = false
 symbol = "SUIUSDC"
 strategy = "micro-mean-reversion"
 [bot.micro_mean_reversion]
-trigger_bps = 3
+trigger_bps = 2
 entry_bps = 1
-exit_bps = 6
+exit_bps = 3
 max_open_entries = 1
 confirm_touch = false
 tp_relax_trigger_bps = 0
 tp_relax_floor_bps = 0
 add_block_bps = 0
-entry_cooldown_ms = 500
+entry_cooldown_ms = 0
 entry_from_touch = false
