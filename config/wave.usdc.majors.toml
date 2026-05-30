@@ -16,15 +16,15 @@
 # a one-sided sweep — integral, not optional). Lattice never recenters; the
 # active window slides over the fixed grid and prunes the tail.
 #
-# Geometry knobs: `step_bps` = spacing between levels; `inner_bps` = distance
-# from mid to the first order each side (independent; unset/0 = defaults to step_bps).
+# Geometry knobs: `step_bps` = spacing between levels; `inner_steps` = dead-zone
+# in STEPS (mid → first order = inner_steps × step), matching Tide. 0 = at touch.
 # The lattice is UNIFORM (constant spacing); a progressive/widening lattice was
 # tried and removed (misaligns on trends once price leaves the frozen origin,
 # and the re-center fix destroys the grid's buy-low/sell-high edge).
 #
 # Tuned 2026-05-29/30 on the real ~54h DOGE + SOL snapshots (maker 0 / taker 0
 # USDC promo, $600 @ 1% ≈ $6/order, 5x). Current config:
-# levels=4 / refill_threshold=2 / step_bps=5 / inner_bps=5 (uniform).
+# levels=4 / refill_threshold=2 / step_bps=5 / inner_steps=1 (uniform).
 #   DOGE 54h: NET +3.59 (realized +7.15, unreal -3.30), peak ~$653
 #   SOL  54h: NET +3.86 (realized +6.21, unreal -1.98), peak ~$617
 # Findings:
@@ -72,7 +72,7 @@ strategy = "wave"
 grid_levels = 4
 refill_threshold = 2
 step_bps = 5
-inner_bps = 5
+inner_steps = 1
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
@@ -85,7 +85,7 @@ strategy = "wave"
 grid_levels = 4
 refill_threshold = 2
 step_bps = 5
-inner_bps = 5
+inner_steps = 1
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 # Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
@@ -98,7 +98,7 @@ strategy = "wave"
 grid_levels = 4
 refill_threshold = 2
 step_bps = 5
-inner_bps = 5
+inner_steps = 1
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
 # Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
@@ -111,4 +111,4 @@ strategy = "wave"
 grid_levels = 4
 refill_threshold = 2
 step_bps = 5
-inner_bps = 5
+inner_steps = 1

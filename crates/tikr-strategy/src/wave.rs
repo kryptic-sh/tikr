@@ -47,12 +47,12 @@ pub struct WaveConfig {
     /// also the default for `inner_bps` when that is unset.
     pub step_bps: u32,
 
-    /// Inner self-spread in bps of mid: the distance from mid to the FIRST
-    /// order on each side (where the frozen origins sit), independent of the
-    /// `step_bps` level spacing. e.g. `inner_bps=2, step_bps=5` → first order
-    /// 2bps off mid, then levels 5bps apart (2,7,12,…). `0` (default/unset) =
-    /// inner defaults to the full `step_bps` each side. Snapped to tick.
-    pub inner_bps: u32,
+    /// Inner dead-zone in STEPS: the first order on each side sits
+    /// `inner_steps × step` from mid (where the frozen origins are anchored),
+    /// matching Tide's `inner_steps`. e.g. `inner_steps=2, step_bps=5` → first
+    /// order 10bps off mid, levels 5bps apart (10,15,20,…). `0` (default) =
+    /// origins at the touch (1-tick spread). Snapped to tick.
+    pub inner_steps: u32,
 
     /// Refill batching: only refill a side once ≥ this many of its band
     /// slots are empty (filled). `1` = refill on any single gap (most
@@ -75,6 +75,15 @@ pub struct WaveConfig {
     /// slots (at/over the cap). Requires `max_position_usdt > 0`. `0`
     /// (default) = no skew (symmetric lattice, original behavior).
     pub inventory_skew_slots: u32,
+
+    /// Chase the reducing side, but only as far as cost basis (Tide semantics).
+    /// When long, the ASK band chases DOWN past the origin to follow price but
+    /// is floored at `avg_entry + gap` — it sells inventory near cost on a
+    /// bounce, never below what was paid. When short, the BID band chases UP
+    /// but is ceilinged at `avg_entry − gap`. The accumulating side stays
+    /// one-sided/frozen. `gap = max(inner_steps,1) × step`. `false` = off
+    /// (pure one-sided lattice).
+    pub chase_to_avg: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -140,7 +149,7 @@ impl Wave {
         best_ask: Option<Price>,
     ) -> (Option<Price>, Option<Price>) {
         let tick = self.config.tick_size;
-        let spread_active = self.config.step_bps > 0 || self.config.inner_bps > 0;
+        let spread_active = self.config.step_bps > 0 || self.config.inner_steps > 0;
         if let (Some(bp), Some(ap)) = (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
@@ -148,15 +157,10 @@ impl Wave {
             && spread_active
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
-            // Distance from mid to the first order on each side. Explicit
-            // `inner_bps` when set (>0); otherwise default to the full
-            // `step_bps` each side (step_bps is required, inner_bps optional).
-            let inner_bps = if self.config.inner_bps > 0 {
-                self.config.inner_bps
-            } else {
-                self.config.step_bps
-            };
-            let required_half = mid * Decimal::from(inner_bps) / Decimal::from(10_000);
+            // Distance from mid to the first order on each side =
+            // `inner_steps × step` (Tide semantics). `inner_steps=0` → offset 0
+            // → origins clamp to the touch via the .min(bp)/.max(ap) below.
+            let required_half = Decimal::from(self.config.inner_steps) * self.compute_step(mid);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -460,7 +464,7 @@ impl Strategy for Wave {
                 mid = %mid,
                 tick = %self.config.tick_size,
                 step_bps = self.config.step_bps,
-                inner_bps = self.config.inner_bps,
+                inner_steps = self.config.inner_steps,
                 step = %base,
                 inner_offset = %(self.bid_lattice_origin.map(|o| mid - o).unwrap_or_default()),
                 "wave: lattice frozen"
@@ -496,6 +500,16 @@ impl Strategy for Wave {
         // slots by `|position notional| / cap`.
         let (bid_skew, ask_skew) = self.inventory_skew(ctx, best_bid, best_ask);
 
+        // chase_to_avg: gap from cost basis = max(inner_steps,1) × step. The
+        // reducing side may chase past the origin (top_k < 0) but no further
+        // than this gap from avg_entry, so it never realizes a loss.
+        let pos_size = ctx.position.size.0;
+        let avg_entry = ctx.position.avg_entry.0;
+        let chase_gap = self
+            .lattice_step
+            .map(|s| Decimal::from(self.config.inner_steps.max(1)) * s)
+            .unwrap_or(Decimal::ZERO);
+
         // Compute both bands around the cross-guarded touch.
         let bid_band = top_b.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
             let mut cap = top.0;
@@ -511,7 +525,19 @@ impl Strategy for Wave {
                 // shallowest bid sits AT the origin, never above it. Without
                 // this the band chases up and buys high, breaking the fixed-grid
                 // invariant (avg buy < avg sell) and bleeding realized on trends.
-                let top_k = top_k.max(0);
+                //
+                // chase_to_avg + SHORT: bids are the reducing side. Let them
+                // chase UP (k < 0) to cover, but floor the k at the avg_entry −
+                // gap slot so they never buy back above what was shorted.
+                let floor_k = if self.config.chase_to_avg
+                    && pos_size < Decimal::ZERO
+                    && avg_entry > Decimal::ZERO
+                {
+                    self.bid_k_at_or_below(avg_entry - chase_gap).unwrap_or(0)
+                } else {
+                    0
+                };
+                let top_k = top_k.max(floor_k);
                 WindowRange {
                     low_k: top_k + bid_skew,
                     high_k: top_k + bid_skew + levels - 1,
@@ -531,7 +557,19 @@ impl Strategy for Wave {
                 // price falls past the origin, top_k goes <= 0 — clamp to 0 so
                 // the shallowest ask sits AT the origin, never below it (no
                 // chasing down / selling low).
-                let top_k = top_k.max(0);
+                //
+                // chase_to_avg + LONG: asks are the reducing side. Let them
+                // chase DOWN (k < 0) to follow price, but floor the k at the
+                // avg_entry + gap slot so they never sell inventory below cost.
+                let floor_k = if self.config.chase_to_avg
+                    && pos_size > Decimal::ZERO
+                    && avg_entry > Decimal::ZERO
+                {
+                    self.ask_k_at_or_above(avg_entry + chase_gap).unwrap_or(0)
+                } else {
+                    0
+                };
+                let top_k = top_k.max(floor_k);
                 WindowRange {
                     low_k: top_k + ask_skew,
                     high_k: top_k + ask_skew + levels - 1,
@@ -625,10 +663,11 @@ mod tests {
             min_notional: Decimal::from(5),
             grid_levels: 6,
             step_bps: 10,
-            inner_bps: 0,
+            inner_steps: 0,
             refill_threshold: 1,
             max_position_usdt: Decimal::ZERO,
             inventory_skew_slots: 0,
+            chase_to_avg: false,
         }
     }
 
@@ -711,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn inner_bps_decouples_first_order_from_step_spacing() {
+    fn inner_steps_pushes_first_order_out_in_step_multiples() {
         let s = snap(Decimal::from(100), Decimal::new(10002, 2)); // 100 / 100.02
         let mid = Decimal::new(10001, 2);
         let sm = sym();
@@ -728,28 +767,27 @@ mod tests {
             let b1 = w.bid_price(1).unwrap();
             (mid - b0, b0 - b1) // (inner gap from mid, step gap)
         };
-        // inner_bps=2 with step_bps=10: first order ~2bps off mid, levels ~10bps.
-        let mut tight = cfg();
-        tight.tick_size = Decimal::new(1, 2);
-        tight.step_bps = 10;
-        tight.inner_bps = 2;
-        let (inner_tight, step_tight) = freeze(tight);
-        // Default (inner_bps=0): first order defaults to full step_bps = 10bps off mid.
-        let mut legacy = cfg();
-        legacy.tick_size = Decimal::new(1, 2);
-        legacy.step_bps = 10;
-        legacy.inner_bps = 0;
-        let (inner_legacy, step_legacy) = freeze(legacy);
-        // Explicit inner_bps=2 puts the first order CLOSER to mid than the
-        // step_bps default (10bps).
+        // inner_steps=2 with step_bps=10: first order ~2 steps (20bps) off mid.
+        let mut wide = cfg();
+        wide.tick_size = Decimal::new(1, 2);
+        wide.step_bps = 10;
+        wide.inner_steps = 2;
+        let (inner_wide, step_wide) = freeze(wide);
+        // inner_steps=1: first order ~1 step (10bps) off mid.
+        let mut narrow = cfg();
+        narrow.tick_size = Decimal::new(1, 2);
+        narrow.step_bps = 10;
+        narrow.inner_steps = 1;
+        let (inner_narrow, step_narrow) = freeze(narrow);
+        // More inner_steps ⇒ first order FARTHER from mid (Tide semantics).
         assert!(
-            inner_tight < inner_legacy,
-            "inner_bps=2 ({inner_tight}) must be tighter than the step_bps default ({inner_legacy})"
+            inner_wide > inner_narrow,
+            "inner_steps=2 ({inner_wide}) must push out farther than inner_steps=1 ({inner_narrow})"
         );
-        // Step spacing is unchanged by inner_bps (both == step_bps geometry).
+        // Step spacing is unchanged by inner_steps (both == step_bps geometry).
         assert_eq!(
-            step_tight, step_legacy,
-            "step spacing independent of inner_bps"
+            step_wide, step_narrow,
+            "step spacing independent of inner_steps"
         );
     }
 

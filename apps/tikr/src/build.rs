@@ -507,12 +507,13 @@ fn build_wave(
         min_notional,
         grid_levels: wave.grid_levels,
         step_bps: wave.step_bps,
-        inner_bps: wave.inner_bps,
+        inner_steps: wave.inner_steps,
         refill_threshold: wave.refill_threshold,
         // Account-derived cap arrives via on_max_position_updated (live
         // channel); seed 0 = uncapped until the first update lands.
         max_position_usdt: Decimal::ZERO,
         inventory_skew_slots: wave.inventory_skew_slots,
+        chase_to_avg: wave.chase_to_avg,
     }))
 }
 

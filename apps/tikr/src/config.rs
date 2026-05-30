@@ -323,10 +323,10 @@ pub struct WaveParams {
     /// Level spacing in bps — gap between consecutive levels. `0` = 1-tick.
     #[serde(default)]
     pub step_bps: u32,
-    /// Inner self-spread in bps (mid → first order each side), independent of
-    /// `step_bps` spacing. Optional — `0`/unset defaults to `step_bps`.
+    /// Inner dead-zone in STEPS (mid → first order = `inner_steps × step`),
+    /// matching Tide. `0` (default) = origins at the touch.
     #[serde(default)]
-    pub inner_bps: u32,
+    pub inner_steps: u32,
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,
@@ -335,6 +335,11 @@ pub struct WaveParams {
     /// asks higher). `0` (default) = symmetric/off.
     #[serde(default)]
     pub inventory_skew_slots: u32,
+    /// Chase the reducing side only to cost basis (asks→avg+gap when long,
+    /// bids→avg−gap when short). Never sells/covers past cost. `false`
+    /// (default) = off (pure one-sided lattice).
+    #[serde(default)]
+    pub chase_to_avg: bool,
 }
 
 fn wave_default_refill_threshold() -> u32 {

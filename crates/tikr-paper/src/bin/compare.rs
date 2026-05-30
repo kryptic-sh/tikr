@@ -828,11 +828,15 @@ struct Args {
     #[arg(long, default_value = "0")]
     wave_inventory_skew_list: String,
 
-    /// Wave sweep: comma-separated inner self-spread values (bps from mid to
-    /// the first order each side), independent of step spacing. `0` = use
-    /// step_bps.
+    /// Wave sweep: comma-separated inner dead-zone values in STEPS (mid → first
+    /// order = `inner_steps × step`), matching Tide. `0` = origins at the touch.
     #[arg(long, default_value = "0")]
-    wave_inner_bps_list: String,
+    wave_inner_steps_list: String,
+
+    /// Wave: chase the reducing side only to cost basis (asks→avg+gap when long,
+    /// bids→avg−gap when short). Never sells/covers past cost. Default off.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    wave_chase_to_avg: bool,
 
     /// SpreadScalp notional per order.
     #[arg(long, default_value = "100")]
@@ -2235,14 +2239,15 @@ async fn run_sweep_collect(
         let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
         let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
         let wave_skew_sweep = parse_u32_list(&args.wave_inventory_skew_list)?;
-        let wave_inner_sweep = parse_u32_list(&args.wave_inner_bps_list)?;
+        let wave_inner_sweep = parse_u32_list(&args.wave_inner_steps_list)?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &skew in &wave_skew_sweep {
                     for &inner in &wave_inner_sweep {
                         let label = format!(
-                            "Wave lv={levels} step={step}bps inner={inner} rt={} skew={skew}",
-                            args.wave_refill_threshold
+                            "Wave lv={levels} step={step}bps inner={inner} rt={} skew={skew}{}",
+                            args.wave_refill_threshold,
+                            if args.wave_chase_to_avg { " cta" } else { "" }
                         );
                         spawn_preset(
                             &mut handles,
@@ -2256,10 +2261,11 @@ async fn run_sweep_collect(
                                 min_notional,
                                 grid_levels: levels,
                                 step_bps: step,
-                                inner_bps: inner,
+                                inner_steps: inner,
                                 refill_threshold: args.wave_refill_threshold,
                                 max_position_usdt: bot_position_cap,
                                 inventory_skew_slots: skew,
+                                chase_to_avg: args.wave_chase_to_avg,
                             }),
                             fees,
                             skim_cfg,
