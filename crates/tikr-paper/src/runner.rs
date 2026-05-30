@@ -840,7 +840,20 @@ where
     loop {
         // Poll the external fill receiver when in live mode. We use an async
         // block that resolves to `Option<Fill>` so the select! can be unified.
+        //
+        // `biased`: poll branches top-to-bottom in a FIXED order instead of
+        // tokio's default random selection. This is load-bearing for backtest
+        // determinism — after a fill the event branch sends on the
+        // balance-compounding watch channels (notional/max_position), so the
+        // next poll has BOTH those branches and the next event ready. Random
+        // selection applied the size/cap update before-or-after the next event
+        // inconsistently, changing quote sizes run-to-run (amplified into large
+        // PnL swings on volatile symbols). Fixed order makes replays
+        // reproducible. The watch/timer branches are only briefly ready (just
+        // after a fill / once a second), never perpetually, so they cannot
+        // starve the event stream — safe for live too.
         tokio::select! {
+            biased;
             changed = async {
                 match notional_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
