@@ -709,6 +709,45 @@ struct Args {
     #[arg(long, default_value = "1")]
     mmr_max_entries_list: String,
 
+    /// MicroMeanReversion dislocation-confirmation gate. When `true`, an
+    /// Ask-side entry only fires when `trade.price >= best_ask`, and a
+    /// Bid-side entry only fires when `trade.price <= best_bid`. Filters
+    /// in-spread trend prints that don't revert. Default `true` (active).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    mmr_confirm_touch: bool,
+
+    /// MicroMeanReversion TP relaxation trigger in bps from avg_entry.
+    /// When adverse move exceeds this, reprice the resting exit to
+    /// avg_entry +/- floor_bps (maker-safe, never crossing). `0` disables.
+    /// Default `20` (active).
+    #[arg(long, default_value_t = 20u32)]
+    mmr_tp_relax_trigger_bps: u32,
+
+    /// MicroMeanReversion TP relaxation floor in bps above avg_entry.
+    /// Used with mmr_tp_relax_trigger_bps. Default `3`.
+    #[arg(long, default_value_t = 3u32)]
+    mmr_tp_relax_floor_bps: u32,
+
+    /// MicroMeanReversion adverse-side entry cooldown in bps from avg_entry.
+    /// Suppresses same-side adds when adverse_bps >= this threshold.
+    /// `0` disables. Default `15` (active).
+    #[arg(long, default_value_t = 15u32)]
+    mmr_add_block_bps: u32,
+
+    /// MicroMeanReversion entry velocity throttle: minimum milliseconds
+    /// between same-side entry posts. Stops a burst of trade prints firing
+    /// many entries in a few hundred ms. `0` disables. Default `0` (sim has
+    /// no rate limit; live config sets this).
+    #[arg(long, default_value_t = 0u64)]
+    mmr_entry_cooldown_ms: u64,
+
+    /// MicroMeanReversion hard same-side net-position ceiling in quote
+    /// notional. Suppresses same-side adds once `|position| * mid >= cap`.
+    /// `0` disables. Default `0` (the runner position cap binds in sim;
+    /// live config sets this as a runaway safety ceiling).
+    #[arg(long, default_value = "0")]
+    mmr_max_net_usdt: String,
+
     /// Tide sweep: comma-separated lattice geometry in bps (inner gap AND
     /// level spacing). Live USDC config uses 20.
     #[arg(long, default_value = "20")]
@@ -2018,6 +2057,12 @@ async fn run_sweep_collect(
         let mmr_entry_sweep = parse_u32_list(&args.mmr_entry_bps_list)?;
         let mmr_exit_sweep = parse_u32_list(&args.mmr_exit_bps_list)?;
         let mmr_max_entries_sweep = parse_u32_list(&args.mmr_max_entries_list)?;
+        let mmr_confirm_touch = args.mmr_confirm_touch;
+        let mmr_tp_relax_trigger_bps = args.mmr_tp_relax_trigger_bps;
+        let mmr_tp_relax_floor_bps = args.mmr_tp_relax_floor_bps;
+        let mmr_add_block_bps = args.mmr_add_block_bps;
+        let mmr_entry_cooldown_ms = args.mmr_entry_cooldown_ms;
+        let mmr_max_net_usdt = Decimal::from_str(&args.mmr_max_net_usdt)?;
         for &trigger in &mmr_trigger_sweep {
             for &entry in &mmr_entry_sweep {
                 for &exit in &mmr_exit_sweep {
@@ -2036,6 +2081,12 @@ async fn run_sweep_collect(
                                 entry_bps: entry,
                                 exit_bps: exit,
                                 max_open_entries: max_entries,
+                                confirm_touch: mmr_confirm_touch,
+                                tp_relax_trigger_bps: mmr_tp_relax_trigger_bps,
+                                tp_relax_floor_bps: mmr_tp_relax_floor_bps,
+                                add_block_bps: mmr_add_block_bps,
+                                entry_cooldown_ms: mmr_entry_cooldown_ms,
+                                max_net_usdt: mmr_max_net_usdt,
                             }),
                             fees,
                             skim_cfg,

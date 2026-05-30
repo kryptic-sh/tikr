@@ -489,12 +489,19 @@ impl Venue for BinanceClient {
         })
     }
 
-    /// Subscribe to a live depth stream.
+    /// Subscribe to a live market-data stream.
     ///
-    /// Returns a `BoxStream` of [`MarketEvent::BookUpdate`] frames sourced
-    /// from the `@depth20@100ms` WebSocket endpoint.
+    /// Merges two WebSocket sources into one [`MarketEvent`] stream:
+    /// [`MarketEvent::BookUpdate`] frames from `@depth20@100ms` and
+    /// [`MarketEvent::Trade`] frames from the trade stream (`@trade` on
+    /// futures, `@aggTrade` on spot). Both are required: book-driven
+    /// strategies (grid/wave) consume the depth frames, while trade-driven
+    /// strategies (micro-mean-reversion) only act on the trade prints — a
+    /// depth-only stream would leave them permanently idle.
     async fn subscribe(&self, symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
-        depth_stream::subscribe_depth(self.env, symbol.clone()).await
+        let depth = depth_stream::subscribe_depth(self.env, symbol.clone()).await?;
+        let trades = trade_stream::subscribe_trades(self.env, symbol.clone()).await?;
+        Ok(Box::pin(futures::stream::select(depth, trades)))
     }
 
     /// Place a post-only limit order.

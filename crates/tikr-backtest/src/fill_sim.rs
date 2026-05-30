@@ -737,9 +737,15 @@ impl FillSim {
             }
         }
         if matches!(intent.tif, TimeInForce::PostOnly) && self.would_cross(&intent) {
+            // Match the real Binance -5022 reject verbatim so strategies gate
+            // on one reason string across sim and live — a sim-only string
+            // would let reject handling diverge in backtest vs the exchange.
             self.pending_rejections.push((
                 intent.clone(),
-                "post-only would cross touch (paper)".to_string(),
+                "binance error (code -5022): Due to the order could not be \
+                 executed as maker, the Post Only order will be rejected. The \
+                 order will not be recorded in the order history"
+                    .to_string(),
             ));
             return None;
         }

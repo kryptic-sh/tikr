@@ -556,6 +556,12 @@ fn build_micro_mean_reversion(
             entry_bps: mmr.entry_bps,
             exit_bps: mmr.exit_bps,
             max_open_entries: mmr.max_open_entries,
+            confirm_touch: mmr.confirm_touch,
+            tp_relax_trigger_bps: mmr.tp_relax_trigger_bps,
+            tp_relax_floor_bps: mmr.tp_relax_floor_bps,
+            add_block_bps: mmr.add_block_bps,
+            entry_cooldown_ms: mmr.entry_cooldown_ms,
+            max_net_usdt: mmr.max_net_usdt,
         },
     ))
 }

@@ -953,6 +953,32 @@ pub struct MicroMeanReversionParams {
     /// Maximum same-side entry quotes to keep open.
     #[serde(default = "mmr_default_max_open_entries")]
     pub max_open_entries: u32,
+    /// Dislocation-confirmation gate. When `true`, an Ask-side entry only
+    /// fires when `trade.price >= best_ask` and a Bid-side entry only fires
+    /// when `trade.price <= best_bid`. `false` = legacy behaviour.
+    #[serde(default = "mmr_default_confirm_touch")]
+    pub confirm_touch: bool,
+    /// TP relaxation trigger in bps from avg_entry. When adverse move exceeds
+    /// this, reprice the resting exit to avg_entry +/- floor_bps (maker-safe,
+    /// never crossing). `0` disables.
+    #[serde(default = "mmr_default_tp_relax_trigger_bps")]
+    pub tp_relax_trigger_bps: u32,
+    /// TP relaxation floor in bps above avg_entry.
+    #[serde(default = "mmr_default_tp_relax_floor_bps")]
+    pub tp_relax_floor_bps: u32,
+    /// Adverse-side entry cooldown in bps from avg_entry.
+    /// Suppresses same-side adds when adverse_bps >= this threshold. `0` disables.
+    #[serde(default = "mmr_default_add_block_bps")]
+    pub add_block_bps: u32,
+    /// Entry velocity throttle: minimum milliseconds between same-side entry
+    /// posts. Stops a live trade-print burst firing many entries in a few
+    /// hundred ms. `0` disables.
+    #[serde(default = "mmr_default_entry_cooldown_ms")]
+    pub entry_cooldown_ms: u64,
+    /// Hard same-side net-position ceiling in quote notional. Suppresses
+    /// same-side adds once `|position| * mid >= max_net_usdt`. `0` disables.
+    #[serde(default = "mmr_default_max_net_usdt")]
+    pub max_net_usdt: Decimal,
 }
 
 fn mmr_default_trigger_bps() -> u32 {
@@ -966,6 +992,24 @@ fn mmr_default_exit_bps() -> u32 {
 }
 fn mmr_default_max_open_entries() -> u32 {
     1
+}
+fn mmr_default_confirm_touch() -> bool {
+    true
+}
+fn mmr_default_tp_relax_trigger_bps() -> u32 {
+    20
+}
+fn mmr_default_tp_relax_floor_bps() -> u32 {
+    3
+}
+fn mmr_default_add_block_bps() -> u32 {
+    15
+}
+fn mmr_default_entry_cooldown_ms() -> u64 {
+    0
+}
+fn mmr_default_max_net_usdt() -> Decimal {
+    Decimal::ZERO
 }
 
 /// SpreadScalp configuration.

@@ -1,4 +1,4 @@
-# ─── MicroMeanReversion on USDC majors — MAINNET ──────────────────────────
+# ─── MicroMeanReversion on USDC majors ────────────────────────────────────
 #
 # 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC — same lineup as the Wave
 # config.toml. MMR fades short-term dislocations: when a trade prints
@@ -9,27 +9,43 @@
 # Account mirrors config.toml: $600 @ 5x, order_balance_pct 1 (~$6/order),
 # max_position_pct 100, inventory boost off.
 #
-# Params (trigger 12 / entry 2 / exit 8 / max_open 1) are the values used in
-# the 4-symbol frozen-data backtest (72h frozen, 76/27ms latency). On that
-# window MMR netted +53.75 across the four with the iter4 risk machinery:
-#   NEAR +1.47  SUI +11.69  WLD +9.53  ZEC +31.05
-# vs +18.82 for the bare hold-to-TP baseline. Single-window result — treat as
-# directional, not precise; watch the first live sessions.
+# ⚠ NOT VALIDATED FOR LIVE — READ BEFORE RUNNING ON MAINNET ⚠
+# The honest 4-symbol frozen backtest (72h frozen, 76/27ms latency, FillSim
+# now emitting the real Binance -5022 post-only reject) is **sum NET +3.71**:
+#   NEAR -4.29   SUI +4.14   WLD -2.93   ZEC +6.79
+# The earlier +53.75 was a SIM ARTIFACT — it relied on FillSim cheaply
+# requoting latency-crossed post-only orders, which on live is the -5022
+# reject storm (a single fast move machine-gunned 48 fills in seconds on
+# mainnet). With sim faithful to live, the real edge is thin and NEGATIVE on
+# NEAR and WLD. Retune (trigger/entry/exit, symbol selection) against the
+# corrected backtest before trusting any mainnet session.
 #
-# Risk machinery — the iter4 winner, pinned explicit on every bot so the
-# config can't drift if code defaults change:
-#   confirm_touch    = true enter only when the trade prints through the touch
-#   tp_relax_trigger = 20   relax TP toward break-even past 20bps adverse …
-#   tp_relax_floor   = 3    … to avg_entry + 3bps, maker-safe, never crossing
-#   add_block_bps    = 15   suppress same-side adds once 15bps adverse
-# (The losing-iter knobs — IOC stop-loss, net cap, skew, IOC give-up, size
-# scaling — were removed from the strategy entirely; they only ever hurt.)
+# Strategy params (iter4 winner core): trigger 12 / entry 2 / exit 8 / max 1.
+# Risk machinery — pinned explicit per bot so the config can't drift on code
+# default changes:
+#   confirm_touch        = true   enter only on a trade printing through touch
+#   tp_relax_trigger_bps = 20     relax TP toward break-even past 20bps adverse
+#   tp_relax_floor_bps   = 3      … to avg_entry + 3bps (maker-safe, no cross)
+#   add_block_bps        = 15     suppress same-side adds once 15bps adverse
+# Live-safety governors (NOT exercised by sim — sim has no rate limit and the
+# runner's own position cap binds there; these protect the live account):
+#   entry_cooldown_ms = 1000      ≥1s between same-side entries — kills the
+#                                 trade-print burst that piled inventory in
+#                                 seconds (max_open_entries caps RESTING quotes
+#                                 only, useless for fill-on-contact entries)
+#   max_net_usdt      = 150       hard same-side notional ceiling; binds from
+#                                 the first fill (add_block only engages after
+#                                 the position is already adverse)
+# (Losing-iter knobs — IOC stop-loss, skew, IOC give-up, size scaling — were
+# removed from the strategy entirely; they only ever hurt.)
 #
-# Pre-flight (identical to config.toml):
+# Pre-flight (mainnet):
 #   1. TIKR_BINANCE_ENABLE_MAINNET=1
 #   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
 #   3. Funded USDC balance in Futures wallet
 #   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+#   5. Given the +3.71 backtest: watch the FIRST session live, do not leave
+#      unattended, and stop on the first sign of one-sided inventory piling.
 
 [account]
 env = "futures-mainnet"
@@ -54,6 +70,8 @@ confirm_touch = true
 tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
+entry_cooldown_ms = 1000
+max_net_usdt = "150"
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -68,6 +86,8 @@ confirm_touch = true
 tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
+entry_cooldown_ms = 1000
+max_net_usdt = "150"
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -82,6 +102,8 @@ confirm_touch = true
 tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
+entry_cooldown_ms = 1000
+max_net_usdt = "150"
 
 # ─── SUIUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -96,3 +118,5 @@ confirm_touch = true
 tp_relax_trigger_bps = 20
 tp_relax_floor_bps = 3
 add_block_bps = 15
+entry_cooldown_ms = 1000
+max_net_usdt = "150"
