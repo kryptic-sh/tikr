@@ -505,9 +505,17 @@ impl Strategy for Wave {
             {
                 cap = cap.min(ap.0 - tick);
             }
-            self.bid_k_at_or_below(cap).map(|top_k| WindowRange {
-                low_k: top_k + bid_skew,
-                high_k: top_k + bid_skew + levels - 1,
+            self.bid_k_at_or_below(cap).map(|top_k| {
+                // One-sided: bids never above bid_origin (k >= 0). When price
+                // rises past the origin, top_k goes <= 0 — clamp to 0 so the
+                // shallowest bid sits AT the origin, never above it. Without
+                // this the band chases up and buys high, breaking the fixed-grid
+                // invariant (avg buy < avg sell) and bleeding realized on trends.
+                let top_k = top_k.max(0);
+                WindowRange {
+                    low_k: top_k + bid_skew,
+                    high_k: top_k + bid_skew + levels - 1,
+                }
             })
         });
         let ask_band = top_a.filter(|t| t.0 > Decimal::ZERO).and_then(|top| {
@@ -518,9 +526,16 @@ impl Strategy for Wave {
             {
                 cap = cap.max(bp.0 + tick);
             }
-            self.ask_k_at_or_above(cap).map(|top_k| WindowRange {
-                low_k: top_k + ask_skew,
-                high_k: top_k + ask_skew + levels - 1,
+            self.ask_k_at_or_above(cap).map(|top_k| {
+                // One-sided mirror: asks never below ask_origin (k >= 0). When
+                // price falls past the origin, top_k goes <= 0 — clamp to 0 so
+                // the shallowest ask sits AT the origin, never below it (no
+                // chasing down / selling low).
+                let top_k = top_k.max(0);
+                WindowRange {
+                    low_k: top_k + ask_skew,
+                    high_k: top_k + ask_skew + levels - 1,
+                }
             })
         });
 
