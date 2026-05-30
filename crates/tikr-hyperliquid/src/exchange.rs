@@ -799,6 +799,7 @@ pub fn fill_from_user_event(_coin: &str, f: &UserEventFill) -> Fill {
         side,
         is_full: true,
         ts: Timestamp(f.time.saturating_mul(1_000_000)),
+        trade_id: None,
     }
 }
 

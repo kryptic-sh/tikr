@@ -768,6 +768,115 @@ pub async fn get_position_risk(
     Ok(out)
 }
 
+/// Fetch the account's executed trades for `symbol` with `time >= start_ms`.
+///
+/// Endpoint: `GET /fapi/v1/userTrades` (signed). Each row is mapped to a
+/// [`Fill`] carrying its venue `trade_id` (the `id` field) so the runner can
+/// deduplicate against fills already applied from the WS user-data stream and
+/// replay ONLY the ones the stream missed — preserving realized PnL + fees
+/// that `force_reconcile` would otherwise discard.
+///
+/// `quote_id` is derived from the trade's `orderId` exactly as the WS path
+/// does, so the replayed fill matches the originating resting order. `is_full`
+/// is set `true` (a `userTrades` row is a completed execution; resting-order
+/// liveness is reconciled separately via `open_orders`). BNB-denominated
+/// commissions are NOT FX-converted here (the live USDC bots pay ~0 maker fee,
+/// and the WS path handles the BNB-conversion common case) — `fee_quote`
+/// carries the raw commission for non-quote assets.
+pub async fn get_user_trades(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    start_ms: u64,
+) -> Result<Vec<tikr_core::Fill>, VenueError> {
+    let params = format!("symbol={symbol}&startTime={start_ms}&limit=1000");
+    let signed = append_auth_dispatch(&params, key_material);
+    let url = format!("{base_url}/fapi/v1/userTrades?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    parse_user_trades(&body)
+}
+
+/// Pure parser for a `GET /fapi/v1/userTrades` response body — split out from
+/// [`get_user_trades`] so the row→[`Fill`] mapping (the part that matters for
+/// fill-reconciliation correctness) is unit-testable without a live HTTP call.
+pub(crate) fn parse_user_trades(body: &Value) -> Result<Vec<tikr_core::Fill>, VenueError> {
+    use std::str::FromStr;
+    use tikr_core::{Asset, Decimal, Fill, Notional, Price, Size, Timestamp};
+
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "userTrades: expected array",
+        )))
+    })?;
+
+    let parse_dec = |field: &str, raw: &str| -> Result<Decimal, VenueError> {
+        Decimal::from_str(raw).map_err(|e| {
+            VenueError::Internal(Box::new(std::io::Error::other(format!(
+                "userTrades {field}='{raw}': {e}"
+            ))))
+        })
+    };
+
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        let trade_id = row.get("id").and_then(Value::as_u64);
+        let order_id = row.get("orderId").and_then(Value::as_u64).unwrap_or(0);
+        let side_str = row.get("side").and_then(Value::as_str).unwrap_or("");
+        let price_s = row.get("price").and_then(Value::as_str).unwrap_or("0");
+        let qty_s = row.get("qty").and_then(Value::as_str).unwrap_or("0");
+        let comm_s = row.get("commission").and_then(Value::as_str).unwrap_or("0");
+        let comm_asset = row
+            .get("commissionAsset")
+            .and_then(Value::as_str)
+            .unwrap_or("USDT");
+        let time_ms = row.get("time").and_then(Value::as_u64).unwrap_or(0);
+
+        let price = parse_dec("price", price_s)?;
+        let qty = parse_dec("qty", qty_s)?;
+        let commission = Decimal::from_str(comm_s).unwrap_or(Decimal::ZERO);
+
+        let side = if side_str == "BUY" {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let quote_id = QuoteId::from_uuid(Uuid::from_u128(order_id as u128));
+
+        out.push(Fill {
+            quote_id,
+            price: Price(price),
+            size: Size(qty),
+            fee_asset: Asset::new(comm_asset),
+            fee_amount: commission,
+            fee_quote: Notional(commission),
+            side,
+            ts: Timestamp(time_ms.saturating_mul(1_000_000)),
+            is_full: true,
+            trade_id,
+        });
+    }
+    Ok(out)
+}
+
 /// Fetch USD-M futures account balance for `asset` (usually `USDT`).
 ///
 /// Endpoint: `GET /fapi/v3/balance`
@@ -948,4 +1057,74 @@ pub(crate) fn network_err(e: reqwest::Error) -> VenueError {
 
 pub(crate) fn internal_err(e: reqwest::Error) -> VenueError {
     VenueError::Internal(Box::new(e))
+}
+
+#[cfg(test)]
+mod user_trades_tests {
+    use super::parse_user_trades;
+    use tikr_core::{Decimal, Side};
+
+    #[test]
+    fn parses_user_trades_with_trade_ids() {
+        // Two-row userTrades response (one BUY, one SELL) shaped like the
+        // real `/fapi/v1/userTrades` payload.
+        let body = serde_json::json!([
+            {
+                "id": 698759,
+                "orderId": 25851813,
+                "symbol": "NEARUSDC",
+                "side": "BUY",
+                "price": "2.5000",
+                "qty": "10",
+                "commission": "0.00100000",
+                "commissionAsset": "USDC",
+                "time": 1569514978020u64,
+                "maker": true
+            },
+            {
+                "id": 698760,
+                "orderId": 25851814,
+                "symbol": "NEARUSDC",
+                "side": "SELL",
+                "price": "2.5100",
+                "qty": "10",
+                "commission": "0",
+                "commissionAsset": "USDC",
+                "time": 1569514979000u64,
+                "maker": true
+            }
+        ]);
+
+        let fills = parse_user_trades(&body).expect("parse");
+        assert_eq!(fills.len(), 2);
+
+        let buy = &fills[0];
+        assert_eq!(buy.trade_id, Some(698759));
+        assert_eq!(buy.side, Side::Bid);
+        assert_eq!(buy.price.0, Decimal::from_str_exact("2.5000").unwrap());
+        assert_eq!(buy.size.0, Decimal::from_str_exact("10").unwrap());
+        assert_eq!(
+            buy.fee_quote.0,
+            Decimal::from_str_exact("0.00100000").unwrap()
+        );
+        assert!(buy.is_full, "REST-derived fills mark is_full");
+        // ts is nanoseconds (ms * 1e6).
+        assert_eq!(buy.ts.0, 1569514978020u64 * 1_000_000);
+
+        let sell = &fills[1];
+        assert_eq!(sell.trade_id, Some(698760));
+        assert_eq!(sell.side, Side::Ask);
+    }
+
+    #[test]
+    fn empty_array_yields_no_fills() {
+        let body = serde_json::json!([]);
+        assert!(parse_user_trades(&body).expect("parse").is_empty());
+    }
+
+    #[test]
+    fn non_array_body_is_error() {
+        let body = serde_json::json!({"code": -1102, "msg": "bad"});
+        assert!(parse_user_trades(&body).is_err());
+    }
 }

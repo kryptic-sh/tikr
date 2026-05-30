@@ -647,6 +647,7 @@ mod tests {
             side,
             ts: Timestamp(1),
             is_full,
+            trade_id: None,
         }
     }
 

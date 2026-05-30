@@ -18,6 +18,7 @@ use crate::state;
 use futures::StreamExt;
 use rust_decimal::MathematicalOps;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -51,6 +52,59 @@ const MAX_FAILS_PER_SIDE: u32 = 3;
 /// the timestamp), but short enough that a transient venue hiccup doesn't
 /// strand a position.
 const SIDE_FAILS_RESET_AFTER: Duration = Duration::from_secs(10);
+
+/// REST `userTrades` reconciliation look-back overlap. Each reconciliation
+/// tick re-fetches trades back to `last_seen − this` and relies on the
+/// [`TradeDedup`] set to skip the ones already applied, so an out-of-order or
+/// boundary-straddling fill within this window is never missed. Also the
+/// retention horizon for the dedup set (entries older than this are pruned).
+const RECONCILE_LOOKBACK: Duration = Duration::from_secs(120);
+
+/// Current wall-clock time in nanoseconds since the UNIX epoch. Live-only
+/// helper for the fill-reconciliation window; the backtest path never calls
+/// it (sim time is driven by recorded event timestamps). See issue #57 for
+/// the planned unified Clock abstraction.
+fn wall_clock_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Bounded trade-id dedup set for live fill reconciliation. Tracks the venue
+/// `trade_id`s already applied to the position tracker — from EITHER the WS
+/// user-data stream OR the REST `userTrades` gap-fill path — so a fill that
+/// arrives over both channels is applied exactly once. Insertion order is kept
+/// so entries older than [`RECONCILE_LOOKBACK`] can be pruned, bounding memory
+/// to roughly one look-back window of trades.
+#[derive(Default)]
+struct TradeDedup {
+    seen: HashSet<u64>,
+    order: VecDeque<(u64, u64)>, // (ts_ms, trade_id), oldest at the front
+}
+
+impl TradeDedup {
+    /// Record `id` (observed at `ts_ms`). Returns `true` if newly inserted,
+    /// `false` if it was already present (i.e. a duplicate to be skipped).
+    fn insert(&mut self, id: u64, ts_ms: u64) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.order.push_back((ts_ms, id));
+        true
+    }
+
+    /// Drop entries observed strictly before `cutoff_ms` to bound memory.
+    fn prune(&mut self, cutoff_ms: u64) {
+        while let Some(&(ts, id)) = self.order.front() {
+            if ts >= cutoff_ms {
+                break;
+            }
+            self.order.pop_front();
+            self.seen.remove(&id);
+        }
+    }
+}
 
 /// Runtime configuration for [`run`].
 #[derive(Debug, Clone)]
@@ -589,6 +643,13 @@ where
     // strand a position when the natural reset triggers
     // (fill + CancelAll) don't fire.
     let mut side_fails_last: HashMap<String, Instant> = HashMap::new();
+    // Fill reconciliation (live): dedup trade ids already applied to the
+    // tracker (via WS or REST) + the REST `userTrades` look-back window start.
+    // Initialised to "now" so the gap-fill path only ever replays fills from
+    // the current live session, never historical trades already reflected in a
+    // resumed snapshot or the seeded starting position.
+    let mut trade_dedup = TradeDedup::default();
+    let mut reconcile_from_ns: u64 = wall_clock_ns();
     let started = Instant::now();
     // Decouple in-memory `snapshot_tap` updates from event-count disk
     // writes so the dashboard sidebar refreshes every ~250ms regardless
@@ -1555,6 +1616,21 @@ where
                     warn!("external fill channel closed; runner exiting for respawn");
                     break;
                 };
+                // Dedup vs the REST gap-fill path: if reconciliation already
+                // applied this trade id (it beat the WS delivery), skip —
+                // applying twice would double-count position + PnL. A real
+                // Binance fill always carries a trade id; a `None` here is
+                // unexpected, so fall through and apply (legacy behaviour)
+                // rather than silently drop a fill.
+                if let Some(tid) = fill.trade_id
+                    && !trade_dedup.insert(tid, fill.ts.0 / 1_000_000)
+                {
+                    debug!(
+                        trade_id = tid,
+                        "WS fill already applied via REST reconciliation; skipping duplicate"
+                    );
+                    continue;
+                }
                 let fill_clone = fill.clone();
                 let fill_is_full = fill_clone.is_full;
                 apply_fill(
@@ -1790,12 +1866,86 @@ where
                 );
             }
             _ = recon_tick.tick(), if live_mode => {
-                // Position-drift safety net: ground-truth via venue.position.
-                // Catches the case where WS user data stream silently stopped
-                // delivering fills (listenKey hijacked by another process,
-                // server-initiated close + bad reconnect, etc.) — without
-                // this the tracker stays at the pre-fill size while the
-                // strategy reasons against phantom inventory.
+                // ── 1) REST gap-fill: replay fills the WS stream missed. ──────
+                // Authoritative source of truth for missed executions. Each
+                // fetched trade carries its venue trade id; the dedup set skips
+                // the ones already applied (WS or a prior tick), so only the
+                // genuinely-missed fills are replayed — through the SAME
+                // apply_fill path as live fills, preserving realized PnL, fees,
+                // and fill counts. This is what makes a WS gap fully
+                // attributable, unlike the force_reconcile fallback below which
+                // only snaps the net size. The resting-order side is handled by
+                // the open_orders reconciliation further down (a filled order's
+                // FillSim ghost is dropped there).
+                match venue.fills_since(&symbol, reconcile_from_ns).await {
+                    Ok(trades) => {
+                        let mut replayed = 0u32;
+                        let mut max_ts_ms = reconcile_from_ns / 1_000_000;
+                        for fill in trades {
+                            let ts_ms = fill.ts.0 / 1_000_000;
+                            if ts_ms > max_ts_ms {
+                                max_ts_ms = ts_ms;
+                            }
+                            match fill.trade_id {
+                                // Already applied (WS delivered it, or an
+                                // earlier reconciliation tick) — skip.
+                                Some(id) if !trade_dedup.insert(id, ts_ms) => continue,
+                                // No trade id: can't dedup safely against the WS
+                                // stream, so skip rather than risk double-apply.
+                                None => continue,
+                                Some(_) => {}
+                            }
+                            apply_fill(
+                                fill,
+                                &mut tracker,
+                                &mut risk_gate,
+                                &mut fills_emitted,
+                                &mut full_fills,
+                                &mut partial_fills,
+                                &mut buy_fills,
+                                &mut sell_fills,
+                                &mut buy_volume,
+                                &mut sell_volume,
+                                alert_sink.as_deref(),
+                                &symbol,
+                            )
+                            .await;
+                            replayed += 1;
+                        }
+                        if replayed > 0 {
+                            warn!(
+                                replayed,
+                                "fill reconciliation: replayed missed fills from REST userTrades (WS gap) with full PnL/fee attribution"
+                            );
+                        }
+                        // Advance the look-back window + prune the dedup set,
+                        // keeping a RECONCILE_LOOKBACK overlap so a boundary-
+                        // straddling / out-of-order fill is still caught next
+                        // tick.
+                        let lookback_ms = RECONCILE_LOOKBACK.as_millis() as u64;
+                        // Advance the window to (newest seen − lookback), but
+                        // NEVER regress: on idle ticks `max_ts_ms` is stale, so
+                        // an unconditional subtract would walk the window
+                        // backward every tick and re-fetch an ever-growing
+                        // range. Clamp to the current start to keep it
+                        // monotonic while preserving the look-back overlap.
+                        let cur_from_ms = reconcile_from_ns / 1_000_000;
+                        let new_from_ms = cur_from_ms.max(max_ts_ms.saturating_sub(lookback_ms));
+                        reconcile_from_ns = new_from_ms.saturating_mul(1_000_000);
+                        trade_dedup.prune(new_from_ms);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "fill reconciliation: fills_since failed; will retry next tick")
+                    }
+                }
+
+                // ── 2) Position-drift fallback: ground-truth via venue.position.
+                // After the REST replay above, any remaining drift is a gap the
+                // trade history could NOT explain (e.g. a brief resume window,
+                // or a venue-side adjustment). Snap the net size as a last
+                // resort — PnL for an unexplained gap stays unattributable, but
+                // the explained common case (WS missed fills) is now handled by
+                // step 1 with full attribution.
                 match venue.position(&symbol).await {
                     Ok(venue_pos) => {
                         let tracker_size = tracker.snapshot().size.0;
@@ -1809,7 +1959,7 @@ where
                                 tracker_size = %tracker_size,
                                 venue_size = %venue_size,
                                 drift = %drift,
-                                "position drift detected — WS likely missed fills; force-reconciling tracker to venue (PnL between drift events is not attributable)"
+                                "position drift persists after REST trade replay — unexplained gap; force-reconciling tracker size to venue as last resort (PnL for this residual gap is not attributable)"
                             );
                             tracker.force_reconcile(
                                 SignedSize(venue_size),
@@ -2569,6 +2719,35 @@ fn make_run_id(symbol: &Symbol) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trade_dedup_applies_each_id_once() {
+        let mut d = TradeDedup::default();
+        // First sight of a trade id is "new"; a repeat is a duplicate.
+        assert!(d.insert(100, 1_000), "first insert is new");
+        assert!(!d.insert(100, 1_000), "repeat is a duplicate");
+        assert!(d.insert(101, 1_010), "different id is new");
+        // Models the WS-then-REST race: REST re-offers 100 → must be skipped.
+        assert!(!d.insert(100, 1_000));
+    }
+
+    #[test]
+    fn trade_dedup_prune_bounds_memory_and_forgets_old() {
+        let mut d = TradeDedup::default();
+        d.insert(1, 1_000);
+        d.insert(2, 2_000);
+        d.insert(3, 3_000);
+        // Prune everything observed strictly before ts=3000.
+        d.prune(3_000);
+        assert_eq!(d.order.len(), 1, "only the ts=3000 entry survives");
+        assert!(d.seen.contains(&3));
+        assert!(!d.seen.contains(&1));
+        assert!(!d.seen.contains(&2));
+        // A pruned id is treated as new again (acceptable: it's far outside the
+        // reconciliation look-back window, so it can never be re-offered).
+        assert!(d.insert(1, 4_000));
+    }
+
     use crate::multi::{MultiSymbolRun, run_multi};
     use async_trait::async_trait;
     use futures::stream::{self, BoxStream};
@@ -2827,9 +3006,6 @@ mod tests {
             Ok(())
         }
         async fn position(&self, _symbol: &Symbol) -> Result<tikr_core::Position, VenueError> {
-            unimplemented!()
-        }
-        async fn fills_since(&self, _since_ts: u64) -> Result<Vec<tikr_core::Fill>, VenueError> {
             unimplemented!()
         }
     }

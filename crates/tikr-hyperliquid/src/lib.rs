@@ -338,7 +338,7 @@ impl Venue for Hyperliquid {
         client.position(symbol, user).await
     }
 
-    async fn fills_since(&self, since_ts: u64) -> Result<Vec<Fill>, VenueError> {
+    async fn fills_since(&self, _symbol: &Symbol, since_ts: u64) -> Result<Vec<Fill>, VenueError> {
         let Some(user) = self.config.user_address.as_deref() else {
             return Err(VenueError::Rejected {
                 reason: "fills_since() requires HyperliquidConfig::user_address".into(),

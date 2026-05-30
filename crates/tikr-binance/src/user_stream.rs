@@ -990,6 +990,12 @@ fn parse_execution_report(
     let is_full = status == "FILLED";
 
     let order_id = v.get("i").and_then(serde_json::Value::as_u64)?;
+    // Spot executionReport trade id (`t`); see the futures path for why.
+    let trade_id = v
+        .get("t")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|&t| t > 0)
+        .map(|t| t as u64);
     let side_str = v.get("S").and_then(serde_json::Value::as_str)?;
     let price_str = v.get("L").and_then(serde_json::Value::as_str)?;
     let qty_str = v.get("l").and_then(serde_json::Value::as_str)?;
@@ -1030,6 +1036,7 @@ fn parse_execution_report(
         side,
         ts: Timestamp(ts_ms.saturating_mul(1_000_000)),
         is_full,
+        trade_id,
     })
 }
 
@@ -1062,6 +1069,16 @@ fn parse_order_trade_update(
     }
 
     let order_id = o.get("i").and_then(serde_json::Value::as_u64)?;
+    // Trade id (`o.t`): unique per executed trade, monotonic per symbol. Used
+    // downstream to dedup against the REST userTrades gap-fill path so a fill
+    // delivered over BOTH channels is applied exactly once. Absent on some
+    // non-trade order updates (we already gate on FILLED/PARTIALLY_FILLED, but
+    // be defensive: `<= 0` means "no trade").
+    let trade_id = o
+        .get("t")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|&t| t > 0)
+        .map(|t| t as u64);
     let side_str = o.get("S").and_then(serde_json::Value::as_str)?;
     let price_str = o.get("L").and_then(serde_json::Value::as_str)?;
     let qty_str = o.get("l").and_then(serde_json::Value::as_str)?;
@@ -1107,6 +1124,7 @@ fn parse_order_trade_update(
         side,
         ts: Timestamp(ts_ms.saturating_mul(1_000_000)),
         is_full,
+        trade_id,
     })
 }
 
@@ -1238,6 +1256,8 @@ mod tests {
         assert_eq!(fill.fee_asset, Asset::new("USDT"));
         let expected_id = QuoteId::from_uuid(Uuid::from_u128(8886774));
         assert_eq!(fill.quote_id, expected_id);
+        // Trade id (`o.t`) is captured for REST-reconciliation dedup.
+        assert_eq!(fill.trade_id, Some(1));
     }
 
     #[test]

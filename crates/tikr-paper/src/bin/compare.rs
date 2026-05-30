@@ -3283,7 +3283,4 @@ impl Venue for BacktestVenue {
             realized_pnl: tikr_core::Notional(Decimal::ZERO),
         })
     }
-    async fn fills_since(&self, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
-        Ok(Vec::new())
-    }
 }

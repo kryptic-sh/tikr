@@ -887,6 +887,7 @@ mod tests {
             side: Side::Bid,
             ts: Timestamp(1_000_000),
             is_full: true,
+            trade_id: None,
         };
         let _ = r.on_event(&ctx, &MarketEvent::Fill(fill));
         assert_eq!(r.last_buy_price, Some(Decimal::from(98554)));

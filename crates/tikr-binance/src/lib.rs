@@ -778,11 +778,29 @@ impl Venue for BinanceClient {
         })
     }
 
-    /// Return fills timestamped at or after `since_ts`.
+    /// Return fills for `symbol` timestamped at or after `since_ts` (ns).
     ///
-    /// v0: returns empty (REST fill history is a follow-up item).
-    async fn fills_since(&self, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
-        Ok(vec![])
+    /// Futures: signed `GET /fapi/v1/userTrades` since `since_ts`, each row
+    /// mapped to a [`Fill`] with its `trade_id` populated so the runner can
+    /// deduplicate against the WS stream and replay only missed fills. Spot
+    /// reconciliation is not wired yet (the live bots are futures); opt out.
+    async fn fills_since(&self, symbol: &Symbol, since_ts: u64) -> Result<Vec<Fill>, VenueError> {
+        if !self.env.is_futures() {
+            return Ok(Vec::new());
+        }
+        let sym_str = binance_symbol(symbol);
+        let base_url = self.env.rest_base_url();
+        // Trait carries nanoseconds; Binance `startTime` is milliseconds.
+        let start_ms = since_ts / 1_000_000;
+        crate::futs::get_user_trades(
+            &self.http,
+            base_url,
+            &self.api_key,
+            &self.key_material,
+            &sym_str,
+            start_ms,
+        )
+        .await
     }
 }
 

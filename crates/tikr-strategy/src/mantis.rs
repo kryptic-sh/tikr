@@ -318,6 +318,7 @@ mod tests {
             side,
             ts: Timestamp(0),
             is_full: true,
+            trade_id: None,
         }
     }
 

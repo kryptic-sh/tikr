@@ -1426,6 +1426,7 @@ mod tests {
                 side: Side::Bid,
                 ts: Timestamp(2),
                 is_full: true,
+                trade_id: None,
             }),
         );
         // Fill replaces only the filled side; opposite side stays live.

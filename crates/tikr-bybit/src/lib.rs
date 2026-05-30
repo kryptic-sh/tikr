@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use std::str::FromStr;
 
-use tikr_core::{Decimal, Fill, MarketEvent, Notional, Position, Price, SignedSize, Symbol};
+use tikr_core::{Decimal, MarketEvent, Notional, Position, Price, SignedSize, Symbol};
 use tikr_venue::{OpenOrder, QuoteId, QuoteIntent, Venue, VenueError};
 
 /// Bybit V5 environment (mainnet vs testnet, linear product).
@@ -154,10 +154,6 @@ impl Venue for BybitClient {
             avg_entry: Price(Decimal::ZERO),
             realized_pnl: Notional(Decimal::ZERO),
         })
-    }
-
-    async fn fills_since(&self, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
-        Ok(Vec::new())
     }
 
     async fn open_orders(&self, _symbol: &Symbol) -> Result<Vec<OpenOrder>, VenueError> {

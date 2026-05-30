@@ -332,6 +332,7 @@ mod tests {
                 side: Side::Ask,
                 ts: Timestamp(2),
                 is_full: true,
+                trade_id: None,
             }),
         );
 
@@ -367,6 +368,7 @@ mod tests {
                 side: Side::Bid,
                 ts: Timestamp(2),
                 is_full: true,
+                trade_id: None,
             }),
         );
 
@@ -439,6 +441,7 @@ mod tests {
                 side: Side::Bid,
                 ts: Timestamp(2),
                 is_full: true,
+                trade_id: None,
             }),
         );
 
@@ -508,6 +511,7 @@ mod tests {
                 side: Side::Ask,
                 ts: Timestamp(2),
                 is_full: true,
+                trade_id: None,
             }),
         );
 

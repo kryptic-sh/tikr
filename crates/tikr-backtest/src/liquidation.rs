@@ -100,6 +100,7 @@ impl LiquidationModel {
             side: close_side,
             ts,
             is_full: true,
+            trade_id: None,
         })
     }
 

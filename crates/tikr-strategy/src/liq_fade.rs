@@ -861,6 +861,7 @@ mod tests {
             side: Side::Bid,
             ts: Timestamp(4_000_000_000),
             is_full: true,
+            trade_id: None,
         };
         let c3 = ctx(&s, &p, &s2, &liqs_empty, 4_000_000_000);
         let actions = f.on_event(&c3, &MarketEvent::Fill(fill));
@@ -949,6 +950,7 @@ mod tests {
             side: Side::Bid,
             ts: Timestamp(4_000_000_000),
             is_full: true,
+            trade_id: None,
         };
         let c3 = ctx(&s, &p0, &s2, &liqs_empty, 4_000_000_000);
         f.on_event(&c3, &MarketEvent::Fill(fill));

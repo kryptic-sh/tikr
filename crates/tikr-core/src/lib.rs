@@ -398,6 +398,13 @@ pub struct Fill {
     /// `false` for partial fills — the order is still resting on the book
     /// and strategies should not re-quote.
     pub is_full: bool,
+    /// Venue trade id when known (Binance `ORDER_TRADE_UPDATE.o.t` over WS,
+    /// or the `id` field from `GET /fapi/v1/userTrades` over REST). Used to
+    /// deduplicate fills that arrive via BOTH the WS stream and the REST
+    /// gap-fill reconciliation path, so missed fills replay exactly once.
+    /// `None` for simulated fills (FillSim, strategy tests) which have no
+    /// venue trade identity.
+    pub trade_id: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +642,7 @@ mod tests {
             side: Side::Bid,
             ts,
             is_full: true,
+            trade_id: None,
         });
         let hb = MarketEvent::Heartbeat { ts };
 

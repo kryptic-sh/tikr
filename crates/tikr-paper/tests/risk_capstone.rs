@@ -106,9 +106,6 @@ impl Venue for MockVenue {
     async fn position(&self, _symbol: &Symbol) -> Result<tikr_core::Position, VenueError> {
         unimplemented!()
     }
-    async fn fills_since(&self, _since_ts: u64) -> Result<Vec<tikr_core::Fill>, VenueError> {
-        unimplemented!()
-    }
 }
 
 // ---------------------------------------------------------------------------

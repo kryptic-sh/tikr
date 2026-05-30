@@ -875,6 +875,7 @@ impl FillSim {
                 // depth (or the limit price is breached) before the
                 // intent size is consumed. `is_full = (consumed == intent.size)`.
                 is_full: total_qty >= intent.size.0,
+                trade_id: None,
             });
         }
         // Snapshot queue position at our price level when placed. We're
@@ -1194,6 +1195,7 @@ impl FillSim {
                 side: q.side,
                 ts: trade_ts,
                 is_full,
+                trade_id: None,
             });
             // Same scale-bound treatment as the IOC arm; see comment above.
             let delta = (fill_price.0 * fill_amount).round_dp(8);

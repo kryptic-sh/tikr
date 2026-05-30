@@ -159,9 +159,18 @@ pub trait Venue: Send + Sync {
     /// Return the current position for `symbol`. Pull path.
     async fn position(&self, symbol: &Symbol) -> Result<Position, VenueError>;
 
-    /// Return all fills timestamped at or after `since_ts` (nanoseconds since UNIX epoch).
-    /// Pull/reconciliation path; not intended for the hot path.
-    async fn fills_since(&self, since_ts: u64) -> Result<Vec<Fill>, VenueError>;
+    /// Return fills for `symbol` timestamped at or after `since_ts`
+    /// (nanoseconds since UNIX epoch). Pull/reconciliation path used by the
+    /// runner to gap-fill trades the WS user-data stream missed — each
+    /// returned [`Fill`] should carry its venue `trade_id` so the caller can
+    /// deduplicate against fills already applied from the WS stream.
+    ///
+    /// Default returns an empty vec — venues without a trade-history REST
+    /// endpoint (paper/backtest, hyperliquid v0 where needed) opt out without
+    /// breaking the trait.
+    async fn fills_since(&self, _symbol: &Symbol, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
+        Ok(Vec::new())
+    }
 
     /// Return the venue's current view of resting orders for `symbol`.
     ///
@@ -242,10 +251,6 @@ mod tests {
         }
 
         async fn position(&self, _symbol: &Symbol) -> Result<Position, VenueError> {
-            unimplemented!()
-        }
-
-        async fn fills_since(&self, _since_ts: u64) -> Result<Vec<Fill>, VenueError> {
             unimplemented!()
         }
     }

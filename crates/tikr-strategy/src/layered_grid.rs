@@ -682,6 +682,7 @@ mod tests {
             side: Side::Bid,
             ts: Timestamp(1000),
             is_full: true,
+            trade_id: None,
         };
         let actions = strat.on_event(&fill_ctx, &MarketEvent::Fill(fill));
         // Quote-first ordering: Quote(TP) + Quote(extension) + Cancel(outermost_opp) = 3

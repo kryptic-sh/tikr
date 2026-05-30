@@ -74,6 +74,6 @@ async fn live_fills_since_requires_user_address_testnet() {
         user_address: None,
         ..Default::default()
     });
-    let res = venue.fills_since(0).await;
+    let res = venue.fills_since(&testnet_symbol(), 0).await;
     assert!(matches!(res, Err(VenueError::Rejected { .. })));
 }
