@@ -84,6 +84,25 @@ pub struct WaveConfig {
     /// one-sided/frozen. `gap = max(inner_steps,1) × step`. `false` = off
     /// (pure one-sided lattice).
     pub chase_to_avg: bool,
+
+    /// Take-profit trigger: favorable move past `avg_entry`, in bps (100 = 1%).
+    /// When holding inventory and the mark has moved `tp_bps` in our favor, a
+    /// resting maker close order sits at `avg_entry × (1 ± tp_bps/1e4)` (sells
+    /// the long above cost / covers the short below cost). If the mark is
+    /// already past it, the close fires marketable (IOC). `0` (default) = off.
+    pub tp_bps: u32,
+    /// Fraction of the CURRENT position to close on a TP, in percent
+    /// (`100` = full flatten, `50` = half). Re-applied each placement, so
+    /// `< 100` ladders out. Ignored when `tp_bps == 0`.
+    pub tp_close_pct: u32,
+    /// Stop-loss trigger: adverse move past `avg_entry`, in bps (100 = 1%).
+    /// When the mark has moved `sl_bps` against us, fire a marketable (IOC)
+    /// close to cap the bag. Realizes the loss — the frozen grid otherwise
+    /// never books it. `0` (default) = off.
+    pub sl_bps: u32,
+    /// Fraction of the CURRENT position to close on an SL, in percent
+    /// (`100` = full flatten). Ignored when `sl_bps == 0`.
+    pub sl_close_pct: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,6 +124,10 @@ pub struct Wave {
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
+    /// Price of the resting maker take-profit order this event, if any. Set in
+    /// `on_event` before pruning so `prune_outside_band` can exempt it (the TP
+    /// order sits outside the band by design and would otherwise be cancelled).
+    tp_order_price: Option<Decimal>,
 }
 
 impl Wave {
@@ -138,6 +161,39 @@ impl Wave {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
+    }
+
+    /// Explicit-size quote (used by TP/SL closes). `size` is a coin quantity,
+    /// floored to the lot step. Caller picks `tif` (PostOnly to rest a maker
+    /// TP, IOC to take a marketable close).
+    fn make_close_quote(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        price: Price,
+        size: Size,
+        tif: TimeInForce,
+    ) -> Action {
+        Action::Quote(QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price,
+            size,
+            tif,
+            kind: QuoteKind::Point,
+        })
+    }
+
+    /// Coin quantity = `pct%` of `|pos|`, floored to the lot step. Zero when
+    /// the result rounds below one lot.
+    fn close_size(&self, pos_abs: Decimal, pct: u32) -> Size {
+        let raw = pos_abs * Decimal::from(pct) / Decimal::from(100);
+        let q = if self.config.step_size > Decimal::ZERO {
+            (raw / self.config.step_size).floor() * self.config.step_size
+        } else {
+            raw
+        };
+        Size(q.max(Decimal::ZERO))
     }
 
     /// Compute `(top_bid_override, top_ask_override)`, pushing the origins
@@ -269,6 +325,11 @@ impl Wave {
             }
         };
         for (id, q) in ctx.open_quotes {
+            // Exempt the resting take-profit order — it sits outside the band
+            // by design (at avg ± tp_bps) and must not be pruned.
+            if Some(q.price.0) == self.tp_order_price {
+                continue;
+            }
             if q.side == side && (q.price.0 < lo || q.price.0 > hi) {
                 actions.push(Action::Cancel(*id));
             }
@@ -430,6 +491,7 @@ impl Strategy for Wave {
             lattice_step: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
+            tp_order_price: None,
         }
     }
 
@@ -476,6 +538,129 @@ impl Strategy for Wave {
             && self.ask_lattice_origin.is_some();
         if !lattice_ready {
             return actions;
+        }
+
+        // 1.5) Take-profit / stop-loss on the open bag. Runs EVERY event,
+        // independent of the refill gate (exits are time-sensitive). TP rests a
+        // maker close at avg ± tp (or takes it marketable if already through);
+        // SL fires a marketable (IOC) close at avg ∓ sl. The lattice origins are
+        // NOT touched — banking/cutting the bag must never recenter the grid
+        // (that would chase). `tp_order_price` is recorded so the pruner exempts
+        // the resting TP (it sits outside the band by design).
+        self.tp_order_price = None;
+        let pos = ctx.position.size.0;
+        let avg = ctx.position.avg_entry.0;
+        let exit_mid = match (best_bid, best_ask) {
+            (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
+            _ => Decimal::ZERO,
+        };
+        if pos != Decimal::ZERO
+            && avg > Decimal::ZERO
+            && exit_mid > Decimal::ZERO
+            && tick > Decimal::ZERO
+            && (self.config.tp_bps > 0 || self.config.sl_bps > 0)
+        {
+            let off = |n: u32| avg * Decimal::from(n) / Decimal::from(10_000);
+            let pos_abs = pos.abs();
+            if pos > Decimal::ZERO {
+                // LONG — reduce by SELLing.
+                if self.config.tp_bps > 0 {
+                    let tp_price = avg + off(self.config.tp_bps);
+                    let sz = self.close_size(pos_abs, self.config.tp_close_pct);
+                    if sz.0 > Decimal::ZERO {
+                        if exit_mid >= tp_price {
+                            if let Some(bp) = best_bid {
+                                actions.push(self.make_close_quote(
+                                    ctx.symbol,
+                                    Side::Ask,
+                                    bp,
+                                    sz,
+                                    TimeInForce::IOC,
+                                ));
+                            }
+                        } else {
+                            let p = Price((tp_price / tick).ceil() * tick);
+                            self.tp_order_price = Some(p.0);
+                            if !ctx
+                                .open_quotes
+                                .iter()
+                                .any(|(_, q)| q.side == Side::Ask && q.price.0 == p.0)
+                            {
+                                actions.push(self.make_close_quote(
+                                    ctx.symbol,
+                                    Side::Ask,
+                                    p,
+                                    sz,
+                                    TimeInForce::PostOnly,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if self.config.sl_bps > 0 && exit_mid <= avg - off(self.config.sl_bps) {
+                    let sz = self.close_size(pos_abs, self.config.sl_close_pct);
+                    if sz.0 > Decimal::ZERO
+                        && let Some(bp) = best_bid
+                    {
+                        actions.push(self.make_close_quote(
+                            ctx.symbol,
+                            Side::Ask,
+                            bp,
+                            sz,
+                            TimeInForce::IOC,
+                        ));
+                    }
+                }
+            } else {
+                // SHORT — reduce by BUYing.
+                if self.config.tp_bps > 0 {
+                    let tp_price = avg - off(self.config.tp_bps);
+                    let sz = self.close_size(pos_abs, self.config.tp_close_pct);
+                    if sz.0 > Decimal::ZERO && tp_price > Decimal::ZERO {
+                        if exit_mid <= tp_price {
+                            if let Some(ap) = best_ask {
+                                actions.push(self.make_close_quote(
+                                    ctx.symbol,
+                                    Side::Bid,
+                                    ap,
+                                    sz,
+                                    TimeInForce::IOC,
+                                ));
+                            }
+                        } else {
+                            let p = Price((tp_price / tick).floor() * tick);
+                            self.tp_order_price = Some(p.0);
+                            if !ctx
+                                .open_quotes
+                                .iter()
+                                .any(|(_, q)| q.side == Side::Bid && q.price.0 == p.0)
+                            {
+                                actions.push(self.make_close_quote(
+                                    ctx.symbol,
+                                    Side::Bid,
+                                    p,
+                                    sz,
+                                    TimeInForce::PostOnly,
+                                ));
+                            }
+                        }
+                    }
+                }
+                if self.config.sl_bps > 0 && exit_mid >= avg + off(self.config.sl_bps) {
+                    let sz = self.close_size(pos_abs, self.config.sl_close_pct);
+                    if sz.0 > Decimal::ZERO
+                        && let Some(ap) = best_ask
+                    {
+                        actions.push(self.make_close_quote(
+                            ctx.symbol,
+                            Side::Bid,
+                            ap,
+                            sz,
+                            TimeInForce::IOC,
+                        ));
+                    }
+                }
+            }
         }
 
         // 2) Round-trip refill on the FIXED lattice.
@@ -668,6 +853,10 @@ mod tests {
             max_position_usdt: Decimal::ZERO,
             inventory_skew_slots: 0,
             chase_to_avg: false,
+            tp_bps: 0,
+            tp_close_pct: 100,
+            sl_bps: 0,
+            sl_close_pct: 100,
         }
     }
 
@@ -719,6 +908,96 @@ mod tests {
             avg_entry: Price(Decimal::ZERO),
             realized_pnl: Notional(Decimal::ZERO),
         }
+    }
+
+    fn pos_long(size: i64, avg: i64) -> Position {
+        Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::from(size)),
+            avg_entry: Price(Decimal::from(avg)),
+            realized_pnl: Notional(Decimal::ZERO),
+        }
+    }
+
+    #[test]
+    fn tp_takes_profit_marketable_when_already_through_target() {
+        let mut c = cfg();
+        c.tp_bps = 100; // 1% → target = 101 for avg 100
+        c.tp_close_pct = 100;
+        let mut w = Wave::new(c);
+        let p = pos_long(1, 100);
+        let s = snap(Decimal::from(102), Decimal::from(103)); // mid 102.5 ≥ 101
+        let sy = sym();
+        let acts = w.on_event(
+            &ctx(&sy, &s, &p, &[]),
+            &MarketEvent::BookUpdate { snapshot: s.clone() },
+        );
+        let q = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask && q.tif == TimeInForce::IOC => Some(q),
+                _ => None,
+            })
+            .expect("expected marketable TP sell");
+        assert_eq!(q.price.0, Decimal::from(102), "sells at best_bid");
+        assert_eq!(q.size.0, Decimal::from(1), "full close");
+    }
+
+    #[test]
+    fn tp_rests_maker_close_at_target_when_not_yet_reached() {
+        let mut c = cfg();
+        c.tp_bps = 100; // target 101
+        let mut w = Wave::new(c);
+        let p = pos_long(1, 100);
+        let s = snap(Decimal::new(1004, 1), Decimal::new(1006, 1)); // mid 100.5 < 101
+        let sy = sym();
+        let _ = w.on_event(
+            &ctx(&sy, &s, &p, &[]),
+            &MarketEvent::BookUpdate { snapshot: s.clone() },
+        );
+        // Records the resting TP price (so the pruner exempts it) at 101.
+        assert_eq!(w.tp_order_price, Some(Decimal::from(101)));
+    }
+
+    #[test]
+    fn sl_fires_marketable_close_on_adverse_move() {
+        let mut c = cfg();
+        c.sl_bps = 100; // 1% → stop at 99 for avg 100
+        let mut w = Wave::new(c);
+        let p = pos_long(1, 100);
+        let s = snap(Decimal::from(98), Decimal::new(985, 1)); // mid 98.25 ≤ 99
+        let sy = sym();
+        let acts = w.on_event(
+            &ctx(&sy, &s, &p, &[]),
+            &MarketEvent::BookUpdate { snapshot: s.clone() },
+        );
+        let q = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask && q.tif == TimeInForce::IOC => Some(q),
+                _ => None,
+            })
+            .expect("expected marketable SL sell");
+        assert_eq!(q.price.0, Decimal::from(98), "stops at best_bid");
+    }
+
+    #[test]
+    fn no_tp_sl_orders_when_both_disabled() {
+        let mut w = Wave::new(cfg()); // tp_bps=0, sl_bps=0
+        let p = pos_long(1, 100);
+        let s = snap(Decimal::from(102), Decimal::from(103));
+        let sy = sym();
+        let acts = w.on_event(
+            &ctx(&sy, &s, &p, &[]),
+            &MarketEvent::BookUpdate { snapshot: s.clone() },
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::Quote(q) if q.tif == TimeInForce::IOC)),
+            "no IOC close orders when TP/SL off"
+        );
+        assert_eq!(w.tp_order_price, None);
     }
 
     #[test]

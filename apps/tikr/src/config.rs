@@ -340,6 +340,24 @@ pub struct WaveParams {
     /// (default) = off (pure one-sided lattice).
     #[serde(default)]
     pub chase_to_avg: bool,
+    /// Take-profit trigger: favorable move past avg_entry in bps (100 = 1%).
+    /// `0` (default) = off.
+    #[serde(default)]
+    pub tp_bps: u32,
+    /// % of position to close on TP (100 = full). Default 100.
+    #[serde(default = "wave_default_close_pct")]
+    pub tp_close_pct: u32,
+    /// Stop-loss trigger: adverse move past avg_entry in bps (100 = 1%).
+    /// `0` (default) = off.
+    #[serde(default)]
+    pub sl_bps: u32,
+    /// % of position to close on SL (100 = full). Default 100.
+    #[serde(default = "wave_default_close_pct")]
+    pub sl_close_pct: u32,
+}
+
+fn wave_default_close_pct() -> u32 {
+    100
 }
 
 fn wave_default_refill_threshold() -> u32 {

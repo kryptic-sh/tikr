@@ -514,6 +514,10 @@ fn build_wave(
         max_position_usdt: Decimal::ZERO,
         inventory_skew_slots: wave.inventory_skew_slots,
         chase_to_avg: wave.chase_to_avg,
+        tp_bps: wave.tp_bps,
+        tp_close_pct: wave.tp_close_pct,
+        sl_bps: wave.sl_bps,
+        sl_close_pct: wave.sl_close_pct,
     }))
 }
 
