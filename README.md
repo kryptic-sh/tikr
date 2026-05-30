@@ -28,15 +28,17 @@
 > responsibility. See [LICENSE](LICENSE) (MIT — "AS IS, WITHOUT WARRANTY OF ANY
 > KIND").
 
-Modular, venue-agnostic market-making engine in Rust. Pre-alpha — backtest
-framework + strategy traits + Hyperliquid stub adapter only. **Not for live
-trading yet.**
+Modular, venue-agnostic market-making engine in Rust. Pre-alpha — parquet
+backtest engine, a multi-strategy library, a live Binance USD-M / Spot adapter,
+and a config-driven multi-bot orchestrator (`tikr`). Unaudited; see the risk
+warning above before running it with real funds.
 
 [![CI](https://github.com/kryptic-sh/tikr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/tikr/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/kryptic-sh/tikr)](https://github.com/kryptic-sh/tikr/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Phase 0** — foundation only. No live trading logic. Watch
+> **Pre-alpha, under active development.** Live trading paths exist and are
+> unaudited — treat every release as experimental. Watch
 > [Roadmap & exit criteria](https://github.com/kryptic-sh/tikr/issues/1) for
 > progress.
 
@@ -54,12 +56,12 @@ venue-agnostic, with risk limits before live capital.
 | ------------------ | ------------------------------------------------------------------------------------------ |
 | `tikr-core`        | Vocabulary types: `Price`, `Size`, `Symbol`, `Position`, `Snapshot`, `MarketEvent`, `Fill` |
 | `tikr-venue`       | `Venue` trait — abstracts over CEX orderbooks, DEX orderbooks, AMMs via quote-intent model |
-| `tikr-strategy`    | `Strategy` trait + reference impls (NaiveGrid, AvellanedaStoikov, GLFT, TopOfBook)         |
+| `tikr-strategy`    | `Strategy` trait + impls (Wave, Tide, SpreadScalp, AvellanedaStoikov, GLFT, TopOfBook, …)  |
 | `tikr-hyperliquid` | Hyperliquid perp adapter                                                                   |
 | `tikr-binance`     | Binance Spot + USD-M Futures adapter (HMAC + Ed25519 auth, WS-API session.logon)           |
-| `tikr-dodo`        | DODO LimitOrder adapter (BSC)                                                              |
-| `tikr-backtest`    | Parquet replay engine + FillSim (queue-priority + cancel modeling) + recorder bins         |
-| `tikr-paper`       | Paper-trading runner (live feed + simulated fills) + backtest runner                       |
+| `tikr-backtest`    | Parquet replay engine + FillSim (queue-priority + cancel modeling) — library only          |
+| `tikr-record`      | Market-data recorder: Binance WS depth + trades → parquet (`record_binance` bin)           |
+| `tikr-paper`       | Paper-trading runner (live feed + simulated fills) + `compare` strategy sweep              |
 | `tikr-risk`        | Risk engine — pre-trade limits, drawdown gates, alerting                                   |
 
 Crates land as phases ship. See
@@ -67,7 +69,9 @@ Crates land as phases ship. See
 
 ## Status
 
-Pre-alpha. Code is design + skeleton. **Do not run against real capital.**
+Pre-alpha and unaudited. Live adapters and the multi-bot orchestrator work, but
+the engine is still being tuned. **Run only with capital you can afford to
+lose.**
 
 ## Install
 
@@ -80,15 +84,12 @@ cargo build --release --workspace
 
 Binaries land in `./target/release/`. Key entry points:
 
-| Bin                  | Crate         | Purpose                                                  |
-| -------------------- | ------------- | -------------------------------------------------------- |
-| `record_binance`     | tikr-backtest | Record Binance market data (depth + aggTrade) to parquet |
-| `record`             | tikr-backtest | Record Hyperliquid market data to parquet                |
-| `backtest`       | tikr-paper    | Run one strategy against parquet data, emit P&L report   |
-| `compare`            | tikr-paper    | Run a strategy preset sweep, emit comparison table       |
-| `run_perp` (example) | tikr-binance  | Live Binance Futures runner (testnet/mainnet)            |
-| `run_spot` (example) | tikr-binance  | Live Binance Spot runner (testnet/mainnet)               |
-| `supervisor`         | tikr-paper    | Multi-symbol paper-trading supervisor                    |
+| Bin                  | Crate        | Purpose                                                    |
+| -------------------- | ------------ | ---------------------------------------------------------- |
+| `tikr`               | apps/tikr    | Multi-bot live/paper orchestrator + TUI (main entry point) |
+| `record_binance`     | tikr-record  | Record Binance market data (depth + aggTrade) to parquet   |
+| `compare`            | tikr-paper   | Backtest a preset sweep on parquet; table + optional JSON  |
+| `run_spot` (example) | tikr-binance | Live Binance Spot runner (testnet/mainnet)                 |
 
 ## Development
 
@@ -106,61 +107,59 @@ cargo test --workspace
 ```bash
 # Binance Futures USD-M, 1 hour, ./data
 cargo run --release --bin record_binance -- \
-  --env futures-mainnet --symbol BTCUSDT --hours 1 --out ./data
-
-# Hyperliquid (mainnet)
-cargo run --release --bin record -- --symbol BTC --hours 1 --out ./data
+  --env futures-mainnet --symbols BTCUSDT --hours 1 --out ./data
 ```
 
 Recorder writes `book_<BASE>_<DATE>_<NNNNNN>.parquet` +
 `trades_<BASE>_<DATE>_<NNNNNN>.parquet` per flush (1000 rows or 60 s).
 
-### Backtest a strategy against recorded data
+### Backtest strategies against recorded data
+
+`compare` is the single backtest entry point: it sweeps a set of strategy
+presets over the same recorded events (apples-to-apples) and prints a `fills`,
+`fills/min`, `realized`, `fees`, `NET`, `$/fill` table. Pass single-element
+sweep lists to backtest one configuration, and `--report-json <path>` to dump
+the per-preset `PaperReport` for downstream tooling.
 
 ```bash
-cargo run --release --bin backtest -- \
-  --data-dir ./data --symbol BTCUSDT \
-  --strategy top-of-book \
-  --size 0.001 --tick-size 0.1 \
-  --improve-when-spread-gt-ticks 1 \
-  --max-imbalance-ticks 5 \
-  --maker-bps 2 --taker-bps 5
-```
-
-Strategies: `naive-grid`, `avellaneda-stoikov` (alias `as`), `glft`,
-`top-of-book` (alias `tob`).
-
-### Compare strategies on the same data
-
-```bash
+# Full preset sweep
 cargo run --release --bin compare -- \
-  --data-dir ./data --symbol BTCUSDT \
+  --data-dir ./data --symbol BTCUSDC \
   --maker-bps 2 --taker-bps 5
+
+# Single Wave config → machine-readable report
+cargo run --release --bin compare -- \
+  --data-dir ./data --symbol BTCUSDC \
+  --wave-step-bps-list 5 --wave-inner-bps-list 5 --wave-grid-levels-list 4 \
+  --report-json ./wave.json
 ```
 
-Runs a fixed sweep (NaiveGrid, A-S, GLFT, TopOfBook with various skew +
-imbalance configs, plus BNB-discount variants) and prints a `fills`,
-`fills/min`, `realized`, `fees`, `NET`, `$/fill` table.
+Venue filters (price tick, lot step, `min_notional`) auto-detect from Binance
+`exchangeInfo` by default (`--no-autodetect-filters` +
+`--tick-size`/`--step-size` for offline runs; `--venue-env` picks the env).
+Account sizing mirrors the live bot: `--sim-initial-balance` ×
+`--sim-order-balance-pct` per order, a `--sim-max-position-pct` wallet cap, and
+`--leverage` for the exchange margin backstop. Latency is probed from the live
+API by default (10 pings → mean latency + stddev jitter; `--no-measure-latency`
+falls back to `--sim-submit-latency-ms` / `--sim-cancel-latency-ms` /
+`--sim-latency-jitter-ms`).
 
 ### Sample config — `config.toml`
 
-The repo's [`config.toml`](./config.toml) is a SpreadScalp setting for Binance
-USD-M perp futures, USDC-margined (0 bps maker promo). 11 fixed bots across USDC
-majors, joining touch on any positive spread, with a 120s+30bps adverse-stop as
-the only risk control (TP/SL/EMA disabled — A/B testing flipped them negative).
-Re-read the warning above before pointing it at real funds.
+The repo's [`config.toml`](./config.toml) runs the Wave strategy (frozen
+fixed-step lattice + round-trip refill) on Binance USD-M perp futures,
+USDC-margined (0 bps maker promo). It currently holds a handful of USDC bots
+(NEAR / ZEC / WLD), each sized at `order_balance_pct` of the wallet per order
+with a `max_position_pct` cap and 5× leverage. Re-read the warning above before
+pointing it at real funds.
 
 ### Run live (testnet first!)
 
 ```bash
-# Binance Futures perp testnet
-cargo run --release --example run_perp -- \
-  --env futures-testnet --symbol BTCUSDT \
-  --strategy top-of-book \
-  --max-imbalance-ticks 5 \
-  --minutes 5
+# Multi-bot orchestrator (config-driven; testnet env in config.toml first!)
+cargo run --release --bin tikr -- --config config.toml
 
-# Binance Spot testnet
+# Single-symbol Binance Spot smoke test (example)
 cargo run --release --example run_spot -- \
   --env spot-testnet --symbol BTCUSDT --minutes 5
 ```

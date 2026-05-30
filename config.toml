@@ -17,7 +17,7 @@
 # active window slides over the fixed grid and prunes the tail.
 #
 # Geometry knobs: `step_bps` = spacing between levels; `inner_bps` = distance
-# from mid to the first order each side (independent; 0 = legacy step_bps/2).
+# from mid to the first order each side (independent; unset/0 = defaults to step_bps).
 # The lattice is UNIFORM (constant spacing) — a progressive/widening lattice
 # was tried and removed: anchored at the frozen origin it misaligns once price
 # trends away (orders drift into the wide tail), and the only fix
