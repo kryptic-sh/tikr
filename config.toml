@@ -80,8 +80,8 @@ inventory_boost_curve = "1"
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 5
+refill_threshold = 4
 inner_bps = 5
 step_bps = 5
 
@@ -93,8 +93,8 @@ step_bps = 5
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 5
+refill_threshold = 4
 inner_bps = 5
 step_bps = 5
 
@@ -106,8 +106,8 @@ step_bps = 5
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 5
+refill_threshold = 4
 inner_bps = 5
 step_bps = 5
 
