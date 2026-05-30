@@ -1,26 +1,30 @@
 # ─── Tide on USDC majors ───────────────────────────────────────────────────
 #
 # 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC — same lineup as config.toml.
-# Tide = single/multi-level touch lattice with straggler pruning. step_bps does
-# DOUBLE duty: the inner self-spread (gap between top bid/ask) AND the spacing
-# between levels. grid_levels = depth per side (inventory ~ N × order). USDC
-# promo (0 bps maker). Account mirrors config.toml: $600 @ 5x, order 0.5%.
+# Tide = frozen one-sided lattice + chase_to_avg on the reducing side. step_bps
+# does DOUBLE duty: the level spacing AND (× inner_steps) the dead-zone around
+# mid. grid_levels = resting depth per side. USDC promo (0 bps maker).
+# Account: $1000 @ 5x, order 0.5% ($5/order), max_position_pct 70%, boost off.
 #
-# ⚠ NOT VALIDATED — THIS PARAM SET LOSES ON THE FROZEN WINDOW ⚠
-# Backtest at levels=5 / step=3 (4 symbols, ~13.07h frozen, 76/27ms latency,
-# 0 bps maker, $600 @ 5x, 100% cap):
-#   sum NET -513.46   NEAR -102   SUI -52   WLD -89   ZEC -270
-# step=3 is FAR too tight for these volatile symbols — the lattice gets
-# steamrolled, churns (ZEC 82,720 fills, 1282/min) and bleeds adverse
-# inventory; ZEC peaked ~$919, OVER the $600 cap (Tide's N-level grid overshoots
-# — investigate before trusting the cap). The validated-baseline tide.usdc.
-# majors.toml uses grid_levels=1 / step_bps=20 for exactly this reason.
+# Tuned 2026-05-30 on data/72h (NEAR/ZEC/WLD/SUI, a trending slice), pinned
+# 76/27ms latency, 0 bps maker, $1000 @ 5x, order 0.5%, boost 0:
+#   step=30 / inner=2 / lv=5 / chase_to_avg / max_pos 70%
+#   sum NET +121.65   NEAR +11.15   SUI +21.93   WLD +66.23   ZEC +22.20
+#   peaks 699–930 (target ~$900). Profitable on all 4.
 #
-# On this 13h slice (a trending/volatile regime) every frozen-grid strategy
-# loses (Wave -82, Tide -513); only the reactive MMR (+75) works here. WIDEN
-# step (toward 20) and/or drop levels, and validate on a RANGING window before
-# any mainnet session. Treat the numbers below as a tuning scaffold, not a
-# deployable config.
+# Why these knobs:
+#  • step=30bps is the profit peak — step<20 churns/bleeds (step=2 → −14 total);
+#    step>30 trims edge (35 → +113, 40 → +97).
+#  • inner_steps=2 (60bps dead-zone) is what fixed NEAR: it stops the grid
+#    over-accumulating the losing long in a down-trend (NEAR −14 → +11).
+#  • boost=0 beats boost=25 here (de-risker that cuts edge in ranging regimes).
+#  • max_position_pct=70 is the PEAK control, NOT geometry. For a trending
+#    symbol the grid loads right up to the cap regardless of step/inner/levels
+#    (verified: at max_pos=100 NEAR/ZEC peak 1050–1185 in EVERY combo). The cap
+#    × ~1.2–1.3 mark-overshoot ⇒ ~$900 peak. Raise the cap and the peak runs.
+#
+# ⚠ This was a TRENDING window. Validate on a RANGING slice before a long
+# mainnet session — frozen grids behave differently across regimes.
 #
 # Pre-flight (mainnet): TIKR_BINANCE_ENABLE_MAINNET=1; .env keys; funded USDC;
 # confirm 0 bps maker still live.
@@ -30,9 +34,9 @@ env = "futures-mainnet"
 state_dir = "./state/tide-usdc"
 asset = "USDC"
 order_balance_pct = "0.5"
-max_position_pct = "100"
+max_position_pct = "70"
 leverage = 5
-inventory_boost_pct = "25"
+inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 
 # ─── NEARUSDC ─────────────────────────────────────────────────────────────
@@ -41,8 +45,8 @@ symbol = "NEARUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 5
-step_bps = 2
-inner_steps = 1
+step_bps = 30
+inner_steps = 2
 prune_stragglers = true
 chase_to_avg = true
 
@@ -52,8 +56,8 @@ symbol = "ZECUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 5
-step_bps = 2
-inner_steps = 1
+step_bps = 30
+inner_steps = 2
 prune_stragglers = true
 chase_to_avg = true
 
@@ -63,8 +67,8 @@ symbol = "WLDUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 5
-step_bps = 2
-inner_steps = 1
+step_bps = 30
+inner_steps = 2
 prune_stragglers = true
 chase_to_avg = true
 
@@ -74,7 +78,7 @@ symbol = "SUIUSDC"
 strategy = "tide"
 [bot.tide]
 grid_levels = 5
-step_bps = 2
-inner_steps = 1
+step_bps = 30
+inner_steps = 2
 prune_stragglers = true
 chase_to_avg = true
