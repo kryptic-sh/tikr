@@ -1,50 +1,46 @@
 # ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
 #
 # 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC. Wave = frozen fixed-step
-# lattice + round-trip refill. USDC promo (0 bps maker).
-#
-# Lineup rotated 2026-05-28: SOL/BNB/DOGE (low vol, weak performers) swapped
-# for higher-volatility USDC perps that resemble ZEC's profile (high realized
-# range + liquidity → more grid oscillation). Selection by volatility +
-# volume, NOT spread (the fixed lattice ignores the live touch). NONE of the
-# new names are backtested — same unvalidated posture as ZEC; watch the first
-# live sessions, and note higher vol means higher peak inventory than the SOL
-# figures below.
+# lattice + round-trip refill + chase_to_avg on the reducing side. USDC
+# promo (0 bps maker).
 #
 # Refill fires when EITHER a both-sides round-trip completes (bid AND ask
 # each drained ≥ refill_threshold) OR one whole side is empty (re-arm after
 # a one-sided sweep — integral, not optional). Lattice never recenters; the
 # active window slides over the fixed grid and prunes the tail.
 #
-# Geometry knobs: `step_bps` = spacing between levels; `inner_bps` = distance
-# from mid to the first order each side (independent; unset/0 = defaults to step_bps).
-# The lattice is UNIFORM (constant spacing) — a progressive/widening lattice
-# was tried and removed: anchored at the frozen origin it misaligns once price
-# trends away (orders drift into the wide tail), and the only fix
-# (cancel-all-and-rebuild-at-touch) destroys the grid's buy-low/sell-high edge
-# (re-centering = chasing → backtested +3.6 → -18). Fixed price levels ARE the
-# edge; keep the lattice frozen and uniform.
+# Geometry knobs (now matching Tide):
+#   step_bps     = spacing between levels.
+#   inner_steps  = dead-zone in STEPS (mid → first order = inner_steps × step);
+#                  0 = at touch. (Renamed from the old bps-based inner_bps.)
+#   chase_to_avg = reducing side chases past the origin toward avg_entry ∓ gap
+#                  (gap = max(inner_steps,1) × step) but never past cost; the
+#                  accumulating side stays one-sided/frozen.
 #
-# Tuned 2026-05-29/30 on the real ~54h DOGE + SOL snapshots (maker 0 / taker 0
-# USDC promo, $600 @ 1% ≈ $6/order, 5x). Current config:
-# levels=4 / refill_threshold=2 / step_bps=5 / inner_bps=5 (uniform).
-#   DOGE 54h: NET +3.59 (realized +7.15, unreal -3.30), peak ~$653
-#   SOL  54h: NET +3.86 (realized +6.21, unreal -1.98), peak ~$617
+# Tuned 2026-05-30 on data/72h (~25h slice, NEAR/ZEC/WLD/SUI), maker 0 / taker
+# 0, $1000 @ 5x, order 0.5% (~$5), max_position_pct 70, boost 0, pinned 76/27ms
+# latency. Winner:
+#   levels=4 / refill_threshold=2 / step_bps=10 / inner_steps=2 / chase_to_avg.
+#   Dependable (stable symbols): NEAR ~+23, SUI ~+41, ZEC ~+56 ≈ +120, peaks
+#   ~$750 (well under the 70%-cap mark). WLD is a ±$50 wildcard (see caveat).
 # Findings:
-#   - FEWER levels + faster refill (4 / rt=2) concentrates capital in the
-#     high-fill inner band and banks more round-trips than the old 10 / rt=9.
-#   - CAVEAT: validated on DOGE + SOL only (the two real ~54h datasets). NONE
-#     of the live names (NEAR/ZEC/WLD/SUI) are backtested on this config —
-#     NEAR/SUI snapshots are only ~4.5h, ZEC/WLD have none. Watch first live
-#     sessions. Single-window numbers; treat as directional, not precise.
+#   - lv=4–6 × rt=1–2 is a PLATEAU (~+110 to +140 total); differences inside
+#     noise. lv=2 craters (WLD), lv=8 fades. step=10/inner=2 banks the most
+#     round-trips; chase_to_avg lifts the trenders (WLD/NEAR) at a small cost
+#     to ZEC — kept ON to raise the floor on the marginal names.
+#   - ⚠ DETERMINISM: the backtest is NOT reproducible run-to-run (runner
+#     reconciles on wall-clock, not sim-time). WLD swings ±$50 between
+#     identical runs; NEAR/SUI/ZEC are stable (±$5). Treat single-run NET as
+#     directional, not precise — esp. WLD. Fix pending before fine-tuning.
+#   - Still a single ~25h TRENDING slice. Validate on a ranging window before
+#     trusting; frozen grids change character across regimes.
 #
 # BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
 # $600 @ 5x account's capacity. Do not add BTCUSDC here.
 #
-# RISK ($600 @ 5x): worst per-market peak in the 72h backtest ~$953 at
-# $10/order → ~$570 at this account's ~$6/order → ~$114 margin at 5x. A ~19%
-# adverse move on that ≈ $108 loss. Wave still has NO hard cap and adds into
-# a trend, but the wide step keeps the excursion survivable. Watch sustained
+# RISK: max_position_pct 70 caps entry notional at 0.70 × balance; peaks mark
+# ~20–30% above that. Wave has no hard stop and adds into a trend, but the
+# round-trip refill + chase_to_avg keep the excursion bounded. Watch sustained
 # one-way moves; size so summed peaks stay well under buying power.
 #
 # Pre-flight:
@@ -58,68 +54,65 @@ env = "futures-mainnet"
 state_dir = "./state/wave-usdc-majors"
 asset = "USDC"
 order_balance_pct = "0.5"
-max_position_pct = "100"
+max_position_pct = "70"
 leverage = 5
 # Inventory-aware order-size boost (runner-side, every strategy). Scales the
 # inventory-REDUCING side's order size up on a curve as |position| approaches
 # the per-bot cap: multiplier = 1 + (pct/100)·(|pos|/cap)^curve.
-#   inventory_boost_pct:   extra size at full inventory, % of base (0 = off).
-#   inventory_boost_curve: 1 = linear, >1 = concentrated near the cap.
-# OFF by default: latency-on backtests show it's a tail-risk hedge, NOT a
-# profit enhancer — it cuts net in ranging/normal regimes (over-trades the
-# reducing side) and barely moves peak once fills are realistic (the cap
-# already binds). Only raise it when deliberately hedging a known one-way
-# trend; re-backtest the value on frozen data + fixed latency before trusting.
+# OFF: tail-risk hedge, not a profit enhancer — cuts net in normal regimes and
+# barely moves peak once fills are realistic (the cap already binds).
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 
 # ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
-# Replaces SOLUSDC. ~19% 24h range, ~$42M vol — most ZEC-like (high vol +
-# liquid). Unvalidated.
+# ~19% 24h range, ~$42M vol — most ZEC-like (high vol + liquid). chase_to_avg
+# lifts it (+9→+20 in tuning); a down-trender that benefits from unwinding to
+# cost.
 [[bot]]
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-inner_bps = 5
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+step_bps = 10
+inner_steps = 2
+chase_to_avg = true
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
-# Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
-# this account). NOT backtested — no ZEC snapshot; running on the winning
-# params unvalidated, watch first live session.
+# High vol + liquid. The steadiest performer (~+56); chase_to_avg costs it a
+# little (it ranges) but it stays one of the best, so cta stays global.
 [[bot]]
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-inner_bps = 5
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+step_bps = 10
+inner_steps = 2
+chase_to_avg = true
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
-# Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
-# highest reward but also highest inventory/pile risk on one-way moves. Watch
-# closely. Unvalidated.
+# Highest vol (~28% 24h range, ~$21M vol) → highest reward AND highest
+# inventory/pile risk. The ±$50 wildcard in backtest (non-determinism +
+# volatility). chase_to_avg helps it most; watch closely live.
 [[bot]]
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-inner_bps = 5
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+step_bps = 10
+inner_steps = 2
+chase_to_avg = true
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
-# Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
-# little wave oscillation). SUI: ZEC-like vol (~12% range) + strong liquidity
-# (~$19M). Unvalidated.
+# ZEC-like vol (~12% range) + strong liquidity (~$19M). Stable ~+41.
 [[bot]]
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-inner_bps = 5
-step_bps = 5
+grid_levels = 4
+refill_threshold = 2
+step_bps = 10
+inner_steps = 2
+chase_to_avg = true
