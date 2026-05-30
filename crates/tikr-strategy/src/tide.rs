@@ -370,13 +370,16 @@ impl Strategy for Tide {
             && self.bid_lattice_origin.is_some()
             && self.ask_lattice_origin.is_some();
 
-        // BID side. Lattice slots = bid_origin + n × step for ANY
-        // integer n (positive or negative — lattice extends both
-        // directions from origin). Highest active slot = largest lattice
-        // slot ≤ placement top. Place at that slot + (levels-1) more
-        // descending in step increments. When price moves up past origin,
-        // n_top is positive and we place at higher slots; when it falls,
-        // n_top is negative and we extend down to fill the gap.
+        // BID side. ONE-SIDED fixed grid: bid slots are bid_origin − k × step
+        // for non-negative k only (at/below the origin). The top active slot is
+        // the largest lattice slot ≤ placement top, but CLAMPED to never exceed
+        // bid_origin (n_top ≤ 0). When price rises above the origin the bids
+        // stay parked at origin-and-below — we do NOT chase up and buy high;
+        // when price falls, n_top goes negative and we extend down to buy the
+        // dip. This keeps every buy ≤ bid_origin < ask_origin ≤ every sell, so
+        // average buy is always below average sell (the grid's edge). Extending
+        // the bid above the origin (chasing) was a bug that bought high on
+        // rallies and turned the round-trip edge negative on trends.
         if lattice_ready
             && let Some(step) = self.lattice_step
             && let Some(bid_origin) = self.bid_lattice_origin
@@ -395,8 +398,9 @@ impl Strategy for Tide {
                     top_cap = max_bid;
                 }
             }
-            // floor((top_cap - origin) / step) — handles negative n.
-            let n_top = ((top_cap - bid_origin) / step).floor();
+            // floor((top_cap - origin) / step), clamped ≤ 0 so the top bid
+            // never sits above bid_origin (no chasing up / buying high).
+            let n_top = ((top_cap - bid_origin) / step).floor().min(Decimal::ZERO);
             let mut price = bid_origin + n_top * step;
             for _ in 0..levels {
                 if price <= Decimal::ZERO {
@@ -412,10 +416,13 @@ impl Strategy for Tide {
             }
         }
 
-        // ASK side mirror. Lowest active slot = smallest lattice slot
-        // ≥ placement top. When price moves down below origin, n_top
-        // is negative and we place at lower slots; when it rises, we
-        // extend up to fill the gap.
+        // ASK side mirror. ONE-SIDED: ask slots are ask_origin + k × step for
+        // non-negative k only (at/above the origin). The top active slot is the
+        // smallest lattice slot ≥ placement top, CLAMPED to never drop below
+        // ask_origin (n_top ≥ 0). When price falls below the origin the asks
+        // stay parked at origin-and-above — we do NOT chase down and sell low;
+        // when price rises, n_top goes positive and we extend up to sell the
+        // rally. Every sell ≥ ask_origin > bid_origin ≥ every buy.
         if lattice_ready
             && let Some(step) = self.lattice_step
             && let Some(ask_origin) = self.ask_lattice_origin
@@ -434,8 +441,9 @@ impl Strategy for Tide {
                     top_cap = min_ask;
                 }
             }
-            // ceil((top_cap - origin) / step) — handles negative n.
-            let n_top = ((top_cap - ask_origin) / step).ceil();
+            // ceil((top_cap - origin) / step), clamped ≥ 0 so the top ask
+            // never sits below ask_origin (no chasing down / selling low).
+            let n_top = ((top_cap - ask_origin) / step).ceil().max(Decimal::ZERO);
             let mut price = ask_origin + n_top * step;
             for _ in 0..levels {
                 if price <= Decimal::ZERO {
