@@ -32,7 +32,7 @@ asset = "USDC"
 order_balance_pct = "0.5"
 max_position_pct = "100"
 leverage = 5
-inventory_boost_pct = "100"
+inventory_boost_pct = "25"
 inventory_boost_curve = "1"
 
 # ─── NEARUSDC ─────────────────────────────────────────────────────────────
@@ -42,7 +42,9 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 5
 step_bps = 2
+inner_steps = 1
 prune_stragglers = true
+chase_to_avg = true
 
 # ─── ZECUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -51,7 +53,9 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 5
 step_bps = 2
+inner_steps = 1
 prune_stragglers = true
+chase_to_avg = true
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -60,7 +64,9 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 5
 step_bps = 2
+inner_steps = 1
 prune_stragglers = true
+chase_to_avg = true
 
 # ─── SUIUSDC ──────────────────────────────────────────────────────────────
 [[bot]]
@@ -69,4 +75,6 @@ strategy = "tide"
 [bot.tide]
 grid_levels = 5
 step_bps = 2
+inner_steps = 1
 prune_stragglers = true
+chase_to_avg = true
