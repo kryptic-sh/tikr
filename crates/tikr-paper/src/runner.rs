@@ -31,7 +31,7 @@ use tikr_core::{
 };
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
-use tikr_venue::{QuoteIntent, Venue};
+use tikr_venue::{QuoteIntent, Venue, VenueError};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -1294,14 +1294,23 @@ where
                             }
                             tikr_strategy::Action::Cancel(id) => {
                                 match venue.cancel(*id).await {
-                                    Ok(()) => fill_sim.drop_quote(*id),
+                                    // UnknownQuote = the order is already gone on
+                                    // the venue (filled / canceled / lost across a
+                                    // reconnect). Drop it from the local mirror too,
+                                    // else we re-issue the cancel every event and
+                                    // spin forever on a phantom order.
+                                    Ok(()) | Err(VenueError::UnknownQuote) => {
+                                        fill_sim.drop_quote(*id)
+                                    }
                                     Err(e) => warn!(error = ?e, "live: venue.cancel failed"),
                                 }
                             }
                             tikr_strategy::Action::CancelAll => {
                                 side_fails.remove(symbol.base.0.as_ref());
                                 match venue.cancel_all(&symbol).await {
-                                    Ok(()) => fill_sim.drop_quotes_for(&symbol),
+                                    Ok(()) | Err(VenueError::UnknownQuote) => {
+                                        fill_sim.drop_quotes_for(&symbol)
+                                    }
                                     Err(e) => warn!(error = ?e, "live: venue.cancel_all failed"),
                                 }
                             }

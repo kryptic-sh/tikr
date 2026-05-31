@@ -232,7 +232,14 @@ pub async fn cancel_order(
         .await
         .map_err(network_err)?;
 
-    let body: Value = read_json(resp).await?;
+    let body: Value = match read_json(resp).await {
+        Ok(b) => b,
+        // Binance returns -2011/-2013 (order not found / already canceled) as
+        // HTTP 400, which read_json maps to UnknownQuote. On the cancel path
+        // that's idempotent success — the order is already gone.
+        Err(VenueError::UnknownQuote) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     if let Some(code) = extract_error_code(&body) {
         if is_cancel_idempotent(code) {
             return Ok(());
@@ -266,7 +273,12 @@ pub async fn cancel_all_orders(
         .await
         .map_err(network_err)?;
 
-    let body: Value = read_json(resp).await?;
+    let body: Value = match read_json(resp).await {
+        Ok(b) => b,
+        // -2011/-2013 (HTTP 400) → no open orders to cancel; idempotent success.
+        Err(VenueError::UnknownQuote) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     if let Some(code) = extract_error_code(&body) {
         if is_cancel_idempotent(code) {
             return Ok(());

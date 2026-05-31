@@ -142,7 +142,12 @@ pub async fn cancel_order(
         .await
         .map_err(network_err)?;
 
-    let body: Value = read_json(resp).await?;
+    let body: Value = match read_json(resp).await {
+        Ok(b) => b,
+        // -2011/-2013 (HTTP 400) → order already gone; idempotent cancel success.
+        Err(VenueError::UnknownQuote) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     if let Some(code) = extract_error_code(&body) {
         if is_cancel_idempotent(code) {
             return Ok(());
@@ -176,7 +181,12 @@ pub async fn cancel_all_orders(
         .await
         .map_err(network_err)?;
 
-    let body: Value = read_json(resp).await?;
+    let body: Value = match read_json(resp).await {
+        Ok(b) => b,
+        // -2011/-2013 (HTTP 400) → no open orders; idempotent success.
+        Err(VenueError::UnknownQuote) => return Ok(()),
+        Err(e) => return Err(e),
+    };
     // cancel_all returns an array of canceled orders; a non-array is an error.
     if let Some(code) = extract_error_code(&body) {
         // -2011/-2013 on bulk cancel = no open orders → idempotent success.
