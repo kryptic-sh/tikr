@@ -31,7 +31,7 @@ use tikr_core::{
 };
 use tikr_risk::{RiskContext, RiskDecision, RiskGate};
 use tikr_strategy::{Strategy, StrategyContext};
-use tikr_venue::{QuoteIntent, Venue, VenueError};
+use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -1252,12 +1252,11 @@ where
                                 debug!("live: all quote intents filtered — skipping dispatch");
                                 continue;
                             }
-                            let results = futures::future::join_all(
-                                run_intents
-                                    .iter()
-                                    .map(|intent| venue.quote(intent.clone())),
-                            )
-                            .await;
+                            // Batch placement: one request per 5 orders
+                            // (`POST /fapi/v1/batchOrders`) instead of N
+                            // concurrent single placements — collapses round
+                            // trips so a fast book doesn't swamp the REST API.
+                            let results = venue.batch_quote(run_intents.clone()).await;
                             for (intent, r) in run_intents.into_iter().zip(results.into_iter()) {
                                 let state = side_fails
                                     .entry(symbol.base.0.to_string())
@@ -1304,6 +1303,42 @@ where
                             }
                             continue;
                         }
+                        if matches!(filtered[i], tikr_strategy::Action::Cancel(_)) {
+                            // Gather a run of consecutive cancels and fire them
+                            // as one request per 10 (`DELETE /fapi/v1/batchOrders`)
+                            // instead of one round trip each — the big win when a
+                            // moved book prunes a whole side of the grid at once.
+                            let mut cancel_ids: Vec<QuoteId> = Vec::new();
+                            while i < filtered.len() {
+                                if let tikr_strategy::Action::Cancel(id) = &filtered[i] {
+                                    cancel_ids.push(*id);
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let cancelled = venue.batch_cancel(cancel_ids.clone()).await;
+                            for (id, r) in cancel_ids.into_iter().zip(cancelled.into_iter()) {
+                                match r {
+                                    // Already gone → drop the mirror entry so we
+                                    // never re-cancel a phantom (see the single
+                                    // cancel path).
+                                    Ok(()) | Err(VenueError::UnknownQuote) => {
+                                        fill_sim.drop_quote(id)
+                                    }
+                                    Err(e) => {
+                                        if let VenueError::RateLimited { retry_after_ms } = e {
+                                            rate_limited_until = Some(
+                                                Instant::now()
+                                                    + Duration::from_millis(retry_after_ms),
+                                            );
+                                        }
+                                        warn!(error = ?e, "live: venue.cancel failed");
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         match &filtered[i] {
                             tikr_strategy::Action::Requote { id, intent } => {
                                 match venue.requote(*id, intent.clone()).await {
@@ -1322,26 +1357,9 @@ where
                                     }
                                 }
                             }
-                            tikr_strategy::Action::Cancel(id) => {
-                                match venue.cancel(*id).await {
-                                    // UnknownQuote = the order is already gone on
-                                    // the venue (filled / canceled / lost across a
-                                    // reconnect). Drop it from the local mirror too,
-                                    // else we re-issue the cancel every event and
-                                    // spin forever on a phantom order.
-                                    Ok(()) | Err(VenueError::UnknownQuote) => {
-                                        fill_sim.drop_quote(*id)
-                                    }
-                                    Err(e) => {
-                                        if let VenueError::RateLimited { retry_after_ms } = e {
-                                            rate_limited_until = Some(
-                                                Instant::now()
-                                                    + Duration::from_millis(retry_after_ms),
-                                            );
-                                        }
-                                        warn!(error = ?e, "live: venue.cancel failed");
-                                    }
-                                }
+                            tikr_strategy::Action::Cancel(_) => {
+                                // Handled by the batched cancel-gather above.
+                                unreachable!("Cancel handled before match")
                             }
                             tikr_strategy::Action::CancelAll => {
                                 side_fails.remove(symbol.base.0.as_ref());

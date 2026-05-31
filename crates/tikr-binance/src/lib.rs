@@ -424,6 +424,22 @@ impl BinanceClient {
 // Venue impl
 // ---------------------------------------------------------------------------
 
+/// Reconstruct a faithful per-element error from a request-level batch failure.
+/// `VenueError` isn't `Clone`, so we rebuild the variants the caller acts on —
+/// `RateLimited` (arms the runner's cooldown) and `UnknownQuote` (idempotent) —
+/// and fall back to a string-cloned `Rejected` for everything else.
+fn clone_batch_err(e: &VenueError, reason: &str) -> VenueError {
+    match e {
+        VenueError::RateLimited { retry_after_ms } => VenueError::RateLimited {
+            retry_after_ms: *retry_after_ms,
+        },
+        VenueError::UnknownQuote => VenueError::UnknownQuote,
+        _ => VenueError::Rejected {
+            reason: reason.to_string(),
+        },
+    }
+}
+
 #[async_trait]
 impl Venue for BinanceClient {
     fn id(&self) -> &str {
@@ -686,6 +702,205 @@ impl Venue for BinanceClient {
             map.remove(&id);
         }
         result
+    }
+
+    /// Batch placement via `POST /fapi/v1/batchOrders` (≤5 orders/request).
+    /// Falls back to the per-order loop on spot or a closed mainnet gate.
+    /// Each prepared intent maps to one wire order; per-intent prep failures
+    /// (rounding / min-notional) become an `Err` at that position and are not
+    /// sent. Results are returned in input order.
+    async fn batch_quote(&self, intents: Vec<QuoteIntent>) -> Vec<Result<QuoteId, VenueError>> {
+        // Spot has no batch endpoint; a closed mainnet gate must surface its
+        // own error — both fall back to the per-order path.
+        if !self.env.is_futures() || self.check_mainnet_gate().is_err() {
+            let mut out = Vec::with_capacity(intents.len());
+            for intent in intents {
+                out.push(self.quote(intent).await);
+            }
+            return out;
+        }
+        let base_url = self.env.rest_base_url();
+        let mut results: Vec<Option<Result<QuoteId, VenueError>>> =
+            (0..intents.len()).map(|_| None).collect();
+        // Prep each intent; keep the owned wire strings alive for the borrow.
+        struct Prep {
+            sym: String,
+            price: String,
+            size: String,
+            coid: String,
+            side: Side,
+            tif: tikr_core::TimeInForce,
+        }
+        let mut prepped: Vec<(usize, Prep)> = Vec::new();
+        for (idx, intent) in intents.iter().enumerate() {
+            let sym_str = binance_symbol(&intent.symbol);
+            let price = match round_price_for_side(
+                &self.exchange_info_cache,
+                &sym_str,
+                intent.price,
+                intent.side,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    results[idx] = Some(Err(e));
+                    continue;
+                }
+            };
+            let size = match round_size(&self.exchange_info_cache, &sym_str, intent.size) {
+                Ok(s) => s,
+                Err(e) => {
+                    results[idx] = Some(Err(e));
+                    continue;
+                }
+            };
+            if let Err(e) = validate_qty(&self.exchange_info_cache, &sym_str, size, price) {
+                results[idx] = Some(Err(e));
+                continue;
+            }
+            prepped.push((
+                idx,
+                Prep {
+                    sym: sym_str,
+                    price: Self::format_decimal(price.0),
+                    size: Self::format_decimal(size.0),
+                    coid: Self::client_order_id(QuoteId::new()),
+                    side: intent.side,
+                    tif: intent.tif,
+                },
+            ));
+        }
+        // Group by symbol (the runner is single-symbol, but stay correct for a
+        // mixed caller), then chunk by the venue's 5-order batch cap.
+        let mut by_symbol: HashMap<String, Vec<usize>> = HashMap::new();
+        for (pi, (_, p)) in prepped.iter().enumerate() {
+            by_symbol.entry(p.sym.clone()).or_default().push(pi);
+        }
+        for (sym, pis) in by_symbol {
+            for chunk in pis.chunks(5) {
+                let reqs: Vec<crate::futs::BatchOrderReq<'_>> = chunk
+                    .iter()
+                    .map(|&pi| {
+                        let p = &prepped[pi].1;
+                        crate::futs::BatchOrderReq {
+                            side: p.side,
+                            price: &p.price,
+                            quantity: &p.size,
+                            client_order_id: &p.coid,
+                            tif: p.tif,
+                        }
+                    })
+                    .collect();
+                let placed = crate::futs::place_batch_orders(
+                    &self.http,
+                    base_url,
+                    &self.api_key,
+                    &self.key_material,
+                    &sym,
+                    &reqs,
+                )
+                .await;
+                match placed {
+                    Ok(per) => {
+                        for (&pi, res) in chunk.iter().zip(per) {
+                            let (orig_idx, prep) = (&prepped[pi].0, &prepped[pi].1);
+                            if let Ok(venue_qid) = &res
+                                && let Ok(mut map) = self.quote_symbols.lock()
+                            {
+                                map.insert(*venue_qid, (prep.sym.clone(), prep.coid.clone()));
+                            }
+                            results[*orig_idx] = Some(res);
+                        }
+                    }
+                    Err(e) => {
+                        // Request-level failure (auth / rate-limit / malformed):
+                        // VenueError isn't Clone, so fan a faithful copy out to
+                        // every leg — preserving RateLimited so the runner's
+                        // cooldown arms no matter which result it inspects.
+                        let reason = format!("batch place request failed: {e:?}");
+                        for &pi in chunk {
+                            let orig_idx = prepped[pi].0;
+                            results[orig_idx] = Some(Err(clone_batch_err(&e, &reason)));
+                        }
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| {
+                r.unwrap_or_else(|| {
+                    Err(VenueError::Internal(Box::new(std::io::Error::other(
+                        "batch_quote: result slot never filled",
+                    ))))
+                })
+            })
+            .collect()
+    }
+
+    /// Batch cancel via `DELETE /fapi/v1/batchOrders` (≤10/request). Falls back
+    /// to the per-order loop on spot / closed gate. Unknown ids (already gone)
+    /// and `-2011`/`-2013` are idempotent `Ok`. Results in input order.
+    async fn batch_cancel(&self, ids: Vec<QuoteId>) -> Vec<Result<(), VenueError>> {
+        if !self.env.is_futures() || self.check_mainnet_gate().is_err() {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                out.push(self.cancel(id).await);
+            }
+            return out;
+        }
+        let base_url = self.env.rest_base_url();
+        let mut results: Vec<Option<Result<(), VenueError>>> =
+            (0..ids.len()).map(|_| None).collect();
+        // Resolve each id → (symbol, coid). A miss = already gone → Ok.
+        let mut resolved: Vec<(usize, String, String)> = Vec::new();
+        {
+            let map = self.quote_symbols.lock().ok();
+            for (idx, id) in ids.iter().enumerate() {
+                match map.as_ref().and_then(|m| m.get(id)) {
+                    Some((sym, coid)) => resolved.push((idx, sym.clone(), coid.clone())),
+                    None => results[idx] = Some(Ok(())),
+                }
+            }
+        }
+        let mut by_symbol: HashMap<String, Vec<usize>> = HashMap::new();
+        for (ri, (_, sym, _)) in resolved.iter().enumerate() {
+            by_symbol.entry(sym.clone()).or_default().push(ri);
+        }
+        for (sym, ris) in by_symbol {
+            for chunk in ris.chunks(10) {
+                let coids: Vec<String> = chunk.iter().map(|&ri| resolved[ri].2.clone()).collect();
+                let cancelled = crate::futs::cancel_batch_orders(
+                    &self.http,
+                    base_url,
+                    &self.api_key,
+                    &self.key_material,
+                    &sym,
+                    &coids,
+                )
+                .await;
+                match cancelled {
+                    Ok(per) => {
+                        for (&ri, res) in chunk.iter().zip(per) {
+                            let (orig_idx, id) = (resolved[ri].0, ids[resolved[ri].0]);
+                            if res.is_ok()
+                                && let Ok(mut map) = self.quote_symbols.lock()
+                            {
+                                map.remove(&id);
+                            }
+                            results[orig_idx] = Some(res);
+                        }
+                    }
+                    Err(e) => {
+                        let reason = format!("batch cancel request failed: {e:?}");
+                        for &ri in chunk {
+                            let orig_idx = resolved[ri].0;
+                            results[orig_idx] = Some(Err(clone_batch_err(&e, &reason)));
+                        }
+                    }
+                }
+            }
+        }
+        results.into_iter().map(|r| r.unwrap_or(Ok(()))).collect()
     }
 
     async fn open_orders(&self, symbol: &Symbol) -> Result<Vec<tikr_venue::OpenOrder>, VenueError> {

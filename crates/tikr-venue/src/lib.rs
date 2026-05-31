@@ -153,6 +153,33 @@ pub trait Venue: Send + Sync {
     /// Cancel the quote identified by `id`.
     async fn cancel(&self, id: QuoteId) -> Result<(), VenueError>;
 
+    /// Place many quotes in as few requests as the venue allows, returning one
+    /// result per input intent (in input order). The default loops [`quote`];
+    /// adapters with a native batch endpoint (e.g. Binance `batchOrders`)
+    /// override this to collapse N round-trips into ⌈N/batch⌉.
+    ///
+    /// [`quote`]: Venue::quote
+    async fn batch_quote(&self, intents: Vec<QuoteIntent>) -> Vec<Result<QuoteId, VenueError>> {
+        let mut out = Vec::with_capacity(intents.len());
+        for intent in intents {
+            out.push(self.quote(intent).await);
+        }
+        out
+    }
+
+    /// Cancel many quotes by id in as few requests as the venue allows,
+    /// returning one result per input id (in input order). The default loops
+    /// [`cancel`]; batch-capable adapters override.
+    ///
+    /// [`cancel`]: Venue::cancel
+    async fn batch_cancel(&self, ids: Vec<QuoteId>) -> Vec<Result<(), VenueError>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(self.cancel(id).await);
+        }
+        out
+    }
+
     /// Cancel all outstanding quotes on `symbol`.
     async fn cancel_all(&self, symbol: &Symbol) -> Result<(), VenueError>;
 

@@ -207,6 +207,208 @@ pub async fn place_market_order(
     Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
 }
 
+/// One leg of a batch placement. Price/quantity are pre-rounded + formatted
+/// by the caller (the `Venue` impl), mirroring [`place_order`].
+pub struct BatchOrderReq<'a> {
+    /// Order side.
+    pub side: Side,
+    /// Pre-rounded, wire-formatted limit price.
+    pub price: &'a str,
+    /// Pre-rounded, wire-formatted quantity.
+    pub quantity: &'a str,
+    /// `newClientOrderId` (the venue-accepted handle for later cancel).
+    pub client_order_id: &'a str,
+    /// Time-in-force (`PostOnly` → `GTX`).
+    pub tif: TimeInForce,
+}
+
+/// Binance Futures TIF wire string.
+fn tif_str(tif: TimeInForce) -> &'static str {
+    match tif {
+        TimeInForce::PostOnly => "GTX",
+        TimeInForce::IOC => "IOC",
+        TimeInForce::FOK => "FOK",
+        TimeInForce::GTC => "GTC",
+    }
+}
+
+/// Build the `batchOrders` JSON array string for a place batch. Pure +
+/// testable; the caller percent-encodes + signs it.
+fn build_batch_orders_json(symbol: &str, orders: &[BatchOrderReq<'_>]) -> String {
+    let arr: Vec<Value> = orders
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "symbol": symbol,
+                "side": match o.side { Side::Bid => "BUY", Side::Ask => "SELL" },
+                "type": "LIMIT",
+                "timeInForce": tif_str(o.tif),
+                "quantity": o.quantity,
+                "price": o.price,
+                "newClientOrderId": o.client_order_id,
+            })
+        })
+        .collect();
+    Value::Array(arr).to_string()
+}
+
+/// Percent-encode every byte that isn't an RFC-3986 unreserved char. The
+/// `batchOrders` / `*List` params carry JSON (`[]{}":,` etc.) that MUST be
+/// encoded both for the signature and for transmission — Binance HMACs the
+/// query string as sent, so the signed bytes and the wire bytes must match
+/// exactly (the signer encodes the resulting query identically).
+fn percent_encode_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Parse one element of a batchOrders place response: a negative `code` is a
+/// per-order error, otherwise pull the `orderId` → venue [`QuoteId`].
+fn parse_place_element(el: &Value) -> Result<QuoteId, VenueError> {
+    if let Some(code) = el.get("code").and_then(Value::as_i64)
+        && code < 0
+    {
+        let msg = el.get("msg").and_then(Value::as_str).unwrap_or("unknown");
+        return Err(parse_binance_error_code(code as i32, msg));
+    }
+    let order_id = el.get("orderId").and_then(Value::as_u64).ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures batchOrders: missing orderId in element: {el}"
+        ))))
+    })?;
+    Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
+}
+
+/// Place up to 5 orders in ONE request.
+///
+/// Endpoint: `POST /fapi/v1/batchOrders` (max 5 orders; weight 5).
+/// Returns one `Result` per input order, in input order — the request can
+/// succeed (HTTP 200) while individual legs are rejected (each element carries
+/// its own `{code,msg}`). A request-level failure (auth, rate-limit, malformed)
+/// returns `Err` for the whole call.
+pub async fn place_batch_orders(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    orders: &[BatchOrderReq<'_>],
+) -> Result<Vec<Result<QuoteId, VenueError>>, VenueError> {
+    if orders.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = build_batch_orders_json(symbol, orders);
+    let params = format!("batchOrders={}", percent_encode_value(&json));
+    let signed = append_auth_dispatch(&params, key_material);
+
+    info!(
+        symbol,
+        count = orders.len(),
+        "futures: placing batch orders"
+    );
+
+    let url = format!("{base_url}/fapi/v1/batchOrders?{signed}");
+    let resp = http
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let body: Value = read_json(resp).await?;
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures batchOrders place: expected array response: {body}"
+        ))))
+    })?;
+    Ok(arr.iter().map(parse_place_element).collect())
+}
+
+/// Parse one element of a batchOrders cancel response. `-2011`/`-2013`
+/// (already gone) is idempotent success.
+fn parse_cancel_element(el: &Value) -> Result<(), VenueError> {
+    if let Some(code) = el.get("code").and_then(Value::as_i64)
+        && code < 0
+    {
+        let code = code as i32;
+        if is_cancel_idempotent(code) {
+            return Ok(());
+        }
+        let msg = el.get("msg").and_then(Value::as_str).unwrap_or("unknown");
+        return Err(parse_binance_error_code(code, msg));
+    }
+    Ok(())
+}
+
+/// Cancel up to 10 orders (by `origClientOrderId`) in ONE request.
+///
+/// Endpoint: `DELETE /fapi/v1/batchOrders` (max 10; weight 1). All ids must
+/// belong to `symbol`. Returns one `Result` per input id, in input order;
+/// `-2011`/`-2013` (already gone) map to `Ok(())` per element. A request-level
+/// failure returns `Err` for the whole call.
+pub async fn cancel_batch_orders(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    client_order_ids: &[String],
+) -> Result<Vec<Result<(), VenueError>>, VenueError> {
+    if client_order_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = Value::Array(
+        client_order_ids
+            .iter()
+            .map(|s| Value::String(s.clone()))
+            .collect(),
+    )
+    .to_string();
+    let params = format!(
+        "symbol={symbol}&origClientOrderIdList={}",
+        percent_encode_value(&list)
+    );
+    let signed = append_auth_dispatch(&params, key_material);
+
+    info!(
+        symbol,
+        count = client_order_ids.len(),
+        "futures: canceling batch orders"
+    );
+
+    let url = format!("{base_url}/fapi/v1/batchOrders?{signed}");
+    let resp = http
+        .delete(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    // A whole-request UnknownQuote (every id gone, surfaced at the top level)
+    // is idempotent success for all.
+    let body: Value = match read_json(resp).await {
+        Ok(b) => b,
+        Err(VenueError::UnknownQuote) => {
+            return Ok(client_order_ids.iter().map(|_| Ok(())).collect());
+        }
+        Err(e) => return Err(e),
+    };
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures batchOrders cancel: expected array response: {body}"
+        ))))
+    })?;
+    Ok(arr.iter().map(parse_cancel_element).collect())
+}
+
 /// Cancel an order by `origClientOrderId` on Futures.
 ///
 /// Endpoint: `DELETE /fapi/v1/order`
@@ -1273,5 +1475,80 @@ mod user_trades_tests {
     fn non_array_body_is_error() {
         let body = serde_json::json!({"code": -1102, "msg": "bad"});
         assert!(parse_user_trades(&body).is_err());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_covers_json_specials() {
+        // unreserved chars pass through; everything else is %XX.
+        assert_eq!(percent_encode_value("aZ09-_.~"), "aZ09-_.~");
+        assert_eq!(percent_encode_value("[]{}\":,"), "%5B%5D%7B%7D%22%3A%2C");
+        assert_eq!(percent_encode_value(" "), "%20");
+    }
+
+    #[test]
+    fn build_place_json_shape() {
+        let orders = [
+            BatchOrderReq {
+                side: Side::Bid,
+                price: "0.0331",
+                quantity: "150",
+                client_order_id: "abc",
+                tif: TimeInForce::PostOnly,
+            },
+            BatchOrderReq {
+                side: Side::Ask,
+                price: "0.0341",
+                quantity: "146",
+                client_order_id: "def",
+                tif: TimeInForce::PostOnly,
+            },
+        ];
+        let json = build_batch_orders_json("PORTALUSDT", &orders);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["symbol"], "PORTALUSDT");
+        assert_eq!(arr[0]["side"], "BUY");
+        assert_eq!(arr[0]["type"], "LIMIT");
+        assert_eq!(arr[0]["timeInForce"], "GTX");
+        assert_eq!(arr[0]["price"], "0.0331");
+        assert_eq!(arr[0]["quantity"], "150");
+        assert_eq!(arr[0]["newClientOrderId"], "abc");
+        assert_eq!(arr[1]["side"], "SELL");
+    }
+
+    #[test]
+    fn place_element_ok_and_err() {
+        let ok = serde_json::json!({"orderId": 123456789u64, "clientOrderId": "abc"});
+        let qid = parse_place_element(&ok).unwrap();
+        assert_eq!(
+            qid,
+            QuoteId::from_uuid(uuid::Uuid::from_u128(123456789u128))
+        );
+        let err = serde_json::json!({"code": -2010, "msg": "insufficient balance"});
+        assert!(matches!(
+            parse_place_element(&err),
+            Err(VenueError::InsufficientBalance { .. })
+        ));
+    }
+
+    #[test]
+    fn cancel_element_idempotent() {
+        // -2011/-2013 (already gone) = Ok.
+        assert!(
+            parse_cancel_element(&serde_json::json!({"code": -2011, "msg": "unknown"})).is_ok()
+        );
+        assert!(parse_cancel_element(&serde_json::json!({"code": -2013, "msg": "gone"})).is_ok());
+        // a real ack = Ok.
+        assert!(
+            parse_cancel_element(&serde_json::json!({"orderId": 1, "status": "CANCELED"})).is_ok()
+        );
+        // other negative code = Err.
+        assert!(parse_cancel_element(&serde_json::json!({"code": -1102, "msg": "bad"})).is_err());
     }
 }
