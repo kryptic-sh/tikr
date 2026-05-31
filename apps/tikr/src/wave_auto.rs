@@ -357,6 +357,7 @@ fn spawn_one_bot(
             refill_threshold: cfg.refill_threshold,
             inventory_skew_slots: 0,
             chase_to_avg: cfg.chase_to_avg,
+            chase: cfg.chase,
             tp_bps: 0,
             tp_close_pct: 100,
             sl_bps: 0,

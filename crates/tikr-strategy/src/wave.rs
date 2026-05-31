@@ -85,6 +85,14 @@ pub struct WaveConfig {
     /// (pure one-sided lattice).
     pub chase_to_avg: bool,
 
+    /// Market-chase: when `true`, the lattice window follows the touch in BOTH
+    /// directions — bids may sit ABOVE the bid origin, asks BELOW the ask
+    /// origin — abandoning the one-sided clamp. Mirrors Tide's `chase`. This is
+    /// the proven LOSING mode (buys high / sells low into a trend → realized
+    /// losses); the one-sided clamp exists to prevent exactly this. `false`
+    /// (default) = frozen one-sided. Overrides `chase_to_avg` when set.
+    pub chase: bool,
+
     /// Take-profit trigger: favorable move past `avg_entry`, in bps (100 = 1%).
     /// When holding inventory and the mark has moved `tp_bps` in our favor, a
     /// resting maker close order sits at `avg_entry × (1 ± tp_bps/1e4)` (sells
@@ -722,7 +730,14 @@ impl Strategy for Wave {
                 } else {
                     0
                 };
-                let top_k = top_k.max(floor_k);
+                // `chase`: market-chase — follow the touch unclamped (bids may
+                // sit ABOVE the origin), abandoning the one-sided invariant. The
+                // losing mode (buys high on trends); off by default.
+                let top_k = if self.config.chase {
+                    top_k
+                } else {
+                    top_k.max(floor_k)
+                };
                 WindowRange {
                     low_k: top_k + bid_skew,
                     high_k: top_k + bid_skew + levels - 1,
@@ -754,7 +769,13 @@ impl Strategy for Wave {
                 } else {
                     0
                 };
-                let top_k = top_k.max(floor_k);
+                // `chase`: market-chase mirror — asks may sit BELOW the origin
+                // (sells low on trends). Off by default.
+                let top_k = if self.config.chase {
+                    top_k
+                } else {
+                    top_k.max(floor_k)
+                };
                 WindowRange {
                     low_k: top_k + ask_skew,
                     high_k: top_k + ask_skew + levels - 1,
@@ -853,6 +874,7 @@ mod tests {
             max_position_usdt: Decimal::ZERO,
             inventory_skew_slots: 0,
             chase_to_avg: false,
+            chase: false,
             tp_bps: 0,
             tp_close_pct: 100,
             sl_bps: 0,

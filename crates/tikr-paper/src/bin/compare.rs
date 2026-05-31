@@ -839,6 +839,12 @@ struct Args {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     wave_chase_to_avg: bool,
 
+    /// Wave: market-chase — lattice follows the touch both ways (bids above
+    /// origin, asks below). The LOSING mode (buys high/sells low on trends);
+    /// overrides chase_to_avg. Default off.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    wave_chase: bool,
+
     /// Wave take-profit trigger: favorable move past avg_entry in bps (100=1%).
     /// `0` (default) = off.
     #[arg(long, default_value_t = 0u32)]
@@ -2303,8 +2309,9 @@ async fn run_sweep_collect(
                 for &skew in &wave_skew_sweep {
                     for &inner in &wave_inner_sweep {
                         let label = format!(
-                            "Wave lv={levels} step={step}bps inner={inner} rt={} skew={skew}{}{}{}",
+                            "Wave lv={levels} step={step}bps inner={inner} rt={} skew={skew}{}{}{}{}",
                             args.wave_refill_threshold,
+                            if args.wave_chase { " chase" } else { "" },
                             if args.wave_chase_to_avg { " cta" } else { "" },
                             if args.wave_tp_bps > 0 {
                                 format!(" tp{}/{}", args.wave_tp_bps, args.wave_tp_close_pct)
@@ -2334,6 +2341,7 @@ async fn run_sweep_collect(
                                 max_position_usdt: bot_position_cap,
                                 inventory_skew_slots: skew,
                                 chase_to_avg: args.wave_chase_to_avg,
+                                chase: args.wave_chase,
                                 tp_bps: args.wave_tp_bps,
                                 tp_close_pct: args.wave_tp_close_pct,
                                 sl_bps: args.wave_sl_bps,

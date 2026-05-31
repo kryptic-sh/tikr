@@ -345,6 +345,11 @@ pub struct WaveParams {
     /// (default) = off (pure one-sided lattice).
     #[serde(default)]
     pub chase_to_avg: bool,
+    /// Market-chase: lattice follows the touch both ways (bids above origin,
+    /// asks below). The proven LOSING mode; off by default. Overrides
+    /// chase_to_avg.
+    #[serde(default)]
+    pub chase: bool,
     /// Take-profit trigger: favorable move past avg_entry in bps (100 = 1%).
     /// `0` (default) = off.
     #[serde(default)]
@@ -704,6 +709,10 @@ pub struct WaveAutoConfig {
     pub refill_threshold: u32,
     #[serde(default = "wave_auto_default_chase_to_avg")]
     pub chase_to_avg: bool,
+    /// Market-chase (lattice follows the touch both ways). The LOSING mode;
+    /// `false` (default). Forwarded to every spawned Wave bot.
+    #[serde(default)]
+    pub chase: bool,
     /// Optional explicit allowlist — when non-empty, only these symbols are
     /// scored (filters still apply). Empty (default) = free discovery.
     #[serde(default)]
