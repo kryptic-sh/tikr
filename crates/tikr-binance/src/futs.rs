@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::errors::{is_cancel_idempotent, parse_binance_error_code};
 use crate::exchange_info::ExchangeInfoResponse;
+use crate::http::{read_json, read_typed};
 use crate::sign::{BinanceKeyMaterial, append_auth_dispatch};
 
 /// USD-M futures account balance values for one margin asset.
@@ -134,14 +135,7 @@ pub async fn place_order(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -198,14 +192,7 @@ pub async fn place_market_order(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -245,14 +232,7 @@ pub async fn cancel_order(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(code) = extract_error_code(&body) {
         if is_cancel_idempotent(code) {
             return Ok(());
@@ -286,14 +266,7 @@ pub async fn cancel_all_orders(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(code) = extract_error_code(&body) {
         if is_cancel_idempotent(code) {
             return Ok(());
@@ -329,14 +302,7 @@ pub async fn update_leverage(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -352,7 +318,7 @@ pub async fn get_exchange_info(
 ) -> Result<ExchangeInfoResponse, VenueError> {
     let url = format!("{base_url}/fapi/v1/exchangeInfo");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let info: ExchangeInfoResponse = resp.json().await.map_err(internal_err)?;
+    let info: ExchangeInfoResponse = read_typed(resp).await?;
     Ok(info)
 }
 
@@ -363,13 +329,7 @@ pub async fn get_24hr_tickers(
 ) -> Result<Vec<FuturesTicker24h>, VenueError> {
     let url = format!("{base_url}/fapi/v1/ticker/24hr");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -448,7 +408,7 @@ pub async fn list_perp_tick_info(
     // 2. ticker/price for current prices.
     let url = format!("{base_url}/fapi/v1/ticker/price");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     let arr = body.as_array().ok_or_else(|| {
         VenueError::Internal(Box::new(std::io::Error::other(
             "ticker/price: expected array",
@@ -550,13 +510,7 @@ pub async fn get_all_book_tickers(
     use std::str::FromStr;
     let url = format!("{base_url}/fapi/v1/ticker/bookTicker");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -604,7 +558,7 @@ pub async fn list_perp_wave_info(
 
     let url = format!("{base_url}/fapi/v1/ticker/price");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     let arr = body.as_array().ok_or_else(|| {
         VenueError::Internal(Box::new(std::io::Error::other(
             "ticker/price: expected array",
@@ -700,13 +654,7 @@ pub async fn get_book_ticker(
 ) -> Result<FuturesBookTicker, VenueError> {
     let url = format!("{base_url}/fapi/v1/ticker/bookTicker?symbol={symbol}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -736,13 +684,7 @@ pub async fn get_1m_closes(
     let limit = limit.clamp(2, 100);
     let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -781,13 +723,7 @@ pub async fn get_1m_avg_candle_pct(
     let limit = limit.clamp(1, 100);
     let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -860,14 +796,7 @@ pub async fn get_open_orders(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -929,14 +858,7 @@ pub async fn get_position_amount(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -980,14 +902,7 @@ pub async fn get_position_risk(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -1052,14 +967,7 @@ pub async fn get_user_trades(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -1147,14 +1055,7 @@ pub async fn get_balance(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -1209,13 +1110,7 @@ pub async fn get_fee_burn_status(
         .send()
         .await
         .map_err(network_err)?;
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -1256,14 +1151,7 @@ pub async fn get_commission_rate(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
         return Err(err);
     }
@@ -1304,10 +1192,6 @@ fn try_parse_error(body: &Value) -> Option<VenueError> {
 
 pub(crate) fn network_err(e: reqwest::Error) -> VenueError {
     VenueError::Network(std::io::Error::other(e.to_string()))
-}
-
-pub(crate) fn internal_err(e: reqwest::Error) -> VenueError {
-    VenueError::Internal(Box::new(e))
 }
 
 #[cfg(test)]

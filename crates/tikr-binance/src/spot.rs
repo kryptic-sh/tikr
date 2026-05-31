@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::errors::{is_cancel_idempotent, parse_binance_error_code};
 use crate::exchange_info::ExchangeInfoResponse;
+use crate::http::{read_json, read_typed};
 use crate::sign::{BinanceKeyMaterial, append_auth_dispatch};
 
 // ---------------------------------------------------------------------------
@@ -101,14 +102,7 @@ pub async fn place_order(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -148,14 +142,7 @@ pub async fn cancel_order(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     if let Some(code) = extract_error_code(&body) {
         if is_cancel_idempotent(code) {
             return Ok(());
@@ -189,14 +176,7 @@ pub async fn cancel_all_orders(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body: Value = read_json(resp).await?;
     // cancel_all returns an array of canceled orders; a non-array is an error.
     if let Some(code) = extract_error_code(&body) {
         // -2011/-2013 on bulk cancel = no open orders → idempotent success.
@@ -218,7 +198,7 @@ pub async fn get_exchange_info(
 ) -> Result<ExchangeInfoResponse, VenueError> {
     let url = format!("{base_url}/api/v3/exchangeInfo");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let info: ExchangeInfoResponse = resp.json().await.map_err(internal_err)?;
+    let info: ExchangeInfoResponse = read_typed(resp).await?;
     Ok(info)
 }
 
@@ -233,8 +213,4 @@ fn extract_error_code(body: &Value) -> Option<i32> {
 
 pub(crate) fn network_err(e: reqwest::Error) -> VenueError {
     VenueError::Network(std::io::Error::other(e.to_string()))
-}
-
-pub(crate) fn internal_err(e: reqwest::Error) -> VenueError {
-    VenueError::Internal(Box::new(e))
 }

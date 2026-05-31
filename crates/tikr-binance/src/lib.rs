@@ -47,6 +47,9 @@ pub mod errors;
 pub mod exchange_info;
 /// USD-M Futures REST endpoint wrappers (`/fapi/v1/...`).
 pub mod futs;
+/// Shared REST response handling: status mapping, rate-limit / `Retry-After`,
+/// and used-weight tracking.
+pub mod http;
 pub mod liquidation_stream;
 pub mod mark_price_stream;
 pub mod sign;

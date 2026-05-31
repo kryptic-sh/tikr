@@ -46,8 +46,9 @@ pub fn parse_binance_error_code(code: i32, msg: &str) -> VenueError {
             reason: format!("post-only order would have crossed (code {code}): {msg}"),
         },
 
-        // Rate-limit hit (HTTP 429 / 418 mapped here for completeness).
-        -1003 => VenueError::RateLimited {
+        // Rate-limit hit. -1003 = too many requests (weight); -1015 = too many
+        // orders (order-rate limit). Both signal "back off".
+        -1003 | -1015 => VenueError::RateLimited {
             retry_after_ms: 1000,
         },
 
