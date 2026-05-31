@@ -378,7 +378,10 @@ impl Tidal {
             (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
             _ => return (0, 0),
         };
-        let pos_notional = ctx.position.size.0 * mid;
+        // Cost basis (avg_entry) for the cap-ratio, matching the hard cap.
+        let avg = ctx.position.avg_entry.0;
+        let cap_price = if avg > Decimal::ZERO { avg } else { mid };
+        let pos_notional = ctx.position.size.0 * cap_price;
         let ratio = (pos_notional.abs() / cap).min(Decimal::ONE);
         let skew = (ratio * Decimal::from(skew_max))
             .round()
@@ -580,7 +583,10 @@ impl Strategy for Tidal {
         // role thrash near zero. Long → asks reduce / bids accumulate. Short →
         // bids reduce / asks accumulate. Flat → both accumulate (patient).
         let one_order = self.config.notional_per_order;
-        let pos_notional = pos * mid;
+        // Value the bag at COST BASIS (avg_entry), not mark — the cap below
+        // bounds capital deployed, and a marked-down loser must not release it.
+        let cap_price = if avg > Decimal::ZERO { avg } else { mid };
+        let pos_notional = pos * cap_price;
         let long = pos_notional >= one_order;
         let short = pos_notional <= -one_order;
 

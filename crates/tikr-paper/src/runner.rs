@@ -1072,12 +1072,22 @@ where
 
                 // Bot-side worst-case inventory cap (order-placement logic for
                 // the bot's own wallet limit; the exchange margin backstop is
-                // simulated separately in FillSim). Value the position at mark,
-                // falling back to book mid then last mid.
-                let cap_price = if last_mark.0 > Decimal::ZERO {
+                // simulated separately in FillSim). Value the position at COST
+                // BASIS (avg_entry) so the cap bounds capital actually DEPLOYED,
+                // not its mark-to-market value. With mark, a losing long marked
+                // down shrinks the notional → releases the cap → the bot buys
+                // deeper into the drop, over-accumulating the loser. Cost basis
+                // binds on what was paid. Fall back to mark only when the entry
+                // is unknown (shouldn't happen with a non-zero position).
+                let mark_price = if last_mark.0 > Decimal::ZERO {
                     last_mark.0
                 } else {
                     snapshot_mid(&current_book).unwrap_or(last_mid.0)
+                };
+                let cap_price = if pos.avg_entry.0 > Decimal::ZERO {
+                    pos.avg_entry.0
+                } else {
+                    mark_price
                 };
                 let signed_pos_notional = pos.size.0 * cap_price;
                 // Inventory-aware order-size boost runs BEFORE the cap: it only

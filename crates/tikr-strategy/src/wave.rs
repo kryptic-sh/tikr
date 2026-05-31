@@ -470,7 +470,10 @@ impl Wave {
             (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
             _ => return (0, 0),
         };
-        let pos_notional = ctx.position.size.0 * mid;
+        // Cost basis (avg_entry) for the cap-ratio, matching the hard cap.
+        let avg = ctx.position.avg_entry.0;
+        let cap_price = if avg > Decimal::ZERO { avg } else { mid };
+        let pos_notional = ctx.position.size.0 * cap_price;
         let ratio = (pos_notional.abs() / cap).min(Decimal::ONE);
         let skew = (ratio * Decimal::from(skew_max))
             .round()
@@ -804,9 +807,17 @@ impl Strategy for Wave {
                 // Hard position cap: when over the cap, suppress the side
                 // that would add to inventory (longs → no bids, shorts → no
                 // asks). Resting orders stay put to catch the reversion.
+                // Value the bag at COST BASIS (avg_entry), not mark, so the cap
+                // bounds capital deployed — a losing bag marked down must not
+                // release the cap and let the adding side over-accumulate.
                 let pos = ctx.position.size.0;
                 let cap = self.config.max_position_usdt;
-                let pos_notional = pos * mid;
+                let cap_price = if avg_entry > Decimal::ZERO {
+                    avg_entry
+                } else {
+                    mid
+                };
+                let pos_notional = pos * cap_price;
                 let suppress_bids = cap > Decimal::ZERO && pos_notional > cap;
                 let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
                 if !suppress_bids {
