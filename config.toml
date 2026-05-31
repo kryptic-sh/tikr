@@ -41,10 +41,10 @@ inventory_boost_curve = "1"
 
 [wave_auto]
 enabled = true
-min_volume_usdt = "200000" # $200K 24h quote volume floor (liquidity + bounds kline calls)
-candle_count = 60          # average the last 60 one-minute candles (~1h window)
-min_candle_pct = "0"       # min avg candle height % to qualify (0 = no floor)
-top_n = 10                 # run Wave on the 5 highest-scored symbols
+min_volume_usdt = "2000000" # $2M 24h quote volume floor (liquidity + bounds kline calls)
+candle_count = 60           # average the last 60 one-minute candles (~1h window)
+min_candle_pct = "0"        # min avg candle height % to qualify (0 = no floor)
+top_n = 10                  # run Wave on the 5 highest-scored symbols
 recheck_interval_secs = 60
 quote_asset = "USDT"
 # defer_underwater defaults true (don't rotate a bot holding a losing bag).
