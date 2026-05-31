@@ -204,10 +204,7 @@ pub fn spawn_wave_auto_manager(
                     let _ = bot.shutdown_tx.send(true);
                     let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
                     flatten_symbols(std::slice::from_ref(&symbol), &account).await;
-                    shared_state.set_status(
-                        &symbol,
-                        BotStatus::Crashed("rotated out: flat/green".into()),
-                    );
+                    shared_state.set_status(&symbol, BotStatus::Rotated);
                     // Start the retirement clock — its [off] tab lingers up to
                     // RETIRE_AFTER_CYCLES rechecks before we drop it.
                     retired.insert(symbol.clone(), 0);

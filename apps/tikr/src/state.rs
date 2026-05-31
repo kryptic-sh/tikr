@@ -51,6 +51,9 @@ pub enum BotStatus {
     Crashed(String),
     /// Sleeping before next respawn (carries human-readable delay).
     Restarting(String),
+    /// Intentionally stopped by an auto-manager (rotated out / removed) — not a
+    /// fault. Lingers in the dashboard for a few cycles before GC.
+    Rotated,
 }
 
 impl BotStatus {
@@ -62,6 +65,7 @@ impl BotStatus {
             Self::Running => "on",
             Self::Crashed(_) => "off",
             Self::Restarting(_) => "restarting",
+            Self::Rotated => "off",
         }
     }
 }
@@ -457,6 +461,8 @@ pub struct AccountAggregate {
     pub restarting_count: usize,
     /// Count of bots in `Starting` state.
     pub starting_count: usize,
+    /// Count of bots intentionally rotated out (`Rotated` state) — not faults.
+    pub rotated_count: usize,
 }
 
 impl AccountAggregate {
@@ -469,6 +475,7 @@ impl AccountAggregate {
                 BotStatus::Crashed(_) => a.crashed_count += 1,
                 BotStatus::Restarting(_) => a.restarting_count += 1,
                 BotStatus::Starting => a.starting_count += 1,
+                BotStatus::Rotated => a.rotated_count += 1,
             }
             if let Some(ref r) = v.snapshot {
                 a.realized += r.realized.0;

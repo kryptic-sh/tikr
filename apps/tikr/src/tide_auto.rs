@@ -163,10 +163,7 @@ pub fn spawn_tide_auto_manager(
                     let _ = bot.shutdown_tx.send(true);
                     let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
                     flatten_symbols(std::slice::from_ref(&symbol), &account).await;
-                    shared_state.set_status(
-                        &symbol,
-                        BotStatus::Crashed("removed: tick_bps below threshold".into()),
-                    );
+                    shared_state.set_status(&symbol, BotStatus::Rotated);
                 }
             }
         }

@@ -851,6 +851,7 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
             BotStatus::Crashed(_) => (Color::Red, v.status.tag()),
             BotStatus::Restarting(_) => (Color::Yellow, v.status.tag()),
             BotStatus::Starting => (Color::Cyan, v.status.tag()),
+            BotStatus::Rotated => (Color::Green, v.status.tag()),
         };
         let active = i == ui.active_tab;
         let label = format!(" {} ({}) [{}] ", v.symbol, v.strategy, tag);
@@ -987,6 +988,8 @@ fn draw_account(
         Span::raw(format!("{}", agg.restarting_count)),
         Span::styled("   ↑   ", Style::default().fg(Color::Cyan)),
         Span::raw(format!("{}", agg.starting_count)),
+        Span::styled("   ⏸   ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{}", agg.rotated_count)),
     ]));
     lines.push(Line::from(""));
     lines.push(kv_line(
@@ -1624,6 +1627,7 @@ fn draw_bot_detail(
         BotStatus::Starting => ("starting".to_string(), Color::Cyan),
         BotStatus::Crashed(why) => (format!("crashed: {why}"), Color::Red),
         BotStatus::Restarting(when) => (format!("restart {when}"), Color::Yellow),
+        BotStatus::Rotated => ("rotated".to_string(), Color::Green),
     };
     lines.push(kv_line(
         "status",
