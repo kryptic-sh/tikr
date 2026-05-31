@@ -87,13 +87,16 @@ pub fn spawn_wave_auto_manager(
                 _ = tick.tick() => {}
                 _ = global_shutdown.changed() => {
                     if *global_shutdown.borrow() {
-                        info!("wave_auto: global shutdown — flushing all bots");
-                        let symbols: Vec<String> = active.keys().cloned().collect();
+                        // Stop the bots but leave their resting orders AND open
+                        // positions UNTOUCHED on shutdown — no cancel, no
+                        // flatten. Positions persist across restarts; the next
+                        // start cancels the orphan orders (clear_on_start=false)
+                        // and resumes managing the inherited position.
+                        info!("wave_auto: global shutdown — stopping bots (orders + positions left intact)");
                         for (_, bot) in active.drain() {
                             let _ = bot.shutdown_tx.send(true);
                             let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
                         }
-                        flatten_symbols(&symbols, &account).await;
                         return;
                     }
                 }
@@ -399,7 +402,10 @@ fn spawn_one_bot(
             notional_rx: account.notional_rx.clone(),
             max_position_rx: account.max_position_rx.clone(),
             bnb_price_rx: account.bnb_price_rx.clone(),
-            clear_on_start: true,
+            // Restart cancels orphan orders but PRESERVES the open position
+            // (clear_on_start=true would flatten). A symbol that re-enters the
+            // top set after a restart resumes managing its inherited bag.
+            clear_on_start: false,
         },
         shared_state.clone(),
         shutdown_rx,
