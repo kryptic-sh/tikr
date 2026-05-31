@@ -84,6 +84,10 @@ enum LogView {
 /// UI state owned by the render loop.
 struct UiState {
     active_tab: usize,
+    /// Symbol of the selected tab, tracked across frames so the selection
+    /// follows its bot as the tab list changes (bots rotate in/out). When the
+    /// selected symbol is removed, the selection falls back to the first tab.
+    active_symbol: Option<String>,
     tab_scroll: usize,
     /// Log viewport mode + anchor.
     log_view: LogView,
@@ -139,6 +143,7 @@ impl UiState {
         let keymap = build_keymap();
         Self {
             active_tab: 0,
+            active_symbol: None,
             tab_scroll: 0,
             log_view: LogView::Follow,
             last_tab_rect: None,
@@ -269,10 +274,24 @@ pub fn run(
             // wasn't marked dirty, so live PnL / log lines flow.
             if dirty || last_draw.elapsed() >= frame {
                 let views = state.views();
-                if ui.active_tab >= views.len() && !views.is_empty() {
-                    ui.active_tab = views.len() - 1;
+                // Selection follows its SYMBOL (navigation keeps active_symbol
+                // in sync), so it survives tab re-sorts (a bot flipping on↔off
+                // moves groups) and removals: follow the symbol to its current
+                // index, or fall back to the first tab if it's gone (e.g. the
+                // off-bot GC dropped the active tab).
+                match ui
+                    .active_symbol
+                    .as_deref()
+                    .and_then(|s| views.iter().position(|v| v.symbol == s))
+                {
+                    Some(idx) => ui.active_tab = idx,
+                    None => ui.active_tab = 0,
+                }
+                if ui.active_tab >= views.len() {
+                    ui.active_tab = 0;
                 }
                 let active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
+                ui.active_symbol = active_symbol.clone();
                 let log_lines = active_symbol
                     .as_deref()
                     .map(|s| logs.snapshot_merged(s))
@@ -385,6 +404,16 @@ fn to_hjkl_key(k: &crossterm::event::KeyEvent) -> Option<hjkl_keymap::KeyEvent> 
     Some(hjkl_keymap::KeyEvent::new(code, mods))
 }
 
+/// Index of the currently-selected symbol in `views` (which may have re-sorted
+/// since the last render). Falls back to the clamped `active_tab`. `views` must
+/// be non-empty.
+fn current_tab_index(views: &[BotViewSnapshot], ui: &UiState) -> usize {
+    ui.active_symbol
+        .as_deref()
+        .and_then(|s| views.iter().position(|v| v.symbol == s))
+        .unwrap_or_else(|| ui.active_tab.min(views.len() - 1))
+}
+
 fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mut UiState) -> bool {
     match action {
         NormalAction::EnterEx => {
@@ -393,11 +422,15 @@ fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mu
             };
         }
         NormalAction::TabPrev if !views.is_empty() => {
-            ui.active_tab = (ui.active_tab + views.len().saturating_sub(1)) % views.len();
+            let cur = current_tab_index(views, ui);
+            ui.active_tab = (cur + views.len() - 1) % views.len();
+            ui.active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
             ui.log_view = LogView::Follow;
         }
         NormalAction::TabNext if !views.is_empty() => {
-            ui.active_tab = (ui.active_tab + 1) % views.len();
+            let cur = current_tab_index(views, ui);
+            ui.active_tab = (cur + 1) % views.len();
+            ui.active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
             ui.log_view = LogView::Follow;
         }
         NormalAction::LeaderPicker => {
@@ -485,6 +518,7 @@ fn handle_key(
                 KeyCode::Enter => {
                     if let Some((idx, _, _)) = filtered.get(*selected) {
                         ui.active_tab = *idx;
+                        ui.active_symbol = views.get(*idx).map(|v| v.symbol.clone());
                         ui.log_view = LogView::Follow;
                     }
                     ui.mode = ModeState::Normal;
@@ -591,6 +625,7 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
                 && idx < views.len()
             {
                 ui.active_tab = idx;
+                ui.active_symbol = views.get(idx).map(|v| v.symbol.clone());
                 ui.log_view = LogView::Follow;
             } else if ui.in_account_pane(mev.column, mev.row)
                 && let Some(sym) = ui.per_symbol_rows.iter().find_map(|(row, s)| {
@@ -603,6 +638,7 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
                 && let Some(idx) = views.iter().position(|v| v.symbol == sym)
             {
                 ui.active_tab = idx;
+                ui.active_symbol = views.get(idx).map(|v| v.symbol.clone());
                 ui.log_view = LogView::Follow;
             }
         }

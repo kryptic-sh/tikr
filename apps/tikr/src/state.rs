@@ -317,7 +317,7 @@ impl SharedBotState {
             Err(_) => return Vec::new(),
         };
         let hist = self.history.read().ok();
-        order
+        let mut out: Vec<BotViewSnapshot> = order
             .into_iter()
             .filter_map(|sym| {
                 let v = map.get(&sym)?;
@@ -333,7 +333,16 @@ impl SharedBotState {
                     history,
                 })
             })
-            .collect()
+            .collect();
+        // Tab order: ON (Running) bots first, then everything else; alphabetical
+        // by symbol within each group. Stable sort keeps it deterministic.
+        out.sort_by(|a, b| {
+            let on = |s: &BotStatus| !matches!(s, BotStatus::Running);
+            on(&a.status)
+                .cmp(&on(&b.status))
+                .then_with(|| a.symbol.cmp(&b.symbol))
+        });
+        out
     }
 
     /// Symbols currently known to the dashboard state.
