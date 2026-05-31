@@ -34,7 +34,7 @@ env = "futures-mainnet"
 state_dir = "./state/wave-auto"
 asset = "USDT"
 order_balance_pct = "0.1"
-max_position_pct = "70"
+max_position_pct = "20"
 leverage = 5
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
@@ -44,14 +44,14 @@ enabled = true
 min_volume_usdt = "1000000" # $1M 24h quote volume floor (liquidity + bounds kline calls)
 candle_count = 60           # average the last 60 one-minute candles (~1h window)
 min_candle_pct = "0"        # min avg candle height % to qualify (0 = no floor)
-top_n = 4                   # run Wave on the 5 highest-scored symbols
+top_n = 10                  # run Wave on the 5 highest-scored symbols
 recheck_interval_secs = 60
 quote_asset = "USDT"
 # defer_underwater defaults true (don't rotate a bot holding a losing bag).
 # Forwarded to every spawned Wave bot.
 grid_levels = 10
 refill_threshold = 5
-step_bps = 10
+step_bps = 20
 inner_steps = 0
 chase_to_avg = true
 chase = false
