@@ -28,6 +28,11 @@ pub struct DashboardConfig {
     /// needed — symbols are auto-discovered.
     #[serde(default)]
     pub tide_auto: Option<TideAutoConfig>,
+    /// Optional Wave auto-rotation: discovers USD-M perps in the GUN-like
+    /// regime (volatile + wide-spread + mean-reverting + liquid), scores them,
+    /// and runs Wave on the top N. No bot list needed.
+    #[serde(default)]
+    pub wave_auto: Option<WaveAutoConfig>,
     /// Optional MEXC spot accumulator (bagboy). Places a single
     /// resting LIMIT BUY at best_bid for the configured symbol,
     /// refills on fill, refreshes when book moves. Pure accumulator —
@@ -649,6 +654,92 @@ fn tide_auto_default_grid_levels() -> u32 {
 }
 fn tide_auto_default_quote_asset() -> String {
     "USDT".to_string()
+}
+
+/// `[wave_auto]` — Wave auto-rotation. Scores every liquid USD-M perp by
+/// RECENT PRICE ACTION — the average height of the last `candle_count`
+/// 1-minute candles, as a percent: `mean((high − low) / low × 100)` (wicks
+/// included). Big 1-minute candles = lots of intra-minute oscillation for the
+/// grid to bank, and a far more responsive signal than 24h aggregates (it
+/// catches a market that JUST woke up, like GUN). A symbol qualifies when
+/// `24h quote volume ≥ min_volume_usdt` (liquidity + bounds the kline calls)
+/// and its avg candle % `≥ min_candle_pct`. The top `top_n` by candle score
+/// run Wave; on recheck, symbols that fall out are shut down + flattened
+/// (unless holding an underwater bag — see `defer_underwater`).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct WaveAutoConfig {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum 24h quote volume to qualify (liquidity floor; also bounds how
+    /// many symbols we fetch klines for). Default `$20M`.
+    #[serde(default = "tide_auto_default_min_volume_usdt")]
+    pub min_volume_usdt: Decimal,
+    /// Number of recent 1-minute candles to average for the score. Default `5`.
+    #[serde(default = "wave_auto_default_candle_count")]
+    pub candle_count: u32,
+    /// Minimum avg candle height (percent) to qualify. Floors out flat
+    /// markets that pass the volume gate. `0` (default) = no floor.
+    #[serde(default)]
+    pub min_candle_pct: Decimal,
+    /// How many top-scored symbols to run concurrently. Default `5`.
+    #[serde(default = "wave_auto_default_top_n")]
+    pub top_n: usize,
+    /// How often to re-discover + re-rank (seconds). Clamped to ≥ 10s.
+    /// Default `60`.
+    #[serde(default = "tide_auto_default_recheck_interval_secs")]
+    pub recheck_interval_secs: u64,
+    /// Quote asset to filter on. Default `"USDC"` (matches the live wave acct).
+    #[serde(default = "wave_auto_default_quote_asset")]
+    pub quote_asset: String,
+    /// Forwarded to every spawned Wave bot. Defaults match the tuned config.
+    #[serde(default = "wave_default_grid_levels")]
+    pub grid_levels: u32,
+    #[serde(default = "wave_auto_default_step_bps")]
+    pub step_bps: u32,
+    #[serde(default = "wave_auto_default_inner_steps")]
+    pub inner_steps: u32,
+    #[serde(default = "wave_default_refill_threshold")]
+    pub refill_threshold: u32,
+    #[serde(default = "wave_auto_default_chase_to_avg")]
+    pub chase_to_avg: bool,
+    /// Optional explicit allowlist — when non-empty, only these symbols are
+    /// scored (filters still apply). Empty (default) = free discovery.
+    #[serde(default)]
+    pub symbols_allowlist: Vec<String>,
+    /// When `true` (default), do NOT rotate a symbol out of the live set while
+    /// its bot is holding an UNDERWATER bag (unrealized < 0, above dust). The
+    /// bot keeps running — its grid + chase_to_avg work the bag off — and it
+    /// only rotates once flat or green. Prevents rotation from crystallizing a
+    /// loss on a bag that, on these mean-reverting markets, usually recovers.
+    /// A deferred symbol holds its slot (total active stays ≤ `top_n`), so a
+    /// stuck bag delays — but never realizes a loss for — a new entrant.
+    #[serde(default = "wave_auto_default_defer_underwater")]
+    pub defer_underwater: bool,
+}
+
+fn wave_auto_default_defer_underwater() -> bool {
+    true
+}
+
+fn wave_auto_default_candle_count() -> u32 {
+    5
+}
+fn wave_auto_default_top_n() -> usize {
+    5
+}
+fn wave_auto_default_quote_asset() -> String {
+    "USDC".to_string()
+}
+fn wave_auto_default_step_bps() -> u32 {
+    10
+}
+fn wave_auto_default_inner_steps() -> u32 {
+    2
+}
+fn wave_auto_default_chase_to_avg() -> bool {
+    true
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

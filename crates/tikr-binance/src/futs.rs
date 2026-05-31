@@ -59,6 +59,12 @@ pub struct FuturesTicker24h {
     pub price_change_percent_abs: tikr_core::Decimal,
     /// 24h quote volume.
     pub quote_volume: tikr_core::Decimal,
+    /// 24h high price.
+    pub high_price: tikr_core::Decimal,
+    /// 24h low price.
+    pub low_price: tikr_core::Decimal,
+    /// 24h volume-weighted average price (used as the range denominator).
+    pub weighted_avg_price: tikr_core::Decimal,
 }
 
 /// USD-M futures best bid/ask for one symbol.
@@ -383,15 +389,20 @@ pub async fn get_24hr_tickers(
             .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
             .unwrap_or_default()
             .abs();
-        let quote_volume = row
-            .get("quoteVolume")
-            .and_then(Value::as_str)
-            .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
-            .unwrap_or_default();
+        let dec = |key: &str| {
+            row.get(key)
+                .and_then(Value::as_str)
+                .and_then(|s| <tikr_core::Decimal as std::str::FromStr>::from_str(s).ok())
+                .unwrap_or_default()
+        };
+        let quote_volume = dec("quoteVolume");
         out.push(FuturesTicker24h {
             symbol: symbol.to_string(),
             price_change_percent_abs: pct,
             quote_volume,
+            high_price: dec("highPrice"),
+            low_price: dec("lowPrice"),
+            weighted_avg_price: dec("weightedAvgPrice"),
         });
     }
     Ok(out)
@@ -475,6 +486,13 @@ pub async fn list_perp_tick_info(
         if sym_raw.status.as_deref() != Some("TRADING") {
             continue;
         }
+        // Skip non-ASCII / non-alphanumeric symbols (e.g. CJK gimmick
+        // listings). Their multi-byte bytes break the request signer's query
+        // string → every signed request fails with -1022, and they're not
+        // worth auto-trading anyway.
+        if !symbol.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
         let Some(meta) = symbol_meta.get(symbol) else {
             continue;
         };
@@ -495,6 +513,180 @@ pub async fn list_perp_tick_info(
             tick_size: meta.tick_size,
             tick_bps,
             quote_volume_24h,
+        });
+    }
+    Ok(out)
+}
+
+/// One USD-M perp symbol scored for Wave's preferred regime: volatile,
+/// wide-spread, mean-reverting, liquid. Produced by [`list_perp_wave_info`].
+#[derive(Debug, Clone)]
+pub struct PerpWaveInfo {
+    /// Binance symbol.
+    pub symbol: String,
+    /// Last/mid price snapshot.
+    pub price: tikr_core::Decimal,
+    /// Venue tick size.
+    pub tick_size: tikr_core::Decimal,
+    /// Live book spread in bps of mid: `(ask − bid) / mid × 10000`.
+    pub spread_bps: tikr_core::Decimal,
+    /// 24h range as a percent of the weighted-avg price:
+    /// `(high − low) / weightedAvg × 100`. Oscillation amplitude.
+    pub range_pct: tikr_core::Decimal,
+    /// 24h absolute net price-change percent. Range ≫ this = mean-reverting.
+    pub change_pct_abs: tikr_core::Decimal,
+    /// 24h quote volume — liquidity floor.
+    pub quote_volume_24h: tikr_core::Decimal,
+}
+
+/// Fetch best bid/ask for ALL USD-M futures symbols in one call
+/// (`/fapi/v1/ticker/bookTicker` with no symbol → array). Returns a map of
+/// `symbol → (bid, ask)`.
+pub async fn get_all_book_tickers(
+    http: &HttpClient,
+    base_url: &str,
+) -> Result<std::collections::HashMap<String, (tikr_core::Decimal, tikr_core::Decimal)>, VenueError>
+{
+    use std::str::FromStr;
+    let url = format!("{base_url}/fapi/v1/ticker/bookTicker");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "ticker/bookTicker: expected array",
+        )))
+    })?;
+    let mut out = std::collections::HashMap::new();
+    for row in arr {
+        let Some(symbol) = row.get("symbol").and_then(Value::as_str) else {
+            continue;
+        };
+        let bid = row
+            .get("bidPrice")
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok());
+        let ask = row
+            .get("askPrice")
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok());
+        if let (Some(b), Some(a)) = (bid, ask) {
+            out.insert(symbol.to_string(), (b, a));
+        }
+    }
+    Ok(out)
+}
+
+/// Discover USD-M PERPETUAL `quote_asset`-quoted symbols scored for Wave's
+/// preferred regime. Joins exchangeInfo (tick) + ticker/price + 24hr ticker
+/// (range / net-change / volume) + the all-symbols bookTicker (live spread).
+/// Four REST calls total. Caller applies the score + filters.
+pub async fn list_perp_wave_info(
+    http: &HttpClient,
+    base_url: &str,
+    quote_asset: &str,
+) -> Result<Vec<PerpWaveInfo>, VenueError> {
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    let info = get_exchange_info(http, base_url).await?;
+    let parsed = crate::exchange_info::parse_exchange_info(&info);
+    let symbol_meta: HashMap<String, &crate::exchange_info::SymbolFilters> =
+        parsed.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+    let url = format!("{base_url}/fapi/v1/ticker/price");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "ticker/price: expected array",
+        )))
+    })?;
+    let prices: HashMap<String, tikr_core::Decimal> = arr
+        .iter()
+        .filter_map(|row| {
+            let symbol = row.get("symbol").and_then(Value::as_str)?;
+            let price = row
+                .get("price")
+                .and_then(Value::as_str)
+                .and_then(|s| tikr_core::Decimal::from_str(s).ok())?;
+            Some((symbol.to_string(), price))
+        })
+        .collect();
+
+    let tickers = get_24hr_tickers(http, base_url).await?;
+    let ticker_map: HashMap<String, FuturesTicker24h> =
+        tickers.into_iter().map(|t| (t.symbol.clone(), t)).collect();
+    let books = get_all_book_tickers(http, base_url).await?;
+
+    let hundred = tikr_core::Decimal::from(100);
+    let ten_k = tikr_core::Decimal::from(10_000);
+    let mut out = Vec::new();
+    for sym_raw in &info.symbols {
+        let symbol = &sym_raw.symbol;
+        if sym_raw.quote_asset.as_deref() != Some(quote_asset) {
+            continue;
+        }
+        if sym_raw.contract_type.as_deref() != Some("PERPETUAL") {
+            continue;
+        }
+        if sym_raw.status.as_deref() != Some("TRADING") {
+            continue;
+        }
+        // Skip non-ASCII / non-alphanumeric symbols (e.g. CJK gimmick
+        // listings). Their multi-byte bytes break the request signer's query
+        // string → every signed request fails with -1022, and they're not
+        // worth auto-trading anyway.
+        if !symbol.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let Some(meta) = symbol_meta.get(symbol) else {
+            continue;
+        };
+        let Some(price) = prices.get(symbol).copied() else {
+            continue;
+        };
+        if price <= tikr_core::Decimal::ZERO || meta.tick_size <= tikr_core::Decimal::ZERO {
+            continue;
+        }
+        let Some(t) = ticker_map.get(symbol) else {
+            continue;
+        };
+        // Range %: prefer the weighted-avg denominator, fall back to price.
+        let denom = if t.weighted_avg_price > tikr_core::Decimal::ZERO {
+            t.weighted_avg_price
+        } else {
+            price
+        };
+        let range_pct = if t.high_price > t.low_price && denom > tikr_core::Decimal::ZERO {
+            (t.high_price - t.low_price) / denom * hundred
+        } else {
+            tikr_core::Decimal::ZERO
+        };
+        // Live spread bps from the all-symbols bookTicker.
+        let spread_bps = match books.get(symbol) {
+            Some((bid, ask)) if *ask > *bid && *bid > tikr_core::Decimal::ZERO => {
+                let mid = (*bid + *ask) / tikr_core::Decimal::from(2);
+                (*ask - *bid) / mid * ten_k
+            }
+            _ => tikr_core::Decimal::ZERO,
+        };
+        out.push(PerpWaveInfo {
+            symbol: symbol.clone(),
+            price,
+            tick_size: meta.tick_size,
+            spread_bps,
+            range_pct,
+            change_pct_abs: t.price_change_percent_abs,
+            quote_volume_24h: t.quote_volume,
         });
     }
     Ok(out)
@@ -572,6 +764,65 @@ pub async fn get_1m_closes(
         }
     }
     Ok(closes)
+}
+
+/// Average full candle height over the last `limit` 1m candles, as a percent:
+/// the mean of `(high − low) / low × 100`. `high`/`low` are the kline extremes,
+/// so the wicks are included. A direct, responsive measure of recent
+/// intra-minute volatility — large = big 1-minute swings, lots of oscillation
+/// for a grid to bank. Returns `0` when no usable candles come back.
+pub async fn get_1m_avg_candle_pct(
+    http: &HttpClient,
+    base_url: &str,
+    symbol: &str,
+    limit: u32,
+) -> Result<tikr_core::Decimal, VenueError> {
+    use std::str::FromStr;
+    let limit = limit.clamp(1, 100);
+    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.as_u16() == 418 {
+        return Err(VenueError::RateLimited {
+            retry_after_ms: 1000,
+        });
+    }
+    let body: Value = resp.json().await.map_err(internal_err)?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let Some(rows) = body.as_array() else {
+        return Ok(tikr_core::Decimal::ZERO);
+    };
+    let hundred = tikr_core::Decimal::from(100);
+    let mut sum = tikr_core::Decimal::ZERO;
+    let mut n: u32 = 0;
+    for row in rows {
+        // kline cols: [openTime, open, high, low, close, volume, ...]
+        let cols = match row.as_array() {
+            Some(c) => c,
+            None => continue,
+        };
+        let high = cols
+            .get(2)
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok());
+        let low = cols
+            .get(3)
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok());
+        if let (Some(h), Some(l)) = (high, low)
+            && h > l
+            && l > tikr_core::Decimal::ZERO
+        {
+            sum += (h - l) / l * hundred;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Ok(tikr_core::Decimal::ZERO);
+    }
+    Ok(sum / tikr_core::Decimal::from(n))
 }
 
 /// Fetch the current position size for `symbol` (USD-M Perp).
