@@ -56,9 +56,11 @@ venue-agnostic, with risk limits before live capital.
 | ------------------ | ------------------------------------------------------------------------------------------ |
 | `tikr-core`        | Vocabulary types: `Price`, `Size`, `Symbol`, `Position`, `Snapshot`, `MarketEvent`, `Fill` |
 | `tikr-venue`       | `Venue` trait — abstracts over CEX orderbooks, DEX orderbooks, AMMs via quote-intent model |
-| `tikr-strategy`    | `Strategy` trait + impls (Wave, Tide, SpreadScalp, AvellanedaStoikov, GLFT, TopOfBook, …)  |
+| `tikr-strategy`    | `Strategy` trait + impls (Wave, Tide, Tidal, Hydra, Ratchet, GLFT, AvellanedaStoikov, …)   |
 | `tikr-hyperliquid` | Hyperliquid perp adapter                                                                   |
 | `tikr-binance`     | Binance Spot + USD-M Futures adapter (HMAC + Ed25519 auth, WS-API session.logon)           |
+| `tikr-bybit`       | Bybit adapter                                                                              |
+| `tikr-mexc`        | MEXC adapter                                                                               |
 | `tikr-backtest`    | Parquet replay engine + FillSim (queue-priority + cancel modeling) — library only          |
 | `tikr-record`      | Market-data recorder: Binance WS depth + trades → parquet (`record_binance` bin)           |
 | `tikr-paper`       | Paper-trading runner (live feed + simulated fills) + `compare` strategy sweep              |
@@ -130,7 +132,7 @@ cargo run --release --bin compare -- \
 # Single Wave config → machine-readable report
 cargo run --release --bin compare -- \
   --data-dir ./data --symbol BTCUSDC \
-  --wave-step-bps-list 5 --wave-inner-bps-list 5 --wave-grid-levels-list 4 \
+  --wave-step-bps-list 5 --wave-inner-steps-list 2 --wave-grid-levels-list 4 \
   --report-json ./wave.json
 ```
 
@@ -146,12 +148,44 @@ falls back to `--sim-submit-latency-ms` / `--sim-cancel-latency-ms` /
 
 ### Sample config — `config.toml`
 
-The repo's [`config.toml`](./config.toml) runs the Wave strategy (frozen
-fixed-step lattice + round-trip refill) on Binance USD-M perp futures,
-USDC-margined (0 bps maker promo). It currently holds a handful of USDC bots
-(NEAR / ZEC / WLD), each sized at `order_balance_pct` of the wallet per order
-with a `max_position_pct` cap and 5× leverage. Re-read the warning above before
-pointing it at real funds.
+The repo's [`config.toml`](./config.toml) ships in **Wave auto-rotation** mode:
+no fixed bot list. The `[wave_auto]` manager scores every liquid Binance USD-M
+perp by recent price action and runs the Wave strategy (frozen fixed-step
+lattice + round-trip refill) on the top N, re-ranking on an interval.
+
+**How the score works.** Each symbol is ranked by the average height of its last
+`candle_count` 1-minute candles, as a percent:
+`mean( (high − low) / low × 100 )`, wicks included. Big 1-minute candles mean
+lots of intra-minute oscillation for the frozen lattice to bank — the signature
+of a market that just woke up. It's a _recent_ signal, so it catches the move as
+it starts rather than diluting it in a 24h aggregate.
+
+**Each recheck** (`recheck_interval_secs`): list perps + price + 24h volume,
+pre-filter by `min_volume_usdt`, fetch the last `candle_count` 1m klines for
+each survivor (concurrent), score, and run Wave on the top `top_n` (avg candle %
+≥ `min_candle_pct`).
+
+**Rotation is graceful.** A symbol that drops out of the top N only rotates when
+its bot is flat or green. A bot holding an underwater bag keeps running until it
+recovers (`defer_underwater`, default on) — rotation never crystallizes a loss.
+On shutdown, bots cancel their open orders but leave positions intact; a restart
+re-adopts the position and only re-cancels stale orders.
+
+Key knobs:
+
+| Section       | Field                                                           | What it does                                                       |
+| ------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `[account]`   | `env` / `asset`                                                 | `futures-mainnet`, USDT-margined (USDT perps host the oscillators) |
+| `[account]`   | `order_balance_pct` / `max_position_pct`                        | per-order size + wallet-relative position cap                      |
+| `[account]`   | `leverage`                                                      | exchange margin backstop                                           |
+| `[wave_auto]` | `candle_count` / `min_candle_pct` / `top_n`                     | scoring window, qualifying floor, how many bots to run             |
+| `[wave_auto]` | `min_volume_usdt` / `quote_asset`                               | liquidity pre-filter + which quote to scan                         |
+| `[wave_auto]` | `grid_levels` / `step_bps` / `inner_steps` / `refill_threshold` | Wave lattice params forwarded to every spawned bot                 |
+| `[wave_auto]` | `chase_to_avg` / `chase`                                        | reducing-side behavior (chase toward avg entry vs. market)         |
+
+To run a **fixed bot list** instead, drop `[wave_auto]` and add `[[bots]]`
+entries (one per symbol/strategy). Re-read the warning above before pointing any
+of this at real funds.
 
 ### Run live (testnet first!)
 
