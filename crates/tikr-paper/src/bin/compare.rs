@@ -34,7 +34,8 @@ use tikr_strategy::{
     Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig,
     LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig, MicroPrice,
     MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
-    StaticGridConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
+    StaticGridConfig, Strategy, Tidal, TidalConfig, Tide, TideConfig, TopOfBook, TopOfBookConfig,
+    Wave, WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -855,6 +856,45 @@ struct Args {
     /// Wave: % of position to close on SL (100 = full). Default 100.
     #[arg(long, default_value_t = 100u32)]
     wave_sl_close_pct: u32,
+
+    // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
+    /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
+    #[arg(long, default_value = "10")]
+    tidal_step_bps_list: String,
+
+    /// Tidal sweep: comma-separated grid_levels (accumulating-side depth).
+    /// Default 10.
+    #[arg(long, default_value = "10")]
+    tidal_grid_levels_list: String,
+
+    /// Tidal: reducing-side band width (reactive exit orders). Default 6.
+    #[arg(long, default_value_t = 6u32)]
+    tidal_reduce_levels: u32,
+
+    /// Tidal: inner dead-zone in STEPS (mid → first order = inner_steps × step).
+    /// Default 2.
+    #[arg(long, default_value_t = 2u32)]
+    tidal_inner_steps: u32,
+
+    /// Tidal: accumulating-side refill batching threshold. Default 5.
+    #[arg(long, default_value_t = 5u32)]
+    tidal_refill_threshold: u32,
+
+    /// Tidal take-profit trigger: favorable move past avg_entry in bps. `0` = off.
+    #[arg(long, default_value_t = 0u32)]
+    tidal_tp_bps: u32,
+
+    /// Tidal: % of position to close on TP (100 = full).
+    #[arg(long, default_value_t = 100u32)]
+    tidal_tp_close_pct: u32,
+
+    /// Tidal stop-loss trigger: adverse move past avg_entry in bps. `0` = off.
+    #[arg(long, default_value_t = 0u32)]
+    tidal_sl_bps: u32,
+
+    /// Tidal: % of position to close on SL (100 = full).
+    #[arg(long, default_value_t = 100u32)]
+    tidal_sl_close_pct: u32,
 
     /// SpreadScalp notional per order.
     #[arg(long, default_value = "100")]
@@ -2307,6 +2347,61 @@ async fn run_sweep_collect(
                         );
                     }
                 }
+            }
+        }
+    }
+
+    // Tidal — asymmetric cadence: patient/batched accumulating side (Wave) +
+    // reactive chase-to-avg reducing side (Tide) + TP/SL.
+    if included("tidal", &allow) {
+        let tidal_steps = parse_u32_list(&args.tidal_step_bps_list)?;
+        let tidal_levels = parse_u32_list(&args.tidal_grid_levels_list)?;
+        for &levels in &tidal_levels {
+            for &step in &tidal_steps {
+                let label = format!(
+                    "Tidal lv={levels} red={} step={step}bps inner={} rt={}{}{}",
+                    args.tidal_reduce_levels,
+                    args.tidal_inner_steps,
+                    args.tidal_refill_threshold,
+                    if args.tidal_tp_bps > 0 {
+                        format!(" tp{}/{}", args.tidal_tp_bps, args.tidal_tp_close_pct)
+                    } else {
+                        String::new()
+                    },
+                    if args.tidal_sl_bps > 0 {
+                        format!(" sl{}/{}", args.tidal_sl_bps, args.tidal_sl_close_pct)
+                    } else {
+                        String::new()
+                    }
+                );
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    Tidal::new(TidalConfig {
+                        notional_per_order: wave_notional,
+                        tick_size: tick,
+                        step_size: lot_step,
+                        min_notional,
+                        grid_levels: levels,
+                        reduce_levels: args.tidal_reduce_levels,
+                        step_bps: step,
+                        inner_steps: args.tidal_inner_steps,
+                        refill_threshold: args.tidal_refill_threshold,
+                        max_position_usdt: bot_position_cap,
+                        inventory_skew_slots: 0,
+                        tp_bps: args.tidal_tp_bps,
+                        tp_close_pct: args.tidal_tp_close_pct,
+                        sl_bps: args.tidal_sl_bps,
+                        sl_close_pct: args.tidal_sl_close_pct,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
             }
         }
     }
