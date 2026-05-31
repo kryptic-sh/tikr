@@ -52,6 +52,6 @@ quote_asset = "USDT"
 grid_levels = 10
 refill_threshold = 5
 step_bps = 50
-inner_steps = 1
+inner_steps = 0
 chase_to_avg = true
 chase = false
