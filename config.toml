@@ -1,118 +1,54 @@
-# ─── Wave on USDC majors — MAINNET ────────────────────────────────────────
+# ─── Wave AUTO-rotation — MAINNET (default config) ────────────────────────
 #
-# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC. Wave = frozen fixed-step
-# lattice + round-trip refill + chase_to_avg on the reducing side. USDC
-# promo (0 bps maker).
+# No fixed bot list. The [wave_auto] manager scores every liquid USD-M perp by
+# RECENT PRICE ACTION and runs Wave on the top N. Re-ranks every recheck.
 #
-# Refill fires when EITHER a both-sides round-trip completes (bid AND ask
-# each drained ≥ refill_threshold) OR one whole side is empty (re-arm after
-# a one-sided sweep — integral, not optional). Lattice never recenters; the
-# active window slides over the fixed grid and prunes the tail.
+# Score = average height of the last `candle_count` 1-minute candles, as a
+# percent: mean( (high − low) / low × 100 ), wicks included. Big 1-minute
+# candles = lots of intra-minute oscillation for the frozen lattice to bank —
+# the GUN signature. This is a RECENT signal, so it catches a market that just
+# woke up, unlike a 24h aggregate that dilutes it.
 #
-# Geometry knobs (now matching Tide):
-#   step_bps     = spacing between levels.
-#   inner_steps  = dead-zone in STEPS (mid → first order = inner_steps × step);
-#                  0 = at touch. (Renamed from the old bps-based inner_bps.)
-#   chase_to_avg = reducing side chases past the origin toward avg_entry ∓ gap
-#                  (gap = max(inner_steps,1) × step) but never past cost; the
-#                  accumulating side stays one-sided/frozen.
+# Each recheck: list perps + price + 24h volume (cheap), pre-filter by
+# `min_volume_usdt`, then fetch the last `candle_count` 1m klines for each
+# survivor (concurrent), score, and run Wave on the top `top_n` (avg candle %
+# ≥ `min_candle_pct`).
 #
-# Tuned 2026-05-31 on data/72h (~25h slice, NEAR/ZEC/WLD/SUI), maker 0 / taker
-# 0, $1000 @ 5x, order 0.5% (~$5), max_position_pct 70, boost 0, pinned 76/27ms
-# latency, DETERMINISTIC replay (see below). Winner:
-#   levels=10 / refill_threshold=5 / step_bps=10 / inner_steps=2 / chase_to_avg.
-#   realized: NEAR +23.9, SUI +33.5, WLD +49.9, ZEC +66.4 = +173.7 (banked).
-#   net:      NEAR −17.6, SUI +33.7, WLD −3.4, ZEC +59.6 = +72.4 (incl. bag).
-#   peaks: NEAR 753, SUI 687, WLD 811, ZEC 753 (≈ the 70%-cap mark + overshoot).
-# Findings:
-#   - lv=10 / rt=5 (deeper grid, less-aggressive refill) is the NET winner: it
-#     reins in the bags vs the old lv=4/rt=2 (WLD unreal −53 vs −120, lower
-#     peaks) while keeping near-top realized. step=20 over-accumulates (WLD bag
-#     blows out to −209); step=10 banks the most round-trips. chase_to_avg ON.
-#   - Weak spot: NEAR (net −17.6) — the down-trender builds a bigger losing
-#     long in the deeper grid. An SL on NEAR would cap it (built, untested live).
-#   - DETERMINISM FIXED (biased select! in the runner): fills + realized PnL are
-#     now bit-identical across runs; only the open-bag mark-to-market tail
-#     wobbles a few $. Rank/trust by REALIZED.
-#   - Still a single ~25h TRENDING slice. Validate on a ranging window too;
-#     frozen grids change character across regimes.
+# Rotation is graceful: a symbol that drops out only rotates when its bot is
+# flat or GREEN. Holding an underwater bag? It keeps running until recovered
+# (defer_underwater, default on) — rotation never crystallizes a loss.
 #
-# BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
-# $600 @ 5x account's capacity. Do not add BTCUSDC here.
+# WHY USDT: the volatile small-cap oscillators (GUN-likes) live on USDT perps;
+# USDC perps are mostly the tight majors. Discovery scans USDT, so the futures
+# wallet needs USDT margin.
 #
-# RISK: max_position_pct 70 caps entry notional at 0.70 × balance; peaks mark
-# ~20–30% above that. Wave has no hard stop and adds into a trend, but the
-# round-trip refill + chase_to_avg keep the excursion bounded. Watch sustained
-# one-way moves; size so summed peaks stay well under buying power.
+# ⚠ Live, real money. Wave adds into a trend; big 1m candles can be a trend as
+# easily as chop. The defer-underwater guard + (optional) SL are the backstops.
+# Watch the first sessions; size so summed peaks stay under buying power.
 #
-# Pre-flight:
-#   1. TIKR_BINANCE_ENABLE_MAINNET=1
-#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
-#   3. Funded USDC balance in Futures wallet
-#   4. Confirm USDC maker fee still 0 bps at binance.com/en/fee/futureFee
+# Pre-flight (mainnet): TIKR_BINANCE_ENABLE_MAINNET=1; .env keys; funded USDT
+# in the Futures wallet; confirm maker fee at binance.com/en/fee/futureFee.
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/wave-usdc-majors"
-asset = "USDC"
-order_balance_pct = "0.5"
+state_dir = "./state/wave-auto"
+asset = "USDT"
+order_balance_pct = "0.1"
 max_position_pct = "70"
 leverage = 5
-# Inventory-aware order-size boost (runner-side, every strategy). Scales the
-# inventory-REDUCING side's order size up on a curve as |position| approaches
-# the per-bot cap: multiplier = 1 + (pct/100)·(|pos|/cap)^curve.
-# OFF: tail-risk hedge, not a profit enhancer — cuts net in normal regimes and
-# barely moves peak once fills are realistic (the cap already binds).
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 
-# ─── NEARUSDC ($5 floor) ──────────────────────────────────────────────────
-# ~19% 24h range, ~$42M vol — most ZEC-like (high vol + liquid). chase_to_avg
-# lifts it (+9→+20 in tuning); a down-trender that benefits from unwinding to
-# cost.
-[[bot]]
-symbol = "NEARUSDC"
-strategy = "wave"
-[bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 10
-inner_steps = 0
-chase_to_avg = true
-
-# ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
-# High vol + liquid. The steadiest performer (~+56); chase_to_avg costs it a
-# little (it ranges) but it stays one of the best, so cta stays global.
-[[bot]]
-symbol = "ZECUSDC"
-strategy = "wave"
-[bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 10
-inner_steps = 0
-chase_to_avg = true
-
-# ─── WLDUSDC ──────────────────────────────────────────────────────────────
-# Highest vol (~28% 24h range, ~$21M vol) → highest reward AND highest
-# inventory/pile risk. The ±$50 wildcard in backtest (non-determinism +
-# volatility). chase_to_avg helps it most; watch closely live.
-[[bot]]
-symbol = "WLDUSDC"
-strategy = "wave"
-[bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 10
-inner_steps = 0
-chase_to_avg = true
-
-# ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
-# ZEC-like vol (~12% range) + strong liquidity (~$19M). Stable ~+41.
-[[bot]]
-symbol = "SUIUSDC"
-strategy = "wave"
-[bot.wave]
+[wave_auto]
+enabled = true
+min_volume_usdt = "1000000" # $1M 24h quote volume floor (liquidity + bounds kline calls)
+candle_count = 60           # average the last 60 one-minute candles (~1h window)
+min_candle_pct = "0"        # min avg candle height % to qualify (0 = no floor)
+top_n = 5                   # run Wave on the 5 highest-scored symbols
+recheck_interval_secs = 60
+quote_asset = "USDT"
+# defer_underwater defaults true (don't rotate a bot holding a losing bag).
+# Forwarded to every spawned Wave bot.
 grid_levels = 10
 refill_threshold = 5
 step_bps = 10
