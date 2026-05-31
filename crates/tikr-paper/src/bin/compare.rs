@@ -1461,6 +1461,11 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per
     let mut total_net = 0.0;
     let mut total_volume = 0.0;
     let mut sum_peak = 0.0;
+    // ROI/day extrapolates each symbol's ROI over its own backtest span to a
+    // 24h basis: `roi% × 86400 / sim_duration_secs`. The basket total sums each
+    // symbol's per-day NET (net × 86400/span) so symbols with different spans
+    // are each annualized on their own clock before being pooled.
+    let mut total_daily_net = 0.0;
     // ROI uses the operator's allocated capital per bot, NOT the peak
     // observed in the run. Allocation is what the wallet reserves; the
     // peak is just the high-water mark of how much of that allocation
@@ -1481,14 +1486,24 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per
                 + decimal_to_f64(&report.sell_volume_usdt.0);
             let peak = decimal_to_f64(&report.peak_position_usdt.0);
             let denom = if cap_denom > 0.0 { cap_denom } else { peak };
+            let span_secs = report.sim_duration_secs as f64;
             let roi = if denom > 0.0 {
                 format!("{:.3}", net / denom * 100.0)
+            } else {
+                "—".to_string()
+            };
+            // Per-day extrapolation: scale this symbol's ROI by 24h/span.
+            let roi_day = if denom > 0.0 && span_secs > 0.0 {
+                format!("{:.3}", net / denom * 100.0 * 86_400.0 / span_secs)
             } else {
                 "—".to_string()
             };
             total_net += net;
             total_volume += volume;
             sum_peak += peak;
+            if span_secs > 0.0 {
+                total_daily_net += net * 86_400.0 / span_secs;
+            }
             rows.push(vec![
                 sym.clone(),
                 format!("{:.4}", net),
@@ -1496,11 +1511,13 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per
                 format!("{:.0}", volume),
                 format!("{:.0}", peak),
                 roi,
+                roi_day,
                 name.clone(),
             ]);
         } else {
             rows.push(vec![
                 sym.clone(),
+                "—".to_string(),
                 "—".to_string(),
                 "—".to_string(),
                 "—".to_string(),
@@ -1525,6 +1542,14 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per
     } else {
         "—".to_string()
     };
+    // Basket per-day ROI: sum of each symbol's span-normalized daily NET over
+    // the pooled capital. Differs from `total_roi × 24/span` whenever symbols
+    // have unequal spans.
+    let total_roi_day = if total_capital > 0.0 {
+        format!("{:.3}", total_daily_net / total_capital * 100.0)
+    } else {
+        "—".to_string()
+    };
     rows.push(vec![
         "TOTAL".to_string(),
         format!("{:.4}", total_net),
@@ -1532,10 +1557,11 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per
         format!("{:.0}", total_volume),
         format!("{:.0}", sum_peak),
         total_roi,
+        total_roi_day,
         String::new(),
     ]);
     let headers = [
-        "symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "preset",
+        "symbol", "NET", "fills", "volume", "peak_pos", "ROI%", "ROI/day%", "preset",
     ];
     render_mysql_table(&headers, &rows);
     let roi_note = if cap_denom > 0.0 {
@@ -1551,6 +1577,7 @@ fn print_basket_summary(per_symbol: &[(String, Vec<(String, PaperReport)>)], per
             .to_string()
     };
     println!("(TOTAL row: volume + peak_pos summed; {roi_note})");
+    println!("(ROI/day% = ROI% extrapolated to 24h per symbol's own backtest span)");
 }
 
 async fn run_sweep(args: Args) -> Result<(), Box<dyn std::error::Error>> {
