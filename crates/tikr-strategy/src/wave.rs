@@ -930,7 +930,9 @@ mod tests {
         let sy = sym();
         let acts = w.on_event(
             &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate { snapshot: s.clone() },
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
         );
         let q = acts
             .iter()
@@ -953,7 +955,9 @@ mod tests {
         let sy = sym();
         let _ = w.on_event(
             &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate { snapshot: s.clone() },
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
         );
         // Records the resting TP price (so the pruner exempts it) at 101.
         assert_eq!(w.tp_order_price, Some(Decimal::from(101)));
@@ -969,7 +973,9 @@ mod tests {
         let sy = sym();
         let acts = w.on_event(
             &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate { snapshot: s.clone() },
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
         );
         let q = acts
             .iter()
@@ -989,7 +995,9 @@ mod tests {
         let sy = sym();
         let acts = w.on_event(
             &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate { snapshot: s.clone() },
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
         );
         assert!(
             !acts
