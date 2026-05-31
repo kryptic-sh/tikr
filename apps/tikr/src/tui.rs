@@ -88,6 +88,9 @@ struct UiState {
     /// follows its bot as the tab list changes (bots rotate in/out). When the
     /// selected symbol is removed, the selection falls back to the first tab.
     active_symbol: Option<String>,
+    /// When the dashboard (≈ the session) started — drives the account-pane
+    /// uptime + $/hour figures.
+    session_start: Instant,
     tab_scroll: usize,
     /// Log viewport mode + anchor.
     log_view: LogView,
@@ -144,6 +147,7 @@ impl UiState {
         Self {
             active_tab: 0,
             active_symbol: None,
+            session_start: Instant::now(),
             tab_scroll: 0,
             log_view: LogView::Follow,
             last_tab_rect: None,
@@ -1037,6 +1041,30 @@ fn draw_account(
         format!("{:>+.2}", dec_to_f64(mtm_net)),
         Style::default().fg(Color::White),
         pnl_style(mtm_net),
+    ));
+    // Session uptime + banked rate ($/hour off real NET).
+    let session_secs = ui.session_start.elapsed().as_secs();
+    let (uh, um, us) = (
+        session_secs / 3600,
+        (session_secs % 3600) / 60,
+        session_secs % 60,
+    );
+    lines.push(kv_line(
+        "uptime",
+        format!("{uh:02}:{um:02}:{us:02}"),
+        Style::default().fg(Color::Gray),
+        Style::default().fg(Color::White),
+    ));
+    let per_hour = if session_secs > 0 {
+        real_net * Decimal::from(3600) / Decimal::from(session_secs)
+    } else {
+        Decimal::ZERO
+    };
+    lines.push(kv_line(
+        "$/hour",
+        format!("{:>+.2}", dec_to_f64(per_hour)),
+        Style::default().fg(Color::Gray),
+        pnl_style(per_hour),
     ));
     lines.push(Line::from(""));
     lines.push(Line::styled(
