@@ -27,7 +27,7 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tide-usdc"
+state_dir = "./state/temp"
 asset = "USDC"
 order_balance_pct = "0.5"
 max_position_pct = "100"
@@ -37,13 +37,11 @@ inventory_boost_curve = "1"
 
 # ─── NEARUSDC ─────────────────────────────────────────────────────────────
 [[bot]]
-symbol = "BSBUSDT"
-strategy = "tide"
-[bot.tide]
-notional = 10
-grid_levels = 5
+symbol = "GUNUSDT"
+strategy = "wave"
+[bot.wave]
+grid_levels = 10
+refill_threshold = 5
 step_bps = 10
-inner_steps = 1
-prune_stragglers = true
+inner_steps = 0
 chase_to_avg = true
-# chase = false

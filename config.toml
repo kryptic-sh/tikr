@@ -77,7 +77,7 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 step_bps = 10
-inner_steps = 2
+inner_steps = 0
 chase_to_avg = true
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
@@ -90,7 +90,7 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 step_bps = 10
-inner_steps = 2
+inner_steps = 0
 chase_to_avg = true
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
@@ -104,7 +104,7 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 step_bps = 10
-inner_steps = 2
+inner_steps = 0
 chase_to_avg = true
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
@@ -116,5 +116,5 @@ strategy = "wave"
 grid_levels = 10
 refill_threshold = 5
 step_bps = 10
-inner_steps = 2
+inner_steps = 0
 chase_to_avg = true
