@@ -651,6 +651,12 @@ where
     // strand a position when the natural reset triggers
     // (fill + CancelAll) don't fire.
     let mut side_fails_last: HashMap<String, Instant> = HashMap::new();
+    // Venue rate-limit cooldown (live). When a venue call returns
+    // `RateLimited` (HTTP 429 / 418 IP-ban / 403 CloudFront block), we pause
+    // ALL venue dispatch until this instant — honoring the `Retry-After`
+    // window — instead of re-firing quotes/cancels on every market event and
+    // hammering the REST API while it's blocked.
+    let mut rate_limited_until: Option<Instant> = None;
     // Fill reconciliation (live): dedup trade ids already applied to the
     // tracker (via WS or REST) + the REST `userTrades` look-back window start.
     // Initialised to "now" so the gap-fill path only ever replays fills from
@@ -1175,6 +1181,16 @@ where
                 // sequentially (Cancel/Requote/CancelAll have ordering
                 // semantics relative to neighbouring quotes).
                 if live_mode {
+                    // Venue rate-limit cooldown: while throttled (Retry-After
+                    // window from the last RateLimited response not yet elapsed),
+                    // drop this event's venue actions so we don't hammer the
+                    // REST API every market event. Resumes once the window passes.
+                    if rate_limited_until.is_some_and(|u| u > Instant::now()) {
+                        debug!("live: venue rate-limited — skipping dispatch this event");
+                        filtered.clear();
+                    } else {
+                        rate_limited_until = None;
+                    }
                     let mut i = 0;
                     while i < filtered.len() {
                         if matches!(filtered[i], tikr_strategy::Action::Quote(_)) {
@@ -1259,6 +1275,12 @@ where
                                         fill_sim.enqueue_place_with_id(intent, ts, qid);
                                     }
                                     Err(e) => {
+                                        if let VenueError::RateLimited { retry_after_ms } = e {
+                                            rate_limited_until = Some(
+                                                Instant::now()
+                                                    + Duration::from_millis(retry_after_ms),
+                                            );
+                                        }
                                         let msg = format!("{e:?}");
                                         let is_transient = msg.contains("-5022")
                                             || msg.contains("Post Only")
@@ -1289,7 +1311,15 @@ where
                                         side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
                                         old_id = ?id, "live: order requoted"
                                     ),
-                                    Err(e) => warn!(error = ?e, "live: venue.requote failed"),
+                                    Err(e) => {
+                                        if let VenueError::RateLimited { retry_after_ms } = e {
+                                            rate_limited_until = Some(
+                                                Instant::now()
+                                                    + Duration::from_millis(retry_after_ms),
+                                            );
+                                        }
+                                        warn!(error = ?e, "live: venue.requote failed");
+                                    }
                                 }
                             }
                             tikr_strategy::Action::Cancel(id) => {
@@ -1302,7 +1332,15 @@ where
                                     Ok(()) | Err(VenueError::UnknownQuote) => {
                                         fill_sim.drop_quote(*id)
                                     }
-                                    Err(e) => warn!(error = ?e, "live: venue.cancel failed"),
+                                    Err(e) => {
+                                        if let VenueError::RateLimited { retry_after_ms } = e {
+                                            rate_limited_until = Some(
+                                                Instant::now()
+                                                    + Duration::from_millis(retry_after_ms),
+                                            );
+                                        }
+                                        warn!(error = ?e, "live: venue.cancel failed");
+                                    }
                                 }
                             }
                             tikr_strategy::Action::CancelAll => {
@@ -1311,7 +1349,15 @@ where
                                     Ok(()) | Err(VenueError::UnknownQuote) => {
                                         fill_sim.drop_quotes_for(&symbol)
                                     }
-                                    Err(e) => warn!(error = ?e, "live: venue.cancel_all failed"),
+                                    Err(e) => {
+                                        if let VenueError::RateLimited { retry_after_ms } = e {
+                                            rate_limited_until = Some(
+                                                Instant::now()
+                                                    + Duration::from_millis(retry_after_ms),
+                                            );
+                                        }
+                                        warn!(error = ?e, "live: venue.cancel_all failed");
+                                    }
                                 }
                             }
                             tikr_strategy::Action::NoOp => {}
