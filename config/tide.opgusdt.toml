@@ -1,0 +1,49 @@
+# ─── Tide on USDC majors ───────────────────────────────────────────────────
+#
+# 4 bots: NEARUSDC, ZECUSDC, WLDUSDC, SUIUSDC — same lineup as config.toml.
+# Tide = single/multi-level touch lattice with straggler pruning. step_bps does
+# DOUBLE duty: the inner self-spread (gap between top bid/ask) AND the spacing
+# between levels. grid_levels = depth per side (inventory ~ N × order). USDC
+# promo (0 bps maker). Account mirrors config.toml: $600 @ 5x, order 0.5%.
+#
+# ⚠ NOT VALIDATED — THIS PARAM SET LOSES ON THE FROZEN WINDOW ⚠
+# Backtest at levels=5 / step=3 (4 symbols, ~13.07h frozen, 76/27ms latency,
+# 0 bps maker, $600 @ 5x, 100% cap):
+#   sum NET -513.46   NEAR -102   SUI -52   WLD -89   ZEC -270
+# step=3 is FAR too tight for these volatile symbols — the lattice gets
+# steamrolled, churns (ZEC 82,720 fills, 1282/min) and bleeds adverse
+# inventory; ZEC peaked ~$919, OVER the $600 cap (Tide's N-level grid overshoots
+# — investigate before trusting the cap). The validated-baseline tide.usdc.
+# majors.toml uses grid_levels=1 / step_bps=20 for exactly this reason.
+#
+# On this 13h slice (a trending/volatile regime) every frozen-grid strategy
+# loses (Wave -82, Tide -513); only the reactive MMR (+75) works here. WIDEN
+# step (toward 20) and/or drop levels, and validate on a RANGING window before
+# any mainnet session. Treat the numbers below as a tuning scaffold, not a
+# deployable config.
+#
+# Pre-flight (mainnet): TIKR_BINANCE_ENABLE_MAINNET=1; .env keys; funded USDC;
+# confirm 0 bps maker still live.
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tide-usdc"
+asset = "USDC"
+order_balance_pct = "0.5"
+max_position_pct = "100"
+leverage = 5
+inventory_boost_pct = "0"
+inventory_boost_curve = "1"
+
+# ─── NEARUSDC ─────────────────────────────────────────────────────────────
+[[bot]]
+symbol = "BSBUSDT"
+strategy = "tide"
+[bot.tide]
+notional = 10
+grid_levels = 5
+step_bps = 10
+inner_steps = 1
+prune_stragglers = true
+chase_to_avg = true
+# chase = false

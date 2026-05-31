@@ -17,23 +17,25 @@
 #                  (gap = max(inner_steps,1) × step) but never past cost; the
 #                  accumulating side stays one-sided/frozen.
 #
-# Tuned 2026-05-30 on data/72h (~25h slice, NEAR/ZEC/WLD/SUI), maker 0 / taker
+# Tuned 2026-05-31 on data/72h (~25h slice, NEAR/ZEC/WLD/SUI), maker 0 / taker
 # 0, $1000 @ 5x, order 0.5% (~$5), max_position_pct 70, boost 0, pinned 76/27ms
-# latency. Winner:
-#   levels=4 / refill_threshold=2 / step_bps=10 / inner_steps=2 / chase_to_avg.
-#   Dependable (stable symbols): NEAR ~+23, SUI ~+41, ZEC ~+56 ≈ +120, peaks
-#   ~$750 (well under the 70%-cap mark). WLD is a ±$50 wildcard (see caveat).
+# latency, DETERMINISTIC replay (see below). Winner:
+#   levels=10 / refill_threshold=5 / step_bps=10 / inner_steps=2 / chase_to_avg.
+#   realized: NEAR +23.9, SUI +33.5, WLD +49.9, ZEC +66.4 = +173.7 (banked).
+#   net:      NEAR −17.6, SUI +33.7, WLD −3.4, ZEC +59.6 = +72.4 (incl. bag).
+#   peaks: NEAR 753, SUI 687, WLD 811, ZEC 753 (≈ the 70%-cap mark + overshoot).
 # Findings:
-#   - lv=4–6 × rt=1–2 is a PLATEAU (~+110 to +140 total); differences inside
-#     noise. lv=2 craters (WLD), lv=8 fades. step=10/inner=2 banks the most
-#     round-trips; chase_to_avg lifts the trenders (WLD/NEAR) at a small cost
-#     to ZEC — kept ON to raise the floor on the marginal names.
-#   - ⚠ DETERMINISM: the backtest is NOT reproducible run-to-run (runner
-#     reconciles on wall-clock, not sim-time). WLD swings ±$50 between
-#     identical runs; NEAR/SUI/ZEC are stable (±$5). Treat single-run NET as
-#     directional, not precise — esp. WLD. Fix pending before fine-tuning.
-#   - Still a single ~25h TRENDING slice. Validate on a ranging window before
-#     trusting; frozen grids change character across regimes.
+#   - lv=10 / rt=5 (deeper grid, less-aggressive refill) is the NET winner: it
+#     reins in the bags vs the old lv=4/rt=2 (WLD unreal −53 vs −120, lower
+#     peaks) while keeping near-top realized. step=20 over-accumulates (WLD bag
+#     blows out to −209); step=10 banks the most round-trips. chase_to_avg ON.
+#   - Weak spot: NEAR (net −17.6) — the down-trender builds a bigger losing
+#     long in the deeper grid. An SL on NEAR would cap it (built, untested live).
+#   - DETERMINISM FIXED (biased select! in the runner): fills + realized PnL are
+#     now bit-identical across runs; only the open-bag mark-to-market tail
+#     wobbles a few $. Rank/trust by REALIZED.
+#   - Still a single ~25h TRENDING slice. Validate on a ranging window too;
+#     frozen grids change character across regimes.
 #
 # BTC EXCLUDED: 0.001 BTC lot ≈ $100/order, peaks ~$3k inventory — exceeds a
 # $600 @ 5x account's capacity. Do not add BTCUSDC here.
@@ -72,8 +74,8 @@ inventory_boost_curve = "1"
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 10
+refill_threshold = 5
 step_bps = 10
 inner_steps = 2
 chase_to_avg = true
@@ -85,8 +87,8 @@ chase_to_avg = true
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 10
+refill_threshold = 5
 step_bps = 10
 inner_steps = 2
 chase_to_avg = true
@@ -99,8 +101,8 @@ chase_to_avg = true
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 10
+refill_threshold = 5
 step_bps = 10
 inner_steps = 2
 chase_to_avg = true
@@ -111,8 +113,8 @@ chase_to_avg = true
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
+grid_levels = 10
+refill_threshold = 5
 step_bps = 10
 inner_steps = 2
 chase_to_avg = true
