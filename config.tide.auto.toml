@@ -67,6 +67,6 @@ kind = "tide" # "wave" | "tide"
 [rampage.strategy.params]
 grid_levels = 10
 step_bps = 30           # step30 inner2 = best uncapped Tide in backtest (peak ~$500, net+)
-inner_steps = 2         # empty dead zone: mid + inner_steps slots each side (5 vacant); innermost order (inner_steps+1) steps from center
+inner_steps = 1         # empty dead zone: mid + inner_steps slots each side (5 vacant); innermost order (inner_steps+1) steps from center
 chase_to_avg = false
 prune_stragglers = true # trim both edges so the ladder stays grid_levels wide (default on)
