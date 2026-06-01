@@ -124,6 +124,17 @@ pub struct Tide {
     bid_lattice_origin: Option<Decimal>,
     ask_lattice_origin: Option<Decimal>,
     lattice_step: Option<Decimal>,
+    /// FILL-DRIVEN window center. Frozen at the first mid, then slides exactly
+    /// one lattice step per net order filled — a slot SOLD rides the window up
+    /// one step, a slot BOUGHT rides it down one step. The activation window is
+    /// `grid_center ± inner_gap` and the emit/prune fill the near end and trim
+    /// the far end, so the lattice tracks price via our own fills and never
+    /// re-fills a freed slot in place. Inventory grows only with a sustained
+    /// one-way slide, bounded by `max_position_usdt`.
+    grid_center: Option<Decimal>,
+    /// Position size at the previous event — net fills = `pos − last`, converted
+    /// to a signed slot count to drive the `grid_center` slide.
+    last_pos_size: Decimal,
     /// Nanosecond timestamp of the last time-based recenter (for `recenter_secs`).
     last_recenter_ns: Option<u64>,
     /// Quote intents the venue rejected (typically -5022 post-only
@@ -257,6 +268,8 @@ impl Strategy for Tide {
             bid_lattice_origin: None,
             ask_lattice_origin: None,
             lattice_step: None,
+            grid_center: None,
+            last_pos_size: Decimal::ZERO,
             pending_retries: Vec::new(),
             last_recenter_ns: None,
         }
@@ -272,6 +285,38 @@ impl Strategy for Tide {
         self.pending_ask_prices.clear();
 
         let mut actions: Vec<Action> = Vec::new();
+
+        // Fill-driven slide. Net fills since the last event = position delta,
+        // converted to a signed slot count (delta notional / notional_per_order).
+        // Each slot SOLD rides the window up one step; each slot BOUGHT rides it
+        // down one step — so the grid follows price via our own fills, adding at
+        // the near end and trimming the far end (handled by the emit/prune
+        // below). Only runs once the lattice is frozen + a center exists.
+        if let (Some(step), Some(center)) = (self.lattice_step, self.grid_center)
+            && step > Decimal::ZERO
+            && self.config.notional_per_order > Decimal::ZERO
+        {
+            let pos_now = ctx.position.size.0;
+            let delta = pos_now - self.last_pos_size;
+            if delta != Decimal::ZERO {
+                let mid = ctx
+                    .latest_book
+                    .bids
+                    .first()
+                    .zip(ctx.latest_book.asks.first())
+                    .map(|(b, a)| (b.price.0 + a.price.0) / Decimal::from(2))
+                    .filter(|m| *m > Decimal::ZERO)
+                    .unwrap_or(center);
+                // slots > 0 = net bought (slide down); < 0 = net sold (slide up).
+                let slots = (delta * mid / self.config.notional_per_order).round();
+                if slots != Decimal::ZERO {
+                    self.grid_center = Some(center - slots * step);
+                }
+            }
+            self.last_pos_size = pos_now;
+        } else {
+            self.last_pos_size = ctx.position.size.0;
+        }
 
         // Retry queue drain. For each rejected-and-still-pending intent,
         // re-emit IF a post-only at that exact price would now be safe
@@ -352,21 +397,13 @@ impl Strategy for Tide {
             _ => Decimal::ZERO,
         };
         let pos_notional = pos_size * mid_for_pos;
-        // Direction-aware accumulation guard. While holding a REAL (non-dust)
-        // position, stop ADDING to the heavy side: don't replenish filled bid
-        // slots when long, or filled ask slots when short. The resting grid
-        // still fills (ladder in / out) and the REDUCING side stays fully
-        // replenished to work the position back to flat — so a price bouncing
-        // on one slot can't repeatedly re-fire the same side and over-
-        // accumulate. Dust (|pos| < min_notional) doesn't suppress, so the grid
-        // re-arms both sides once essentially flat. The `cap` term is the hard
-        // backstop on top.
-        let real_pos = self.config.min_notional <= Decimal::ZERO
-            || pos_notional.abs() >= self.config.min_notional;
-        let suppress_bids =
-            (cap > Decimal::ZERO && pos_notional > cap) || (real_pos && pos_size > Decimal::ZERO);
-        let suppress_asks =
-            (cap > Decimal::ZERO && pos_notional < -cap) || (real_pos && pos_size < Decimal::ZERO);
+        // Inventory backstop: the fill-driven slide rides the grid into a
+        // sustained trend (selling into a rally accumulates short, etc.), so the
+        // ONLY accumulation limit is the hard position cap. When long notional
+        // exceeds the cap, stop adding bids; when short exceeds it, stop adding
+        // asks. The reducing side always stays active to work back toward flat.
+        let suppress_bids = cap > Decimal::ZERO && pos_notional > cap;
+        let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
 
         // Min-self-spread enforcement: when the book spread is tighter
         // than the configured minimum, push the placement tops apart so
@@ -374,7 +411,7 @@ impl Strategy for Tide {
         //
         // Bps mode: required_spread = `bps × mid / 10000`.
         let spread_active = self.config.step_bps > 0;
-        let (top_bid_override, top_ask_override) = if let (Some(bp), Some(ap)) =
+        let (mut top_bid_override, mut top_ask_override) = if let (Some(bp), Some(ap)) =
             (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
@@ -417,6 +454,7 @@ impl Strategy for Tide {
                 self.lattice_step = None;
                 self.bid_lattice_origin = None;
                 self.ask_lattice_origin = None;
+                self.grid_center = None; // re-freeze (and re-seed center) next event
                 self.pending_bid_prices.clear();
                 self.pending_ask_prices.clear();
                 self.pending_retries.clear();
@@ -452,6 +490,11 @@ impl Strategy for Tide {
                         actions.push(Action::CancelAll);
                         self.bid_lattice_origin = Some(new_bid);
                         self.ask_lattice_origin = Some(new_ask);
+                        // Re-anchor the fill-driven center onto the new avg-based
+                        // midpoint; reset the fill baseline so we don't slide on
+                        // the re-anchor itself.
+                        self.grid_center = Some((new_bid + new_ask) / Decimal::from(2));
+                        self.last_pos_size = ctx.position.size.0;
                         self.pending_bid_prices.clear();
                         self.pending_ask_prices.clear();
                         self.pending_retries.clear();
@@ -483,6 +526,10 @@ impl Strategy for Tide {
             self.lattice_step = Some(step);
             self.bid_lattice_origin = Some(top_b.0);
             self.ask_lattice_origin = Some(top_a.0);
+            // Seed the fill-driven window center at the freeze mid; it slides
+            // from here on each fill.
+            self.grid_center = Some(mid);
+            self.last_pos_size = ctx.position.size.0;
             // Start (or restart, on a time-based recenter) the recenter timer.
             self.last_recenter_ns = Some(ctx.now.0);
         }
@@ -490,6 +537,27 @@ impl Strategy for Tide {
         let lattice_ready = self.lattice_step.is_some()
             && self.bid_lattice_origin.is_some()
             && self.ask_lattice_origin.is_some();
+
+        // Drive the activation window from the FILL-DRIVEN center (not the live
+        // touch). Innermost bid/ask sit `inner_steps × step` either side of the
+        // center (the dead zone); the emit fills `grid_levels` out from there
+        // and the prune trims beyond. As `grid_center` slides on fills, the
+        // window slides with it — adding at the near end, cancelling the far.
+        if let (Some(step), Some(center), Some(bo), Some(ao)) = (
+            self.lattice_step,
+            self.grid_center,
+            self.bid_lattice_origin,
+            self.ask_lattice_origin,
+        ) && step > Decimal::ZERO
+        {
+            // Half the frozen self-spread keeps the innermost bid/ask separated
+            // (so they don't collapse onto the center and self-cross); inner_steps
+            // adds the configured dead zone on top.
+            let half = (ao - bo) / Decimal::from(2);
+            let inner = half + Decimal::from(self.config.inner_steps) * step;
+            top_bid_override = Some(Price(center - inner));
+            top_ask_override = Some(Price(center + inner));
+        }
 
         // BID side. ONE-SIDED fixed grid: bid slots are bid_origin − k × step
         // for non-negative k only (at/below the origin). The top active slot is
@@ -534,16 +602,11 @@ impl Strategy for Tide {
             // floor((top_cap - origin) / step). One-sided (default) clamps ≤ 0 so
             // the top bid never sits above bid_origin; `chase`/`chase_to_avg`
             // remove the clamp and let bids follow price up.
-            let raw_n = ((top_cap - bid_origin) / step).floor();
-            // Bids un-clamp only when chasing, or when SHORT under chase_to_avg
-            // (bids are the reducing side then). When long, keep bids one-sided
-            // so they don't chase up and buy high / over-accumulate.
-            let n_top =
-                if self.config.chase || (self.config.chase_to_avg && pos_size < Decimal::ZERO) {
-                    raw_n
-                } else {
-                    raw_n.min(Decimal::ZERO)
-                };
+            // Window top follows the fill-driven center (top_cap = center −
+            // inner_gap), so the slot index is taken straight from it —
+            // unclamped, so the window rides both above and below the frozen
+            // origin as the center slides.
+            let n_top = ((top_cap - bid_origin) / step).floor();
             let mut price = bid_origin + n_top * step;
             for _ in 0..levels {
                 if price <= Decimal::ZERO {
@@ -596,19 +659,9 @@ impl Strategy for Tide {
                 let gap = Decimal::from(self.config.inner_steps.max(1)) * step;
                 top_cap = top_cap.max(avg_entry + gap);
             }
-            // ceil((top_cap - origin) / step). One-sided (default) clamps ≥ 0 so
-            // the top ask never sits below ask_origin; `chase`/`chase_to_avg`
-            // remove the clamp and let asks follow price down.
-            let raw_n = ((top_cap - ask_origin) / step).ceil();
-            // Asks un-clamp only when chasing, or when LONG under chase_to_avg
-            // (asks are the reducing side then). When short, keep asks one-sided
-            // so they don't chase down and sell low / over-accumulate.
-            let n_top =
-                if self.config.chase || (self.config.chase_to_avg && pos_size > Decimal::ZERO) {
-                    raw_n
-                } else {
-                    raw_n.max(Decimal::ZERO)
-                };
+            // Unclamped: window bottom follows the fill-driven center
+            // (top_cap = center + inner_gap), riding both sides of the origin.
+            let n_top = ((top_cap - ask_origin) / step).ceil();
             let mut price = ask_origin + n_top * step;
             for _ in 0..levels {
                 if price <= Decimal::ZERO {
@@ -665,14 +718,9 @@ impl Strategy for Tide {
                     top_cap = top_cap
                         .min(avg_entry - Decimal::from(self.config.inner_steps.max(1)) * step);
                 }
-                let raw_n = ((top_cap - bid_origin) / step).floor();
-                let n_top = if self.config.chase
-                    || (self.config.chase_to_avg && pos_size < Decimal::ZERO)
-                {
-                    raw_n
-                } else {
-                    raw_n.min(Decimal::ZERO)
-                };
+                // Match the emit window (unclamped, center-driven) so we prune
+                // exactly the bids that fell off the far end as the window slid.
+                let n_top = ((top_cap - bid_origin) / step).floor();
                 let slot_top = bid_origin + n_top * step;
                 let window_low = slot_top - outward;
                 for (id, q) in ctx.open_quotes {
@@ -703,14 +751,8 @@ impl Strategy for Tide {
                     top_cap = top_cap
                         .max(avg_entry + Decimal::from(self.config.inner_steps.max(1)) * step);
                 }
-                let raw_n = ((top_cap - ask_origin) / step).ceil();
-                let n_top = if self.config.chase
-                    || (self.config.chase_to_avg && pos_size > Decimal::ZERO)
-                {
-                    raw_n
-                } else {
-                    raw_n.max(Decimal::ZERO)
-                };
+                // Match the emit window (unclamped, center-driven).
+                let n_top = ((top_cap - ask_origin) / step).ceil();
                 let slot_top = ask_origin + n_top * step;
                 let window_high = slot_top + outward;
                 for (id, q) in ctx.open_quotes {
@@ -1046,66 +1088,61 @@ mod tests {
     }
 
     #[test]
-    fn bids_suppressed_while_long() {
-        // Direction-aware guard: holding a real LONG, new bids are suppressed
-        // (no adding to the heavy side) even as price falls — this is the
-        // anti-accumulation rule. Asks stay active to sell the long down.
+    fn sell_fill_slides_grid_up() {
+        // Fill-driven slide: after SELLS fill (position goes short), the window
+        // center rides UP, so the grid emits bids/asks at HIGHER prices than the
+        // flat grid did — the lattice follows price via our own fills.
         let mut c = cfg();
         c.grid_levels = 3;
         let mut s = Tide::new(c);
         let symbol = sym();
         let flat = pos();
 
-        let snap1 = book(Decimal::new(10, 4), Decimal::new(11, 4));
-        let ctx1 = make_ctx(&symbol, &snap1, &flat, &[]);
-        let _ = s.on_event(
+        // Freeze around mid 0.0015 (book 0.0010/0.0020, step = 1 tick).
+        let snap = book(Decimal::new(10, 4), Decimal::new(20, 4));
+        let ctx1 = make_ctx(&symbol, &snap, &flat, &[]);
+        let a1 = s.on_event(
             &ctx1,
             &MarketEvent::BookUpdate {
-                snapshot: snap1.clone(),
+                snapshot: snap.clone(),
             },
         );
+        let top_bid_1 = a1
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .max()
+            .expect("flat grid emits bids");
 
-        // A buy filled: position is a real long (notional ≫ min_notional).
-        let long = Position {
+        // Sells filled → short. notional_per_order=10, mid≈0.0015 ⇒ one slot ≈
+        // 6667 base; −20000 base ≈ 3 slots sold ⇒ center rides up ~3 steps.
+        let short = Position {
             symbol: symbol.clone(),
-            size: SignedSize(Decimal::from(1_000_000)),
-            avg_entry: Price(Decimal::new(9, 4)),
+            size: SignedSize(Decimal::from(-20_000)),
+            avg_entry: Price(Decimal::new(16, 4)),
             realized_pnl: Notional(Decimal::ZERO),
         };
-        let snap2 = book(Decimal::new(8, 4), Decimal::new(9, 4));
-        let open: Vec<(QuoteId, QuoteIntent)> = [10, 9, 8]
-            .iter()
-            .map(|p| {
-                (
-                    QuoteId::new(),
-                    QuoteIntent {
-                        symbol: symbol.clone(),
-                        side: Side::Bid,
-                        price: Price(Decimal::new(*p, 4)),
-                        size: Size(Decimal::ONE),
-                        tif: TimeInForce::PostOnly,
-                        kind: QuoteKind::Point,
-                    },
-                )
-            })
-            .collect();
-        let ctx2 = make_ctx(&symbol, &snap2, &long, &open);
-        let actions = s.on_event(
+        let ctx2 = make_ctx(&symbol, &snap, &short, &[]);
+        let a2 = s.on_event(
             &ctx2,
             &MarketEvent::BookUpdate {
-                snapshot: snap2.clone(),
+                snapshot: snap.clone(),
             },
         );
-        let new_bids = actions
+        let top_bid_2 = a2
             .iter()
-            .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Bid))
-            .count();
-        assert_eq!(new_bids, 0, "long → no new bids (accumulation guard)");
-        // Asks remain active (reducing side) — at least one ask emitted.
-        let new_asks = actions
-            .iter()
-            .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Ask))
-            .count();
-        assert!(new_asks > 0, "long → asks still emit to sell down");
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .max()
+            .expect("slid grid still emits bids");
+
+        assert!(
+            top_bid_2 > top_bid_1,
+            "sell fills should slide the grid UP: top_bid {top_bid_1} -> {top_bid_2}"
+        );
     }
 }
