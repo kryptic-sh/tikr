@@ -485,6 +485,7 @@ fn spawn_one_bot(
             inner_steps,
             chase,
             chase_to_avg,
+            prune_stragglers,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -493,7 +494,7 @@ fn spawn_one_bot(
                     notional: None,
                     grid_levels: *grid_levels,
                     step_bps: *step_bps,
-                    prune_stragglers: true,
+                    prune_stragglers: *prune_stragglers,
                     recenter_bps: 0,
                     recenter_secs: 0,
                     inner_steps: *inner_steps,

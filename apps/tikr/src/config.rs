@@ -682,6 +682,10 @@ pub enum RampageStrategy {
         chase: bool,
         #[serde(default)]
         chase_to_avg: bool,
+        /// Trim straggler orders so the resting ladder stays `grid_levels` wide
+        /// (two-sided window prune). Default `true`.
+        #[serde(default = "tide_prune_default")]
+        prune_stragglers: bool,
     },
 }
 

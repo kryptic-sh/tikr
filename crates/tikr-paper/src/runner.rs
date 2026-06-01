@@ -2390,36 +2390,59 @@ async fn dispatch_post_fill_actions<V, S>(
     }
 
     // Live mode: dispatch to venue; track rejected Quote intents for recovery.
+    // Batch consecutive same-type actions — one request per 5 places
+    // (`POST /fapi/v1/batchOrders`) / 10 cancels (`DELETE …`) — instead of a
+    // round trip each. A fill-driven slide (Tide) emits a side of adds plus the
+    // far-edge cancels in one shot, so batching collapses the REST bursts.
     let mut rejected_intents: Vec<(QuoteIntent, String)> = Vec::new();
-    for action in actions {
-        match &action {
-            tikr_strategy::Action::Quote(intent) => {
+    let mut i = 0;
+    while i < actions.len() {
+        if matches!(actions[i], tikr_strategy::Action::Quote(_)) {
+            // Gather a run of Quotes, applying the per-side failure gate +
+            // sub-min-notional drop, then place the survivors as one batch.
+            let mut run_intents: Vec<QuoteIntent> = Vec::new();
+            while i < actions.len() {
+                if let tikr_strategy::Action::Quote(intent) = &actions[i] {
+                    let state = side_fails
+                        .entry(symbol.base.0.to_string())
+                        .or_insert((0, 0));
+                    let skip = match intent.side {
+                        Side::Bid => state.0 >= MAX_FAILS_PER_SIDE,
+                        Side::Ask => state.1 >= MAX_FAILS_PER_SIDE,
+                    };
+                    let below_min = min_notional > Decimal::ZERO
+                        && intent.size.0 * intent.price.0 < min_notional;
+                    if skip {
+                        warn!(
+                            side = ?intent.side, bid_fails = state.0, ask_fails = state.1,
+                            "live: skipping post-fill quote — side exceeded max failures"
+                        );
+                    } else if below_min {
+                        debug!(
+                            side = ?intent.side,
+                            qty = %intent.size.0,
+                            price = %intent.price.0,
+                            notional = %(intent.size.0 * intent.price.0),
+                            min = %min_notional,
+                            "live: dropping sub-min-notional quote (post-fill)"
+                        );
+                    } else {
+                        run_intents.push(intent.clone());
+                    }
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if run_intents.is_empty() {
+                continue;
+            }
+            let results = venue.batch_quote(run_intents.clone()).await;
+            for (intent, r) in run_intents.into_iter().zip(results) {
                 let state = side_fails
                     .entry(symbol.base.0.to_string())
                     .or_insert((0, 0));
-                let skip = match intent.side {
-                    Side::Bid => state.0 >= MAX_FAILS_PER_SIDE,
-                    Side::Ask => state.1 >= MAX_FAILS_PER_SIDE,
-                };
-                if skip {
-                    warn!(
-                        side = ?intent.side, bid_fails = state.0, ask_fails = state.1,
-                        "live: skipping post-fill quote — side exceeded max failures"
-                    );
-                    continue;
-                }
-                if min_notional > Decimal::ZERO && intent.size.0 * intent.price.0 < min_notional {
-                    debug!(
-                        side = ?intent.side,
-                        qty = %intent.size.0,
-                        price = %intent.price.0,
-                        notional = %(intent.size.0 * intent.price.0),
-                        min = %min_notional,
-                        "live: dropping sub-min-notional quote (post-fill)"
-                    );
-                    continue;
-                }
-                match venue.quote(intent.clone()).await {
+                match r {
                     Ok(qid) => {
                         info!(
                             side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
@@ -2449,15 +2472,35 @@ async fn dispatch_post_fill_actions<V, S>(
                     }
                 }
             }
+            continue;
+        }
+        if matches!(actions[i], tikr_strategy::Action::Cancel(_)) {
+            // Gather a run of cancels and fire them as one batch.
+            let mut cancel_ids: Vec<QuoteId> = Vec::new();
+            while i < actions.len() {
+                if let tikr_strategy::Action::Cancel(id) = &actions[i] {
+                    cancel_ids.push(*id);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            let cancelled = venue.batch_cancel(cancel_ids.clone()).await;
+            for (id, r) in cancel_ids.into_iter().zip(cancelled) {
+                match r {
+                    // Already gone → drop the mirror so we never re-cancel a phantom.
+                    Ok(()) | Err(VenueError::UnknownQuote) => fill_sim.drop_quote(id),
+                    Err(e) => warn!(error = ?e, "live: venue.cancel failed (post-fill)"),
+                }
+            }
+            continue;
+        }
+        match &actions[i] {
             tikr_strategy::Action::Requote { id, intent } => {
                 if let Err(e) = venue.requote(*id, intent.clone()).await {
                     warn!(error = ?e, "live: venue.requote failed (post-fill)");
                 }
             }
-            tikr_strategy::Action::Cancel(id) => match venue.cancel(*id).await {
-                Ok(()) => fill_sim.drop_quote(*id),
-                Err(e) => warn!(error = ?e, "live: venue.cancel failed (post-fill)"),
-            },
             tikr_strategy::Action::CancelAll => {
                 side_fails.remove(symbol.base.0.as_ref());
                 match venue.cancel_all(symbol).await {
@@ -2466,7 +2509,9 @@ async fn dispatch_post_fill_actions<V, S>(
                 }
             }
             tikr_strategy::Action::NoOp => {}
+            tikr_strategy::Action::Quote(_) | tikr_strategy::Action::Cancel(_) => unreachable!(),
         }
+        i += 1;
     }
 
     // Recovery: any Quote actions the venue rejected get bounced back to
