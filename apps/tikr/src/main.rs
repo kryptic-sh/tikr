@@ -16,14 +16,13 @@ mod bnb_refill;
 mod build;
 mod config;
 mod logs;
+mod rampage;
 mod scalp_rotation;
 mod selection;
 mod state;
 mod supervisor;
-mod tide_auto;
 mod tui;
 mod venue;
-mod wave_auto;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -503,11 +502,11 @@ async fn main() -> anyhow::Result<()> {
     let (bnb_price_tx, bnb_price_rx) = watch::channel(Decimal::ZERO);
 
     // Margin asset priority:
-    // 1. tide_auto.quote_asset (when auto-rotation enabled)
+    // 1. rampage.quote_asset (when auto-rotation enabled)
     // 2. account.asset (explicit override for fixed-bot configs)
     // 3. "USDT" (default)
     let wallet_asset = cfg
-        .tide_auto
+        .rampage
         .as_ref()
         .filter(|c| c.enabled)
         .map(|c| c.quote_asset.clone())
@@ -596,30 +595,10 @@ async fn main() -> anyhow::Result<()> {
             global_shutdown_rx.clone(),
         ));
     }
-    if let Some(auto) = cfg.tide_auto.clone().filter(|c| c.enabled) {
-        supervisors.push(tide_auto::spawn_tide_auto_manager(
+    if let Some(auto) = cfg.rampage.clone().filter(|c| c.enabled) {
+        supervisors.push(rampage::spawn_rampage_manager(
             auto,
-            tide_auto::TideAutoAccountCtx {
-                env,
-                api_key: api_key.clone(),
-                key_material: key_material.clone(),
-                base_state_dir: cfg.account.state_dir.clone(),
-                order_balance_pct: cfg.account.order_balance_pct,
-                leverage: cfg.account.leverage,
-                max_position_pct: cfg.account.max_position_pct,
-                inventory_boost: cfg.account.inventory_boost(),
-                notional_rx: notional_rx.clone(),
-                max_position_rx: max_position_rx.clone(),
-                bnb_price_rx: bnb_price_rx.clone(),
-            },
-            shared_state.clone(),
-            global_shutdown_rx.clone(),
-        ));
-    }
-    if let Some(auto) = cfg.wave_auto.clone().filter(|c| c.enabled) {
-        supervisors.push(wave_auto::spawn_wave_auto_manager(
-            auto,
-            wave_auto::WaveAutoAccountCtx {
+            rampage::RampageAccountCtx {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),

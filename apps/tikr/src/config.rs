@@ -23,16 +23,11 @@ pub struct DashboardConfig {
     /// Optional rotating StaticGrid manager.
     #[serde(default)]
     pub static_grid_rotation: Option<ScalpRotationConfig>,
-    /// Optional Tide auto-rotation: spawns a Tide bot on
-    /// every USDT-perp where `tick_bps ≥ min_tick_bps`. No bot list
-    /// needed — symbols are auto-discovered.
+    /// Optional unified auto-rotation manager. Replaces the old `[wave_auto]`
+    /// and `[tide_auto]` sections. Selects symbols by `score` mode and runs
+    /// the configured `strategy` on the top N qualifiers.
     #[serde(default)]
-    pub tide_auto: Option<TideAutoConfig>,
-    /// Optional Wave auto-rotation: discovers USD-M perps in the GUN-like
-    /// regime (volatile + wide-spread + mean-reverting + liquid), scores them,
-    /// and runs Wave on the top N. No bot list needed.
-    #[serde(default)]
-    pub wave_auto: Option<WaveAutoConfig>,
+    pub rampage: Option<RampageConfig>,
     /// Optional MEXC spot accumulator (bagboy). Places a single
     /// resting LIMIT BUY at best_bid for the configured symbol,
     /// refills on fill, refreshes when book moves. Pure accumulator —
@@ -592,56 +587,6 @@ fn tide_default_grid_levels() -> u32 {
     1
 }
 
-/// `[tide_auto]` — auto-rotation manager. Discovers Binance
-/// Futures USDT-perp symbols with `tick_size / price × 10000 ≥
-/// min_tick_bps` AND `24h quote volume ≥ min_volume_usdt`. Spawns
-/// one Tide bot per qualifying symbol. Re-checks every
-/// `recheck_interval_secs`; when a symbol drops below threshold,
-/// shuts down its bot and flattens the position via market order.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct TideAutoConfig {
-    /// Master switch.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Minimum `tick_bps` to qualify. `6` is the recommended floor
-    /// (covers ~3.6 bps BNB-discounted maker RT fees with ~2.4 bps edge).
-    #[serde(default = "tide_auto_default_min_tick_bps")]
-    pub min_tick_bps: Decimal,
-    /// Minimum 24h quote volume in USDT for a symbol to qualify.
-    /// Filters out thin/dead markets. Default `$20M`.
-    #[serde(default = "tide_auto_default_min_volume_usdt")]
-    pub min_volume_usdt: Decimal,
-    /// How often to re-discover + diff (seconds). Clamped to ≥ 10s.
-    /// Default `60`.
-    #[serde(default = "tide_auto_default_recheck_interval_secs")]
-    pub recheck_interval_secs: u64,
-    /// Forwarded to every spawned Tide bot as `TideConfig.step_bps`
-    /// (inner gap + level spacing). Default `10`.
-    #[serde(default = "tide_auto_default_step_bps")]
-    pub step_bps: u32,
-    /// Forwarded to every spawned Tide bot as
-    /// `TideConfig.grid_levels`. Default `12`.
-    #[serde(default = "tide_auto_default_grid_levels")]
-    pub grid_levels: u32,
-    /// Quote asset to filter discovery on. Typical values: `"USDT"`
-    /// (default) or `"USDC"`. Affects which set of USD-M perps the
-    /// rotation manager considers. Note: USDC perps are settled in
-    /// USDC, so you'll need USDC in your futures wallet to trade them.
-    #[serde(default = "tide_auto_default_quote_asset")]
-    pub quote_asset: String,
-    /// Optional explicit symbol allowlist (e.g. `["BTCUSDC", "ETHUSDC"]`).
-    /// When non-empty, ONLY these symbols spawn and the
-    /// `min_tick_bps` + `min_volume_usdt` filters are BYPASSED.
-    /// `min_self_spread_bps` synthesizes the required spread
-    /// regardless of natural book width, so the tick filter is
-    /// redundant when the operator picks symbols explicitly.
-    /// When empty (default), free discovery — every qualifying symbol
-    /// passes the tick + volume filters.
-    #[serde(default)]
-    pub symbols_allowlist: Vec<String>,
-}
-
 fn tide_auto_default_min_tick_bps() -> Decimal {
     Decimal::from(6)
 }
@@ -656,76 +601,6 @@ fn tide_auto_default_step_bps() -> u32 {
 }
 fn tide_auto_default_grid_levels() -> u32 {
     12
-}
-fn tide_auto_default_quote_asset() -> String {
-    "USDT".to_string()
-}
-
-/// `[wave_auto]` — Wave auto-rotation. Scores every liquid USD-M perp by
-/// RECENT PRICE ACTION — the average height of the last `candle_count`
-/// 1-minute candles, as a percent: `mean((high − low) / low × 100)` (wicks
-/// included). Big 1-minute candles = lots of intra-minute oscillation for the
-/// grid to bank, and a far more responsive signal than 24h aggregates (it
-/// catches a market that JUST woke up, like GUN). A symbol qualifies when
-/// `24h quote volume ≥ min_volume_usdt` (liquidity + bounds the kline calls)
-/// and its avg candle % `≥ min_candle_pct`. The top `top_n` by candle score
-/// run Wave; on recheck, symbols that fall out are shut down + flattened
-/// (unless holding an underwater bag — see `defer_underwater`).
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct WaveAutoConfig {
-    /// Master switch.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Minimum 24h quote volume to qualify (liquidity floor; also bounds how
-    /// many symbols we fetch klines for). Default `$20M`.
-    #[serde(default = "tide_auto_default_min_volume_usdt")]
-    pub min_volume_usdt: Decimal,
-    /// Number of recent 1-minute candles to average for the score. Default `5`.
-    #[serde(default = "wave_auto_default_candle_count")]
-    pub candle_count: u32,
-    /// Minimum avg candle height (percent) to qualify. Floors out flat
-    /// markets that pass the volume gate. `0` (default) = no floor.
-    #[serde(default)]
-    pub min_candle_pct: Decimal,
-    /// How many top-scored symbols to run concurrently. Default `5`.
-    #[serde(default = "wave_auto_default_top_n")]
-    pub top_n: usize,
-    /// How often to re-discover + re-rank (seconds). Clamped to ≥ 10s.
-    /// Default `60`.
-    #[serde(default = "tide_auto_default_recheck_interval_secs")]
-    pub recheck_interval_secs: u64,
-    /// Quote asset to filter on. Default `"USDC"` (matches the live wave acct).
-    #[serde(default = "wave_auto_default_quote_asset")]
-    pub quote_asset: String,
-    /// Forwarded to every spawned Wave bot. Defaults match the tuned config.
-    #[serde(default = "wave_default_grid_levels")]
-    pub grid_levels: u32,
-    #[serde(default = "wave_auto_default_step_bps")]
-    pub step_bps: u32,
-    #[serde(default = "wave_auto_default_inner_steps")]
-    pub inner_steps: u32,
-    #[serde(default = "wave_default_refill_threshold")]
-    pub refill_threshold: u32,
-    #[serde(default = "wave_auto_default_chase_to_avg")]
-    pub chase_to_avg: bool,
-    /// Market-chase (lattice follows the touch both ways). The LOSING mode;
-    /// `false` (default). Forwarded to every spawned Wave bot.
-    #[serde(default)]
-    pub chase: bool,
-    /// Optional explicit allowlist — when non-empty, only these symbols are
-    /// scored (filters still apply). Empty (default) = free discovery.
-    #[serde(default)]
-    pub symbols_allowlist: Vec<String>,
-    /// When `true` (default), do NOT rotate a symbol out of the live set while
-    /// its bot is holding an UNDERWATER bag (unrealized < 0, above dust). The
-    /// bot keeps running — its grid + chase_to_avg work the bag off — and it
-    /// only rotates once flat or green. Prevents rotation from crystallizing a
-    /// loss on a bag that, on these mean-reverting markets, usually recovers.
-    /// A deferred symbol holds its slot (total active stays ≤ `top_n`), so a
-    /// stuck bag delays — but never realizes a loss for — a new entrant.
-    #[serde(default = "wave_auto_default_defer_underwater")]
-    pub defer_underwater: bool,
 }
 
 fn wave_auto_default_defer_underwater() -> bool {
@@ -749,6 +624,102 @@ fn wave_auto_default_inner_steps() -> u32 {
 }
 fn wave_auto_default_chase_to_avg() -> bool {
     true
+}
+
+/// Scoring mode for the rampage auto-rotation manager.
+///
+/// Uses an adjacently-tagged representation so the `toml` crate can parse it
+/// correctly — internally-tagged enums are not supported by the `toml` crate
+/// when the variant contains non-string fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", content = "params", rename_all = "snake_case")]
+pub enum ScoreMode {
+    /// Score by average 1-minute candle height (wicks included) as a percent.
+    CandleHeight {
+        #[serde(default = "wave_auto_default_candle_count")]
+        candle_count: u32,
+        #[serde(default)]
+        min_candle_pct: Decimal,
+    },
+    /// Score by tick_bps (`tick_size / price × 10000`) from the exchange info
+    /// — no extra HTTP calls.
+    TickBps {
+        #[serde(default = "tide_auto_default_min_tick_bps")]
+        min_tick_bps: Decimal,
+    },
+}
+
+/// Strategy spawned by the rampage manager for each qualifying symbol.
+///
+/// Uses an adjacently-tagged representation for `toml` crate compatibility.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", content = "params", rename_all = "snake_case")]
+pub enum RampageStrategy {
+    /// Spawn a Wave (frozen-lattice) bot.
+    Wave {
+        #[serde(default = "wave_default_grid_levels")]
+        grid_levels: u32,
+        #[serde(default = "wave_auto_default_step_bps")]
+        step_bps: u32,
+        #[serde(default = "wave_auto_default_inner_steps")]
+        inner_steps: u32,
+        #[serde(default = "wave_default_refill_threshold")]
+        refill_threshold: u32,
+        #[serde(default = "wave_auto_default_chase_to_avg")]
+        chase_to_avg: bool,
+        #[serde(default)]
+        chase: bool,
+    },
+    /// Spawn a Tide (at-touch grid) bot.
+    Tide {
+        #[serde(default = "tide_auto_default_grid_levels")]
+        grid_levels: u32,
+        #[serde(default = "tide_auto_default_step_bps")]
+        step_bps: u32,
+        #[serde(default)]
+        inner_steps: u32,
+        #[serde(default)]
+        chase: bool,
+        #[serde(default)]
+        chase_to_avg: bool,
+    },
+}
+
+/// `[rampage]` — unified auto-rotation manager. Replaces both `[wave_auto]`
+/// and `[tide_auto]`. Discovers qualifying symbols via the configured `score`
+/// mode, takes the top `top_n`, and runs the configured `strategy` (Wave or
+/// Tide) on each. Preserves all wave_auto features: orphan adoption,
+/// defer_underwater, retired-tab GC, graceful shutdown that leaves positions.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RampageConfig {
+    /// Master switch.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum 24h quote volume in USDT for a symbol to qualify.
+    #[serde(default = "tide_auto_default_min_volume_usdt")]
+    pub min_volume_usdt: Decimal,
+    /// How often to re-discover + re-rank (seconds). Clamped to ≥ 10s.
+    #[serde(default = "tide_auto_default_recheck_interval_secs")]
+    pub recheck_interval_secs: u64,
+    /// Quote asset to filter discovery on. Default `"USDC"`.
+    #[serde(default = "wave_auto_default_quote_asset")]
+    pub quote_asset: String,
+    /// How many top-scored symbols to run concurrently. Default `5`.
+    #[serde(default = "wave_auto_default_top_n")]
+    pub top_n: usize,
+    /// When `true` (default), do NOT rotate a symbol out while its bot holds an
+    /// underwater bag. The bot keeps running until flat or green.
+    #[serde(default = "wave_auto_default_defer_underwater")]
+    pub defer_underwater: bool,
+    /// Optional explicit symbol allowlist. When non-empty, only these symbols
+    /// are considered (volume + score filters still apply).
+    #[serde(default)]
+    pub symbols_allowlist: Vec<String>,
+    /// Scoring mode used to rank candidate symbols.
+    pub score: ScoreMode,
+    /// Strategy to spawn on each qualifying symbol.
+    pub strategy: RampageStrategy,
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus
@@ -1397,5 +1368,110 @@ mod tests {
         assert_eq!(sg.levels, 3);
         assert_eq!(sg.inner_bps, 3);
         assert_eq!(sg.scale_max, Decimal::from(4));
+    }
+
+    #[test]
+    fn rampage_wave_variant_deserializes() {
+        let s = r#"
+            [account]
+            env = "futures-testnet"
+
+            [rampage]
+            enabled = true
+            min_volume_usdt = "2000000"
+            recheck_interval_secs = 60
+            quote_asset = "USDT"
+            top_n = 10
+
+            [rampage.score]
+            mode = "candle_height"
+            [rampage.score.params]
+            candle_count = 60
+            min_candle_pct = "0"
+
+            [rampage.strategy]
+            kind = "wave"
+            [rampage.strategy.params]
+            grid_levels = 10
+            step_bps = 30
+            inner_steps = 2
+            refill_threshold = 5
+            chase_to_avg = false
+            chase = true
+        "#;
+        let cfg: DashboardConfig = toml::from_str(s).unwrap();
+        let r = cfg.rampage.as_ref().expect("rampage must be present");
+        assert!(r.enabled);
+        assert_eq!(r.top_n, 10);
+        match &r.score {
+            ScoreMode::CandleHeight {
+                candle_count,
+                min_candle_pct,
+            } => {
+                assert_eq!(*candle_count, 60);
+                assert_eq!(*min_candle_pct, Decimal::ZERO);
+            }
+            other => panic!("expected CandleHeight, got {other:?}"),
+        }
+        match &r.strategy {
+            RampageStrategy::Wave {
+                grid_levels,
+                step_bps,
+                chase,
+                ..
+            } => {
+                assert_eq!(*grid_levels, 10);
+                assert_eq!(*step_bps, 30);
+                assert!(*chase);
+            }
+            other => panic!("expected Wave, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rampage_tide_variant_deserializes() {
+        let s = r#"
+            [account]
+            env = "futures-testnet"
+
+            [rampage]
+            enabled = true
+            min_volume_usdt = "20000000"
+            recheck_interval_secs = 60
+            quote_asset = "USDT"
+            top_n = 5
+
+            [rampage.score]
+            mode = "tick_bps"
+            [rampage.score.params]
+            min_tick_bps = "6"
+
+            [rampage.strategy]
+            kind = "tide"
+            [rampage.strategy.params]
+            grid_levels = 12
+            step_bps = 10
+        "#;
+        let cfg: DashboardConfig = toml::from_str(s).unwrap();
+        let r = cfg.rampage.as_ref().expect("rampage must be present");
+        assert!(r.enabled);
+        assert_eq!(r.top_n, 5);
+        match &r.score {
+            ScoreMode::TickBps { min_tick_bps } => {
+                assert_eq!(*min_tick_bps, Decimal::from(6));
+            }
+            other => panic!("expected TickBps, got {other:?}"),
+        }
+        match &r.strategy {
+            RampageStrategy::Tide {
+                grid_levels,
+                step_bps,
+                ..
+            } => {
+                assert_eq!(*grid_levels, 12);
+                assert_eq!(*step_bps, 10);
+            }
+            other => panic!("expected Tide, got {other:?}"),
+        }
     }
 }

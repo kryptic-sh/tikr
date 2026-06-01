@@ -1,18 +1,23 @@
-//! Auto-rotation manager for Wave — hunts the "GUN regime": volatile +
-//! wide-spread + mean-reverting + liquid markets where the frozen lattice
-//! oscillates and banks round-trips with near-zero inventory.
+//! Generic auto-rotation manager — replaces both `wave_auto` and `tide_auto`.
 //!
 //! Every `recheck_interval_secs` (default 60s):
-//! 1. Query Binance Futures exchangeInfo + ticker/price + ticker/24hr +
-//!    all-symbols bookTicker (one call each) via `list_perp_wave_info`.
-//! 2. Keep symbols passing the floors: `24h quote volume ≥ min_volume_usdt`,
-//!    `24h range% ≥ min_range_pct`, live `spread_bps ≥ min_spread_bps`, and
-//!    `chop_ratio = range% / |24h net change%| ≥ min_chop_ratio`
-//!    (oscillation, not a one-way trend → low bag risk).
-//! 3. Score survivors by `range% × chop_ratio × spread_bps`, take the top
-//!    `top_n`.
-//! 4. Diff against the running set: spawn Wave on new entrants, shut down +
-//!    flatten symbols that fell out of the top set.
+//! 1. Query Binance Futures exchangeInfo + ticker/price + ticker/24hr via
+//!    `list_perp_tick_info`.
+//! 2. Pre-filter to liquid symbols: `24h quote volume ≥ min_volume_usdt`,
+//!    optional allowlist.
+//! 3. Score survivors by the configured `ScoreMode`:
+//!    - `CandleHeight`: concurrent `get_1m_avg_candle_pct` over candidates,
+//!      filtered `≥ min_candle_pct`.
+//!    - `TickBps`: score from the already-fetched `tick_bps` field, filtered
+//!      `≥ min_tick_bps` (no extra HTTP calls).
+//! 4. Sort desc by score, truncate to `top_n`.
+//! 5. Diff against the running set: spawn the configured `RampageStrategy` on
+//!    new entrants, shut down + flatten symbols that fell out.
+//!
+//! All features from `wave_auto` are preserved: orphan-position adoption,
+//! `defer_underwater`, retired-tab GC (`RETIRE_AFTER_CYCLES`), `stop_bot`
+//! abort+reap, `flatten_symbols`, and graceful global-shutdown that leaves
+//! positions intact.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -25,7 +30,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::config::{BotConfig, WaveAutoConfig, WaveParams};
+use crate::config::{BotConfig, RampageConfig, RampageStrategy, ScoreMode, TideParams, WaveParams};
 use crate::state::{BotStatus, BotView, SharedBotState};
 use crate::supervisor::{SupervisorCtx, reset_symbol_state, spawn_supervisor};
 use crate::venue;
@@ -34,8 +39,9 @@ use crate::venue;
 /// tab is removed. If it rotates back in before this, the counter resets.
 const RETIRE_AFTER_CYCLES: u32 = 5;
 
-/// Account/env context shared by all spawned Wave supervisors.
-pub struct WaveAutoAccountCtx {
+/// Account/env context shared by all spawned supervisors under the rampage
+/// manager.
+pub struct RampageAccountCtx {
     pub env: BinanceEnv,
     pub api_key: String,
     pub key_material: Arc<BinanceKeyMaterial>,
@@ -54,11 +60,11 @@ struct ActiveBot {
     handle: JoinHandle<()>,
 }
 
-/// Spawn the Wave auto-rotation manager. Returns immediately; runs in the
+/// Spawn the rampage auto-rotation manager. Returns immediately; runs in the
 /// background until global shutdown fires.
-pub fn spawn_wave_auto_manager(
-    cfg: WaveAutoConfig,
-    account: WaveAutoAccountCtx,
+pub fn spawn_rampage_manager(
+    cfg: RampageConfig,
+    account: RampageAccountCtx,
     shared_state: SharedBotState,
     mut global_shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -72,14 +78,27 @@ pub fn spawn_wave_auto_manager(
         let mut tick = tokio::time::interval(Duration::from_secs(recheck));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        let score_label = match &cfg.score {
+            ScoreMode::CandleHeight {
+                candle_count,
+                min_candle_pct,
+            } => format!("candle_height(count={candle_count}, min_pct={min_candle_pct})"),
+            ScoreMode::TickBps { min_tick_bps } => {
+                format!("tick_bps(min={min_tick_bps})")
+            }
+        };
+        let strategy_label = match &cfg.strategy {
+            RampageStrategy::Wave { .. } => "wave",
+            RampageStrategy::Tide { .. } => "tide",
+        };
         info!(
             min_volume_usdt = %cfg.min_volume_usdt,
-            candle_count = cfg.candle_count,
-            min_candle_pct = %cfg.min_candle_pct,
+            score = %score_label,
+            strategy = %strategy_label,
             top_n = cfg.top_n,
             recheck_interval_secs = recheck,
             quote_asset = %cfg.quote_asset,
-            "wave_auto: starting discovery loop (score = avg 1m candle height %)"
+            "rampage: starting discovery loop"
         );
 
         loop {
@@ -92,7 +111,7 @@ pub fn spawn_wave_auto_manager(
                         // flatten. Positions persist across restarts; the next
                         // start cancels the orphan orders (clear_on_start=false)
                         // and resumes managing the inherited position.
-                        info!("wave_auto: global shutdown — stopping bots (orders + positions left intact)");
+                        info!("rampage: global shutdown — stopping bots (orders + positions left intact)");
                         for (_, bot) in active.drain() {
                             stop_bot(bot).await;
                         }
@@ -112,7 +131,7 @@ pub fn spawn_wave_auto_manager(
             {
                 Ok(rows) => rows,
                 Err(e) => {
-                    warn!(error = ?e, "wave_auto: discovery failed, retrying next cycle");
+                    warn!(error = ?e, "rampage: discovery failed, retrying next cycle");
                     continue;
                 }
             };
@@ -137,33 +156,52 @@ pub fn spawn_wave_auto_manager(
                 .map(|r| r.symbol.clone())
                 .collect();
 
-            // 3. Score each candidate by RECENT PRICE ACTION: the avg height of
-            // its last `candle_count` 1m candles, as a percent (wicks included).
-            // Fetched concurrently (cap 16) to keep the recheck fast.
-            let base_url = account.env.rest_base_url().to_string();
-            let n_candles = cfg.candle_count;
-            let http_ref = &http;
-            let raw_scores: Vec<(String, Decimal)> = futures::stream::iter(candidates)
-                .map(|sym| {
-                    let base = base_url.clone();
-                    async move {
-                        let score = tikr_binance::futs::get_1m_avg_candle_pct(
-                            http_ref, &base, &sym, n_candles,
-                        )
-                        .await
-                        .unwrap_or_default();
-                        (sym, score)
-                    }
-                })
-                .buffer_unordered(16)
-                .collect()
-                .await;
+            // 3. Score candidates according to the configured ScoreMode.
+            let mut scored: Vec<(String, Decimal)> = match &cfg.score {
+                ScoreMode::CandleHeight {
+                    candle_count,
+                    min_candle_pct,
+                } => {
+                    // Fetch avg 1m candle height concurrently (cap 16).
+                    let base_url = account.env.rest_base_url().to_string();
+                    let n_candles = *candle_count;
+                    let min_pct = *min_candle_pct;
+                    let http_ref = &http;
+                    let raw: Vec<(String, Decimal)> = futures::stream::iter(candidates)
+                        .map(|sym| {
+                            let base = base_url.clone();
+                            async move {
+                                let score = tikr_binance::futs::get_1m_avg_candle_pct(
+                                    http_ref, &base, &sym, n_candles,
+                                )
+                                .await
+                                .unwrap_or_default();
+                                (sym, score)
+                            }
+                        })
+                        .buffer_unordered(16)
+                        .collect()
+                        .await;
+                    raw.into_iter().filter(|(_, s)| *s >= min_pct).collect()
+                }
+                ScoreMode::TickBps { min_tick_bps } => {
+                    // Score from the already-fetched tick_bps — no extra HTTP.
+                    let tick_map: HashMap<String, Decimal> = discovered
+                        .iter()
+                        .map(|r| (r.symbol.clone(), r.tick_bps))
+                        .collect();
+                    let min = *min_tick_bps;
+                    candidates
+                        .into_iter()
+                        .filter_map(|sym| {
+                            let bps = tick_map.get(&sym).copied().unwrap_or_default();
+                            if bps >= min { Some((sym, bps)) } else { None }
+                        })
+                        .collect()
+                }
+            };
 
-            // 4. Floor on the candle score, rank desc, take top_n.
-            let mut scored: Vec<(String, Decimal)> = raw_scores
-                .into_iter()
-                .filter(|(_, s)| *s >= cfg.min_candle_pct)
-                .collect();
+            // 4. Rank desc, take top_n.
             scored.sort_by_key(|(_, sc)| std::cmp::Reverse(*sc));
             scored.truncate(cfg.top_n);
             let qualifying: HashSet<String> = scored.iter().map(|(s, _)| s.clone()).collect();
@@ -171,12 +209,12 @@ pub fn spawn_wave_auto_manager(
                 candidates = qualifying.len(),
                 running = active.len(),
                 top = ?scored.iter().map(|(s, sc)| format!("{s}:{sc:.1}")).collect::<Vec<_>>(),
-                "wave_auto: discovery tick"
+                "rampage: discovery tick"
             );
 
             // 4-pre. Adopt orphan positions. Any symbol with an open position
             // on the venue but NO active bot gets one spawned to MANAGE/DRAIN
-            // it — covers positions inherited across a restart (wave_auto leaves
+            // it — covers positions inherited across a restart (rampage leaves
             // positions intact on shutdown) whose symbol has since fallen off
             // the top set. Without this they'd sit with no orders, unmanaged.
             // Once adopted they obey the normal rules below: deferred while
@@ -210,7 +248,7 @@ pub fn spawn_wave_auto_manager(
                             symbol = %sym,
                             amount = %amt,
                             notional = %(amt.abs() * mark),
-                            "wave_auto: adopting orphan position (no active bot) — spawning manager"
+                            "rampage: adopting orphan position (no active bot) — spawning manager"
                         );
                         let bot = spawn_one_bot(&sym, &account, &shared_state, &cfg);
                         active.insert(sym.clone(), bot);
@@ -218,7 +256,7 @@ pub fn spawn_wave_auto_manager(
                     }
                 }
                 Err(e) => {
-                    warn!(error = ?e, "wave_auto: orphan-position scan failed (skipping this cycle)")
+                    warn!(error = ?e, "rampage: orphan-position scan failed (skipping this cycle)")
                 }
             }
 
@@ -239,14 +277,14 @@ pub fn spawn_wave_auto_manager(
                 if cfg.defer_underwater && holds_underwater_bag(&symbol, mark, &account).await {
                     info!(
                         symbol = %symbol,
-                        "wave_auto: out of top set but holding an underwater bag — deferring rotation"
+                        "rampage: out of top set but holding an underwater bag — deferring rotation"
                     );
                     continue; // keep the bot; it holds its slot until recovered
                 }
                 if let Some(bot) = active.remove(&symbol) {
                     warn!(
                         symbol = %symbol,
-                        "wave_auto: rotating out (flat/green) — shutting down + flattening"
+                        "rampage: rotating out (flat/green) — shutting down + flattening"
                     );
                     // Ensure the bot is fully STOPPED before flattening — a
                     // still-running bot would re-quote and re-open the position
@@ -272,7 +310,7 @@ pub fn spawn_wave_auto_manager(
                     continue;
                 }
                 let bot = spawn_one_bot(symbol, &account, &shared_state, &cfg);
-                info!(symbol = %symbol, "wave_auto: spawned new bot");
+                info!(symbol = %symbol, "rampage: spawned new bot");
                 active.insert(symbol.clone(), bot);
             }
 
@@ -291,7 +329,7 @@ pub fn spawn_wave_auto_manager(
                     info!(
                         symbol = %sym,
                         cycles = RETIRE_AFTER_CYCLES,
-                        "wave_auto: dropped stale off-bot from the dashboard"
+                        "rampage: dropped stale off-bot from the dashboard"
                     );
                     return false;
                 }
@@ -309,7 +347,7 @@ pub fn spawn_wave_auto_manager(
 async fn holds_underwater_bag(
     symbol_str: &str,
     mark: Decimal,
-    account: &WaveAutoAccountCtx,
+    account: &RampageAccountCtx,
 ) -> bool {
     use tikr_venue::Venue;
     let symbol = venue::perp_symbol(symbol_str);
@@ -324,14 +362,14 @@ async fn holds_underwater_bag(
     {
         Ok(v) => v,
         Err(e) => {
-            warn!(symbol = symbol_str, error = ?e, "wave_auto: venue build for bag check failed — deferring");
+            warn!(symbol = symbol_str, error = ?e, "rampage: venue build for bag check failed — deferring");
             return true;
         }
     };
     let pos = match v.position(&symbol).await {
         Ok(p) => p,
         Err(e) => {
-            warn!(symbol = symbol_str, error = ?e, "wave_auto: position read for bag check failed — deferring");
+            warn!(symbol = symbol_str, error = ?e, "rampage: position read for bag check failed — deferring");
             return true;
         }
     };
@@ -362,8 +400,7 @@ async fn holds_underwater_bag(
 /// touches its symbol (cancel-all / flatten). A bare `timeout(.., handle)` that
 /// elapses merely drops the `JoinHandle`, which DETACHES the task — it keeps
 /// running and can re-quote / re-open the very position we're about to flatten,
-/// orphaning it on the venue. So on timeout we abort and reap, ensuring the bot
-/// is dead first.
+/// orphaning it. So on timeout we abort and reap, ensuring the bot is dead first.
 async fn stop_bot(bot: ActiveBot) {
     let _ = bot.shutdown_tx.send(true);
     let mut handle = bot.handle;
@@ -371,13 +408,13 @@ async fn stop_bot(bot: ActiveBot) {
         .await
         .is_err()
     {
-        warn!("wave_auto: bot did not stop in 5s — aborting before cancel/flatten");
+        warn!("rampage: bot did not stop in 5s — aborting before cancel/flatten");
         handle.abort();
         let _ = handle.await;
     }
 }
 
-async fn flatten_symbols(symbols: &[String], account: &WaveAutoAccountCtx) {
+async fn flatten_symbols(symbols: &[String], account: &RampageAccountCtx) {
     for symbol_str in symbols {
         let symbol = venue::perp_symbol(symbol_str);
         match venue::build_venue(
@@ -390,13 +427,13 @@ async fn flatten_symbols(symbols: &[String], account: &WaveAutoAccountCtx) {
         .await
         {
             Ok(v) => {
-                info!(symbol = symbol_str, "wave_auto: cancel + flatten");
+                info!(symbol = symbol_str, "rampage: cancel + flatten");
                 reset_symbol_state(&v, &symbol).await;
             }
             Err(e) => warn!(
                 symbol = symbol_str,
                 error = ?e,
-                "wave_auto: venue build for flatten failed"
+                "rampage: venue build for flatten failed"
             ),
         }
     }
@@ -404,49 +441,96 @@ async fn flatten_symbols(symbols: &[String], account: &WaveAutoAccountCtx) {
 
 fn spawn_one_bot(
     symbol: &str,
-    account: &WaveAutoAccountCtx,
+    account: &RampageAccountCtx,
     shared_state: &SharedBotState,
-    cfg: &WaveAutoConfig,
+    cfg: &RampageConfig,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bot_cfg = BotConfig {
-        symbol: symbol.to_string(),
-        strategy: "wave".to_string(),
-        // Notional + cap come from the account-wide pollers; geometry from
-        // the wave_auto config.
-        wave: Some(WaveParams {
-            notional: None,
-            grid_levels: cfg.grid_levels,
-            step_bps: cfg.step_bps,
-            inner_steps: cfg.inner_steps,
-            refill_threshold: cfg.refill_threshold,
-            inventory_skew_slots: 0,
-            chase_to_avg: cfg.chase_to_avg,
-            chase: cfg.chase,
-            tp_bps: 0,
-            tp_close_pct: 100,
-            sl_bps: 0,
-            sl_close_pct: 100,
-        }),
-        tide: None,
-        sg: None,
-        lg: None,
-        ladder_reentry: None,
-        simple_gap: None,
-        micro_mean_reversion: None,
-        spread_scalp: None,
-        liq_fade: None,
-        hydra: None,
-        joker: None,
-        rsi_mr: None,
-        mantis: None,
+    let (bot_cfg, strategy_name, label) = match &cfg.strategy {
+        RampageStrategy::Wave {
+            grid_levels,
+            step_bps,
+            inner_steps,
+            refill_threshold,
+            chase_to_avg,
+            chase,
+        } => {
+            let bc = BotConfig {
+                symbol: symbol.to_string(),
+                strategy: "wave".to_string(),
+                wave: Some(WaveParams {
+                    notional: None,
+                    grid_levels: *grid_levels,
+                    step_bps: *step_bps,
+                    inner_steps: *inner_steps,
+                    refill_threshold: *refill_threshold,
+                    inventory_skew_slots: 0,
+                    chase_to_avg: *chase_to_avg,
+                    chase: *chase,
+                    tp_bps: 0,
+                    tp_close_pct: 100,
+                    sl_bps: 0,
+                    sl_close_pct: 100,
+                }),
+                tide: None,
+                sg: None,
+                lg: None,
+                ladder_reentry: None,
+                simple_gap: None,
+                micro_mean_reversion: None,
+                spread_scalp: None,
+                liq_fade: None,
+                hydra: None,
+                joker: None,
+                rsi_mr: None,
+                mantis: None,
+            };
+            (bc, "wave", format!("{symbol}/wave"))
+        }
+        RampageStrategy::Tide {
+            grid_levels,
+            step_bps,
+            inner_steps,
+            chase,
+            chase_to_avg,
+        } => {
+            let bc = BotConfig {
+                symbol: symbol.to_string(),
+                strategy: "tide".to_string(),
+                tide: Some(TideParams {
+                    notional: None,
+                    grid_levels: *grid_levels,
+                    step_bps: *step_bps,
+                    prune_stragglers: true,
+                    recenter_bps: 0,
+                    recenter_secs: 0,
+                    inner_steps: *inner_steps,
+                    chase: *chase,
+                    chase_to_avg: *chase_to_avg,
+                    relattice_timeout_secs: 300,
+                }),
+                wave: None,
+                sg: None,
+                lg: None,
+                ladder_reentry: None,
+                simple_gap: None,
+                micro_mean_reversion: None,
+                spread_scalp: None,
+                liq_fade: None,
+                hydra: None,
+                joker: None,
+                rsi_mr: None,
+                mantis: None,
+            };
+            (bc, "tide", format!("{symbol}/tide"))
+        }
     };
     shared_state.insert(
         symbol,
         BotView {
-            label: format!("{symbol}/wave"),
+            label,
             symbol: symbol.to_string(),
-            strategy: "wave".to_string(),
+            strategy: strategy_name.to_string(),
             status: BotStatus::Starting,
             snapshot: Arc::new(RwLock::new(None)),
             live: Arc::new(RwLock::new(None)),

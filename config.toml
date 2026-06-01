@@ -1,18 +1,17 @@
-# ─── Wave AUTO-rotation — MAINNET (default config) ────────────────────────
+# ─── Rampage AUTO-rotation — MAINNET (default config) ──────────────────────
 #
-# No fixed bot list. The [wave_auto] manager scores every liquid USD-M perp by
-# RECENT PRICE ACTION and runs Wave on the top N. Re-ranks every recheck.
+# No fixed bot list. The [rampage] manager scores every liquid USD-M perp and
+# runs the configured strategy on the top N. Re-ranks every recheck.
 #
-# Score = average height of the last `candle_count` 1-minute candles, as a
-# percent: mean( (high − low) / low × 100 ), wicks included. Big 1-minute
-# candles = lots of intra-minute oscillation for the frozen lattice to bank —
-# the GUN signature. This is a RECENT signal, so it catches a market that just
-# woke up, unlike a 24h aggregate that dilutes it.
+# Score mode: candle_height — average height of the last `candle_count`
+# 1-minute candles, as a percent: mean( (high − low) / low × 100 ), wicks
+# included. Big 1-minute candles = lots of intra-minute oscillation for the
+# frozen lattice to bank — the GUN signature. This is a RECENT signal, so it
+# catches a market that just woke up, unlike a 24h aggregate that dilutes it.
 #
 # Each recheck: list perps + price + 24h volume (cheap), pre-filter by
 # `min_volume_usdt`, then fetch the last `candle_count` 1m klines for each
-# survivor (concurrent), score, and run Wave on the top `top_n` (avg candle %
-# ≥ `min_candle_pct`).
+# survivor (concurrent), score, and run the strategy on the top `top_n`.
 #
 # Rotation is graceful: a symbol that drops out only rotates when its bot is
 # flat or GREEN. Holding an underwater bag? It keeps running until recovered
@@ -39,19 +38,26 @@ leverage = 10
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 
-[wave_auto]
+[rampage]
 enabled = true
-min_volume_usdt = "2000000" # $2M 24h quote volume floor (liquidity + bounds kline calls)
-candle_count = 60           # average the last 60 one-minute candles (~1h window)
-min_candle_pct = "0"        # min avg candle height % to qualify (0 = no floor)
-top_n = 10                  # run Wave on the 5 highest-scored symbols
+min_volume_usdt = "2000000" # $2M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDT"
-# defer_underwater defaults true (don't rotate a bot holding a losing bag).
-# Forwarded to every spawned Wave bot.
+top_n = 10
+# defer_underwater defaults true (don't rotate a bot holding a losing bag)
+
+[rampage.score]
+mode = "candle_height"   # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
+[rampage.score.params]
+candle_count = 60        # average the last 60 one-minute candles (~1h window)
+min_candle_pct = "0"     # min avg candle height % to qualify (0 = no floor)
+
+[rampage.strategy]
+kind = "wave"            # "wave" | "tide"
+[rampage.strategy.params]
 grid_levels = 10
-refill_threshold = 5
 step_bps = 30
 inner_steps = 2
+refill_threshold = 5
 chase_to_avg = false
 chase = true
