@@ -798,6 +798,12 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     tide_inner_steps: u32,
 
+    /// Tide sweep: comma-separated inner_steps values (dead-zone size; innermost
+    /// order at `(inner_steps+1)` steps from center). Overrides
+    /// `--tide-inner-steps` when set to more than the default.
+    #[arg(long, default_value = "0")]
+    tide_inner_steps_list: String,
+
     /// Tide: when set, the lattice chases price both ways (bids follow up, asks
     /// follow down). Default off = one-sided/frozen (the +118 baseline).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -2290,36 +2296,39 @@ async fn run_sweep_collect(
     if included("tide", &allow) {
         let tide_steps = parse_u32_list(&args.tide_step_bps_list)?;
         let tide_levels = parse_u32_list(&args.tide_grid_levels_list)?;
+        let tide_inners = parse_u32_list(&args.tide_inner_steps_list)?;
         for &levels in &tide_levels {
-            for &step in &tide_steps {
-                let label = format!("Tide lv={levels} step={step}bps");
-                spawn_preset(
-                    &mut handles,
-                    &shared_data,
-                    &symbol,
-                    &label,
-                    Tide::new(TideConfig {
-                        notional_per_order: tide_notional,
-                        tick_size: tick,
-                        step_size: lot_step,
-                        min_notional,
-                        grid_levels: levels,
-                        step_bps: step,
-                        max_position_usdt: Decimal::ZERO,
-                        prune_stragglers: true,
-                        recenter_bps: args.tide_recenter_bps,
-                        recenter_secs: args.tide_recenter_secs,
-                        inner_steps: args.tide_inner_steps,
-                        chase: args.tide_chase,
-                        chase_to_avg: args.tide_chase_to_avg,
-                        relattice_timeout_secs: args.tide_relattice_timeout_secs,
-                    }),
-                    fees,
-                    skim_cfg,
-                    funding_cfg,
-                    sim_cfg_template.clone(),
-                    equity_csv_dir.clone(),
-                );
+            for &inner in &tide_inners {
+                for &step in &tide_steps {
+                    let label = format!("Tide lv={levels} step={step}bps in={inner}");
+                    spawn_preset(
+                        &mut handles,
+                        &shared_data,
+                        &symbol,
+                        &label,
+                        Tide::new(TideConfig {
+                            notional_per_order: tide_notional,
+                            tick_size: tick,
+                            step_size: lot_step,
+                            min_notional,
+                            grid_levels: levels,
+                            step_bps: step,
+                            max_position_usdt: Decimal::ZERO,
+                            prune_stragglers: true,
+                            recenter_bps: args.tide_recenter_bps,
+                            recenter_secs: args.tide_recenter_secs,
+                            inner_steps: inner,
+                            chase: args.tide_chase,
+                            chase_to_avg: args.tide_chase_to_avg,
+                            relattice_timeout_secs: args.tide_relattice_timeout_secs,
+                        }),
+                        fees,
+                        skim_cfg,
+                        funding_cfg,
+                        sim_cfg_template.clone(),
+                        equity_csv_dir.clone(),
+                    );
+                }
             }
         }
     }
