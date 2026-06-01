@@ -48,17 +48,17 @@ top_n = 10
 rotate_loss_pct = "1" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 
 [rampage.score]
-mode = "candle_height"   # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
+mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
 [rampage.score.params]
-candle_count = 60        # average the last 60 one-minute candles (~1h window)
-min_candle_pct = "0"     # min avg candle height % to qualify (0 = no floor)
+candle_count = 60    # average the last 60 one-minute candles (~1h window)
+min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 
 [rampage.strategy]
-kind = "wave"            # "wave" | "tide"
+kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 grid_levels = 10
 step_bps = 30
-inner_steps = 2
+inner_steps = 0
 refill_threshold = 5
 chase_to_avg = false
 chase = true
