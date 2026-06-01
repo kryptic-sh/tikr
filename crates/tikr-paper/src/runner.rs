@@ -899,6 +899,7 @@ where
                             config.min_notional,
                             current_max_position,
                             inventory_boost,
+                            &mut rate_limited_until,
                         ).await;
                     }
                 }
@@ -943,6 +944,7 @@ where
                             config.min_notional,
                             current_max_position,
                             inventory_boost,
+                            &mut rate_limited_until,
                         ).await;
                     }
                 }
@@ -1496,6 +1498,7 @@ where
                             config.min_notional,
                             current_max_position,
                             inventory_boost,
+                            &mut rate_limited_until,
                         )
                         .await;
                     }
@@ -1857,6 +1860,7 @@ where
                     config.min_notional,
                     current_max_position,
                     inventory_boost,
+                    &mut rate_limited_until,
                 )
                 .await;
                 // Publish AFTER local mirror has dropped the filled order and
@@ -2351,6 +2355,7 @@ async fn dispatch_post_fill_actions<V, S>(
     min_notional: Decimal,
     max_position: Decimal,
     inventory_boost: Option<InventoryBoostConfig>,
+    rate_limited_until: &mut Option<Instant>,
 ) where
     V: Venue,
     S: Strategy,
@@ -2389,11 +2394,22 @@ async fn dispatch_post_fill_actions<V, S>(
         return;
     }
 
-    // Live mode: dispatch to venue; track rejected Quote intents for recovery.
+    // Live mode: dispatch to venue. The grid is a FIXED LATTICE, so we do NOT
+    // retry a failed/rejected order — the slot is left empty and the next tick's
+    // deterministic emit refills it if still wanted (dedup against open_quotes).
+    // This is what keeps a rate-limit window from snowballing: the old recovery
+    // path re-placed every rejected intent up to 20× per fill (each round also
+    // re-fetching the book), which turned one 429 into a burst and escalated the
+    // Retry-After. Now a 429 just (a) arms the shared cooldown and (b) drops the
+    // rest of this fill's orders; the book loop + next fill resume once it clears.
+    if rate_limited_until.is_some_and(|u| u > Instant::now()) {
+        return;
+    }
     // Batch consecutive same-type actions — one request per 5 places
-    // (`POST /fapi/v1/batchOrders`) / 10 cancels (`DELETE …`) — instead of a
-    // round trip each. A fill-driven slide (Tide) emits a side of adds plus the
-    // far-edge cancels in one shot, so batching collapses the REST bursts.
+    // (`POST /fapi/v1/batchOrders`) / 10 cancels (`DELETE …`). Creates run BEFORE
+    // cancels (the strategy emits adds then prune, and the batcher dispatches the
+    // quote runs first), so on a fast move new orders land before stale ones are
+    // pulled — never a one-sided gap.
     let mut rejected_intents: Vec<(QuoteIntent, String)> = Vec::new();
     let mut i = 0;
     while i < actions.len() {
@@ -2455,20 +2471,24 @@ async fn dispatch_post_fill_actions<V, S>(
                         fill_sim.enqueue_place_with_id(intent.clone(), ts, qid);
                     }
                     Err(e) => {
+                        if let VenueError::RateLimited { retry_after_ms } = e {
+                            *rate_limited_until =
+                                Some(Instant::now() + Duration::from_millis(retry_after_ms));
+                        }
                         let msg = format!("{e:?}");
                         let is_transient = msg.contains("-5022")
                             || msg.contains("Post Only")
                             || msg.contains("RateLimited")
                             || msg.contains("-4400")
                             || msg.contains("Quantitative Rules");
-                        warn!(error = ?e, "live: venue.quote failed (post-fill)");
+                        warn!(error = ?e, "live: venue.quote failed (post-fill) — leaving slot empty, refill next tick");
                         if !is_transient {
                             match intent.side {
                                 Side::Bid => state.0 += 1,
                                 Side::Ask => state.1 += 1,
                             }
                         }
-                        rejected_intents.push((intent.clone(), msg));
+                        // No retry: the fixed lattice refills this slot next tick.
                     }
                 }
             }
@@ -2490,6 +2510,12 @@ async fn dispatch_post_fill_actions<V, S>(
                 match r {
                     // Already gone → drop the mirror so we never re-cancel a phantom.
                     Ok(()) | Err(VenueError::UnknownQuote) => fill_sim.drop_quote(id),
+                    Err(VenueError::RateLimited { retry_after_ms }) => {
+                        *rate_limited_until =
+                            Some(Instant::now() + Duration::from_millis(retry_after_ms));
+                        // Leave the order + its mirror intact; the next tick's
+                        // prune re-issues the cancel once the cooldown clears.
+                    }
                     Err(e) => warn!(error = ?e, "live: venue.cancel failed (post-fill)"),
                 }
             }
