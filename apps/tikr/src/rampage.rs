@@ -446,6 +446,9 @@ fn spawn_one_bot(
             refill_threshold,
             chase_to_avg,
             chase,
+            candle_count,
+            lattice_adjust_secs,
+            step_volatility_mult,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -458,6 +461,9 @@ fn spawn_one_bot(
                     refill_threshold: *refill_threshold,
                     chase_to_avg: *chase_to_avg,
                     chase: *chase,
+                    candle_count: *candle_count,
+                    lattice_adjust_secs: *lattice_adjust_secs,
+                    step_volatility_mult: *step_volatility_mult,
                 }),
                 tide: None,
                 sg: None,

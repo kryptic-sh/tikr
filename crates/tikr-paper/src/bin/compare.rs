@@ -845,6 +845,23 @@ struct Args {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     wave_chase: bool,
 
+    /// Wave adaptive lattice: number of 1-minute candle ranges to average for
+    /// the volatility estimate. `0` → 10. Default 10.
+    #[arg(long, default_value_t = 10u32)]
+    wave_candle_count: u32,
+
+    /// Wave adaptive lattice: re-evaluate + (if the step changed) re-lattice
+    /// this often, in seconds. `0` (default) = adaptive OFF.
+    #[arg(long, default_value_t = 0u32)]
+    wave_lattice_adjust_secs: u32,
+
+    /// Wave adaptive lattice: comma-separated `step_volatility_mult` sweep.
+    /// effective step bps = mult × avg_candle_range_bps, floored at step_bps.
+    /// `0` (default) = adaptive off. Multiple values create one preset per
+    /// value. Example: `--wave-step-vol-mult-list "0,0.5,1.0"`.
+    #[arg(long, default_value = "0")]
+    wave_step_vol_mult_list: String,
+
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
     #[arg(long, default_value = "10")]
@@ -2315,39 +2332,50 @@ async fn run_sweep_collect(
         let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
         let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
         let wave_inner_sweep = parse_u32_list(&args.wave_inner_steps_list)?;
+        let wave_vol_mults = parse_decimal_list(&args.wave_step_vol_mult_list)?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &inner in &wave_inner_sweep {
-                    let label = format!(
-                        "Wave lv={levels} step={step}bps inner={inner} rt={}{}{}",
-                        args.wave_refill_threshold,
-                        if args.wave_chase { " chase" } else { "" },
-                        if args.wave_chase_to_avg { " cta" } else { "" },
-                    );
-                    spawn_preset(
-                        &mut handles,
-                        &shared_data,
-                        &symbol,
-                        &label,
-                        Wave::new(WaveConfig {
-                            notional_per_order: wave_notional,
-                            tick_size: tick,
-                            step_size: lot_step,
-                            min_notional,
-                            grid_levels: levels,
-                            step_bps: step,
-                            inner_steps: inner,
-                            refill_threshold: args.wave_refill_threshold,
-                            max_position_usdt: bot_position_cap,
-                            chase_to_avg: args.wave_chase_to_avg,
-                            chase: args.wave_chase,
-                        }),
-                        fees,
-                        skim_cfg,
-                        funding_cfg,
-                        sim_cfg_template.clone(),
-                        equity_csv_dir.clone(),
-                    );
+                    for &vmult in &wave_vol_mults {
+                        let label = format!(
+                            "Wave lv={levels} step={step}bps inner={inner} rt={}{}{}{}",
+                            args.wave_refill_threshold,
+                            if args.wave_chase { " chase" } else { "" },
+                            if args.wave_chase_to_avg { " cta" } else { "" },
+                            if vmult > Decimal::ZERO {
+                                format!(" vmult_{vmult}")
+                            } else {
+                                String::new()
+                            },
+                        );
+                        spawn_preset(
+                            &mut handles,
+                            &shared_data,
+                            &symbol,
+                            &label,
+                            Wave::new(WaveConfig {
+                                notional_per_order: wave_notional,
+                                tick_size: tick,
+                                step_size: lot_step,
+                                min_notional,
+                                grid_levels: levels,
+                                step_bps: step,
+                                inner_steps: inner,
+                                refill_threshold: args.wave_refill_threshold,
+                                max_position_usdt: bot_position_cap,
+                                chase_to_avg: args.wave_chase_to_avg,
+                                chase: args.wave_chase,
+                                candle_count: args.wave_candle_count,
+                                lattice_adjust_secs: args.wave_lattice_adjust_secs,
+                                step_volatility_mult: vmult,
+                            }),
+                            fees,
+                            skim_cfg,
+                            funding_cfg,
+                            sim_cfg_template.clone(),
+                            equity_csv_dir.clone(),
+                        );
+                    }
                 }
             }
         }

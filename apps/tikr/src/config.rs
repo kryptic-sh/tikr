@@ -340,6 +340,16 @@ pub struct WaveParams {
     /// chase_to_avg.
     #[serde(default)]
     pub chase: bool,
+    /// Adaptive lattice: number of 1-minute candle ranges to average. `0` → 10.
+    #[serde(default = "wave_default_candle_count")]
+    pub candle_count: u32,
+    /// Adaptive lattice: re-evaluate interval in seconds. `0` (default) = off.
+    #[serde(default)]
+    pub lattice_adjust_secs: u32,
+    /// Adaptive lattice: step_bps = `step_volatility_mult × avg_candle_range_bps`,
+    /// floored at `step_bps`. `0` (default) = off.
+    #[serde(default)]
+    pub step_volatility_mult: Decimal,
 }
 
 fn wave_default_refill_threshold() -> u32 {
@@ -348,6 +358,10 @@ fn wave_default_refill_threshold() -> u32 {
 
 fn wave_default_grid_levels() -> u32 {
     12
+}
+
+fn wave_default_candle_count() -> u32 {
+    10
 }
 
 /// Mantis — symmetric touch scalper; rests a bid+ask at the touch.
@@ -646,6 +660,12 @@ pub enum RampageStrategy {
         chase_to_avg: bool,
         #[serde(default)]
         chase: bool,
+        #[serde(default = "wave_default_candle_count")]
+        candle_count: u32,
+        #[serde(default)]
+        lattice_adjust_secs: u32,
+        #[serde(default)]
+        step_volatility_mult: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {

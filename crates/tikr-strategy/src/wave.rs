@@ -21,7 +21,7 @@
 //! one-sided accumulation) and per-order size — run on small-min-notional
 //! markets so accumulated fills stay survivable.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
@@ -83,6 +83,16 @@ pub struct WaveConfig {
     /// losses); the one-sided clamp exists to prevent exactly this. `false`
     /// (default) = frozen one-sided. Overrides `chase_to_avg` when set.
     pub chase: bool,
+
+    /// Adaptive lattice: number of 1-minute candle ranges to average for the
+    /// volatility estimate. `0`/unset → 10.
+    pub candle_count: u32,
+    /// Adaptive lattice: re-evaluate + (if the step changed) re-lattice this
+    /// often, in seconds. `0` (default) = adaptive OFF (static `step_bps`).
+    pub lattice_adjust_secs: u32,
+    /// Adaptive lattice: effective step bps = `step_volatility_mult × average
+    /// 1-minute candle range (bps)`, floored at `step_bps`. `0` (default) = off.
+    pub step_volatility_mult: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -104,6 +114,14 @@ pub struct Wave {
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
+    /// Completed 1-minute candle ranges, in bps ((high−low)/low×1e4), newest at back.
+    candles: VecDeque<Decimal>,
+    /// In-progress candle: (minute_bucket, high, low).
+    cur_candle: Option<(u64, Decimal, Decimal)>,
+    /// ctx.now.0 (ns) of the last adaptive re-evaluation.
+    last_adjust_ns: Option<u64>,
+    /// Current volatility-derived step bps (None until first adjust → uses config.step_bps).
+    adaptive_step_bps: Option<u32>,
 }
 
 impl Wave {
@@ -148,7 +166,7 @@ impl Wave {
         best_ask: Option<Price>,
     ) -> (Option<Price>, Option<Price>) {
         let tick = self.config.tick_size;
-        let spread_active = self.config.step_bps > 0 || self.config.inner_steps > 0;
+        let spread_active = self.effective_step_bps() > 0 || self.config.inner_steps > 0;
         if let (Some(bp), Some(ap)) = (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
@@ -173,13 +191,19 @@ impl Wave {
         }
     }
 
-    /// Base lattice gap = `step_bps` of mid, snapped up to tick (min 1 tick).
+    /// Returns the effective step bps: adaptive when set, else config.step_bps.
+    fn effective_step_bps(&self) -> u32 {
+        self.adaptive_step_bps.unwrap_or(self.config.step_bps)
+    }
+
+    /// Base lattice gap = `effective_step_bps` of mid, snapped up to tick (min 1 tick).
     /// `step_bps = 0` → 1-tick gap. This is the distance from origin to the
     /// first level.
     fn compute_step(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
-        if self.config.step_bps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
-            let target = mid * Decimal::from(self.config.step_bps) / Decimal::from(10_000);
+        let sbps = self.effective_step_bps();
+        if sbps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
+            let target = mid * Decimal::from(sbps) / Decimal::from(10_000);
             return if target > tick {
                 (target / tick).ceil() * tick
             } else {
@@ -392,6 +416,10 @@ impl Strategy for Wave {
             lattice_step: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
+            candles: VecDeque::new(),
+            cur_candle: None,
+            last_adjust_ns: None,
+            adaptive_step_bps: None,
         }
     }
 
@@ -408,6 +436,79 @@ impl Strategy for Wave {
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
         let (top_b, top_a) = self.top_overrides(best_bid, best_ask);
         let tick = self.config.tick_size;
+
+        // 0) Candle tracking + adaptive re-lattice.
+        //
+        // Compute mid (requires both sides usable).
+        if let (Some(b), Some(a)) = (best_bid, best_ask)
+            && b.0 > Decimal::ZERO
+            && a.0 > b.0
+        {
+            let mid = (b.0 + a.0) / Decimal::from(2);
+
+            // Track 1-minute candle ranges.
+            let minute = ctx.now.0 / 60_000_000_000;
+            match &mut self.cur_candle {
+                None => self.cur_candle = Some((minute, mid, mid)),
+                Some((m, hi, lo)) if minute > *m => {
+                    // close the finished candle
+                    if *lo > Decimal::ZERO {
+                        let range_bps = (*hi - *lo) / *lo * Decimal::from(10_000);
+                        self.candles.push_back(range_bps);
+                        let keep = self.config.candle_count.max(1) as usize;
+                        while self.candles.len() > keep {
+                            self.candles.pop_front();
+                        }
+                    }
+                    self.cur_candle = Some((minute, mid, mid));
+                }
+                Some((_, hi, lo)) => {
+                    if mid > *hi {
+                        *hi = mid;
+                    }
+                    if mid < *lo {
+                        *lo = mid;
+                    }
+                }
+            }
+
+            // Adaptive re-lattice: only when enabled and candles are available.
+            let due = self.last_adjust_ns.is_none_or(|t| {
+                ctx.now.0.saturating_sub(t)
+                    >= u64::from(self.config.lattice_adjust_secs) * 1_000_000_000
+            });
+            if self.config.lattice_adjust_secs > 0
+                && self.config.step_volatility_mult > Decimal::ZERO
+                && due
+                && !self.candles.is_empty()
+            {
+                self.last_adjust_ns = Some(ctx.now.0);
+                let sum: Decimal = self.candles.iter().copied().sum();
+                let avg = sum / Decimal::from(self.candles.len() as u64);
+                // effective step bps = mult × avg candle bps, floored at config.step_bps,
+                // clamped to a sane ceiling.
+                let raw = (self.config.step_volatility_mult * avg).round();
+                let floor = self.config.step_bps.max(1);
+                let new_bps = raw
+                    .to_string()
+                    .parse::<f64>()
+                    .ok()
+                    .map(|f| (f as i64).clamp(floor as i64, 5_000))
+                    .unwrap_or(floor as i64) as u32;
+                // Re-lattice ONLY when the rounded step actually changes (no churn in
+                // stable vol): cancel all + reset the lattice so the next event
+                // re-freezes at the new step around the current mid.
+                if Some(new_bps) != self.adaptive_step_bps {
+                    self.adaptive_step_bps = Some(new_bps);
+                    if self.lattice_step.is_some() {
+                        actions.push(Action::CancelAll);
+                        self.lattice_step = None;
+                        self.bid_lattice_origin = None;
+                        self.ask_lattice_origin = None;
+                    }
+                }
+            }
+        }
 
         // 1) Lattice init (one-shot): freeze step + origins on first usable book.
         if self.lattice_step.is_none()
@@ -644,6 +745,28 @@ mod tests {
             max_position_usdt: Decimal::ZERO,
             chase_to_avg: false,
             chase: false,
+            candle_count: 10,
+            lattice_adjust_secs: 0,
+            step_volatility_mult: Decimal::ZERO,
+        }
+    }
+
+    /// Build a StrategyContext with a configurable timestamp.
+    fn make_ctx<'a>(
+        symbol: &'a Symbol,
+        s: &'a Snapshot,
+        p: &'a Position,
+        open: &'a [(QuoteId, QuoteIntent)],
+        now_ns: u64,
+    ) -> StrategyContext<'a> {
+        StrategyContext {
+            symbol,
+            now: Timestamp(now_ns),
+            position: p,
+            recent_fills: &[],
+            latest_book: s,
+            open_quotes: open,
+            recent_liqs: &[],
         }
     }
 
@@ -796,5 +919,270 @@ mod tests {
             },
         );
         assert!(actions.is_empty(), "no churn when band intact: {actions:?}");
+    }
+
+    #[test]
+    fn adaptive_off_by_default() {
+        // lattice_adjust_secs=0 → adaptive disabled. Feed events across multiple
+        // minutes and verify no CancelAll is ever emitted and adaptive_step_bps
+        // stays None.
+        let mut c = cfg();
+        c.lattice_adjust_secs = 0;
+        c.step_volatility_mult = Decimal::from(2);
+        c.candle_count = 3;
+        let mut w = Wave::new(c);
+        let sm = sym();
+        let p = pos_flat();
+
+        // Simulate 5 minutes of events, advancing by 1 minute each time.
+        let minute_ns = 60_000_000_000u64;
+        for i in 0..5u64 {
+            // Swing mid slightly each minute to create candle ranges
+            let bid = if i % 2 == 0 {
+                Decimal::from(100)
+            } else {
+                Decimal::from(102)
+            };
+            let ask = bid + Decimal::new(1, 1);
+            let s_i = snap(bid, ask);
+            let c_i = make_ctx(&sm, &s_i, &p, &[], i * minute_ns + 30_000_000_000);
+            let actions = w.on_event(
+                &c_i,
+                &MarketEvent::BookUpdate {
+                    snapshot: s_i.clone(),
+                },
+            );
+            // No CancelAll should ever fire
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::CancelAll)),
+                "adaptive off: no CancelAll at minute {i}"
+            );
+        }
+        assert_eq!(
+            w.adaptive_step_bps, None,
+            "adaptive_step_bps must stay None when lattice_adjust_secs=0"
+        );
+        // Lattice must be frozen at some point (first event seeds it)
+        assert!(
+            w.lattice_step.is_some(),
+            "lattice must freeze on first usable event"
+        );
+        // Lattice step must be derived from static step_bps, not adaptive.
+        // The step is frozen from the first event (bid=100, ask=100.1, mid=100.05).
+        // compute_step(100.05): target = 100.05 * 10 / 10000 = 0.1005
+        // 0.1005 > 0.1 → ceil(0.1005/0.1)*0.1 = ceil(1.005)*0.1 = 2*0.1 = 0.2
+        let frozen = w.lattice_step.unwrap();
+        assert_eq!(
+            frozen,
+            Decimal::new(2, 1),
+            "static step_bps=10 at mid=100.05 should yield 0.2 (tick-snapped)"
+        );
+    }
+
+    #[test]
+    fn adaptive_resizes_step_on_volatility() {
+        // step_bps=10 (floor), step_volatility_mult=1.0, lattice_adjust_secs=60,
+        // candle_count=1. Feed a 1-minute candle with a KNOWN range of ≈ 200 bps
+        // (hi=101, lo=99, range_bps=(101-99)/99×10000≈202). After feeding that
+        // candle and waiting ≥60s, verify:
+        //  - a CancelAll is emitted (re-lattice fired)
+        //  - adaptive_step_bps > 100 (well above the 10 bps floor)
+        //  - lattice_step re-frozen at the new (larger) step in the SAME event
+        //  - some Quote actions follow in the same Vec (re-seed)
+        let mut c = cfg();
+        c.step_bps = 10; // floor
+        c.step_volatility_mult = Decimal::ONE;
+        c.lattice_adjust_secs = 60;
+        c.candle_count = 1; // keep only 1 candle → avg = that candle's range
+        c.tick_size = Decimal::new(1, 1); // 0.1
+        let mut w = Wave::new(c);
+        let sm = sym();
+        let p = pos_flat();
+
+        let minute_ns = 60_000_000_000u64;
+        // t=0 in minute 0: open candle at hi=101, lo=99 (mid≈100)
+        // Use wide bid/ask so mid swings across 99 and 101 within minute 0.
+        let s_hi = snap(Decimal::new(10095, 2), Decimal::new(10105, 2)); // mid=101
+        let c_first = make_ctx(&sm, &s_hi, &p, &[], 10_000_000_000u64); // t=10s, min=0
+        let a_first = w.on_event(
+            &c_first,
+            &MarketEvent::BookUpdate {
+                snapshot: s_hi.clone(),
+            },
+        );
+        // First event seeds the lattice.
+        assert!(!a_first.is_empty(), "first event must seed the lattice");
+        let initial_step = w.lattice_step.unwrap();
+
+        // Still in minute 0: lo tick sets lo=99
+        let s_lo = snap(Decimal::new(9895, 2), Decimal::new(9905, 2)); // mid=99
+        let c_lo = make_ctx(&sm, &s_lo, &p, &[], 30_000_000_000u64); // t=30s, min=0
+        let _ = w.on_event(
+            &c_lo,
+            &MarketEvent::BookUpdate {
+                snapshot: s_lo.clone(),
+            },
+        );
+
+        // Advance to minute 1: closes minute-0 candle (hi=101, lo=99 → ≈202 bps)
+        // last_adjust_ns=None → due=true. candles=[≈202] (non-empty). Fires adjust!
+        // new_bps = round(1.0 × 202) = 202. floor=10. 202 != None → CancelAll + re-seed.
+        let s_mid = snap(Decimal::new(9995, 2), Decimal::new(10005, 2)); // mid=100
+        let c_adj = make_ctx(&sm, &s_mid, &p, &[], minute_ns + 5_000_000_000u64); // t=65s, min=1
+        let actions = w.on_event(
+            &c_adj,
+            &MarketEvent::BookUpdate {
+                snapshot: s_mid.clone(),
+            },
+        );
+
+        // CancelAll must be emitted
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CancelAll)),
+            "adaptive: CancelAll must be emitted on first volatility resize. actions={actions:?}"
+        );
+        // adaptive_step_bps must be set and >> 10
+        let abps = w
+            .adaptive_step_bps
+            .expect("adaptive_step_bps must be Some after adjust");
+        assert!(
+            abps > 10,
+            "adaptive step bps {abps} must be well above floor 10"
+        );
+        assert!(
+            abps > 100,
+            "adaptive step bps {abps} should be ~200 for ≈202bps candle"
+        );
+
+        // lattice_step must be re-frozen at the new step (larger than initial)
+        let new_step = w
+            .lattice_step
+            .expect("lattice must re-freeze in same event");
+        assert!(
+            new_step > initial_step,
+            "new lattice step {new_step} must be larger than initial {initial_step}"
+        );
+        // Some Quote actions must also be present (the re-seed)
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Quote(_))),
+            "re-seed quotes must follow CancelAll in same event: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_no_churn_when_stable() {
+        // Once the first adjust sets adaptive_step_bps, subsequent adjusts with
+        // the SAME rounded step must emit NO further CancelAll.
+        // Use candle_count=1 so the rolling avg always equals the single latest
+        // candle — stable candle range → stable rounded bps → no churn.
+        let mut c = cfg();
+        c.step_bps = 10;
+        c.step_volatility_mult = Decimal::ONE;
+        c.lattice_adjust_secs = 60;
+        c.candle_count = 1; // only 1 candle in the buffer → avg = that candle
+        c.tick_size = Decimal::new(1, 1);
+        let mut w = Wave::new(c);
+        let sm = sym();
+        let p = pos_flat();
+
+        let minute_ns = 60_000_000_000u64;
+
+        // Minute 0: open candle with hi=101, lo=99
+        let s_hi = snap(Decimal::new(10095, 2), Decimal::new(10105, 2));
+        let c0_hi = make_ctx(&sm, &s_hi, &p, &[], 10_000_000_000u64);
+        let _ = w.on_event(
+            &c0_hi,
+            &MarketEvent::BookUpdate {
+                snapshot: s_hi.clone(),
+            },
+        );
+        let s_lo = snap(Decimal::new(9895, 2), Decimal::new(9905, 2));
+        let c0_lo = make_ctx(&sm, &s_lo, &p, &[], 30_000_000_000u64);
+        let _ = w.on_event(
+            &c0_lo,
+            &MarketEvent::BookUpdate {
+                snapshot: s_lo.clone(),
+            },
+        );
+
+        // Minute 1: closes min-0 candle (≈202bps), first adjust fires → CancelAll.
+        // We enter minute 1 via a hi tick so minute 1's candle starts at hi=101.
+        let s1_hi = snap(Decimal::new(10095, 2), Decimal::new(10105, 2));
+        let c1_hi = make_ctx(&sm, &s1_hi, &p, &[], minute_ns + 5_000_000_000u64);
+        let first_actions = w.on_event(
+            &c1_hi,
+            &MarketEvent::BookUpdate {
+                snapshot: s1_hi.clone(),
+            },
+        );
+        assert!(
+            first_actions.iter().any(|a| matches!(a, Action::CancelAll)),
+            "first adjust must fire a CancelAll"
+        );
+        let first_abps = w.adaptive_step_bps.unwrap();
+
+        // Still minute 1: add a lo tick so the candle has hi=101, lo=99 → ≈202bps.
+        let s1_lo = snap(Decimal::new(9895, 2), Decimal::new(9905, 2));
+        let c1_lo = make_ctx(&sm, &s1_lo, &p, &[], minute_ns + 30_000_000_000u64);
+        let _ = w.on_event(
+            &c1_lo,
+            &MarketEvent::BookUpdate {
+                snapshot: s1_lo.clone(),
+            },
+        );
+
+        // Now feed identical-range candles in subsequent minutes (same hi/lo →
+        // same range → same rounded bps). Each "stable" minute: hi tick + lo tick
+        // WITHIN the minute, then a close event in the NEXT minute (which records
+        // the previous candle ≈202 bps). The adaptive check fires on the close
+        // event (>60s from last_adjust_ns) and sees candle=[202] → new_bps=202 =
+        // first_abps → guard `Some(202) != Some(202)` is FALSE → no CancelAll.
+        let mut cancel_count = 0usize;
+        for i in 2u64..=7 {
+            // Hi tick within minute i
+            let s_h = snap(Decimal::new(10095, 2), Decimal::new(10105, 2));
+            let c_h = make_ctx(&sm, &s_h, &p, &[], i * minute_ns + 10_000_000_000u64);
+            let a = w.on_event(
+                &c_h,
+                &MarketEvent::BookUpdate {
+                    snapshot: s_h.clone(),
+                },
+            );
+            cancel_count += a.iter().filter(|x| matches!(x, Action::CancelAll)).count();
+
+            // Lo tick within minute i (same minute bucket)
+            let s_l = snap(Decimal::new(9895, 2), Decimal::new(9905, 2));
+            let c_l = make_ctx(&sm, &s_l, &p, &[], i * minute_ns + 30_000_000_000u64);
+            let b = w.on_event(
+                &c_l,
+                &MarketEvent::BookUpdate {
+                    snapshot: s_l.clone(),
+                },
+            );
+            cancel_count += b.iter().filter(|x| matches!(x, Action::CancelAll)).count();
+
+            // Close event: enter minute i+1 (records minute i's candle: ≈202bps)
+            // Also >60s from last adjust_ns → adjust fires with candle=[202] →
+            // new_bps=202 = first_abps → guard holds → no CancelAll.
+            let s_c = snap(Decimal::new(9995, 2), Decimal::new(10005, 2));
+            let c_c = make_ctx(&sm, &s_c, &p, &[], (i + 1) * minute_ns + 5_000_000_000u64);
+            let d = w.on_event(
+                &c_c,
+                &MarketEvent::BookUpdate {
+                    snapshot: s_c.clone(),
+                },
+            );
+            cancel_count += d.iter().filter(|x| matches!(x, Action::CancelAll)).count();
+        }
+        assert_eq!(
+            cancel_count, 0,
+            "no CancelAll after step stabilises (same rounded bps {first_abps})"
+        );
+        // adaptive_step_bps must be unchanged
+        assert_eq!(
+            w.adaptive_step_bps,
+            Some(first_abps),
+            "adaptive_step_bps must not change when candle range is stable"
+        );
     }
 }

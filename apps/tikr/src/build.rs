@@ -514,6 +514,9 @@ fn build_wave(
         max_position_usdt: Decimal::ZERO,
         chase_to_avg: wave.chase_to_avg,
         chase: wave.chase,
+        candle_count: wave.candle_count,
+        lattice_adjust_secs: wave.lattice_adjust_secs,
+        step_volatility_mult: wave.step_volatility_mult,
     }))
 }
 
