@@ -80,12 +80,7 @@ pub fn spawn_tide_auto_manager(
                         info!("tide_auto: global shutdown — flushing all bots");
                         let symbols: Vec<String> = active.keys().cloned().collect();
                         for (_, bot) in active.drain() {
-                            let _ = bot.shutdown_tx.send(true);
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                bot.handle,
-                            )
-                            .await;
+                            stop_bot(bot).await;
                         }
                         flatten_symbols(&symbols, &account).await;
                         return;
@@ -160,14 +155,32 @@ pub fn spawn_tide_auto_manager(
                         symbol = %symbol,
                         "tide_auto: tick_bps below threshold — shutting down + flattening"
                     );
-                    let _ = bot.shutdown_tx.send(true);
-                    let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
+                    // Stop the bot fully (abort on timeout) before flattening so
+                    // a still-running bot can't re-open the position we close.
+                    stop_bot(bot).await;
                     flatten_symbols(std::slice::from_ref(&symbol), &account).await;
                     shared_state.set_status(&symbol, BotStatus::Rotated);
                 }
             }
         }
     })
+}
+
+/// Signal a bot to shut down and ensure it has STOPPED before the caller
+/// cancels/flattens its symbol. A bare `timeout(.., handle)` that elapses just
+/// drops (detaches) the task — it keeps running and can re-open the position
+/// being flattened. On timeout we abort + reap so the bot is dead first.
+async fn stop_bot(bot: ActiveBot) {
+    let _ = bot.shutdown_tx.send(true);
+    let mut handle = bot.handle;
+    if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+        .await
+        .is_err()
+    {
+        warn!("tide_auto: bot did not stop in 5s — aborting before cancel/flatten");
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 async fn flatten_symbols(symbols: &[String], account: &TideAutoAccountCtx) {

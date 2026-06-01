@@ -94,8 +94,7 @@ pub fn spawn_wave_auto_manager(
                         // and resumes managing the inherited position.
                         info!("wave_auto: global shutdown — stopping bots (orders + positions left intact)");
                         for (_, bot) in active.drain() {
-                            let _ = bot.shutdown_tx.send(true);
-                            let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
+                            stop_bot(bot).await;
                         }
                         return;
                     }
@@ -249,8 +248,10 @@ pub fn spawn_wave_auto_manager(
                         symbol = %symbol,
                         "wave_auto: rotating out (flat/green) — shutting down + flattening"
                     );
-                    let _ = bot.shutdown_tx.send(true);
-                    let _ = tokio::time::timeout(Duration::from_secs(5), bot.handle).await;
+                    // Ensure the bot is fully STOPPED before flattening — a
+                    // still-running bot would re-quote and re-open the position
+                    // we're about to close, orphaning it.
+                    stop_bot(bot).await;
                     flatten_symbols(std::slice::from_ref(&symbol), &account).await;
                     shared_state.set_status(&symbol, BotStatus::Rotated);
                     // Start the retirement clock — its [off] tab lingers up to
@@ -354,6 +355,25 @@ async fn holds_underwater_bag(
         mark < avg
     } else {
         mark > avg
+    }
+}
+
+/// Signal a bot to shut down and GUARANTEE it has stopped before the caller
+/// touches its symbol (cancel-all / flatten). A bare `timeout(.., handle)` that
+/// elapses merely drops the `JoinHandle`, which DETACHES the task — it keeps
+/// running and can re-quote / re-open the very position we're about to flatten,
+/// orphaning it on the venue. So on timeout we abort and reap, ensuring the bot
+/// is dead first.
+async fn stop_bot(bot: ActiveBot) {
+    let _ = bot.shutdown_tx.send(true);
+    let mut handle = bot.handle;
+    if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+        .await
+        .is_err()
+    {
+        warn!("wave_auto: bot did not stop in 5s — aborting before cancel/flatten");
+        handle.abort();
+        let _ = handle.await;
     }
 }
 

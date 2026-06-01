@@ -449,7 +449,10 @@ async fn flatten_with_limit_fallback(
                         "limit close did not fully fill in 10s, using market order for remainder"
                     );
                     let _ = venue.cancel_all(symbol).await;
-                    let _ = venue.market_close(symbol, side, Size(remaining)).await;
+                    if let Err(e) = venue.market_close(symbol, side, Size(remaining)).await {
+                        warn!(error = ?e, remaining = %remaining,
+                            "market close of flatten remainder FAILED — position left open (will be re-adopted next wave_auto cycle)");
+                    }
                 }
                 Ok(_) => {
                     info!("limit close fully filled");
@@ -461,7 +464,10 @@ async fn flatten_with_limit_fallback(
         }
         Err(e) => {
             warn!(error = ?e, "limit close failed, falling back to market order");
-            let _ = venue.market_close(symbol, side, qty).await;
+            if let Err(e) = venue.market_close(symbol, side, qty).await {
+                warn!(error = ?e, qty = %qty.0,
+                    "market close fallback FAILED — position left open (will be re-adopted next wave_auto cycle)");
+            }
         }
     }
 }
