@@ -51,7 +51,7 @@ quote_asset = "USDT"
 # Forwarded to every spawned Wave bot.
 grid_levels = 10
 refill_threshold = 5
-step_bps = 30
-inner_steps = 0
+step_bps = 20
+inner_steps = 2
 chase_to_avg = false
 chase = true
