@@ -487,6 +487,7 @@ fn spawn_one_bot(
             chase_to_avg,
             prune_stragglers,
             inventory_skew,
+            inventory_skew_deadband,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -503,6 +504,7 @@ fn spawn_one_bot(
                     chase_to_avg: *chase_to_avg,
                     relattice_timeout_secs: 300,
                     inventory_skew: *inventory_skew,
+                    inventory_skew_deadband: *inventory_skew_deadband,
                 }),
                 wave: None,
                 sg: None,
