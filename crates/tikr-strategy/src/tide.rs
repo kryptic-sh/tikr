@@ -166,43 +166,51 @@ impl Tide {
         };
 
         let levels = self.config.grid_levels.max(1);
+        let center = snapped_center;
 
-        // Inventory skew: shift the active window AGAINST the bag in whole steps
-        // so it stays on the static lattice. Short (pos<0) → shift up; long →
-        // down. Gated on TWO signals: a non-zero bag AND that bag being RED
-        // (unrealized < 0). When flat or GREEN — the normal case in chop, where
-        // the bag is small and mean-reverts — skew stays off so the printing
-        // grid is untouched; it only engages to defend a losing bag on a trend.
+        // Inventory skew — ONE-SIDED: push the BAG side AWAY from mid, never the
+        // cover side toward it. Short bag → asks further UP; long bag → bids
+        // further DOWN. Moving a side away from mid can never cross the book, so
+        // this produces ZERO post-only rejects (unlike shifting the center,
+        // which dragged the cover side across the touch). Starving the
+        // accumulating side stops the bag from growing; the cover side stays on
+        // the static grid, ready to work it off on a reversion. Gated on TWO
+        // signals — a non-zero bag AND that bag being RED (unrealized < 0) — so
+        // a flat/green book (the chop case) leaves the grid fully symmetric.
+        // Magnitude ∝ bag size in order-sizes, clamped to grid_levels steps.
         let pos_size = ctx.position.size.0;
         let avg_entry = ctx.position.avg_entry.0;
-        let mark = Self::book_mid(ctx.latest_book).unwrap_or(snapped_center);
+        let mark = Self::book_mid(ctx.latest_book).unwrap_or(center);
         let unrealized = pos_size * (mark - avg_entry);
-        let center = if self.config.inventory_skew > Decimal::ZERO
+        let (bid_skew, ask_skew) = if self.config.inventory_skew > Decimal::ZERO
             && self.config.notional_per_order > Decimal::ZERO
             && pos_size != Decimal::ZERO
             && avg_entry > Decimal::ZERO
             && unrealized < Decimal::ZERO
         {
-            let pos_notional = pos_size * snapped_center;
-            let rungs = pos_notional / self.config.notional_per_order;
-            let max_shift = Decimal::from(levels);
-            let shift = (-self.config.inventory_skew * rungs)
-                .clamp(-max_shift, max_shift)
+            let rungs = (pos_size * center / self.config.notional_per_order).abs();
+            let shift = (self.config.inventory_skew * rungs)
+                .clamp(Decimal::ZERO, Decimal::from(levels))
                 .round();
-            snapped_center + shift * step
+            if pos_size < Decimal::ZERO {
+                (Decimal::ZERO, shift) // short → push the ASK (bag) side away
+            } else {
+                (shift, Decimal::ZERO) // long → push the BID (bag) side away
+            }
         } else {
-            snapped_center
+            (Decimal::ZERO, Decimal::ZERO)
         };
 
         let inner = Decimal::from(self.config.inner_steps + 1);
 
-        // Compute target prices.
+        // Compute target prices. The bag side carries an extra `*_skew` steps of
+        // offset (pushed away from mid); the cover side is unchanged.
         let mut target_bids: Vec<Decimal> = Vec::with_capacity(levels as usize);
         let mut target_asks: Vec<Decimal> = Vec::with_capacity(levels as usize);
         for k in 0..levels {
-            let offset = (inner + Decimal::from(k)) * step;
-            let bid_price = center - offset;
-            let ask_price = center + offset;
+            let k = Decimal::from(k);
+            let bid_price = center - (inner + k + bid_skew) * step;
+            let ask_price = center + (inner + k + ask_skew) * step;
             if bid_price > Decimal::ZERO {
                 target_bids.push(bid_price);
             }
@@ -958,20 +966,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: inventory_skew shifts the window center AGAINST a short position.
+    // Test: inventory_skew pushes the BAG side away from mid (one-sided), with
+    // the cover side unchanged. Short red bag → asks pushed out, bids stay put.
     //
     // Config: inventory_skew=0.5, inner_steps=0, grid_levels=3,
     //         notional_per_order=10, step_bps=0 (step=tick=0.0001).
     //
-    // Flat position (size=0) → no shift; innermost bid 0.9999, ask 1.0001.
+    // Flat position (size=0) → no skew; innermost bid 0.9999, ask 1.0001.
     //
-    // Short position (size=−40 units @ price ~1.0):
-    //   pos_notional = −40 × 1.0000 = −40
-    //   rungs = −40 / 10 = −4
-    //   shift = −(0.5 × −4) = +2 (clamped to ±3), rounded → +2
-    //   center shifts UP by 2 ticks: 1.0000 → 1.0002
-    //   innermost bid = 1.0002 − 1·step = 1.0001
-    //   innermost ask = 1.0002 + 1·step = 1.0003
+    // RED short (size=−40 @ avg 0.9990, mark 1.0000 → unrealized < 0):
+    //   rungs = |−40 × 1.0000 / 10| = 4
+    //   shift = 0.5 × 4 = 2 (clamped to grid_levels=3), rounded → 2 (ASK side)
+    //   innermost bid = 1.0000 − 1·step = 0.9999 (cover side, UNCHANGED)
+    //   innermost ask = 1.0000 + (1+2)·step = 1.0003 (bag side, pushed away)
     // -----------------------------------------------------------------------
     #[test]
     fn inventory_skew_shifts_center_against_short() {
@@ -1066,22 +1073,29 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // center shifted UP 2 ticks → 1.0002; inner_steps=0 → offset = 1×step.
-        // innermost bid = 1.0002 − 0.0001 = 1.0001
-        // innermost ask = 1.0002 + 0.0001 = 1.0003
-        assert!(
-            bids.contains(&Decimal::new(10001, 4)),
-            "short: innermost bid must be 1.0001 (skewed up 2): {bids:?}"
+        // ONE-SIDED: short bag → ASK (bag) side pushed away 2 steps; BID (cover)
+        // side unchanged. innermost bid = 1.0000 − 1·step = 0.9999 (unchanged);
+        // innermost ask = 1.0000 + (1+2)·step = 1.0003 (pushed out).
+        assert_eq!(
+            bids.iter().cloned().reduce(Decimal::max),
+            Some(Decimal::new(9999, 4)),
+            "short: innermost bid UNCHANGED at 0.9999 (cover side): {bids:?}"
         );
-        assert!(
-            asks.contains(&Decimal::new(10003, 4)),
-            "short: innermost ask must be 1.0003 (skewed up 2): {asks:?}"
+        assert_eq!(
+            asks.iter().cloned().reduce(Decimal::min),
+            Some(Decimal::new(10003, 4)),
+            "short: innermost ask pushed away to 1.0003 (bag side): {asks:?}"
         );
-        // Confirm skew was non-zero (different from flat).
+        // Cover (bid) side identical to flat; only the bag (ask) side moved.
+        assert_eq!(
+            bids.iter().cloned().reduce(Decimal::max),
+            flat_bids.iter().cloned().reduce(Decimal::max),
+            "bids unchanged vs flat (cover side never moves)"
+        );
         assert_ne!(
             asks.iter().cloned().reduce(Decimal::min),
             flat_asks.iter().cloned().reduce(Decimal::min),
-            "short skew must shift asks vs flat"
+            "asks pushed away vs flat (bag side)"
         );
 
         // --- inventory_skew=0: no shift even with short position ---
