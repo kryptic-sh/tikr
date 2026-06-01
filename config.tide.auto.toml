@@ -39,7 +39,7 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tide-auto"  # separate from wave-auto so state never collides
+state_dir = "./state/tide-auto" # separate from wave-auto so state never collides
 asset = "USDT"
 order_balance_pct = "0.1"
 max_position_pct = "0"
@@ -57,17 +57,16 @@ top_n = 10
 rotate_loss_pct = "1" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 
 [rampage.score]
-mode = "candle_height"   # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
+mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
 [rampage.score.params]
-candle_count = 60        # average the last 60 one-minute candles (~1h window)
-min_candle_pct = "0"     # min avg candle height % to qualify (0 = no floor)
+candle_count = 60    # average the last 60 one-minute candles (~1h window)
+min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 
 [rampage.strategy]
-kind = "tide"            # "wave" | "tide"
+kind = "tide" # "wave" | "tide"
 [rampage.strategy.params]
 grid_levels = 10
-step_bps = 30            # step30 inner2 = best uncapped Tide in backtest (peak ~$500, net+)
-inner_steps = 2          # inner spread = inner_steps × step_bps in the middle
-chase = false            # Tide slides on fills; market-chase off
+step_bps = 30           # step30 inner2 = best uncapped Tide in backtest (peak ~$500, net+)
+inner_steps = 2         # empty dead zone: mid + inner_steps slots each side (5 vacant); innermost order (inner_steps+1) steps from center
 chase_to_avg = false
-prune_stragglers = true  # trim both edges so the ladder stays grid_levels wide (default on)
+prune_stragglers = true # trim both edges so the ladder stays grid_levels wide (default on)

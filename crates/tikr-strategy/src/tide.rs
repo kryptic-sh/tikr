@@ -81,12 +81,11 @@ pub struct TideConfig {
     /// Set `2` to keep the first buy/sell `2 × step_bps` from mid, widening
     /// the minimum round-trip so each completed pair clears a guaranteed gap.
     pub inner_steps: u32,
-    /// When `true`, the lattice CHASES price in both directions — bids follow
-    /// price up, asks follow price down (the window slides past the origin both
-    /// ways). When `false` (default), the lattice is one-sided/frozen: bids
-    /// only extend at/below the origin, asks at/above, so it never buys high or
-    /// sells low (the +118 baseline). Chasing keeps the grid active across a
-    /// trend but can sell held inventory below cost.
+    /// DEPRECATED / NO-OP in the fill-driven lattice. The window already
+    /// follows price by sliding `grid_center` one step per net fill (and the
+    /// center-anchored emit rides above/below the origin freely), so there is no
+    /// separate chase clamp to toggle — this field is read nowhere. Kept only so
+    /// existing configs/`compare` flags still parse; remove in a future cleanup.
     pub chase: bool,
     /// Chase the reducing side, but only as far as our cost basis. When long,
     /// asks chase DOWN to follow price but are floored at `avg_entry + gap` —
@@ -479,21 +478,22 @@ impl Strategy for Tide {
             if pos != Decimal::ZERO && avg > Decimal::ZERO {
                 let center = (bo + ao) / Decimal::from(2);
                 let drift_bps = (center - avg).abs() / avg * Decimal::from(10_000);
-                if drift_bps > Decimal::from(self.config.recenter_bps) {
-                    // Re-anchor origins around avg_entry with the same
-                    // self-spread the freeze uses (step_bps/2 each side),
-                    // snapped to tick. lattice_step is unchanged.
-                    let half = avg * Decimal::from(self.config.step_bps) / Decimal::from(20_000);
-                    let new_bid = ((avg - half) / tick).floor() * tick;
-                    let new_ask = ((avg + half) / tick).ceil() * tick;
+                if drift_bps > Decimal::from(self.config.recenter_bps)
+                    && let Some(step) = self.lattice_step
+                {
+                    // Re-anchor the center onto our cost basis (snapped to tick);
+                    // origins follow at ± (inner_steps + 1) steps, matching the
+                    // freeze geometry. lattice_step is unchanged. Reset the fill
+                    // baseline so we don't slide on the re-anchor itself.
+                    let center = (avg / tick).round() * tick;
+                    let inner = Decimal::from(self.config.inner_steps + 1) * step;
+                    let new_bid = center - inner;
+                    let new_ask = center + inner;
                     if new_bid > Decimal::ZERO && new_ask > new_bid {
                         actions.push(Action::CancelAll);
                         self.bid_lattice_origin = Some(new_bid);
                         self.ask_lattice_origin = Some(new_ask);
-                        // Re-anchor the fill-driven center onto the new avg-based
-                        // midpoint; reset the fill baseline so we don't slide on
-                        // the re-anchor itself.
-                        self.grid_center = Some((new_bid + new_ask) / Decimal::from(2));
+                        self.grid_center = Some(center);
                         self.last_pos_size = ctx.position.size.0;
                         self.pending_bid_prices.clear();
                         self.pending_ask_prices.clear();
@@ -523,12 +523,17 @@ impl Strategy for Tide {
             } else {
                 tick
             };
+            // Snap the center to the tick so every slot price (center ± k·step)
+            // is clean, and anchor the origins (innermost slots) exactly
+            // (inner_steps + 1) steps either side — so the active window snaps
+            // onto the lattice with no quantization drift as the center slides.
+            let center = (mid / tick).round() * tick;
+            let inner = Decimal::from(self.config.inner_steps + 1) * step;
             self.lattice_step = Some(step);
-            self.bid_lattice_origin = Some(top_b.0);
-            self.ask_lattice_origin = Some(top_a.0);
-            // Seed the fill-driven window center at the freeze mid; it slides
-            // from here on each fill.
-            self.grid_center = Some(mid);
+            self.bid_lattice_origin = Some(center - inner);
+            self.ask_lattice_origin = Some(center + inner);
+            // Seed the fill-driven window center; it slides from here on each fill.
+            self.grid_center = Some(center);
             self.last_pos_size = ctx.position.size.0;
             // Start (or restart, on a time-based recenter) the recenter timer.
             self.last_recenter_ns = Some(ctx.now.0);
@@ -543,18 +548,15 @@ impl Strategy for Tide {
         // center (the dead zone); the emit fills `grid_levels` out from there
         // and the prune trims beyond. As `grid_center` slides on fills, the
         // window slides with it — adding at the near end, cancelling the far.
-        if let (Some(step), Some(center), Some(bo), Some(ao)) = (
-            self.lattice_step,
-            self.grid_center,
-            self.bid_lattice_origin,
-            self.ask_lattice_origin,
-        ) && step > Decimal::ZERO
+        if let (Some(step), Some(center)) = (self.lattice_step, self.grid_center)
+            && step > Decimal::ZERO
         {
-            // Half the frozen self-spread keeps the innermost bid/ask separated
-            // (so they don't collapse onto the center and self-cross); inner_steps
-            // adds the configured dead zone on top.
-            let half = (ao - bo) / Decimal::from(2);
-            let inner = half + Decimal::from(self.config.inner_steps) * step;
+            // Innermost order sits (inner_steps + 1) steps from the center: the
+            // center slot AND `inner_steps` slots either side stay empty (the
+            // dead zone), then `grid_levels` orders extend outward. So the
+            // innermost buy↔sell gap is exactly 2·(inner_steps + 1)·step and
+            // the lattice holds 2·inner_steps + 1 vacant slots around the mid.
+            let inner = Decimal::from(self.config.inner_steps + 1) * step;
             top_bid_override = Some(Price(center - inner));
             top_ask_override = Some(Price(center + inner));
         }
@@ -587,12 +589,10 @@ impl Strategy for Tide {
                     top_cap = max_bid;
                 }
             }
-            // Skip inner rungs: hold the top bid at least `inner_steps × step`
-            // below the current mid (dead zone around mid).
-            if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
-                let inner = Decimal::from(self.config.inner_steps) * step;
-                top_cap = top_cap.min(mid_for_pos - inner);
-            }
+            // The dead zone is set by the center-anchored window override
+            // (top_bid = center − (inner_steps+1)·step), so no extra mid-relative
+            // inner clamp here — that would double-count it and distort the gap
+            // whenever the fill-driven center has skewed away from mid.
             // chase_to_avg: when SHORT, bids chase up to cover but never above
             // avg_entry − gap (never buy back the short above what we sold for).
             if self.config.chase_to_avg && pos_size < Decimal::ZERO && avg_entry > Decimal::ZERO {
@@ -647,12 +647,8 @@ impl Strategy for Tide {
                     top_cap = min_ask;
                 }
             }
-            // Skip inner rungs: hold the top ask at least `inner_steps × step`
-            // above the current mid.
-            if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
-                let inner = Decimal::from(self.config.inner_steps) * step;
-                top_cap = top_cap.max(mid_for_pos + inner);
-            }
+            // Dead zone is set by the center-anchored window override (see the
+            // bid side); no extra mid-relative inner clamp here.
             // chase_to_avg: when LONG, asks chase down to follow price but never
             // below avg_entry + gap (never sell inventory below cost).
             if self.config.chase_to_avg && pos_size > Decimal::ZERO && avg_entry > Decimal::ZERO {
@@ -706,13 +702,9 @@ impl Strategy for Tide {
                         top_cap = max_bid;
                     }
                 }
-                // MUST match the emit (inner_steps cap + chase clamp) — else the
-                // prune window misaligns with the emitted bids and cancels them
-                // every event in a cancel/create storm at the grid edge.
-                if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
-                    top_cap =
-                        top_cap.min(mid_for_pos - Decimal::from(self.config.inner_steps) * step);
-                }
+                // MUST match the emit clamps — else the prune window misaligns
+                // with the emitted bids and churns the edge. No mid-relative
+                // inner clamp here (removed from the emit too).
                 if self.config.chase_to_avg && pos_size < Decimal::ZERO && avg_entry > Decimal::ZERO
                 {
                     top_cap = top_cap
@@ -749,11 +741,8 @@ impl Strategy for Tide {
                         top_cap = min_ask;
                     }
                 }
-                // MUST match the emit (inner_steps cap + chase clamp) — see bid.
-                if self.config.inner_steps > 0 && mid_for_pos > Decimal::ZERO {
-                    top_cap =
-                        top_cap.max(mid_for_pos + Decimal::from(self.config.inner_steps) * step);
-                }
+                // MUST match the emit clamps — see bid. No mid-relative inner
+                // clamp here (removed from the emit too).
                 if self.config.chase_to_avg && pos_size > Decimal::ZERO && avg_entry > Decimal::ZERO
                 {
                     top_cap = top_cap
@@ -923,7 +912,10 @@ mod tests {
     }
 
     #[test]
-    fn first_event_places_both_sides_at_touch() {
+    fn first_event_places_inner_pair_around_center() {
+        // inner_steps=0, step=tick=0.0001. Book 0.0010/0.0011 → center snaps to
+        // 0.0010; mid slot empty, innermost pair one step either side:
+        // bid 0.0009, ask 0.0011 (gap = 2 steps = 2·(inner_steps+1)).
         let mut s = Tide::new(cfg());
         let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
         let p = pos();
@@ -943,7 +935,7 @@ mod tests {
                 _ => panic!("expected Quote"),
             })
             .collect();
-        assert!(prices.contains(&(Side::Bid, Decimal::new(10, 4))));
+        assert!(prices.contains(&(Side::Bid, Decimal::new(9, 4))));
         assert!(prices.contains(&(Side::Ask, Decimal::new(11, 4))));
     }
 
@@ -953,10 +945,11 @@ mod tests {
         let snap = book(Decimal::new(10, 4), Decimal::new(11, 4));
         let p = pos();
         let symbol = sym();
+        // Active inner slots for center=0.0010, inner_steps=0: bid 0.0009 / ask 0.0011.
         let bid_intent = QuoteIntent {
             symbol: symbol.clone(),
             side: Side::Bid,
-            price: Price(Decimal::new(10, 4)),
+            price: Price(Decimal::new(9, 4)),
             size: Size(Decimal::ONE),
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
@@ -997,8 +990,9 @@ mod tests {
                 _ => None,
             })
             .collect();
+        // center=0.0015, inner_steps=0 → innermost ask one step out at 0.0016.
         assert_eq!(asks.len(), 1, "only grid ask, no close emit: {asks:?}");
-        assert_eq!(asks[0], Decimal::new(20, 4));
+        assert_eq!(asks[0], Decimal::new(16, 4));
     }
 
     #[test]
@@ -1016,7 +1010,8 @@ mod tests {
                 snapshot: snap.clone(),
             },
         );
-        // 3 BIDs at 0.0010, 0.0009, 0.0008 + 3 ASKs at 0.0011, 0.0012, 0.0013.
+        // center=0.0010, inner_steps=0: mid empty, innermost one step out.
+        // 3 BIDs at 0.0009, 0.0008, 0.0007 + 3 ASKs at 0.0011, 0.0012, 0.0013.
         let bids: BTreeSet<Decimal> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1025,9 +1020,9 @@ mod tests {
             })
             .collect();
         assert_eq!(bids.len(), 3);
-        assert!(bids.contains(&Decimal::new(10, 4)));
         assert!(bids.contains(&Decimal::new(9, 4)));
         assert!(bids.contains(&Decimal::new(8, 4)));
+        assert!(bids.contains(&Decimal::new(7, 4)));
         let asks: BTreeSet<Decimal> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1100,6 +1095,72 @@ mod tests {
         assert_eq!(new_bids.len(), 2, "flat → grid extends down: {new_bids:?}");
         assert!(new_bids.contains(&Decimal::new(7, 4)));
         assert!(new_bids.contains(&Decimal::new(6, 4)));
+    }
+
+    #[test]
+    fn inner_steps_2_lattice_geometry() {
+        // Production geometry (inner_steps=2, grid_levels=3, step=tick=0.0001).
+        // Book 0.0100/0.0102 → center snaps to 0.0101. Expect:
+        //   mid (0.0101) + 2 slots each side (0.0099,0.0100 / 0.0102,0.0103)
+        //   empty → 5 vacant slots;
+        //   BIDs at 0.0098,0.0097,0.0096 ; ASKs at 0.0104,0.0105,0.0106 ;
+        //   innermost gap 0.0104-0.0098 = 6 steps = 2·(inner_steps+1).
+        let mut c = cfg();
+        c.inner_steps = 2;
+        c.grid_levels = 3;
+        let mut s = Tide::new(c);
+        let snap = book(Decimal::new(100, 4), Decimal::new(102, 4));
+        let p = pos();
+        let symbol = sym();
+        let ctx = make_ctx(&symbol, &snap, &p, &[]);
+        let actions = s.on_event(
+            &ctx,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let bids: BTreeSet<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let asks: BTreeSet<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // Exactly grid_levels per side.
+        assert_eq!(bids.len(), 3, "3 bids: {bids:?}");
+        assert_eq!(asks.len(), 3, "3 asks: {asks:?}");
+        // Innermost pair 3 steps either side of center (mid + 2 skip empty).
+        assert_eq!(*bids.iter().next_back().unwrap(), Decimal::new(98, 4));
+        assert_eq!(*asks.iter().next().unwrap(), Decimal::new(104, 4));
+        // Full ladders.
+        for px in [96, 97, 98] {
+            assert!(bids.contains(&Decimal::new(px, 4)), "bid {px}: {bids:?}");
+        }
+        for px in [104, 105, 106] {
+            assert!(asks.contains(&Decimal::new(px, 4)), "ask {px}: {asks:?}");
+        }
+        // Dead zone (mid + 2 each side) carries no orders.
+        for vacant in [99, 100, 101, 102, 103] {
+            let v = Decimal::new(vacant, 4);
+            assert!(
+                !bids.contains(&v) && !asks.contains(&v),
+                "slot {vacant} must be empty"
+            );
+        }
+        // Innermost gap = 6 steps.
+        let gap = asks.iter().next().unwrap() - bids.iter().next_back().unwrap();
+        assert_eq!(
+            gap,
+            Decimal::new(6, 4),
+            "innermost gap = 2·(inner_steps+1)·step"
+        );
     }
 
     #[test]
