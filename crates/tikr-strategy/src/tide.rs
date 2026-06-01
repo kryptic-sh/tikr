@@ -718,13 +718,21 @@ impl Strategy for Tide {
                     top_cap = top_cap
                         .min(avg_entry - Decimal::from(self.config.inner_steps.max(1)) * step);
                 }
-                // Match the emit window (unclamped, center-driven) so we prune
-                // exactly the bids that fell off the far end as the window slid.
+                // Match the emit window (unclamped, center-driven), then trim
+                // BOTH edges so the resting ladder stays exactly `levels` wide.
+                // Far (low) edge: slots the window slid past going up. Near
+                // (high) edge: bids STRANDED above the window top when the
+                // fill-driven center slides DOWN on long accumulation — the
+                // receding edge the old one-sided prune never cancelled, which
+                // let the bid side grow without bound. `+ step` slack so a
+                // 1-step boundary jitter doesn't churn the innermost slot.
                 let n_top = ((top_cap - bid_origin) / step).floor();
                 let slot_top = bid_origin + n_top * step;
                 let window_low = slot_top - outward;
                 for (id, q) in ctx.open_quotes {
-                    if q.side == Side::Bid && q.price.0 < window_low {
+                    if q.side == Side::Bid
+                        && (q.price.0 < window_low || q.price.0 > slot_top + step)
+                    {
                         actions.push(Action::Cancel(*id));
                     }
                 }
@@ -751,12 +759,18 @@ impl Strategy for Tide {
                     top_cap = top_cap
                         .max(avg_entry + Decimal::from(self.config.inner_steps.max(1)) * step);
                 }
-                // Match the emit window (unclamped, center-driven).
+                // Match the emit window (unclamped, center-driven), then trim
+                // BOTH edges (mirror of the bid side). Far (high) edge: slots
+                // the window slid past going down. Near (low) edge: asks
+                // STRANDED below the window when the center slides UP on short
+                // accumulation. `- step` slack against 1-step boundary jitter.
                 let n_top = ((top_cap - ask_origin) / step).ceil();
                 let slot_top = ask_origin + n_top * step;
                 let window_high = slot_top + outward;
                 for (id, q) in ctx.open_quotes {
-                    if q.side == Side::Ask && q.price.0 > window_high {
+                    if q.side == Side::Ask
+                        && (q.price.0 > window_high || q.price.0 < slot_top - step)
+                    {
                         actions.push(Action::Cancel(*id));
                     }
                 }
@@ -1047,7 +1061,8 @@ mod tests {
 
         // Book moves down: 0.0008 / 0.0009. New bid grid should cover
         // 0.0008 (already there), 0.0007 (NEW — extension), 0.0006 (NEW).
-        // Existing 0.0010, 0.0009 stay (orphans we don't cancel).
+        // Existing 0.0010 sits above the new window top and is now TRIMMED by
+        // the two-sided prune (see `long_accumulation_trims_stranded_bids`).
         let snap2 = book(Decimal::new(8, 4), Decimal::new(9, 4));
         // Simulate open orders from first cycle (10, 9, 8 BIDs).
         let open: Vec<(QuoteId, QuoteIntent)> = [10, 9, 8]
@@ -1085,6 +1100,75 @@ mod tests {
         assert_eq!(new_bids.len(), 2, "flat → grid extends down: {new_bids:?}");
         assert!(new_bids.contains(&Decimal::new(7, 4)));
         assert!(new_bids.contains(&Decimal::new(6, 4)));
+    }
+
+    #[test]
+    fn long_accumulation_trims_stranded_bids() {
+        // Regression: the fill-driven window slides DOWN as the bot accumulates
+        // long, leaving bids stranded ABOVE the new window top. The old
+        // one-sided prune (far/low edge only) never cancelled them, so the bid
+        // side grew without bound (observed live: 109 resting buys @ levels=3).
+        // The two-sided prune must now cancel every bid above slot_top + step.
+        let mut c = cfg();
+        c.grid_levels = 3;
+        let mut s = Tide::new(c);
+        let symbol = sym();
+        let p = pos();
+
+        // Event 1: freeze the lattice at 0.0010 / 0.0011 (step = tick = 0.0001).
+        let snap1 = book(Decimal::new(10, 4), Decimal::new(11, 4));
+        let ctx1 = make_ctx(&symbol, &snap1, &p, &[]);
+        let _ = s.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+
+        // Event 2: book drops to 0.0005 / 0.0006. The active bid window is now
+        // [0.0003, 0.0005]. Stranded high bids 0.0010/0.0009/0.0008/0.0007/0.0006
+        // all sit above slot_top (0.0005) + step (0.0001) = 0.0006 and MUST be
+        // cancelled; 0.0010..0.0007 strictly exceed it.
+        let snap2 = book(Decimal::new(5, 4), Decimal::new(6, 4));
+        let open: Vec<(QuoteId, QuoteIntent)> = [10, 9, 8, 7]
+            .iter()
+            .map(|px| {
+                (
+                    QuoteId::new(),
+                    QuoteIntent {
+                        symbol: symbol.clone(),
+                        side: Side::Bid,
+                        price: Price(Decimal::new(*px, 4)),
+                        size: Size(Decimal::ONE),
+                        tif: TimeInForce::PostOnly,
+                        kind: QuoteKind::Point,
+                    },
+                )
+            })
+            .collect();
+        let ctx2 = make_ctx(&symbol, &snap2, &p, &open);
+        let actions = s.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap2.clone(),
+            },
+        );
+        let cancelled_ids: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Cancel(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        // Every stranded high bid (all four are > 0.0006) gets a Cancel.
+        assert_eq!(
+            cancelled_ids.len(),
+            4,
+            "all stranded high bids trimmed: {actions:?}"
+        );
+        for (id, _) in &open {
+            assert!(cancelled_ids.contains(id), "missing cancel for {id:?}");
+        }
     }
 
     #[test]
