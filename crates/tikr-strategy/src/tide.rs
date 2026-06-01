@@ -132,21 +132,6 @@ pub struct Tide {
     /// or ASK > best_bid). Entries also drop if `already_have_order`
     /// covers them. Dedup on enqueue by (side, price).
     pending_retries: Vec<(Side, Price, Size)>,
-    /// Round-trip pairing budgets (base qty). A BID is (re)placed only while
-    /// `buy_budget` covers its size; an ASK only while `sell_budget` does.
-    /// `buy_budget` is earned when a SELL fills (position drops) and
-    /// `sell_budget` when a BUY fills (position rises) — so a slot freed by a
-    /// fill is refilled on the OPPOSITE side, never the same side. Stops a
-    /// price bouncing on one slot from repeatedly re-selling (or re-buying in a
-    /// downtrend) and over-accumulating. The initial grid (and each post-recenter
-    /// grid) is placed un-gated via `bootstrapped`; refills after are paired.
-    buy_budget: Decimal,
-    sell_budget: Decimal,
-    /// Position size at the previous event — fill detection is `pos − last`.
-    last_pos_size: Decimal,
-    /// `false` until the current grid's first full placement is done; while
-    /// false, emits bypass the budget gate (seed the grid). Reset on relattice.
-    bootstrapped: bool,
 }
 
 impl Tide {
@@ -274,10 +259,6 @@ impl Strategy for Tide {
             lattice_step: None,
             pending_retries: Vec::new(),
             last_recenter_ns: None,
-            buy_budget: Decimal::ZERO,
-            sell_budget: Decimal::ZERO,
-            last_pos_size: Decimal::ZERO,
-            bootstrapped: false,
         }
     }
 
@@ -289,21 +270,6 @@ impl Strategy for Tide {
         // Pending sets are per-event dedupe only; clear at the top.
         self.pending_bid_prices.clear();
         self.pending_ask_prices.clear();
-
-        // Round-trip pairing: detect fills via the position delta since the
-        // last event and credit the OPPOSITE side's refill budget. A buy fill
-        // (position up) funds future SELLs; a sell fill (position down) funds
-        // future BUYs. The grid emits below only (re)place a side while its
-        // budget covers the order — so a slot freed by a fill is refilled by
-        // the opposite side closing, never by the same side re-firing.
-        let pos_now = ctx.position.size.0;
-        let pos_delta = pos_now - self.last_pos_size;
-        self.last_pos_size = pos_now;
-        if pos_delta > Decimal::ZERO {
-            self.sell_budget += pos_delta;
-        } else if pos_delta < Decimal::ZERO {
-            self.buy_budget += -pos_delta;
-        }
 
         let mut actions: Vec<Action> = Vec::new();
 
@@ -386,8 +352,21 @@ impl Strategy for Tide {
             _ => Decimal::ZERO,
         };
         let pos_notional = pos_size * mid_for_pos;
-        let suppress_bids = cap > Decimal::ZERO && pos_notional > cap;
-        let suppress_asks = cap > Decimal::ZERO && pos_notional < -cap;
+        // Direction-aware accumulation guard. While holding a REAL (non-dust)
+        // position, stop ADDING to the heavy side: don't replenish filled bid
+        // slots when long, or filled ask slots when short. The resting grid
+        // still fills (ladder in / out) and the REDUCING side stays fully
+        // replenished to work the position back to flat — so a price bouncing
+        // on one slot can't repeatedly re-fire the same side and over-
+        // accumulate. Dust (|pos| < min_notional) doesn't suppress, so the grid
+        // re-arms both sides once essentially flat. The `cap` term is the hard
+        // backstop on top.
+        let real_pos = self.config.min_notional <= Decimal::ZERO
+            || pos_notional.abs() >= self.config.min_notional;
+        let suppress_bids =
+            (cap > Decimal::ZERO && pos_notional > cap) || (real_pos && pos_size > Decimal::ZERO);
+        let suppress_asks =
+            (cap > Decimal::ZERO && pos_notional < -cap) || (real_pos && pos_size < Decimal::ZERO);
 
         // Min-self-spread enforcement: when the book spread is tighter
         // than the configured minimum, push the placement tops apart so
@@ -441,10 +420,6 @@ impl Strategy for Tide {
                 self.pending_bid_prices.clear();
                 self.pending_ask_prices.clear();
                 self.pending_retries.clear();
-                // Grid wiped — re-seed un-gated, fresh pairing budgets.
-                self.bootstrapped = false;
-                self.buy_budget = Decimal::ZERO;
-                self.sell_budget = Decimal::ZERO;
             }
         }
 
@@ -480,10 +455,6 @@ impl Strategy for Tide {
                         self.pending_bid_prices.clear();
                         self.pending_ask_prices.clear();
                         self.pending_retries.clear();
-                        // Grid re-anchored — re-seed un-gated, fresh budgets.
-                        self.bootstrapped = false;
-                        self.buy_budget = Decimal::ZERO;
-                        self.sell_budget = Decimal::ZERO;
                     }
                 }
             }
@@ -582,16 +553,7 @@ impl Strategy for Tide {
                 if !self.already_have_order(ctx, Side::Bid, p, Decimal::ZERO)
                     && !self.would_self_cross(ctx, Side::Bid, p)
                 {
-                    // Pair-gate: a (re)placed bid must be funded by a prior
-                    // sell fill. The initial/post-recenter grid (`!bootstrapped`)
-                    // is exempt so the ladder seeds.
-                    let sz = self.quote_size(p).0;
-                    if !self.bootstrapped || self.buy_budget >= sz {
-                        actions.push(self.emit(ctx.symbol, Side::Bid, p));
-                        if self.bootstrapped {
-                            self.buy_budget -= sz;
-                        }
-                    }
+                    actions.push(self.emit(ctx.symbol, Side::Bid, p));
                 }
                 price -= step;
             }
@@ -656,15 +618,7 @@ impl Strategy for Tide {
                 if !self.already_have_order(ctx, Side::Ask, p, Decimal::ZERO)
                     && !self.would_self_cross(ctx, Side::Ask, p)
                 {
-                    // Pair-gate: a (re)placed ask must be funded by a prior buy
-                    // fill. The initial/post-recenter grid is exempt.
-                    let sz = self.quote_size(p).0;
-                    if !self.bootstrapped || self.sell_budget >= sz {
-                        actions.push(self.emit(ctx.symbol, Side::Ask, p));
-                        if self.bootstrapped {
-                            self.sell_budget -= sz;
-                        }
-                    }
+                    actions.push(self.emit(ctx.symbol, Side::Ask, p));
                 }
                 price += step;
             }
@@ -765,12 +719,6 @@ impl Strategy for Tide {
                     }
                 }
             }
-        }
-
-        // Once the grid is up and reachable, switch on pair-gating: subsequent
-        // refills must be funded by an opposite-side fill (see budgets above).
-        if lattice_ready {
-            self.bootstrapped = true;
         }
 
         // Suppress unused-variable warning for events we no longer process.
@@ -1038,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn no_bid_extension_without_sell_fill() {
+    fn grid_extends_down_when_flat() {
         let mut c = cfg();
         c.grid_levels = 3;
         let mut s = Tide::new(c);
@@ -1090,20 +1038,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // PAIR-GATING: position is still flat — no SELL has closed, so no
-        // buy_budget. The grid must NOT extend bids down; buying into a fall
-        // without closing a sell is exactly the over-accumulation we prevent.
-        assert_eq!(
-            new_bids.len(),
-            0,
-            "no sell closed → no new bids (pair-gated): {new_bids:?}"
-        );
+        // Flat position → not on the heavy side → the grid extends bids down
+        // normally (full, tight). 0.0008 already open; 0.0007 + 0.0006 are new.
+        assert_eq!(new_bids.len(), 2, "flat → grid extends down: {new_bids:?}");
+        assert!(new_bids.contains(&Decimal::new(7, 4)));
+        assert!(new_bids.contains(&Decimal::new(6, 4)));
     }
 
     #[test]
-    fn bid_extension_unlocked_by_sell_fill() {
-        // Same setup as above, but a SELL filled between cycles (position went
-        // short), funding buy_budget — now the grid IS allowed to extend down.
+    fn bids_suppressed_while_long() {
+        // Direction-aware guard: holding a real LONG, new bids are suppressed
+        // (no adding to the heavy side) even as price falls — this is the
+        // anti-accumulation rule. Asks stay active to sell the long down.
         let mut c = cfg();
         c.grid_levels = 3;
         let mut s = Tide::new(c);
@@ -1119,11 +1065,10 @@ mod tests {
             },
         );
 
-        // A sell filled: position dropped to a large short, so buy_budget is
-        // ample (base-qty) to fund both bid extensions at these micro-prices.
-        let short = Position {
+        // A buy filled: position is a real long (notional ≫ min_notional).
+        let long = Position {
             symbol: symbol.clone(),
-            size: SignedSize(Decimal::from(-1_000_000)),
+            size: SignedSize(Decimal::from(1_000_000)),
             avg_entry: Price(Decimal::new(9, 4)),
             realized_pnl: Notional(Decimal::ZERO),
         };
@@ -1144,27 +1089,23 @@ mod tests {
                 )
             })
             .collect();
-        let ctx2 = make_ctx(&symbol, &snap2, &short, &open);
+        let ctx2 = make_ctx(&symbol, &snap2, &long, &open);
         let actions = s.on_event(
             &ctx2,
             &MarketEvent::BookUpdate {
                 snapshot: snap2.clone(),
             },
         );
-        let new_bids: BTreeSet<Decimal> = actions
+        let new_bids = actions
             .iter()
-            .filter_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
-                _ => None,
-            })
-            .collect();
-        // 0.0008 already open; 0.0007 + 0.0006 are funded extensions.
-        assert_eq!(
-            new_bids.len(),
-            2,
-            "sell closed → 2 new bid levels: {new_bids:?}"
-        );
-        assert!(new_bids.contains(&Decimal::new(7, 4)));
-        assert!(new_bids.contains(&Decimal::new(6, 4)));
+            .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Bid))
+            .count();
+        assert_eq!(new_bids, 0, "long → no new bids (accumulation guard)");
+        // Asks remain active (reducing side) — at least one ask emitted.
+        let new_asks = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Ask))
+            .count();
+        assert!(new_asks > 0, "long → asks still emit to sell down");
     }
 }
