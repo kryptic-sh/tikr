@@ -49,9 +49,9 @@ recheck_interval_secs = 60
 quote_asset = "USDT"
 # defer_underwater defaults true (don't rotate a bot holding a losing bag).
 # Forwarded to every spawned Wave bot.
-grid_levels = 4
-refill_threshold = 2
-step_bps = 20
+grid_levels = 10
+refill_threshold = 5
+step_bps = 30
 inner_steps = 2
 chase_to_avg = false
 chase = true
