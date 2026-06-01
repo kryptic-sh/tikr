@@ -76,6 +76,67 @@ use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Wrap a depth stream so a lagging consumer can never back up the upstream
+/// socket. A light task drains the source continuously and republishes only the
+/// LATEST book through a `watch` channel; bursts of `@depth20` snapshots between
+/// consumer polls coalesce to the freshest one (each full snapshot supersedes
+/// the previous), so the socket pump never blocks on handoff and the consumer
+/// never wades through stale books to catch up. Live-bot only — the recorder
+/// consumes `subscribe_depth` directly to keep recordings lossless.
+fn coalesce_latest_book(
+    mut src: BoxStream<'static, MarketEvent>,
+) -> BoxStream<'static, MarketEvent> {
+    use futures::StreamExt;
+    use tokio_stream::wrappers::WatchStream;
+    let (tx, rx) = tokio::sync::watch::channel::<Option<MarketEvent>>(None);
+    tokio::spawn(async move {
+        while let Some(ev) = src.next().await {
+            // Non-blocking overwrite; errors only once every receiver is gone.
+            if tx.send(Some(ev)).is_err() {
+                break;
+            }
+        }
+    });
+    // WatchStream::new yields the seed `None` once (filtered out), then the
+    // latest value on each change — coalescing bursts to the freshest book.
+    Box::pin(WatchStream::new(rx).filter_map(|opt| async move { opt }))
+}
+
+/// Wrap a trade stream so a lagging consumer can never back up the upstream
+/// socket. A light task drains the source and forwards over a bounded queue via
+/// `try_send`; when the consumer falls behind and the queue fills, NEW trade
+/// frames are dropped (with a periodic logged count) instead of blocking the
+/// reader. Acceptable for the live bot: real fills arrive on the user data
+/// stream, not this signal-only trade feed. Live-bot only — the recorder
+/// consumes `subscribe_trades` directly to keep recordings lossless.
+fn drop_newest_on_lag(mut src: BoxStream<'static, MarketEvent>) -> BoxStream<'static, MarketEvent> {
+    use futures::StreamExt;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+    let (tx, rx) = mpsc::channel::<MarketEvent>(512);
+    tokio::spawn(async move {
+        let mut dropped: u64 = 0;
+        while let Some(ev) = src.next().await {
+            match tx.try_send(ev) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    dropped += 1;
+                    // Log on the first drop and every 256 after — never silent.
+                    if dropped % 256 == 1 {
+                        warn!(
+                            dropped,
+                            "binance trade stream: consumer lagging — dropping trade frames \
+                             (live fills come from the user data stream, unaffected)"
+                        );
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+    });
+    Box::pin(ReceiverStream::new(rx))
+}
+
 // ---------------------------------------------------------------------------
 // BinanceEnv
 // ---------------------------------------------------------------------------
@@ -520,6 +581,19 @@ impl Venue for BinanceClient {
     async fn subscribe(&self, symbol: &Symbol) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
         let depth = depth_stream::subscribe_depth(self.env, symbol.clone()).await?;
         let trades = trade_stream::subscribe_trades(self.env, symbol.clone()).await?;
+        // Decouple the socket readers from THIS stream's consumer. The bot's
+        // runner does inline REST order placement between stream polls, so a
+        // stall there (slow round-trip, rate-limit cooldown) must never
+        // back-pressure all the way to the TCP sockets. Each socket pump is its
+        // own task, but it hands off over a bounded channel with a blocking
+        // send — under a long enough consumer stall that buffer fills and the
+        // reader blocks. These adapters insert an always-draining task in front
+        // of the consumer: depth COALESCES to the latest book (a full @depth20
+        // snapshot supersedes the previous), trades DROP-newest under lag. The
+        // recorder consumes `subscribe_depth`/`subscribe_trades` directly, so
+        // its recordings stay lossless.
+        let depth = coalesce_latest_book(depth);
+        let trades = drop_newest_on_lag(trades);
         Ok(Box::pin(futures::stream::select(depth, trades)))
     }
 
