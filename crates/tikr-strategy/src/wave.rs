@@ -67,15 +67,6 @@ pub struct WaveConfig {
     /// from the account-derived cap. `0` (default) = uncapped.
     pub max_position_usdt: Decimal,
 
-    /// Inventory skew, in lattice slots. As `|position notional|` grows toward
-    /// `max_position_usdt`, the *overloaded* side's band is shifted to deeper
-    /// frozen slots — long → bids move lower (buy slower), short → asks move
-    /// higher (sell slower) — while the reducing side stays at the touch to
-    /// actively flatten. Offset scales linearly from 0 (flat) to this many
-    /// slots (at/over the cap). Requires `max_position_usdt > 0`. `0`
-    /// (default) = no skew (symmetric lattice, original behavior).
-    pub inventory_skew_slots: u32,
-
     /// Chase the reducing side, but only as far as cost basis (Tide semantics).
     /// When long, the ASK band chases DOWN past the origin to follow price but
     /// is floored at `avg_entry + gap` — it sells inventory near cost on a
@@ -92,25 +83,6 @@ pub struct WaveConfig {
     /// losses); the one-sided clamp exists to prevent exactly this. `false`
     /// (default) = frozen one-sided. Overrides `chase_to_avg` when set.
     pub chase: bool,
-
-    /// Take-profit trigger: favorable move past `avg_entry`, in bps (100 = 1%).
-    /// When holding inventory and the mark has moved `tp_bps` in our favor, a
-    /// resting maker close order sits at `avg_entry × (1 ± tp_bps/1e4)` (sells
-    /// the long above cost / covers the short below cost). If the mark is
-    /// already past it, the close fires marketable (IOC). `0` (default) = off.
-    pub tp_bps: u32,
-    /// Fraction of the CURRENT position to close on a TP, in percent
-    /// (`100` = full flatten, `50` = half). Re-applied each placement, so
-    /// `< 100` ladders out. Ignored when `tp_bps == 0`.
-    pub tp_close_pct: u32,
-    /// Stop-loss trigger: adverse move past `avg_entry`, in bps (100 = 1%).
-    /// When the mark has moved `sl_bps` against us, fire a marketable (IOC)
-    /// close to cap the bag. Realizes the loss — the frozen grid otherwise
-    /// never books it. `0` (default) = off.
-    pub sl_bps: u32,
-    /// Fraction of the CURRENT position to close on an SL, in percent
-    /// (`100` = full flatten). Ignored when `sl_bps == 0`.
-    pub sl_close_pct: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -132,10 +104,6 @@ pub struct Wave {
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
-    /// Price of the resting maker take-profit order this event, if any. Set in
-    /// `on_event` before pruning so `prune_outside_band` can exempt it (the TP
-    /// order sits outside the band by design and would otherwise be cancelled).
-    tp_order_price: Option<Decimal>,
 }
 
 impl Wave {
@@ -169,39 +137,6 @@ impl Wave {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
-    }
-
-    /// Explicit-size quote (used by TP/SL closes). `size` is a coin quantity,
-    /// floored to the lot step. Caller picks `tif` (PostOnly to rest a maker
-    /// TP, IOC to take a marketable close).
-    fn make_close_quote(
-        &self,
-        symbol: &Symbol,
-        side: Side,
-        price: Price,
-        size: Size,
-        tif: TimeInForce,
-    ) -> Action {
-        Action::Quote(QuoteIntent {
-            symbol: symbol.clone(),
-            side,
-            price,
-            size,
-            tif,
-            kind: QuoteKind::Point,
-        })
-    }
-
-    /// Coin quantity = `pct%` of `|pos|`, floored to the lot step. Zero when
-    /// the result rounds below one lot.
-    fn close_size(&self, pos_abs: Decimal, pct: u32) -> Size {
-        let raw = pos_abs * Decimal::from(pct) / Decimal::from(100);
-        let q = if self.config.step_size > Decimal::ZERO {
-            (raw / self.config.step_size).floor() * self.config.step_size
-        } else {
-            raw
-        };
-        Size(q.max(Decimal::ZERO))
     }
 
     /// Compute `(top_bid_override, top_ask_override)`, pushing the origins
@@ -333,11 +268,6 @@ impl Wave {
             }
         };
         for (id, q) in ctx.open_quotes {
-            // Exempt the resting take-profit order — it sits outside the band
-            // by design (at avg ± tp_bps) and must not be pruned.
-            if Some(q.price.0) == self.tp_order_price {
-                continue;
-            }
             if q.side == side && (q.price.0 < lo || q.price.0 > hi) {
                 actions.push(Action::Cancel(*id));
             }
@@ -449,46 +379,6 @@ impl Wave {
             }
         }
     }
-
-    /// Per-side band slot offset from inventory skew: `(bid_skew, ask_skew)`.
-    /// Only the overloaded side is offset (long → bids deeper, short → asks
-    /// deeper); the reducing side stays at the touch. Offset scales linearly
-    /// from 0 (flat) to `inventory_skew_slots` (|position notional| ≥ cap).
-    /// Returns `(0, 0)` when skew is disabled or no cap is set.
-    fn inventory_skew(
-        &self,
-        ctx: &StrategyContext<'_>,
-        best_bid: Option<Price>,
-        best_ask: Option<Price>,
-    ) -> (i64, i64) {
-        let skew_max = self.config.inventory_skew_slots as i64;
-        let cap = self.config.max_position_usdt;
-        if skew_max <= 0 || cap <= Decimal::ZERO {
-            return (0, 0);
-        }
-        let mid = match (best_bid, best_ask) {
-            (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
-            _ => return (0, 0),
-        };
-        // Cost basis (avg_entry) for the cap-ratio, matching the hard cap.
-        let avg = ctx.position.avg_entry.0;
-        let cap_price = if avg > Decimal::ZERO { avg } else { mid };
-        let pos_notional = ctx.position.size.0 * cap_price;
-        let ratio = (pos_notional.abs() / cap).min(Decimal::ONE);
-        let skew = (ratio * Decimal::from(skew_max))
-            .round()
-            .to_string()
-            .parse::<i64>()
-            .unwrap_or(0)
-            .clamp(0, skew_max);
-        if pos_notional > Decimal::ZERO {
-            (skew, 0)
-        } else if pos_notional < Decimal::ZERO {
-            (0, skew)
-        } else {
-            (0, 0)
-        }
-    }
 }
 
 impl Strategy for Wave {
@@ -502,7 +392,6 @@ impl Strategy for Wave {
             lattice_step: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
-            tp_order_price: None,
         }
     }
 
@@ -551,129 +440,6 @@ impl Strategy for Wave {
             return actions;
         }
 
-        // 1.5) Take-profit / stop-loss on the open bag. Runs EVERY event,
-        // independent of the refill gate (exits are time-sensitive). TP rests a
-        // maker close at avg ± tp (or takes it marketable if already through);
-        // SL fires a marketable (IOC) close at avg ∓ sl. The lattice origins are
-        // NOT touched — banking/cutting the bag must never recenter the grid
-        // (that would chase). `tp_order_price` is recorded so the pruner exempts
-        // the resting TP (it sits outside the band by design).
-        self.tp_order_price = None;
-        let pos = ctx.position.size.0;
-        let avg = ctx.position.avg_entry.0;
-        let exit_mid = match (best_bid, best_ask) {
-            (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
-            _ => Decimal::ZERO,
-        };
-        if pos != Decimal::ZERO
-            && avg > Decimal::ZERO
-            && exit_mid > Decimal::ZERO
-            && tick > Decimal::ZERO
-            && (self.config.tp_bps > 0 || self.config.sl_bps > 0)
-        {
-            let off = |n: u32| avg * Decimal::from(n) / Decimal::from(10_000);
-            let pos_abs = pos.abs();
-            if pos > Decimal::ZERO {
-                // LONG — reduce by SELLing.
-                if self.config.tp_bps > 0 {
-                    let tp_price = avg + off(self.config.tp_bps);
-                    let sz = self.close_size(pos_abs, self.config.tp_close_pct);
-                    if sz.0 > Decimal::ZERO {
-                        if exit_mid >= tp_price {
-                            if let Some(bp) = best_bid {
-                                actions.push(self.make_close_quote(
-                                    ctx.symbol,
-                                    Side::Ask,
-                                    bp,
-                                    sz,
-                                    TimeInForce::IOC,
-                                ));
-                            }
-                        } else {
-                            let p = Price((tp_price / tick).ceil() * tick);
-                            self.tp_order_price = Some(p.0);
-                            if !ctx
-                                .open_quotes
-                                .iter()
-                                .any(|(_, q)| q.side == Side::Ask && q.price.0 == p.0)
-                            {
-                                actions.push(self.make_close_quote(
-                                    ctx.symbol,
-                                    Side::Ask,
-                                    p,
-                                    sz,
-                                    TimeInForce::PostOnly,
-                                ));
-                            }
-                        }
-                    }
-                }
-                if self.config.sl_bps > 0 && exit_mid <= avg - off(self.config.sl_bps) {
-                    let sz = self.close_size(pos_abs, self.config.sl_close_pct);
-                    if sz.0 > Decimal::ZERO
-                        && let Some(bp) = best_bid
-                    {
-                        actions.push(self.make_close_quote(
-                            ctx.symbol,
-                            Side::Ask,
-                            bp,
-                            sz,
-                            TimeInForce::IOC,
-                        ));
-                    }
-                }
-            } else {
-                // SHORT — reduce by BUYing.
-                if self.config.tp_bps > 0 {
-                    let tp_price = avg - off(self.config.tp_bps);
-                    let sz = self.close_size(pos_abs, self.config.tp_close_pct);
-                    if sz.0 > Decimal::ZERO && tp_price > Decimal::ZERO {
-                        if exit_mid <= tp_price {
-                            if let Some(ap) = best_ask {
-                                actions.push(self.make_close_quote(
-                                    ctx.symbol,
-                                    Side::Bid,
-                                    ap,
-                                    sz,
-                                    TimeInForce::IOC,
-                                ));
-                            }
-                        } else {
-                            let p = Price((tp_price / tick).floor() * tick);
-                            self.tp_order_price = Some(p.0);
-                            if !ctx
-                                .open_quotes
-                                .iter()
-                                .any(|(_, q)| q.side == Side::Bid && q.price.0 == p.0)
-                            {
-                                actions.push(self.make_close_quote(
-                                    ctx.symbol,
-                                    Side::Bid,
-                                    p,
-                                    sz,
-                                    TimeInForce::PostOnly,
-                                ));
-                            }
-                        }
-                    }
-                }
-                if self.config.sl_bps > 0 && exit_mid >= avg + off(self.config.sl_bps) {
-                    let sz = self.close_size(pos_abs, self.config.sl_close_pct);
-                    if sz.0 > Decimal::ZERO
-                        && let Some(ap) = best_ask
-                    {
-                        actions.push(self.make_close_quote(
-                            ctx.symbol,
-                            Side::Bid,
-                            ap,
-                            sz,
-                            TimeInForce::IOC,
-                        ));
-                    }
-                }
-            }
-        }
-
         // 2) Round-trip refill on the FIXED lattice.
         //
         // Refill fires ONLY when BOTH sides of the band have drained by
@@ -688,13 +454,6 @@ impl Strategy for Wave {
         // current-touch band prices, then prune the tail (orders left
         // outside the new band). Between refills: do nothing.
         let levels = self.config.grid_levels.max(1) as i64;
-
-        // Inventory skew: shift the overloaded side's band to deeper frozen
-        // slots so it quotes further from the touch (long → bids lower, short
-        // → asks higher), throttling the side that grows inventory while the
-        // reducing side stays at the touch to flatten. Offset scales 0..N
-        // slots by `|position notional| / cap`.
-        let (bid_skew, ask_skew) = self.inventory_skew(ctx, best_bid, best_ask);
 
         // chase_to_avg: gap from cost basis = max(inner_steps,1) × step. The
         // reducing side may chase past the origin (top_k < 0) but no further
@@ -742,8 +501,8 @@ impl Strategy for Wave {
                     top_k.max(floor_k)
                 };
                 WindowRange {
-                    low_k: top_k + bid_skew,
-                    high_k: top_k + bid_skew + levels - 1,
+                    low_k: top_k,
+                    high_k: top_k + levels - 1,
                 }
             })
         });
@@ -780,8 +539,8 @@ impl Strategy for Wave {
                     top_k.max(floor_k)
                 };
                 WindowRange {
-                    low_k: top_k + ask_skew,
-                    high_k: top_k + ask_skew + levels - 1,
+                    low_k: top_k,
+                    high_k: top_k + levels - 1,
                 }
             })
         });
@@ -883,13 +642,8 @@ mod tests {
             inner_steps: 0,
             refill_threshold: 1,
             max_position_usdt: Decimal::ZERO,
-            inventory_skew_slots: 0,
             chase_to_avg: false,
             chase: false,
-            tp_bps: 0,
-            tp_close_pct: 100,
-            sl_bps: 0,
-            sl_close_pct: 100,
         }
     }
 
@@ -932,141 +686,6 @@ mod tests {
             open_quotes: open,
             recent_liqs: &[],
         }
-    }
-
-    fn pos_size(size: i64) -> Position {
-        Position {
-            symbol: sym(),
-            size: SignedSize(Decimal::from(size)),
-            avg_entry: Price(Decimal::ZERO),
-            realized_pnl: Notional(Decimal::ZERO),
-        }
-    }
-
-    fn pos_long(size: i64, avg: i64) -> Position {
-        Position {
-            symbol: sym(),
-            size: SignedSize(Decimal::from(size)),
-            avg_entry: Price(Decimal::from(avg)),
-            realized_pnl: Notional(Decimal::ZERO),
-        }
-    }
-
-    #[test]
-    fn tp_takes_profit_marketable_when_already_through_target() {
-        let mut c = cfg();
-        c.tp_bps = 100; // 1% → target = 101 for avg 100
-        c.tp_close_pct = 100;
-        let mut w = Wave::new(c);
-        let p = pos_long(1, 100);
-        let s = snap(Decimal::from(102), Decimal::from(103)); // mid 102.5 ≥ 101
-        let sy = sym();
-        let acts = w.on_event(
-            &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate {
-                snapshot: s.clone(),
-            },
-        );
-        let q = acts
-            .iter()
-            .find_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Ask && q.tif == TimeInForce::IOC => Some(q),
-                _ => None,
-            })
-            .expect("expected marketable TP sell");
-        assert_eq!(q.price.0, Decimal::from(102), "sells at best_bid");
-        assert_eq!(q.size.0, Decimal::from(1), "full close");
-    }
-
-    #[test]
-    fn tp_rests_maker_close_at_target_when_not_yet_reached() {
-        let mut c = cfg();
-        c.tp_bps = 100; // target 101
-        let mut w = Wave::new(c);
-        let p = pos_long(1, 100);
-        let s = snap(Decimal::new(1004, 1), Decimal::new(1006, 1)); // mid 100.5 < 101
-        let sy = sym();
-        let _ = w.on_event(
-            &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate {
-                snapshot: s.clone(),
-            },
-        );
-        // Records the resting TP price (so the pruner exempts it) at 101.
-        assert_eq!(w.tp_order_price, Some(Decimal::from(101)));
-    }
-
-    #[test]
-    fn sl_fires_marketable_close_on_adverse_move() {
-        let mut c = cfg();
-        c.sl_bps = 100; // 1% → stop at 99 for avg 100
-        let mut w = Wave::new(c);
-        let p = pos_long(1, 100);
-        let s = snap(Decimal::from(98), Decimal::new(985, 1)); // mid 98.25 ≤ 99
-        let sy = sym();
-        let acts = w.on_event(
-            &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate {
-                snapshot: s.clone(),
-            },
-        );
-        let q = acts
-            .iter()
-            .find_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Ask && q.tif == TimeInForce::IOC => Some(q),
-                _ => None,
-            })
-            .expect("expected marketable SL sell");
-        assert_eq!(q.price.0, Decimal::from(98), "stops at best_bid");
-    }
-
-    #[test]
-    fn no_tp_sl_orders_when_both_disabled() {
-        let mut w = Wave::new(cfg()); // tp_bps=0, sl_bps=0
-        let p = pos_long(1, 100);
-        let s = snap(Decimal::from(102), Decimal::from(103));
-        let sy = sym();
-        let acts = w.on_event(
-            &ctx(&sy, &s, &p, &[]),
-            &MarketEvent::BookUpdate {
-                snapshot: s.clone(),
-            },
-        );
-        assert!(
-            !acts
-                .iter()
-                .any(|a| matches!(a, Action::Quote(q) if q.tif == TimeInForce::IOC)),
-            "no IOC close orders when TP/SL off"
-        );
-        assert_eq!(w.tp_order_price, None);
-    }
-
-    #[test]
-    fn inventory_skew_offsets_overloaded_side() {
-        let mut c = cfg();
-        c.inventory_skew_slots = 8;
-        c.max_position_usdt = Decimal::from(600);
-        let w = Wave::new(c);
-        let s = snap(Decimal::from(100), Decimal::from(101)); // mid 100.5
-        let bb = s.bids.first().map(|l| l.price);
-        let ba = s.asks.first().map(|l| l.price);
-        let sy = sym();
-
-        // Flat → no skew either side.
-        let flat = pos_flat();
-        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &flat, &[]), bb, ba), (0, 0));
-
-        // Long at/over cap (6 × 100.5 = 603 ≥ 600) → full skew on bids only.
-        let long = pos_size(6);
-        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &long, &[]), bb, ba), (8, 0));
-
-        // Short at/over cap → full skew on asks only.
-        let short = pos_size(-6);
-        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &short, &[]), bb, ba), (0, 8));
-
-        // Half cap long (3 × 100.5 = 301.5 ≈ 0.5×600) → ~half skew on bids.
-        let half = pos_size(3);
-        assert_eq!(w.inventory_skew(&ctx(&sy, &s, &half, &[]), bb, ba), (4, 0));
     }
 
     #[test]
@@ -1126,31 +745,6 @@ mod tests {
         let b: Vec<Decimal> = (0..4).map(|k| w.bid_price(k).unwrap()).collect();
         assert_eq!(b[0] - b[1], b[1] - b[2], "uniform gaps must be equal");
         assert_eq!(b[1] - b[2], b[2] - b[3]);
-    }
-
-    #[test]
-    fn inventory_skew_disabled_without_cap_or_slots() {
-        let s = snap(Decimal::from(100), Decimal::from(101));
-        let bb = s.bids.first().map(|l| l.price);
-        let ba = s.asks.first().map(|l| l.price);
-        let sy = sym();
-        let long = pos_size(6);
-        // slots=0 → off even with a cap.
-        let mut c1 = cfg();
-        c1.inventory_skew_slots = 0;
-        c1.max_position_usdt = Decimal::from(600);
-        assert_eq!(
-            Wave::new(c1).inventory_skew(&ctx(&sy, &s, &long, &[]), bb, ba),
-            (0, 0)
-        );
-        // cap=0 → off even with slots (no ratio to scale).
-        let mut c2 = cfg();
-        c2.inventory_skew_slots = 8;
-        c2.max_position_usdt = Decimal::ZERO;
-        assert_eq!(
-            Wave::new(c2).inventory_skew(&ctx(&sy, &s, &long, &[]), bb, ba),
-            (0, 0)
-        );
     }
 
     #[test]

@@ -829,12 +829,6 @@ struct Args {
     #[arg(long, default_value_t = 5u32)]
     wave_refill_threshold: u32,
 
-    /// Wave sweep: comma-separated inventory-skew slot counts. Shifts the
-    /// overloaded side's lattice band deeper as |position| nears the cap
-    /// (long → bids lower, short → asks higher). `0` = symmetric/off.
-    #[arg(long, default_value = "0")]
-    wave_inventory_skew_list: String,
-
     /// Wave sweep: comma-separated inner dead-zone values in STEPS (mid → first
     /// order = `inner_steps × step`), matching Tide. `0` = origins at the touch.
     #[arg(long, default_value = "0")]
@@ -850,24 +844,6 @@ struct Args {
     /// overrides chase_to_avg. Default off.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     wave_chase: bool,
-
-    /// Wave take-profit trigger: favorable move past avg_entry in bps (100=1%).
-    /// `0` (default) = off.
-    #[arg(long, default_value_t = 0u32)]
-    wave_tp_bps: u32,
-
-    /// Wave: % of position to close on TP (100 = full). Default 100.
-    #[arg(long, default_value_t = 100u32)]
-    wave_tp_close_pct: u32,
-
-    /// Wave stop-loss trigger: adverse move past avg_entry in bps (100=1%).
-    /// `0` (default) = off.
-    #[arg(long, default_value_t = 0u32)]
-    wave_sl_bps: u32,
-
-    /// Wave: % of position to close on SL (100 = full). Default 100.
-    #[arg(long, default_value_t = 100u32)]
-    wave_sl_close_pct: u32,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -2338,58 +2314,40 @@ async fn run_sweep_collect(
     if included("wave", &allow) {
         let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
         let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
-        let wave_skew_sweep = parse_u32_list(&args.wave_inventory_skew_list)?;
         let wave_inner_sweep = parse_u32_list(&args.wave_inner_steps_list)?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
-                for &skew in &wave_skew_sweep {
-                    for &inner in &wave_inner_sweep {
-                        let label = format!(
-                            "Wave lv={levels} step={step}bps inner={inner} rt={} skew={skew}{}{}{}{}",
-                            args.wave_refill_threshold,
-                            if args.wave_chase { " chase" } else { "" },
-                            if args.wave_chase_to_avg { " cta" } else { "" },
-                            if args.wave_tp_bps > 0 {
-                                format!(" tp{}/{}", args.wave_tp_bps, args.wave_tp_close_pct)
-                            } else {
-                                String::new()
-                            },
-                            if args.wave_sl_bps > 0 {
-                                format!(" sl{}/{}", args.wave_sl_bps, args.wave_sl_close_pct)
-                            } else {
-                                String::new()
-                            }
-                        );
-                        spawn_preset(
-                            &mut handles,
-                            &shared_data,
-                            &symbol,
-                            &label,
-                            Wave::new(WaveConfig {
-                                notional_per_order: wave_notional,
-                                tick_size: tick,
-                                step_size: lot_step,
-                                min_notional,
-                                grid_levels: levels,
-                                step_bps: step,
-                                inner_steps: inner,
-                                refill_threshold: args.wave_refill_threshold,
-                                max_position_usdt: bot_position_cap,
-                                inventory_skew_slots: skew,
-                                chase_to_avg: args.wave_chase_to_avg,
-                                chase: args.wave_chase,
-                                tp_bps: args.wave_tp_bps,
-                                tp_close_pct: args.wave_tp_close_pct,
-                                sl_bps: args.wave_sl_bps,
-                                sl_close_pct: args.wave_sl_close_pct,
-                            }),
-                            fees,
-                            skim_cfg,
-                            funding_cfg,
-                            sim_cfg_template.clone(),
-                            equity_csv_dir.clone(),
-                        );
-                    }
+                for &inner in &wave_inner_sweep {
+                    let label = format!(
+                        "Wave lv={levels} step={step}bps inner={inner} rt={}{}{}",
+                        args.wave_refill_threshold,
+                        if args.wave_chase { " chase" } else { "" },
+                        if args.wave_chase_to_avg { " cta" } else { "" },
+                    );
+                    spawn_preset(
+                        &mut handles,
+                        &shared_data,
+                        &symbol,
+                        &label,
+                        Wave::new(WaveConfig {
+                            notional_per_order: wave_notional,
+                            tick_size: tick,
+                            step_size: lot_step,
+                            min_notional,
+                            grid_levels: levels,
+                            step_bps: step,
+                            inner_steps: inner,
+                            refill_threshold: args.wave_refill_threshold,
+                            max_position_usdt: bot_position_cap,
+                            chase_to_avg: args.wave_chase_to_avg,
+                            chase: args.wave_chase,
+                        }),
+                        fees,
+                        skim_cfg,
+                        funding_cfg,
+                        sim_cfg_template.clone(),
+                        equity_csv_dir.clone(),
+                    );
                 }
             }
         }

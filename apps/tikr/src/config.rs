@@ -330,11 +330,6 @@ pub struct WaveParams {
     /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
     #[serde(default = "wave_default_refill_threshold")]
     pub refill_threshold: u32,
-    /// Inventory skew in lattice slots: shift the overloaded side's band
-    /// deeper as |position| nears the account cap (long → bids lower, short →
-    /// asks higher). `0` (default) = symmetric/off.
-    #[serde(default)]
-    pub inventory_skew_slots: u32,
     /// Chase the reducing side only to cost basis (asks→avg+gap when long,
     /// bids→avg−gap when short). Never sells/covers past cost. `false`
     /// (default) = off (pure one-sided lattice).
@@ -345,24 +340,6 @@ pub struct WaveParams {
     /// chase_to_avg.
     #[serde(default)]
     pub chase: bool,
-    /// Take-profit trigger: favorable move past avg_entry in bps (100 = 1%).
-    /// `0` (default) = off.
-    #[serde(default)]
-    pub tp_bps: u32,
-    /// % of position to close on TP (100 = full). Default 100.
-    #[serde(default = "wave_default_close_pct")]
-    pub tp_close_pct: u32,
-    /// Stop-loss trigger: adverse move past avg_entry in bps (100 = 1%).
-    /// `0` (default) = off.
-    #[serde(default)]
-    pub sl_bps: u32,
-    /// % of position to close on SL (100 = full). Default 100.
-    #[serde(default = "wave_default_close_pct")]
-    pub sl_close_pct: u32,
-}
-
-fn wave_default_close_pct() -> u32 {
-    100
 }
 
 fn wave_default_refill_threshold() -> u32 {
