@@ -804,6 +804,14 @@ struct Args {
     #[arg(long, default_value = "0")]
     tide_inner_steps_list: String,
 
+    /// Tide sweep: comma-separated persistence-skew gains. `0` = off.
+    #[arg(long, default_value = "0")]
+    tide_inventory_skew_list: String,
+
+    /// Tide sweep: comma-separated skew windows (snapshots ~1/sec).
+    #[arg(long, default_value = "60")]
+    tide_skew_window_list: String,
+
     /// Tide: when set, the lattice chases price both ways (bids follow up, asks
     /// follow down). Default off = one-sided/frozen (the +118 baseline).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -2297,37 +2305,52 @@ async fn run_sweep_collect(
         let tide_steps = parse_u32_list(&args.tide_step_bps_list)?;
         let tide_levels = parse_u32_list(&args.tide_grid_levels_list)?;
         let tide_inners = parse_u32_list(&args.tide_inner_steps_list)?;
+        let tide_skew_list = parse_decimal_list(&args.tide_inventory_skew_list)?;
+        let tide_window_list = parse_u32_list(&args.tide_skew_window_list)?;
         for &levels in &tide_levels {
             for &inner in &tide_inners {
                 for &step in &tide_steps {
-                    let label = format!("Tide lv={levels} step={step}bps in={inner}");
-                    spawn_preset(
-                        &mut handles,
-                        &shared_data,
-                        &symbol,
-                        &label,
-                        Tide::new(TideConfig {
-                            notional_per_order: tide_notional,
-                            tick_size: tick,
-                            step_size: lot_step,
-                            min_notional,
-                            grid_levels: levels,
-                            step_bps: step,
-                            max_position_usdt: Decimal::ZERO,
-                            prune_stragglers: true,
-                            recenter_bps: args.tide_recenter_bps,
-                            recenter_secs: args.tide_recenter_secs,
-                            inner_steps: inner,
-                            chase: args.tide_chase,
-                            chase_to_avg: args.tide_chase_to_avg,
-                            relattice_timeout_secs: args.tide_relattice_timeout_secs,
-                        }),
-                        fees,
-                        skim_cfg,
-                        funding_cfg,
-                        sim_cfg_template.clone(),
-                        equity_csv_dir.clone(),
-                    );
+                    for &skew in &tide_skew_list {
+                        for &window in &tide_window_list {
+                            let label = format!(
+                                "Tide lv={levels} step={step}bps in={inner}{}",
+                                if skew > Decimal::ZERO {
+                                    format!(" skew_{skew} w_{window}")
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            spawn_preset(
+                                &mut handles,
+                                &shared_data,
+                                &symbol,
+                                &label,
+                                Tide::new(TideConfig {
+                                    notional_per_order: tide_notional,
+                                    tick_size: tick,
+                                    step_size: lot_step,
+                                    min_notional,
+                                    grid_levels: levels,
+                                    step_bps: step,
+                                    max_position_usdt: Decimal::ZERO,
+                                    prune_stragglers: true,
+                                    recenter_bps: args.tide_recenter_bps,
+                                    recenter_secs: args.tide_recenter_secs,
+                                    inner_steps: inner,
+                                    chase: args.tide_chase,
+                                    chase_to_avg: args.tide_chase_to_avg,
+                                    relattice_timeout_secs: args.tide_relattice_timeout_secs,
+                                    inventory_skew: skew,
+                                    inventory_skew_window: window,
+                                }),
+                                fees,
+                                skim_cfg,
+                                funding_cfg,
+                                sim_cfg_template.clone(),
+                                equity_csv_dir.clone(),
+                            );
+                        }
+                    }
                 }
             }
         }

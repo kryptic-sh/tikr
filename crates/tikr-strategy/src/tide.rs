@@ -6,6 +6,8 @@
 //! absent and cancels orders that have drifted outside the re-centered
 //! target lattice.
 
+use std::collections::VecDeque;
+
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
 
@@ -47,6 +49,12 @@ pub struct TideConfig {
     pub chase_to_avg: bool,
     /// Unused. Kept for config compat.
     pub relattice_timeout_secs: u32,
+    /// Persistence skew gain: lattice STEPS to back the bag side off per
+    /// order-size of the ROLLING-AVERAGE signed bag. `0` (default) = off.
+    pub inventory_skew: Decimal,
+    /// Window (number of per-reconcile snapshots, ~1/sec) for the rolling
+    /// signed-bag average that drives the skew. `0`/unset → 60.
+    pub inventory_skew_window: u32,
 }
 
 /// Center-tracking, timer-reconciled ladder strategy state.
@@ -64,6 +72,9 @@ pub struct Tide {
     center: Option<Decimal>,
     /// `ctx.now.0` at the last reconcile, in nanoseconds.
     last_reconcile_ns: Option<u64>,
+    /// Rolling window of signed bag in order-sizes (newest at back), used to
+    /// compute the persistence-driven inventory skew.
+    bag_window: VecDeque<Decimal>,
 }
 
 impl Tide {
@@ -163,13 +174,45 @@ impl Tide {
         let levels = self.config.grid_levels.max(1);
         let inner = Decimal::from(self.config.inner_steps + 1);
 
+        // Snapshot the current SIGNED bag (in order-sizes) once per reconcile
+        // (~1/sec) into a rolling window; its average drives a one-sided widen.
+        let mark = Self::book_mid(ctx.latest_book).unwrap_or(center);
+        let window = self.config.inventory_skew_window.max(1) as usize;
+        let bag_rungs = if self.config.notional_per_order > Decimal::ZERO {
+            ctx.position.size.0 * mark / self.config.notional_per_order
+        } else {
+            Decimal::ZERO
+        };
+        self.bag_window.push_back(bag_rungs);
+        while self.bag_window.len() > window {
+            self.bag_window.pop_front();
+        }
+        let (bid_skew, ask_skew) =
+            if self.config.inventory_skew > Decimal::ZERO && !self.bag_window.is_empty() {
+                let sum: Decimal = self.bag_window.iter().copied().sum();
+                let avg = sum / Decimal::from(self.bag_window.len() as u64);
+                // round() gives a free deadband: near-zero (chop) avg → 0 shift.
+                let shift = (self.config.inventory_skew * avg.abs())
+                    .clamp(Decimal::ZERO, Decimal::from(levels))
+                    .round();
+                if avg < Decimal::ZERO {
+                    (Decimal::ZERO, shift) // persistently SHORT → push ASKS away (up)
+                } else if avg > Decimal::ZERO {
+                    (shift, Decimal::ZERO) // persistently LONG → push BIDS away (down)
+                } else {
+                    (Decimal::ZERO, Decimal::ZERO)
+                }
+            } else {
+                (Decimal::ZERO, Decimal::ZERO)
+            };
+
         // Compute target prices.
         let mut target_bids: Vec<Decimal> = Vec::with_capacity(levels as usize);
         let mut target_asks: Vec<Decimal> = Vec::with_capacity(levels as usize);
         for k in 0..levels {
-            let offset = (inner + Decimal::from(k)) * step;
-            let bid_price = center - offset;
-            let ask_price = center + offset;
+            let k_dec = Decimal::from(k);
+            let bid_price = center - (inner + k_dec + bid_skew) * step;
+            let ask_price = center + (inner + k_dec + ask_skew) * step;
             if bid_price > Decimal::ZERO {
                 target_bids.push(bid_price);
             }
@@ -248,6 +291,7 @@ impl Strategy for Tide {
             lattice_step: None,
             center: None,
             last_reconcile_ns: None,
+            bag_window: VecDeque::new(),
         }
     }
 
@@ -395,6 +439,8 @@ mod tests {
             chase: false,
             chase_to_avg: false,
             relattice_timeout_secs: 300,
+            inventory_skew: Decimal::ZERO,
+            inventory_skew_window: 60,
         }
     }
 
@@ -921,6 +967,255 @@ mod tests {
             let n = (*p - origin) / step;
             assert_eq!(n, n.round(), "price {p} must be on the lattice");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: persistence_skew_off_in_chop
+    // gain=0.5, window=4, inner_steps=0, grid_levels=3, step_bps=0
+    // (step=tick=0.0001), notional_per_order=10, mid 1.0000.
+    // Alternating short/long (−40, +40, −40, +40) → signed avg ≈ 0 → no skew.
+    // Innermost ask stays at 1.0001, innermost bid at 0.9999.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn persistence_skew_off_in_chop() {
+        let mut c = cfg();
+        c.inner_steps = 0;
+        c.grid_levels = 3;
+        c.step_bps = 0;
+        c.notional_per_order = Decimal::from(10);
+        c.inventory_skew = Decimal::new(5, 1); // 0.5
+        c.inventory_skew_window = 4;
+        c.tick_size = Decimal::new(1, 4); // 0.0001
+        let mut s = Tide::new(c);
+        let symbol = sym();
+
+        // mid = 1.0000 (book 0.9999/1.0001)
+        let snap = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
+
+        // Positions alternating short/long: size × mark / notional = ±4 rungs
+        // avg over 4 samples → 0
+        let positions = [
+            Position {
+                symbol: symbol.clone(),
+                size: SignedSize(Decimal::from(-40)),
+                avg_entry: Price(Decimal::new(9990, 4)),
+                realized_pnl: Notional(Decimal::ZERO),
+            },
+            Position {
+                symbol: symbol.clone(),
+                size: SignedSize(Decimal::from(40)),
+                avg_entry: Price(Decimal::new(10010, 4)),
+                realized_pnl: Notional(Decimal::ZERO),
+            },
+            Position {
+                symbol: symbol.clone(),
+                size: SignedSize(Decimal::from(-40)),
+                avg_entry: Price(Decimal::new(9990, 4)),
+                realized_pnl: Notional(Decimal::ZERO),
+            },
+            Position {
+                symbol: symbol.clone(),
+                size: SignedSize(Decimal::from(40)),
+                avg_entry: Price(Decimal::new(10010, 4)),
+                realized_pnl: Notional(Decimal::ZERO),
+            },
+        ];
+
+        let mut last_actions = Vec::new();
+        for (i, p) in positions.iter().enumerate() {
+            let now_ns = (i as u64 + 1) * 1_000_000_000; // 1s apart
+            let ctx = make_ctx(&symbol, &snap, p, &[], now_ns);
+            last_actions = s.on_event(
+                &ctx,
+                &MarketEvent::BookUpdate {
+                    snapshot: snap.clone(),
+                },
+            );
+        }
+
+        let asks: Vec<Decimal> = last_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let bids: Vec<Decimal> = last_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+
+        // inner=1 (inner_steps=0 → inner=1), step=0.0001
+        // innermost ask = center + 1*step = 1.0000 + 0.0001 = 1.0001
+        // innermost bid = center − 1*step = 1.0000 − 0.0001 = 0.9999
+        assert!(
+            asks.contains(&Decimal::new(10001, 4)),
+            "innermost ask must be 1.0001 (no skew): {asks:?}"
+        );
+        assert!(
+            bids.contains(&Decimal::new(9999, 4)),
+            "innermost bid must be 0.9999 (no skew): {bids:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: persistence_skew_engages_on_sustained_short
+    // Same cfg as above. Feed ≥window reconciles with persistent short (−40).
+    // avg ≈ −4 rungs → shift = round(0.5×4) = 2
+    // Innermost ASK pushed out to 1.0003; innermost BID stays 0.9999.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn persistence_skew_engages_on_sustained_short() {
+        let mut c = cfg();
+        c.inner_steps = 0;
+        c.grid_levels = 3;
+        c.step_bps = 0;
+        c.notional_per_order = Decimal::from(10);
+        c.inventory_skew = Decimal::new(5, 1); // 0.5
+        c.inventory_skew_window = 4;
+        c.tick_size = Decimal::new(1, 4); // 0.0001
+        let mut s = Tide::new(c);
+        let symbol = sym();
+
+        // mid = 1.0000
+        let snap = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
+
+        // Persistent short: size=−40, mark=1.0000, notional=10 → bag_rungs=−4
+        let short_pos = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::from(-40)),
+            avg_entry: Price(Decimal::new(9990, 4)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+
+        let mut last_actions = Vec::new();
+        for i in 0..5usize {
+            // 5 > window=4 so window is fully filled with −4
+            let now_ns = (i as u64 + 1) * 1_000_000_000;
+            let ctx = make_ctx(&symbol, &snap, &short_pos, &[], now_ns);
+            last_actions = s.on_event(
+                &ctx,
+                &MarketEvent::BookUpdate {
+                    snapshot: snap.clone(),
+                },
+            );
+        }
+
+        let asks: Vec<Decimal> = last_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let bids: Vec<Decimal> = last_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+
+        // shift = round(0.5 × 4) = 2
+        // ask_skew = 2 → innermost ask = center + (1 + 2)*step = 1.0003
+        // bid_skew = 0 → innermost bid = center − 1*step = 0.9999 (unchanged)
+        assert!(
+            asks.contains(&Decimal::new(10003, 4)),
+            "innermost ask must be 1.0003 (skew=2 on short): {asks:?}"
+        );
+        assert!(
+            bids.contains(&Decimal::new(9999, 4)),
+            "innermost bid must be 0.9999 (no bid skew on short): {bids:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: persistence_skew_window_bounds_history
+    // window=2. Two longs then verify bid side is skewed; an earlier short
+    // (outside the window) is forgotten.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn persistence_skew_window_bounds_history() {
+        let mut c = cfg();
+        c.inner_steps = 0;
+        c.grid_levels = 3;
+        c.step_bps = 0;
+        c.notional_per_order = Decimal::from(10);
+        c.inventory_skew = Decimal::new(5, 1); // 0.5
+        c.inventory_skew_window = 2;
+        c.tick_size = Decimal::new(1, 4); // 0.0001
+        let mut s = Tide::new(c);
+        let symbol = sym();
+
+        let snap = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
+
+        let short_pos = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::from(-40)),
+            avg_entry: Price(Decimal::new(9990, 4)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let long_pos = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::from(40)),
+            avg_entry: Price(Decimal::new(10010, 4)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+
+        // t=1s: short (−4 rungs)
+        let ctx0 = make_ctx(&symbol, &snap, &short_pos, &[], 1_000_000_000);
+        let _ = s.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        // t=2s: long (+4 rungs) — window now [−4, +4]
+        let ctx1 = make_ctx(&symbol, &snap, &long_pos, &[], 2_000_000_000);
+        let _ = s.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        // t=3s: long (+4 rungs) — window evicts short, now [+4, +4]
+        let ctx2 = make_ctx(&symbol, &snap, &long_pos, &[], 3_000_000_000);
+        let last_actions = s.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+
+        let bids: Vec<Decimal> = last_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let asks: Vec<Decimal> = last_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+
+        // avg over window [+4, +4] = +4 → shift = round(0.5×4) = 2
+        // bid_skew = 2 → innermost bid = center − (1+2)*step = 0.9997
+        // ask_skew = 0 → innermost ask = center + 1*step = 1.0001
+        assert!(
+            bids.contains(&Decimal::new(9997, 4)),
+            "innermost bid must be 0.9997 (bid skew=2 on sustained long): {bids:?}"
+        );
+        assert!(
+            asks.contains(&Decimal::new(10001, 4)),
+            "innermost ask must be 1.0001 (no ask skew when long): {asks:?}"
+        );
     }
 
     #[test]
