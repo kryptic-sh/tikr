@@ -573,18 +573,6 @@ pub struct TideParams {
     /// (default).
     #[serde(default = "tide_default_relattice_timeout_secs")]
     pub relattice_timeout_secs: u32,
-    /// Persistence skew gain: lattice STEPS to back the bag side off per
-    /// order-size of the rolling-average signed bag. `0` (default) = off.
-    #[serde(default)]
-    pub inventory_skew: Decimal,
-    /// Window (number of per-reconcile snapshots, ~1/sec) for the rolling
-    /// signed-bag average that drives the skew. Default `60`.
-    #[serde(default = "tide_default_skew_window")]
-    pub inventory_skew_window: u32,
-}
-
-fn tide_default_skew_window() -> u32 {
-    60
 }
 
 fn tide_prune_default() -> bool {
@@ -698,10 +686,6 @@ pub enum RampageStrategy {
         /// (two-sided window prune). Default `true`.
         #[serde(default = "tide_prune_default")]
         prune_stragglers: bool,
-        #[serde(default)]
-        inventory_skew: Decimal,
-        #[serde(default = "tide_default_skew_window")]
-        inventory_skew_window: u32,
     },
 }
 

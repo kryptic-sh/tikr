@@ -414,16 +414,6 @@ fn build_tide(
             .as_ref()
             .map(|t| t.relattice_timeout_secs)
             .unwrap_or(300),
-        inventory_skew: cfg
-            .tide
-            .as_ref()
-            .map(|t| t.inventory_skew)
-            .unwrap_or(Decimal::ZERO),
-        inventory_skew_window: cfg
-            .tide
-            .as_ref()
-            .map(|t| t.inventory_skew_window)
-            .unwrap_or(60),
     }))
 }
 
