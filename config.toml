@@ -50,7 +50,7 @@ rotate_loss_pct = "1" # accept NET loss up to 1% of wallet on rotate (NET = real
 [rampage.score]
 mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
 [rampage.score.params]
-candle_count = 60    # average the last 60 one-minute candles (~1h window)
+candle_count = 30    # average the last 60 one-minute candles (~1h window)
 min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 
 [rampage.strategy]
