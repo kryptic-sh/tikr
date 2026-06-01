@@ -148,44 +148,85 @@ falls back to `--sim-submit-latency-ms` / `--sim-cancel-latency-ms` /
 
 ### Sample config — `config.toml`
 
-The repo's [`config.toml`](./config.toml) ships in **Wave auto-rotation** mode:
-no fixed bot list. The `[wave_auto]` manager scores every liquid Binance USD-M
-perp by recent price action and runs the Wave strategy (frozen fixed-step
-lattice + round-trip refill) on the top N, re-ranking on an interval.
+The repo's [`config.toml`](./config.toml) ships in **auto-rotation** mode: no
+fixed bot list. The `[rampage]` manager scores every liquid Binance USD-M perp,
+runs a strategy on the top N, and re-ranks on an interval. One rotator drives
+both supported strategies — pick the scoring signal (`[rampage.score]`) and the
+strategy + geometry (`[rampage.strategy]`) independently.
 
-**How the score works.** Each symbol is ranked by the average height of its last
-`candle_count` 1-minute candles, as a percent:
-`mean( (high − low) / low × 100 )`, wicks included. Big 1-minute candles mean
-lots of intra-minute oscillation for the frozen lattice to bank — the signature
-of a market that just woke up. It's a _recent_ signal, so it catches the move as
-it starts rather than diluting it in a 24h aggregate.
+**Scoring (`[rampage.score]`).** `mode` selects how candidates are ranked:
+
+- `candle_height` (Wave's signal): rank by the average height of the last
+  `candle_count` 1-minute candles, as a percent:
+  `mean((high − low) / low × 100)`, wicks included. Big 1m candles mean lots of
+  intra-minute oscillation for the frozen lattice to bank — the signature of a
+  market that just woke up. A _recent_ signal, so it catches the move as it
+  starts rather than diluting it in a 24h aggregate. Floors with
+  `min_candle_pct`.
+- `tick_bps` (Tide's signal): rank by `tick_size / price × 10000` (no extra API
+  calls — read from the discovery snapshot). Floors with `min_tick_bps`.
+
+**Strategy (`[rampage.strategy]`).** `kind` selects what each spawned bot runs:
+
+- `wave` — frozen fixed-step lattice + round-trip refill.
+- `tide` — fill-driven sliding lattice (grid re-centers as fills land).
 
 **Each recheck** (`recheck_interval_secs`): list perps + price + 24h volume,
-pre-filter by `min_volume_usdt`, fetch the last `candle_count` 1m klines for
-each survivor (concurrent), score, and run Wave on the top `top_n` (avg candle %
-≥ `min_candle_pct`).
+pre-filter by `min_volume_usdt`, score the survivors, and run the chosen
+strategy on the top `top_n`.
 
 **Rotation is graceful.** A symbol that drops out of the top N only rotates when
 its bot is flat or green. A bot holding an underwater bag keeps running until it
 recovers (`defer_underwater`, default on) — rotation never crystallizes a loss.
 On shutdown, bots cancel their open orders but leave positions intact; a restart
-re-adopts the position and only re-cancels stale orders.
+re-adopts the position (orphan-position adoption) and only re-cancels stale
+orders.
+
+The `mode`/`kind` tag and its parameters live in separate tables (the params go
+under a nested `.params` table):
+
+```toml
+[rampage]
+enabled = true
+min_volume_usdt = "2000000"
+recheck_interval_secs = 60
+quote_asset = "USDT"
+top_n = 10
+# defer_underwater defaults true
+
+[rampage.score]
+mode = "candle_height"      # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
+[rampage.score.params]
+candle_count = 60
+min_candle_pct = "0"
+
+[rampage.strategy]
+kind = "wave"               # "wave" | "tide"
+[rampage.strategy.params]
+grid_levels = 10
+step_bps = 30
+inner_steps = 2
+refill_threshold = 5
+chase_to_avg = false
+chase = true
+```
 
 Key knobs:
 
-| Section       | Field                                                           | What it does                                                       |
-| ------------- | --------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `[account]`   | `env` / `asset`                                                 | `futures-mainnet`, USDT-margined (USDT perps host the oscillators) |
-| `[account]`   | `order_balance_pct` / `max_position_pct`                        | per-order size + wallet-relative position cap                      |
-| `[account]`   | `leverage`                                                      | exchange margin backstop                                           |
-| `[wave_auto]` | `candle_count` / `min_candle_pct` / `top_n`                     | scoring window, qualifying floor, how many bots to run             |
-| `[wave_auto]` | `min_volume_usdt` / `quote_asset`                               | liquidity pre-filter + which quote to scan                         |
-| `[wave_auto]` | `grid_levels` / `step_bps` / `inner_steps` / `refill_threshold` | Wave lattice params forwarded to every spawned bot                 |
-| `[wave_auto]` | `chase_to_avg` / `chase`                                        | reducing-side behavior (chase toward avg entry vs. market)         |
+| Section              | Field                                    | What it does                                                                     |
+| -------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
+| `[account]`          | `env` / `asset`                          | `futures-mainnet`, USDT-margined (USDT perps host the oscillators)               |
+| `[account]`          | `order_balance_pct` / `max_position_pct` | per-order size + wallet-relative position cap                                    |
+| `[account]`          | `leverage`                               | exchange margin backstop                                                         |
+| `[rampage]`          | `top_n` / `recheck_interval_secs`        | how many bots to run + how often to re-rank                                      |
+| `[rampage]`          | `min_volume_usdt` / `quote_asset`        | liquidity pre-filter + which quote to scan                                       |
+| `[rampage]`          | `defer_underwater` / `symbols_allowlist` | hold losing bags through rotation + optional explicit symbol set                 |
+| `[rampage.score]`    | `mode` + `params`                        | `candle_height` (`candle_count`/`min_candle_pct`) or `tick_bps` (`min_tick_bps`) |
+| `[rampage.strategy]` | `kind` + `params`                        | `wave` or `tide` lattice params forwarded to every spawned bot                   |
 
-To run a **fixed bot list** instead, drop `[wave_auto]` and add `[[bots]]`
-entries (one per symbol/strategy). Re-read the warning above before pointing any
-of this at real funds.
+To run a **fixed bot list** instead, drop `[rampage]` and add `[[bots]]` entries
+(one per symbol/strategy). Re-read the warning above before pointing any of this
+at real funds.
 
 ### Run live (testnet first!)
 
