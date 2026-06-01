@@ -186,6 +186,10 @@ pub struct SharedBotState {
     /// starting BNB value. Used for BNB-aware NET calculation
     /// (subtract BNB-value delta from realized PnL → real banked).
     bnb_start_value_usdt: Arc<RwLock<Option<Decimal>>>,
+    /// Running P&L totals of bots removed from the dashboard (rotated out +
+    /// GC'd), so the account summary keeps counting their realized P&L (which
+    /// the exchange wallet retains).
+    retired: Arc<Mutex<RetiredTotals>>,
 }
 
 impl Default for SharedBotState {
@@ -205,7 +209,13 @@ impl SharedBotState {
             start_balance: Arc::new(RwLock::new(None)),
             bnb: Arc::new(RwLock::new(BnbState::default())),
             bnb_start_value_usdt: Arc::new(RwLock::new(None)),
+            retired: Arc::new(Mutex::new(RetiredTotals::default())),
         }
+    }
+
+    /// Running totals of departed (removed) bots, for the account summary.
+    pub fn retired_totals(&self) -> RetiredTotals {
+        self.retired.lock().ok().map(|t| *t).unwrap_or_default()
     }
 
     /// Update the BNB state snapshot. Captures the starting BNB-value
@@ -271,10 +281,24 @@ impl SharedBotState {
         }
     }
 
-    /// Remove a symbol from the dashboard state.
+    /// Remove a symbol from the dashboard state. Folds the departing bot's
+    /// realized P&L into the retired totals first, so the account summary keeps
+    /// counting it (the exchange wallet does) instead of dropping it on rotation.
     pub fn remove(&self, symbol: &str) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.remove(symbol);
+        if let Ok(mut g) = self.inner.lock()
+            && let Some(view) = g.remove(symbol)
+            && let Ok(snap) = view.snapshot.read()
+            && let Some(r) = snap.as_ref()
+            && let Ok(mut t) = self.retired.lock()
+        {
+            t.realized += r.realized.0;
+            t.unrealized += r.unrealized.0;
+            t.fees += r.fees.0;
+            t.funding += r.funding.0;
+            t.net += r.net.0;
+            t.events = t.events.saturating_add(r.events_processed);
+            t.fills = t.fills.saturating_add(r.fills_emitted);
+            t.count += 1;
         }
         if let Ok(mut o) = self.order.lock() {
             o.retain(|s| s != symbol);
@@ -415,6 +439,31 @@ pub struct BotViewSnapshot {
 }
 
 /// Account-wide aggregate computed from all bot views.
+/// Running totals for bots that have been REMOVED from the dashboard (rotated
+/// out by an auto-manager and GC'd). Their realized P&L stays in the exchange
+/// wallet, so the account summary must keep counting it — otherwise the bot's
+/// totals drift below the API/wallet truth as symbols rotate. Folded in on
+/// [`SharedBotState::remove`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RetiredTotals {
+    /// Σ realized PnL of departed bots.
+    pub realized: Decimal,
+    /// Σ unrealized PnL at removal (≈0 — rotated bots are flattened first).
+    pub unrealized: Decimal,
+    /// Σ fees paid by departed bots.
+    pub fees: Decimal,
+    /// Σ funding accrued by departed bots.
+    pub funding: Decimal,
+    /// Σ NET of departed bots.
+    pub net: Decimal,
+    /// Σ events processed by departed bots.
+    pub events: u64,
+    /// Σ fills emitted by departed bots.
+    pub fills: u64,
+    /// Number of departed bots folded in.
+    pub count: usize,
+}
+
 #[derive(Default)]
 pub struct AccountAggregate {
     /// Σ realized PnL across all bots.
@@ -463,12 +512,30 @@ pub struct AccountAggregate {
     pub starting_count: usize,
     /// Count of bots intentionally rotated out (`Rotated` state) — not faults.
     pub rotated_count: usize,
+    /// NET P&L of bots that were REMOVED (rotated out + GC'd), already folded
+    /// into the realized/net totals above. Surfaced separately so the operator
+    /// can see how much of the total came from departed bots.
+    pub retired_net: Decimal,
+    /// Number of departed bots folded in.
+    pub retired_count: usize,
 }
 
 impl AccountAggregate {
-    /// Compute from a snapshot of bot views.
-    pub fn compute(views: &[BotViewSnapshot]) -> Self {
+    /// Compute from a snapshot of bot views, seeded with the running totals of
+    /// already-departed (rotated-out + GC'd) bots so the account summary tracks
+    /// the exchange wallet rather than drifting down as symbols rotate.
+    pub fn compute(views: &[BotViewSnapshot], retired: RetiredTotals) -> Self {
         let mut a = AccountAggregate::default();
+        // Seed with departed-bot totals (their P&L is still in the wallet).
+        a.realized += retired.realized;
+        a.unrealized += retired.unrealized;
+        a.fees += retired.fees;
+        a.funding += retired.funding;
+        a.net += retired.net;
+        a.events = a.events.saturating_add(retired.events);
+        a.fills = a.fills.saturating_add(retired.fills);
+        a.retired_net = retired.net;
+        a.retired_count = retired.count;
         for v in views {
             match v.status {
                 BotStatus::Running => a.running_count += 1,

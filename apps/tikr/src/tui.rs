@@ -300,7 +300,7 @@ pub fn run(
                     .as_deref()
                     .map(|s| logs.snapshot_merged(s))
                     .unwrap_or_else(|| logs.snapshot(crate::logs::SYSTEM_KEY));
-                let agg = AccountAggregate::compute(&views);
+                let agg = AccountAggregate::compute(&views, state.retired_totals());
                 let api_account = state.api_account();
                 let start_balance = state.start_balance();
                 let bnb = state.bnb_snapshot();
@@ -1045,6 +1045,20 @@ fn draw_account(
         Style::default().fg(Color::White),
         pnl_style(mtm_net),
     ));
+    // How much of the totals came from bots that have rotated out + been GC'd
+    // (folded in so the summary tracks the wallet, not just live bots).
+    if agg.retired_count > 0 {
+        lines.push(kv_line(
+            "retired",
+            format!(
+                "{:>+.2} ({})",
+                dec_to_f64(agg.retired_net),
+                agg.retired_count
+            ),
+            Style::default().fg(Color::Gray),
+            pnl_style(agg.retired_net),
+        ));
+    }
     // Session uptime + banked rate ($/hour off real NET).
     let session_secs = ui.session_start.elapsed().as_secs();
     let (uh, um, us) = (
