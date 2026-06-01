@@ -396,22 +396,21 @@ impl FillSim {
                 },
             ));
         }
-        // Live mode: include in-flight Place ops that already carry a
-        // venue-issued id. They're physically resting on the exchange
-        // book even though `apply_pending` hasn't promoted them into
-        // `live_quotes` yet. Excluding them makes the strategy think
-        // the side is empty between back-to-back fills and trigger a
-        // spurious RefillSide — open-order count then balloons past
-        // `levels_per_side`. Pure-paper Place ops (override_id=None)
-        // stay excluded since the venue doesn't know about them.
+        // Include ALL in-flight Place ops — both live (venue id) and pure-paper
+        // (no id yet). They occupy their lattice slot the moment they're sent;
+        // excluding them makes the strategy think the slot is empty during the
+        // submit-latency window and re-emit a DUPLICATE order at the same price
+        // (acute on a fast book where many events fire before the ack). Live
+        // ops carry their venue id; paper ops get the nil placeholder (the
+        // strategy dedups by price, so the id is only cosmetic here).
         for p in &self.pending {
             if let Op::Place {
                 intent,
-                override_id: Some(qid),
+                override_id,
             } = &p.op
                 && &intent.symbol == symbol
             {
-                out.push((*qid, intent.clone()));
+                out.push((override_id.unwrap_or_else(QuoteId::nil), intent.clone()));
             }
         }
     }
@@ -484,16 +483,24 @@ impl FillSim {
         for p in &self.pending {
             if let Op::Place {
                 intent,
-                override_id: Some(qid),
+                override_id,
             } = &p.op
                 && &intent.symbol == symbol
             {
                 count += 1;
-                let id = qid.0.as_u128();
+                // Fold price/side/size + (venue id when present). Paper ops
+                // have no id yet; folding 0 keeps the fingerprint stable and
+                // still flips whenever a pending price/size/side changes.
+                let id = override_id.map(|q| q.0.as_u128()).unwrap_or(0);
+                let side_bit = match intent.side {
+                    Side::Bid => 0u64,
+                    Side::Ask => 1u64,
+                };
                 mix(&mut h1, id as u64);
                 mix(&mut h2, (id >> 64) as u64);
                 mix(&mut h1, intent.price.0.mantissa() as u64);
-                mix(&mut h2, intent.size.0.mantissa() as u64);
+                mix(&mut h2, (intent.price.0.scale() as u64) << 1 | side_bit);
+                mix(&mut h1, intent.size.0.mantissa() as u64);
             }
         }
         mix(&mut h1, count);

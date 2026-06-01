@@ -329,6 +329,14 @@ impl QuoteId {
     pub fn from_uuid(u: Uuid) -> Self {
         QuoteId(u)
     }
+
+    /// The all-zero (nil) id. Used as a stable, recognizable placeholder for
+    /// in-flight pure-paper orders surfaced in the open-quote view — the
+    /// strategy dedups by price, so the id is cosmetic, but a fixed value keeps
+    /// the open-quote cache fingerprint deterministic.
+    pub const fn nil() -> Self {
+        QuoteId(Uuid::nil())
+    }
 }
 
 impl Default for QuoteId {
