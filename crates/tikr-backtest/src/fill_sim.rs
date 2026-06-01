@@ -404,13 +404,20 @@ impl FillSim {
         // ops carry their venue id; paper ops get the nil placeholder (the
         // strategy dedups by price, so the id is only cosmetic here).
         for p in &self.pending {
-            if let Op::Place {
-                intent,
-                override_id,
-            } = &p.op
-                && &intent.symbol == symbol
-            {
-                out.push((override_id.unwrap_or_else(QuoteId::nil), intent.clone()));
+            match &p.op {
+                Op::Place {
+                    intent,
+                    override_id,
+                } if &intent.symbol == symbol => {
+                    out.push((override_id.unwrap_or_else(QuoteId::nil), intent.clone()));
+                }
+                // A pending Replace's NEW intent occupies its slot the moment
+                // it's sent, exactly like a Place — surface it so a
+                // requote-driven strategy doesn't re-quote the slot mid-flight.
+                Op::Replace { id, intent } if &intent.symbol == symbol => {
+                    out.push((*id, intent.clone()));
+                }
+                _ => {}
             }
         }
     }
@@ -481,17 +488,23 @@ impl FillSim {
             mix(&mut h2, q.size_remaining.0.scale() as u64);
         }
         for p in &self.pending {
-            if let Op::Place {
-                intent,
-                override_id,
-            } = &p.op
-                && &intent.symbol == symbol
-            {
+            // Mirror live_quotes_into: fold every in-flight Place AND Replace
+            // (their new intent) for `symbol`. Fold price/side/size + venue id
+            // when present (paper has none → 0, still stable + change-sensitive).
+            let folded = match &p.op {
+                Op::Place {
+                    intent,
+                    override_id,
+                } if &intent.symbol == symbol => {
+                    Some((intent, override_id.map(|q| q.0.as_u128()).unwrap_or(0)))
+                }
+                Op::Replace { id, intent } if &intent.symbol == symbol => {
+                    Some((intent, id.0.as_u128()))
+                }
+                _ => None,
+            };
+            if let Some((intent, id)) = folded {
                 count += 1;
-                // Fold price/side/size + (venue id when present). Paper ops
-                // have no id yet; folding 0 keeps the fingerprint stable and
-                // still flips whenever a pending price/size/side changes.
-                let id = override_id.map(|q| q.0.as_u128()).unwrap_or(0);
                 let side_bit = match intent.side {
                     Side::Bid => 0u64,
                     Side::Ask => 1u64,
