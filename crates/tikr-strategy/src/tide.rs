@@ -52,10 +52,15 @@ pub struct TideConfig {
 /// Center-tracking, timer-reconciled ladder strategy state.
 pub struct Tide {
     config: TideConfig,
+    /// STATIC lattice anchor — tick-aligned, frozen on the first reconcile. The
+    /// price grid is `lattice_origin + n·lattice_step` for all integers n and
+    /// NEVER moves. Only the active window (which slots carry orders) slides.
+    lattice_origin: Option<Decimal>,
     /// Frozen lattice step. Set on the first reconcile.
     lattice_step: Option<Decimal>,
-    /// Anchor price for the lattice. Set to the last full fill price;
-    /// bootstrapped to the first available book mid.
+    /// Window anchor (the "filled-step center"): the last full fill price,
+    /// bootstrapped to the first book mid. Snapped onto the static lattice in
+    /// `reconcile` so the grid stays put and only the window slides.
     center: Option<Decimal>,
     /// `ctx.now.0` at the last reconcile, in nanoseconds.
     last_reconcile_ns: Option<u64>,
@@ -122,15 +127,37 @@ impl Tide {
     /// Reconcile the resting order set against the target lattice anchored at
     /// `center`. Emits adds first, then cancels — the runner dispatches them
     /// in that order (adds land before any cancel-triggered gaps).
-    fn reconcile(&mut self, ctx: &StrategyContext<'_>, center: Decimal) -> Vec<Action> {
-        // Freeze the lattice step on the first reconcile.
+    fn reconcile(&mut self, ctx: &StrategyContext<'_>, center_raw: Decimal) -> Vec<Action> {
+        // Freeze the STATIC lattice on the first reconcile: a fixed step and a
+        // tick-aligned origin. The price grid `origin + n·step` NEVER moves.
         let step = match self.lattice_step {
             Some(s) => s,
             None => {
-                let s = self.compute_step(center);
+                let s = self.compute_step(center_raw);
                 self.lattice_step = Some(s);
                 s
             }
+        };
+        let origin = match self.lattice_origin {
+            Some(o) => o,
+            None => {
+                let tick = self.config.tick_size;
+                let o = if tick > Decimal::ZERO {
+                    (center_raw / tick).round() * tick
+                } else {
+                    center_raw
+                };
+                self.lattice_origin = Some(o);
+                o
+            }
+        };
+        // Snap the anchor onto the static lattice — only the active window slides
+        // (in whole steps); the grid itself stays put. This is what keeps the
+        // fixed lattice honored even when the anchor is an off-grid book mid.
+        let center = if step > Decimal::ZERO {
+            origin + ((center_raw - origin) / step).round() * step
+        } else {
+            center_raw
         };
 
         let levels = self.config.grid_levels.max(1);
@@ -217,6 +244,7 @@ impl Strategy for Tide {
     fn new(config: Self::Config) -> Self {
         Self {
             config,
+            lattice_origin: None,
             lattice_step: None,
             center: None,
             last_reconcile_ns: None,
@@ -830,6 +858,69 @@ mod tests {
             asks.contains(&Decimal::new(122, 4)),
             "re-anchored innermost ask 0.0122: {asks:?}"
         );
+    }
+
+    #[test]
+    fn static_lattice_honored_when_anchor_off_grid() {
+        // step_bps=30 at mid 1.0 → step 0.0030 (30 ticks); origin snaps to 1.0000.
+        // The grid is 1.0000 + n·0.0030 and must NEVER move. inner_steps=0,
+        // grid_levels=2.
+        let mut c = cfg();
+        c.step_bps = 30;
+        c.inner_steps = 0;
+        c.grid_levels = 2;
+        let mut s = Tide::new(c);
+        let symbol = sym();
+        let p = pos();
+
+        // Seed at mid 1.0000 (book 0.9999/1.0001), t=0.
+        let snap1 = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
+        let ctx1 = make_ctx(&symbol, &snap1, &p, &[], 0);
+        let _ = s.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+
+        // Book mid jumps to 1.0123 — OFF the 0.0030 grid (|Δ| 0.0123 > reach
+        // 0.0060). Fallback snaps the anchor to the nearest lattice point 1.0120,
+        // so the innermost ask is 1.0150 (= 1.0000 + 5·0.0030), NOT the off-grid
+        // 1.0153 (= mid + step). The fixed lattice is honored.
+        let snap2 = book(Decimal::new(10122, 4), Decimal::new(10124, 4));
+        let ctx2 = make_ctx(&symbol, &snap2, &p, &[], 2_000_000_000);
+        let actions = s.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap2.clone(),
+            },
+        );
+        let prices: Vec<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            prices.contains(&Decimal::new(10150, 4)),
+            "innermost ask on the static grid (1.0150): {prices:?}"
+        );
+        assert!(
+            prices.contains(&Decimal::new(10090, 4)),
+            "innermost bid on the static grid (1.0090): {prices:?}"
+        );
+        assert!(
+            !prices.contains(&Decimal::new(10153, 4)),
+            "must NOT place the off-grid 1.0153: {prices:?}"
+        );
+        // Every emitted price sits exactly on origin + n·step.
+        let origin = Decimal::new(10000, 4);
+        let step = Decimal::new(30, 4);
+        for p in &prices {
+            let n = (*p - origin) / step;
+            assert_eq!(n, n.round(), "price {p} must be on the lattice");
+        }
     }
 
     #[test]
