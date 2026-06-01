@@ -45,6 +45,7 @@ recheck_interval_secs = 60
 quote_asset = "USDT"
 top_n = 10
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
+rotate_loss_pct = "1" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 
 [rampage.score]
 mode = "candle_height"   # "candle_height" (Wave signal) | "tick_bps" (Tide signal)

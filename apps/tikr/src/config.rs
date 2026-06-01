@@ -708,10 +708,21 @@ pub struct RampageConfig {
     /// How many top-scored symbols to run concurrently. Default `5`.
     #[serde(default = "wave_auto_default_top_n")]
     pub top_n: usize,
-    /// When `true` (default), do NOT rotate a symbol out while its bot holds an
-    /// underwater bag. The bot keeps running until flat or green.
+    /// When `true` (default), do NOT rotate a symbol out while its bot's NET PnL
+    /// (`realized + unrealized − fees`) is a loss LARGER than the acceptable
+    /// `rotate_loss_pct` of total wallet. The bot keeps running until its NET is
+    /// green or the loss shrinks within tolerance. When `false`, rotate
+    /// regardless of NET.
     #[serde(default = "wave_auto_default_defer_underwater")]
     pub defer_underwater: bool,
+    /// Acceptable NET loss when rotating a symbol out, as a PERCENT of total
+    /// wallet balance (futures wallet + BNB value). A bot rotates only when its
+    /// NET (`realized + unrealized − fees`) is green, OR its NET loss is within
+    /// this percent of the wallet; a larger NET loss defers rotation (the bot
+    /// keeps working the bag off so rotation never crystallizes more than this).
+    /// Only consulted when `defer_underwater` is on. Default `1` (= 1% of wallet).
+    #[serde(default = "rampage_default_rotate_loss_pct")]
+    pub rotate_loss_pct: Decimal,
     /// Optional explicit symbol allowlist. When non-empty, only these symbols
     /// are considered (volume + score filters still apply).
     #[serde(default)]
@@ -720,6 +731,10 @@ pub struct RampageConfig {
     pub score: ScoreMode,
     /// Strategy to spawn on each qualifying symbol.
     pub strategy: RampageStrategy,
+}
+
+fn rampage_default_rotate_loss_pct() -> Decimal {
+    Decimal::from(1)
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

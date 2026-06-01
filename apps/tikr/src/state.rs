@@ -305,6 +305,16 @@ impl SharedBotState {
         }
     }
 
+    /// Current NET PnL (`realized + unrealized − fees`) for `symbol`, read from
+    /// its bot's latest snapshot. `None` if the symbol is unknown or has no
+    /// snapshot yet. Used by the rampage rotator to gate rotation on NET.
+    pub fn net_for(&self, symbol: &str) -> Option<Decimal> {
+        let g = self.inner.lock().ok()?;
+        let view = g.get(symbol)?;
+        let snap = view.snapshot.read().ok()?;
+        snap.as_ref().map(|r| r.net.0)
+    }
+
     /// Update status for a symbol.
     pub fn set_status(&self, symbol: &str, status: BotStatus) {
         if let Ok(mut g) = self.inner.lock()

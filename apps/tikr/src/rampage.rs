@@ -261,30 +261,31 @@ pub fn spawn_rampage_manager(
             }
 
             // 4a. Teardown FIRST so freed slots can be filled this cycle.
-            // A symbol that fell out of the top set rotates ONLY when its bot is
-            // flat or holding a GREEN bag. If it's holding an UNDERWATER bag
-            // (and defer_underwater is on), keep the bot running — its grid +
-            // chase_to_avg work the bag off; it rotates once recovered. This
-            // stops rotation from crystallizing a loss on a bag that, on these
-            // mean-reverting markets, usually comes back.
+            // A symbol that fell out of the top set rotates ONLY when its bot's
+            // NET PnL (realized + unrealized − fees) is green, OR its NET loss is
+            // within the acceptable `rotate_loss_pct` of total wallet. A NET loss
+            // bigger than that defers rotation (defer_underwater on) — the bot
+            // keeps running and works the bag off, so rotation never crystallizes
+            // more than the tolerated loss on these mean-reverting markets.
             let dropped: Vec<String> = active
                 .keys()
                 .filter(|s| !qualifying.contains(s.as_str()))
                 .cloned()
                 .collect();
             for symbol in dropped {
-                let mark = price_map.get(&symbol).copied().unwrap_or_default();
-                if cfg.defer_underwater && holds_underwater_bag(&symbol, mark, &account).await {
+                if should_defer_rotation(&symbol, &cfg, &shared_state) {
                     info!(
                         symbol = %symbol,
-                        "rampage: out of top set but holding an underwater bag — deferring rotation"
+                        net = ?shared_state.net_for(&symbol),
+                        "rampage: out of top set but NET loss exceeds rotate_loss_pct — deferring rotation"
                     );
                     continue; // keep the bot; it holds its slot until recovered
                 }
                 if let Some(bot) = active.remove(&symbol) {
                     warn!(
                         symbol = %symbol,
-                        "rampage: rotating out (flat/green) — shutting down + flattening"
+                        net = ?shared_state.net_for(&symbol),
+                        "rampage: rotating out (NET green or within rotate_loss_pct) — shutting down + flattening"
                     );
                     // Ensure the bot is fully STOPPED before flattening — a
                     // still-running bot would re-quote and re-open the position
@@ -339,61 +340,52 @@ pub fn spawn_rampage_manager(
     })
 }
 
-/// `true` if `symbol`'s live position is a significant (≥ minNotional) bag
-/// whose mark is underwater vs `avg_entry` — i.e. rotating it would realize a
-/// loss. Flat / green / dust-below-minNotional → `false` (safe to rotate). On
-/// ANY read error, returns `true` (defer — never crystallize a loss we can't
-/// confirm is safe; the bot keeps managing itself meanwhile).
-async fn holds_underwater_bag(
+/// Decide whether `symbol`'s bot should DEFER rotation rather than rotate out
+/// now. A bot rotates only when its NET PnL (`realized + unrealized − fees`, as
+/// reported by the bot) is green, OR its NET loss is within the acceptable
+/// `rotate_loss_pct` of total wallet balance. A NET loss larger than that
+/// defers (returns `true`) — the bot keeps managing the bag until it recovers,
+/// so rotation never crystallizes more than the tolerated loss.
+///
+/// Conservative: when `defer_underwater` is off, never defer. When the bot has
+/// no snapshot yet (NET unknown), defer — we can't confirm it's safe to realize.
+fn should_defer_rotation(
     symbol_str: &str,
-    mark: Decimal,
-    account: &RampageAccountCtx,
+    cfg: &RampageConfig,
+    shared_state: &SharedBotState,
 ) -> bool {
-    use tikr_venue::Venue;
-    let symbol = venue::perp_symbol(symbol_str);
-    let v = match venue::build_venue(
-        account.env,
-        &account.api_key,
-        &account.key_material,
-        &symbol,
-        account.leverage,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(symbol = symbol_str, error = ?e, "rampage: venue build for bag check failed — deferring");
-            return true;
-        }
+    if !cfg.defer_underwater {
+        return false; // deferral disabled → always rotate
+    }
+    let net = match shared_state.net_for(symbol_str) {
+        Some(n) => n,
+        None => return true, // no snapshot yet → can't confirm → defer
     };
-    let pos = match v.position(&symbol).await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(symbol = symbol_str, error = ?e, "rampage: position read for bag check failed — deferring");
-            return true;
-        }
-    };
-    let size = pos.size.0;
-    if size == Decimal::ZERO {
-        return false; // flat → safe to rotate
+    if net >= Decimal::ZERO {
+        return false; // green NET → safe to rotate
     }
-    let avg = pos.avg_entry.0;
-    if avg <= Decimal::ZERO || mark <= Decimal::ZERO {
-        return true; // unknown cost/mark → defer
-    }
-    // Dust below minNotional: reset_symbol_state can't close it anyway, so let
-    // it rotate (the slot frees; dust is left for the next bot to trade on top).
-    if let Some(min_n) = v.min_notional(&symbol)
-        && size.abs() * avg < min_n
-    {
-        return false;
-    }
-    // Underwater? long: mark < avg; short: mark > avg.
-    if size > Decimal::ZERO {
-        mark < avg
+    // Underwater: tolerate a NET loss up to rotate_loss_pct % of total wallet.
+    let total_wallet = total_wallet_balance(shared_state);
+    let tolerance = total_wallet * cfg.rotate_loss_pct / Decimal::from(100);
+    -net > tolerance // defer only if the NET loss EXCEEDS the tolerance
+}
+
+/// Total wallet balance for the `rotate_loss_pct` tolerance: futures wallet
+/// balance + BNB value (when BNB-fee mode is on), mirroring the account poller's
+/// sizing base. `0` if no account snapshot has landed yet (→ zero tolerance →
+/// any underwater bot defers, the safe default).
+fn total_wallet_balance(shared_state: &SharedBotState) -> Decimal {
+    let wallet = shared_state
+        .api_account()
+        .map(|a| a.wallet_balance)
+        .unwrap_or_default();
+    let bnb = shared_state.bnb_snapshot();
+    let bnb_value = if bnb.enabled {
+        bnb.balance * bnb.price_usdt
     } else {
-        mark > avg
-    }
+        Decimal::ZERO
+    };
+    wallet + bnb_value
 }
 
 /// Signal a bot to shut down and GUARANTEE it has stopped before the caller
