@@ -573,11 +573,6 @@ pub struct TideParams {
     /// (default).
     #[serde(default = "tide_default_relattice_timeout_secs")]
     pub relattice_timeout_secs: u32,
-    /// Center skew against inventory, in lattice STEPS per order-size of net
-    /// inventory. Short → shifts window center UP; long → DOWN. `0` (default)
-    /// = off.
-    #[serde(default)]
-    pub inventory_skew: Decimal,
 }
 
 fn tide_prune_default() -> bool {
@@ -691,10 +686,6 @@ pub enum RampageStrategy {
         /// (two-sided window prune). Default `true`.
         #[serde(default = "tide_prune_default")]
         prune_stragglers: bool,
-        /// Center skew against inventory, in lattice steps per order-size. `0`
-        /// (default) = off.
-        #[serde(default)]
-        inventory_skew: Decimal,
     },
 }
 
