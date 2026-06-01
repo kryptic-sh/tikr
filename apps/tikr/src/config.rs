@@ -578,10 +578,6 @@ pub struct TideParams {
     /// = off.
     #[serde(default)]
     pub inventory_skew: Decimal,
-    /// Minimum bag size (in order-sizes) before the inventory skew engages; the
-    /// skew applies only to the excess beyond it. `0` (default) = no deadband.
-    #[serde(default)]
-    pub inventory_skew_deadband: Decimal,
 }
 
 fn tide_prune_default() -> bool {
@@ -699,9 +695,6 @@ pub enum RampageStrategy {
         /// (default) = off.
         #[serde(default)]
         inventory_skew: Decimal,
-        /// Minimum bag size (order-sizes) before the skew engages. `0` = off.
-        #[serde(default)]
-        inventory_skew_deadband: Decimal,
     },
 }
 

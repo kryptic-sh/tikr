@@ -52,12 +52,6 @@ pub struct TideConfig {
     /// UP (bids cover, asks back off); long → DOWN. Shift is whole steps (stays
     /// on the static grid), clamped to ±grid_levels. `0` (default) = off.
     pub inventory_skew: Decimal,
-    /// Minimum bag size, in order-sizes (`notional_per_order`), before the
-    /// inventory skew engages. The skew ramps from zero at this threshold
-    /// (applied to the EXCESS bag beyond it), so small transient bags in chop
-    /// don't move the grid — only a real trend bag does. `0` (default) = no
-    /// deadband (skew engages on any red bag).
-    pub inventory_skew_deadband: Decimal,
 }
 
 /// Center-tracking, timer-reconciled ladder strategy state.
@@ -195,10 +189,7 @@ impl Tide {
             && unrealized < Decimal::ZERO
         {
             let rungs = (pos_size * center / self.config.notional_per_order).abs();
-            // Only the bag BEYOND the deadband drives the skew → small chop
-            // bags (≤ deadband order-sizes) leave the grid fully symmetric.
-            let excess = (rungs - self.config.inventory_skew_deadband).max(Decimal::ZERO);
-            let shift = (self.config.inventory_skew * excess)
+            let shift = (self.config.inventory_skew * rungs)
                 .clamp(Decimal::ZERO, Decimal::from(levels))
                 .round();
             if pos_size < Decimal::ZERO {
@@ -446,7 +437,6 @@ mod tests {
             chase_to_avg: false,
             relattice_timeout_secs: 300,
             inventory_skew: Decimal::ZERO,
-            inventory_skew_deadband: Decimal::ZERO,
         }
     }
 
@@ -1212,64 +1202,6 @@ mod tests {
             "green bag → innermost ask unshifted at 1.0001: {asks:?}"
         );
         let _ = prices;
-    }
-
-    #[test]
-    fn skew_deadband_suppresses_small_bag() {
-        // skew=0.5, deadband=5 order-sizes, inner_steps=0, grid_levels=3,
-        // notional_per_order=10, step_bps=0 (step=tick=0.0001), mid 1.0000.
-        // Returns the innermost ask after reconciling a RED short of `units`.
-        fn inner_ask(units: i64) -> Decimal {
-            let symbol = sym();
-            let snap = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
-            let mut c = cfg();
-            c.inventory_skew = Decimal::new(5, 1); // 0.5
-            c.inventory_skew_deadband = Decimal::from(5); // 5 order-sizes
-            c.inner_steps = 0;
-            c.grid_levels = 3;
-            c.notional_per_order = Decimal::from(10);
-            c.step_bps = 0;
-            let mut s = Tide::new(c);
-            let pos = Position {
-                symbol: symbol.clone(),
-                size: SignedSize(Decimal::from(units)),
-                avg_entry: Price(Decimal::new(9990, 4)), // red short
-                realized_pnl: Notional(Decimal::ZERO),
-            };
-            let ctx0 = make_ctx(&symbol, &snap, &pos, &[], 0);
-            let _ = s.on_event(
-                &ctx0,
-                &MarketEvent::BookUpdate {
-                    snapshot: snap.clone(),
-                },
-            );
-            let ctx1 = make_ctx(&symbol, &snap, &pos, &[], 1_000_000_000);
-            s.on_event(
-                &ctx1,
-                &MarketEvent::BookUpdate {
-                    snapshot: snap.clone(),
-                },
-            )
-            .iter()
-            .filter_map(|a| match a {
-                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
-                _ => None,
-            })
-            .reduce(Decimal::min)
-            .unwrap()
-        }
-        // 4-rung bag (< deadband 5) → no skew → innermost ask unchanged 1.0001.
-        assert_eq!(
-            inner_ask(-40),
-            Decimal::new(10001, 4),
-            "small bag (4 rungs ≤ deadband 5) must not skew"
-        );
-        // 8-rung bag (> deadband 5): excess 3, shift round(0.5×3)=2 → ask 1.0003.
-        assert_eq!(
-            inner_ask(-80),
-            Decimal::new(10003, 4),
-            "bag past deadband (8 rungs) skews the ask side out 2"
-        );
     }
 
     #[test]

@@ -419,11 +419,6 @@ fn build_tide(
             .as_ref()
             .map(|t| t.inventory_skew)
             .unwrap_or(Decimal::ZERO),
-        inventory_skew_deadband: cfg
-            .tide
-            .as_ref()
-            .map(|t| t.inventory_skew_deadband)
-            .unwrap_or(Decimal::ZERO),
     }))
 }
 
