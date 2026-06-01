@@ -47,6 +47,11 @@ pub struct TideConfig {
     pub chase_to_avg: bool,
     /// Unused. Kept for config compat.
     pub relattice_timeout_secs: u32,
+    /// Center skew against inventory, in lattice STEPS per order-size
+    /// (`notional_per_order`) of net inventory. Short → shifts the window center
+    /// UP (bids cover, asks back off); long → DOWN. Shift is whole steps (stays
+    /// on the static grid), clamped to ±grid_levels. `0` (default) = off.
+    pub inventory_skew: Decimal,
 }
 
 /// Center-tracking, timer-reconciled ladder strategy state.
@@ -154,13 +159,41 @@ impl Tide {
         // Snap the anchor onto the static lattice — only the active window slides
         // (in whole steps); the grid itself stays put. This is what keeps the
         // fixed lattice honored even when the anchor is an off-grid book mid.
-        let center = if step > Decimal::ZERO {
+        let snapped_center = if step > Decimal::ZERO {
             origin + ((center_raw - origin) / step).round() * step
         } else {
             center_raw
         };
 
         let levels = self.config.grid_levels.max(1);
+
+        // Inventory skew: shift the active window AGAINST the bag in whole steps
+        // so it stays on the static lattice. Short (pos<0) → shift up; long →
+        // down. Gated on TWO signals: a non-zero bag AND that bag being RED
+        // (unrealized < 0). When flat or GREEN — the normal case in chop, where
+        // the bag is small and mean-reverts — skew stays off so the printing
+        // grid is untouched; it only engages to defend a losing bag on a trend.
+        let pos_size = ctx.position.size.0;
+        let avg_entry = ctx.position.avg_entry.0;
+        let mark = Self::book_mid(ctx.latest_book).unwrap_or(snapped_center);
+        let unrealized = pos_size * (mark - avg_entry);
+        let center = if self.config.inventory_skew > Decimal::ZERO
+            && self.config.notional_per_order > Decimal::ZERO
+            && pos_size != Decimal::ZERO
+            && avg_entry > Decimal::ZERO
+            && unrealized < Decimal::ZERO
+        {
+            let pos_notional = pos_size * snapped_center;
+            let rungs = pos_notional / self.config.notional_per_order;
+            let max_shift = Decimal::from(levels);
+            let shift = (-self.config.inventory_skew * rungs)
+                .clamp(-max_shift, max_shift)
+                .round();
+            snapped_center + shift * step
+        } else {
+            snapped_center
+        };
+
         let inner = Decimal::from(self.config.inner_steps + 1);
 
         // Compute target prices.
@@ -395,6 +428,7 @@ mod tests {
             chase: false,
             chase_to_avg: false,
             relattice_timeout_secs: 300,
+            inventory_skew: Decimal::ZERO,
         }
     }
 
@@ -921,6 +955,239 @@ mod tests {
             let n = (*p - origin) / step;
             assert_eq!(n, n.round(), "price {p} must be on the lattice");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: inventory_skew shifts the window center AGAINST a short position.
+    //
+    // Config: inventory_skew=0.5, inner_steps=0, grid_levels=3,
+    //         notional_per_order=10, step_bps=0 (step=tick=0.0001).
+    //
+    // Flat position (size=0) → no shift; innermost bid 0.9999, ask 1.0001.
+    //
+    // Short position (size=−40 units @ price ~1.0):
+    //   pos_notional = −40 × 1.0000 = −40
+    //   rungs = −40 / 10 = −4
+    //   shift = −(0.5 × −4) = +2 (clamped to ±3), rounded → +2
+    //   center shifts UP by 2 ticks: 1.0000 → 1.0002
+    //   innermost bid = 1.0002 − 1·step = 1.0001
+    //   innermost ask = 1.0002 + 1·step = 1.0003
+    // -----------------------------------------------------------------------
+    #[test]
+    fn inventory_skew_shifts_center_against_short() {
+        let symbol = sym();
+        // book mid = 1.0000
+        let snap = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
+
+        // --- flat position: no skew ---
+        let mut c_flat = cfg();
+        c_flat.inventory_skew = Decimal::new(5, 1); // 0.5
+        c_flat.inner_steps = 0;
+        c_flat.grid_levels = 3;
+        c_flat.notional_per_order = Decimal::from(10);
+        c_flat.step_bps = 0; // step = tick = 0.0001
+        let mut s_flat = Tide::new(c_flat);
+        let flat_pos = pos(); // size = 0
+        let ctx_flat = make_ctx(&symbol, &snap, &flat_pos, &[], 0);
+        let flat_actions = s_flat.on_event(
+            &ctx_flat,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let flat_bids: Vec<Decimal> = flat_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let flat_asks: Vec<Decimal> = flat_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // Flat: innermost bid = 0.9999, innermost ask = 1.0001.
+        assert!(
+            flat_bids.contains(&Decimal::new(9999, 4)),
+            "flat innermost bid 0.9999: {flat_bids:?}"
+        );
+        assert!(
+            flat_asks.contains(&Decimal::new(10001, 4)),
+            "flat innermost ask 1.0001: {flat_asks:?}"
+        );
+
+        // --- short position: shift up 2 steps ---
+        let mut c_short = cfg();
+        c_short.inventory_skew = Decimal::new(5, 1); // 0.5
+        c_short.inner_steps = 0;
+        c_short.grid_levels = 3;
+        c_short.notional_per_order = Decimal::from(10);
+        c_short.step_bps = 0;
+        let mut s_short = Tide::new(c_short);
+        // RED short: sold at avg 0.9990, mark (mid) 1.0000 → underwater
+        // (unrealized = −40 × (1.0000 − 0.9990) < 0) → skew engages.
+        let short_pos = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::from(-40)), // −40 units → −40 notional @ 1.0
+            avg_entry: Price(Decimal::new(9990, 4)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        // First event at t=0 to bootstrap the lattice (flat pos used for
+        // lattice init; we pass short_pos here already so the skew takes effect).
+        let ctx0 = make_ctx(&symbol, &snap, &short_pos, &[], 0);
+        let _ = s_short.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        // Second reconcile at t≥1000ms (open_quotes empty → full re-seed).
+        let ctx1 = make_ctx(&symbol, &snap, &short_pos, &[], 1_000_000_000);
+        let actions = s_short.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let bids: Vec<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let asks: Vec<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // center shifted UP 2 ticks → 1.0002; inner_steps=0 → offset = 1×step.
+        // innermost bid = 1.0002 − 0.0001 = 1.0001
+        // innermost ask = 1.0002 + 0.0001 = 1.0003
+        assert!(
+            bids.contains(&Decimal::new(10001, 4)),
+            "short: innermost bid must be 1.0001 (skewed up 2): {bids:?}"
+        );
+        assert!(
+            asks.contains(&Decimal::new(10003, 4)),
+            "short: innermost ask must be 1.0003 (skewed up 2): {asks:?}"
+        );
+        // Confirm skew was non-zero (different from flat).
+        assert_ne!(
+            asks.iter().cloned().reduce(Decimal::min),
+            flat_asks.iter().cloned().reduce(Decimal::min),
+            "short skew must shift asks vs flat"
+        );
+
+        // --- inventory_skew=0: no shift even with short position ---
+        let mut c_zero = cfg();
+        c_zero.inventory_skew = Decimal::ZERO;
+        c_zero.inner_steps = 0;
+        c_zero.grid_levels = 3;
+        c_zero.notional_per_order = Decimal::from(10);
+        c_zero.step_bps = 0;
+        let mut s_zero = Tide::new(c_zero);
+        let ctx_z0 = make_ctx(&symbol, &snap, &short_pos, &[], 0);
+        let _ = s_zero.on_event(
+            &ctx_z0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let ctx_z1 = make_ctx(&symbol, &snap, &short_pos, &[], 1_000_000_000);
+        let z_actions = s_zero.on_event(
+            &ctx_z1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let z_asks: Vec<Decimal> = z_actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // With skew=0, innermost ask = 1.0001 (same as flat, no shift).
+        assert!(
+            z_asks.contains(&Decimal::new(10001, 4)),
+            "skew=0 innermost ask must be 1.0001 (no shift): {z_asks:?}"
+        );
+    }
+
+    #[test]
+    fn skew_off_when_position_green() {
+        // Same short bag size + skew as the red test, but GREEN: sold at avg
+        // 1.0010, mark (mid) 1.0000 → unrealized > 0. Skew must NOT engage —
+        // the grid stays at center 1.0000 (innermost bid 0.9999, ask 1.0001).
+        let symbol = sym();
+        let snap = book(Decimal::new(9999, 4), Decimal::new(10001, 4));
+        let mut c = cfg();
+        c.inventory_skew = Decimal::new(5, 1); // 0.5
+        c.inner_steps = 0;
+        c.grid_levels = 3;
+        c.notional_per_order = Decimal::from(10);
+        c.step_bps = 0;
+        let mut s = Tide::new(c);
+        let green_short = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::from(-40)),
+            avg_entry: Price(Decimal::new(10010, 4)), // sold high → short is green
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let ctx0 = make_ctx(&symbol, &snap, &green_short, &[], 0);
+        let _ = s.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let ctx1 = make_ctx(&symbol, &snap, &green_short, &[], 1_000_000_000);
+        let actions = s.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let prices: Vec<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let bids: Vec<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Bid => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        let asks: Vec<Decimal> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        // No skew → innermost bid 0.9999, innermost ask 1.0001 (a +2 skew would
+        // make them 1.0001 / 1.0003).
+        assert_eq!(
+            bids.iter().cloned().reduce(Decimal::max),
+            Some(Decimal::new(9999, 4)),
+            "green bag → innermost bid unshifted at 0.9999: {bids:?}"
+        );
+        assert_eq!(
+            asks.iter().cloned().reduce(Decimal::min),
+            Some(Decimal::new(10001, 4)),
+            "green bag → innermost ask unshifted at 1.0001: {asks:?}"
+        );
+        let _ = prices;
     }
 
     #[test]
