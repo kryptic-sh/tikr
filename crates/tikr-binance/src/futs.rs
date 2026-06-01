@@ -1148,6 +1148,51 @@ pub async fn get_position_risk(
     Ok(out)
 }
 
+/// List every open position on Futures in ONE call (weight 5). Returns
+/// `(symbol, signed positionAmt)` for each symbol with a non-zero position.
+/// Endpoint: `GET /fapi/v2/positionRisk` with NO symbol filter. Used by
+/// wave_auto to adopt positions inherited across a restart whose symbol fell
+/// off the top set, so they don't sit unmanaged.
+pub async fn list_open_positions(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+) -> Result<Vec<(String, tikr_core::Decimal)>, VenueError> {
+    let signed = append_auth_dispatch("", key_material);
+    let url = format!("{base_url}/fapi/v2/positionRisk?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let body: Value = read_json(resp).await?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "positionRisk(all): expected array",
+        )))
+    })?;
+    let mut out = Vec::new();
+    for row in arr {
+        let sym = row.get("symbol").and_then(Value::as_str).unwrap_or("");
+        let amt_str = row
+            .get("positionAmt")
+            .and_then(Value::as_str)
+            .unwrap_or("0");
+        let amt = <tikr_core::Decimal as std::str::FromStr>::from_str(amt_str)
+            .unwrap_or(tikr_core::Decimal::ZERO);
+        if !sym.is_empty() && amt != tikr_core::Decimal::ZERO {
+            out.push((sym.to_string(), amt));
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch the account's executed trades for `symbol` with `time >= start_ms`.
 ///
 /// Endpoint: `GET /fapi/v1/userTrades` (signed). Each row is mapped to a

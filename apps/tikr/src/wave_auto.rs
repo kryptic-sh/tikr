@@ -175,6 +175,54 @@ pub fn spawn_wave_auto_manager(
                 "wave_auto: discovery tick"
             );
 
+            // 4-pre. Adopt orphan positions. Any symbol with an open position
+            // on the venue but NO active bot gets one spawned to MANAGE/DRAIN
+            // it — covers positions inherited across a restart (wave_auto leaves
+            // positions intact on shutdown) whose symbol has since fallen off
+            // the top set. Without this they'd sit with no orders, unmanaged.
+            // Once adopted they obey the normal rules below: deferred while
+            // underwater, rotated out (flattened) once flat/green. Runs every
+            // cycle (cheap: one positionRisk call) and is a no-op once adopted
+            // (the symbol is then in `active`). Dust / untradeable (no mark)
+            // skipped so we don't churn a bot we can't meaningfully run.
+            match tikr_binance::futs::list_open_positions(
+                &http,
+                account.env.rest_base_url(),
+                &account.api_key,
+                &account.key_material,
+            )
+            .await
+            {
+                Ok(positions) => {
+                    for (sym, amt) in positions {
+                        if active.contains_key(&sym) {
+                            continue;
+                        }
+                        let mark = price_map.get(&sym).copied().unwrap_or_default();
+                        if mark <= Decimal::ZERO {
+                            continue; // untradeable / unknown price — can't manage
+                        }
+                        // ~min-notional floor (USDT); below this it's dust that
+                        // reset_symbol_state can't close anyway.
+                        if amt.abs() * mark < Decimal::from(5) {
+                            continue;
+                        }
+                        warn!(
+                            symbol = %sym,
+                            amount = %amt,
+                            notional = %(amt.abs() * mark),
+                            "wave_auto: adopting orphan position (no active bot) — spawning manager"
+                        );
+                        let bot = spawn_one_bot(&sym, &account, &shared_state, &cfg);
+                        active.insert(sym.clone(), bot);
+                        retired.remove(&sym); // it's live again — stop the GC clock
+                    }
+                }
+                Err(e) => {
+                    warn!(error = ?e, "wave_auto: orphan-position scan failed (skipping this cycle)")
+                }
+            }
+
             // 4a. Teardown FIRST so freed slots can be filled this cycle.
             // A symbol that fell out of the top set rotates ONLY when its bot is
             // flat or holding a GREEN bag. If it's holding an UNDERWATER bag
