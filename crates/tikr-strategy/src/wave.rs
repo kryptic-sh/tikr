@@ -166,7 +166,14 @@ impl Wave {
         };
         let min = self.config.min_notional;
         if min > Decimal::ZERO && stepped * price.0 < min && self.config.step_size > Decimal::ZERO {
-            let needed = (min / price.0 / self.config.step_size).ceil() * self.config.step_size;
+            let mut needed = (min / price.0 / self.config.step_size).ceil() * self.config.step_size;
+            // Guard: the chained Decimal divisions above can truncate the ratio a
+            // hair below its true value, so `ceil` lands one lot short and the
+            // notional ends up just under min (e.g. 4.9998 < 5 → exchange reject).
+            // Bump by whole lots until the notional actually clears min.
+            while needed * price.0 < min {
+                needed += self.config.step_size;
+            }
             Size(needed)
         } else {
             Size(stepped)
@@ -958,6 +965,27 @@ mod tests {
         let b: Vec<Decimal> = (0..4).map(|k| w.bid_price(k).unwrap()).collect();
         assert_eq!(b[0] - b[1], b[1] - b[2], "uniform gaps must be equal");
         assert_eq!(b[1] - b[2], b[2] - b[3]);
+    }
+
+    #[test]
+    fn quote_size_always_meets_min_notional() {
+        // The min-notional bump must never leave the order a hair under min
+        // (the 4.9998 < 5 reject). Whole-lot step = worst case for the chained-
+        // division truncation; sweep awkward repeating-decimal prices.
+        let mut c = cfg();
+        c.min_notional = Decimal::from(5);
+        c.step_size = Decimal::ONE; // whole-lot step
+        c.notional_per_order = Decimal::ONE; // tiny → forces the min-notional path
+        let w = Wave::new(c);
+        for i in 1..=500u32 {
+            let price = Decimal::from(i) / Decimal::from(133); // 133 = 7×19 → repeating
+            let sz = w.quote_size(Price(price)).0;
+            assert!(
+                sz * price >= Decimal::from(5),
+                "notional {} < min 5 at price {price} (size {sz})",
+                sz * price
+            );
+        }
     }
 
     #[test]
