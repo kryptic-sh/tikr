@@ -17,21 +17,21 @@
 # flat or GREEN. Holding an underwater bag? It keeps running until recovered
 # (defer_underwater, default on) — rotation never crystallizes a loss.
 #
-# WHY USDT: the volatile small-cap oscillators (GUN-likes) live on USDT perps;
-# USDC perps are mostly the tight majors. Discovery scans USDT, so the futures
-# wallet needs USDT margin.
+# WHY USDC: the volatile small-cap oscillators (GUN-likes) live on USDC perps;
+# USDC perps are mostly the tight majors. Discovery scans USDC, so the futures
+# wallet needs USDC margin.
 #
 # ⚠ Live, real money. Wave adds into a trend; big 1m candles can be a trend as
 # easily as chop. The defer-underwater guard + (optional) SL are the backstops.
 # Watch the first sessions; size so summed peaks stay under buying power.
 #
-# Pre-flight (mainnet): TIKR_BINANCE_ENABLE_MAINNET=1; .env keys; funded USDT
+# Pre-flight (mainnet): TIKR_BINANCE_ENABLE_MAINNET=1; .env keys; funded USDC
 # in the Futures wallet; confirm maker fee at binance.com/en/fee/futureFee.
 
 [account]
 env = "futures-mainnet"
 state_dir = "./state/wave-auto"
-asset = "USDT"
+asset = "USDC"
 order_balance_pct = "0.1"
 max_position_pct = "0"
 leverage = 10
@@ -41,9 +41,9 @@ inventory_boost_curve = "1"
 [rampage]
 enabled = true
 min_volume_usdt = "0"      # $2M 24h quote volume floor
-recheck_interval_secs = 30
-quote_asset = "USDT"
-top_n = 8
+recheck_interval_secs = 60
+quote_asset = "USDC"
+top_n = 5
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.1" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 
@@ -51,15 +51,15 @@ rotate_loss_pct = "0.1" # accept NET loss up to 1% of wallet on rotate (NET = re
 mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
 [rampage.score.params]
 candle_count = 30    # average the last 60 one-minute candles (~1h window)
-min_candle_pct = "1" # min avg candle height % to qualify (0 = no floor)
+min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 grid_levels = 10
-step_bps = 30
+step_bps = 5
 refill_threshold = 5
-inner_steps = 1
-chase = true
-# forced_refill_secs = 60
-# chase_to_avg = true
+inner_steps = 0
+# chase = true
+forced_refill_secs = 120
+chase_to_avg = true
