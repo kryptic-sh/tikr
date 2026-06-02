@@ -520,6 +520,7 @@ fn build_wave(
         step_volatility_mult: wave.step_volatility_mult,
         trend_depth_candles: wave.trend_depth_candles,
         forced_refill_secs: wave.forced_refill_secs,
+        profit_flatten_usdt: wave.profit_flatten_usdt,
     }))
 }
 

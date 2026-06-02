@@ -118,6 +118,11 @@ pub struct WaveConfig {
     /// tracking. `0` (default) = off (refills only on round-trip / side-empty).
     /// No effect when `chase` is false.
     pub forced_refill_secs: u32,
+    /// Profit-flatten: when NET (realized + unrealized) since the last flatten
+    /// reaches this many quote units, cancel all, market-close the bag (IOC), and
+    /// reset the cycle — banking a fixed profit and starting fresh. `0` (default)
+    /// = off.
+    pub profit_flatten_usdt: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +154,9 @@ pub struct Wave {
     adaptive_step_bps: Option<u32>,
     /// ctx.now.0 (ns) of the last refill (any trigger). Drives `forced_refill_secs`.
     last_refill_ns: Option<u64>,
+    /// NET (realized + unrealized) reference at the last profit-flatten (or first
+    /// event). Drives `profit_flatten_usdt`.
+    profit_baseline: Option<Decimal>,
 }
 
 impl Wave {
@@ -189,6 +197,29 @@ impl Wave {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
+    }
+
+    /// Marketable IOC order to close inventory at `price` (used by the
+    /// profit-flatten exit). Crosses the spread so it takes liquidity.
+    fn make_close_quote(&self, symbol: &Symbol, side: Side, price: Price, size: Size) -> Action {
+        Action::Quote(QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price,
+            size,
+            tif: TimeInForce::IOC,
+            kind: QuoteKind::Point,
+        })
+    }
+
+    /// Round an absolute position size down to the lot step for a close order.
+    fn close_size(&self, pos_abs: Decimal) -> Size {
+        let q = if self.config.step_size > Decimal::ZERO {
+            (pos_abs / self.config.step_size).floor() * self.config.step_size
+        } else {
+            pos_abs
+        };
+        Size(q.max(Decimal::ZERO))
     }
 
     /// Compute `(top_bid_override, top_ask_override)`, pushing the origins
@@ -455,6 +486,7 @@ impl Strategy for Wave {
             last_adjust_ns: None,
             adaptive_step_bps: None,
             last_refill_ns: None,
+            profit_baseline: None,
         }
     }
 
@@ -560,6 +592,56 @@ impl Strategy for Wave {
                         self.ask_lattice_origin = None;
                     }
                 }
+            }
+        }
+
+        // 0.5) Profit-flatten: bank a fixed NET profit, then reset the cycle.
+        //
+        // Track NET (realized + unrealized = mark-to-market, what we'd bank on a
+        // close) since the last flatten. When it clears `profit_flatten_usdt`,
+        // cancel all, market-close the bag (IOC into the touch), drop the lattice
+        // so it re-seeds fresh, and re-baseline. NET is conserved across the close
+        // (it just moves unrealized → realized), so the new baseline = current NET
+        // prevents an immediate re-trigger before the close fills.
+        if self.config.profit_flatten_usdt > Decimal::ZERO
+            && let (Some(bb), Some(aa)) = (best_bid, best_ask)
+            && bb.0 > Decimal::ZERO
+            && aa.0 > bb.0
+        {
+            let mid = (bb.0 + aa.0) / Decimal::from(2);
+            let pos = ctx.position.size.0;
+            let avg = ctx.position.avg_entry.0;
+            // Signed unrealized: (mid − avg) × size works for long and short; 0 flat.
+            let unreal = if avg > Decimal::ZERO {
+                (mid - avg) * pos
+            } else {
+                Decimal::ZERO
+            };
+            let net = ctx.position.realized_pnl.0 + unreal;
+            match self.profit_baseline {
+                None => self.profit_baseline = Some(net),
+                Some(base) if net - base >= self.config.profit_flatten_usdt => {
+                    actions.push(Action::CancelAll);
+                    if pos != Decimal::ZERO {
+                        // Long → sell into the bid; short → buy from the ask. IOC so
+                        // it takes liquidity and actually flattens.
+                        let (side, px) = if pos > Decimal::ZERO {
+                            (Side::Ask, bb)
+                        } else {
+                            (Side::Bid, aa)
+                        };
+                        let size = self.close_size(pos.abs());
+                        if size.0 > Decimal::ZERO {
+                            actions.push(self.make_close_quote(ctx.symbol, side, px, size));
+                        }
+                    }
+                    self.profit_baseline = Some(net);
+                    self.lattice_step = None;
+                    self.bid_lattice_origin = None;
+                    self.ask_lattice_origin = None;
+                    return actions;
+                }
+                Some(_) => {}
             }
         }
 
@@ -835,6 +917,7 @@ mod tests {
             step_volatility_mult: Decimal::ZERO,
             trend_depth_candles: 4,
             forced_refill_secs: 0,
+            profit_flatten_usdt: Decimal::ZERO,
         }
     }
 
@@ -1003,6 +1086,49 @@ mod tests {
         );
         // 6 bids + 6 asks
         assert_eq!(actions.len(), 12);
+    }
+
+    #[test]
+    fn profit_flatten_closes_and_resets_on_net_target() {
+        // profit_flatten_usdt=5, long 10 @ avg 100. At mid 100 NET=0 (baseline);
+        // at mid 100.5 unrealized = (100.5−100)×10 = 5 ≥ target → flatten: cancel
+        // all + IOC ask close + lattice reset.
+        let mut c = cfg();
+        c.profit_flatten_usdt = Decimal::from(5);
+        let mut w = Wave::new(c);
+        let sm = sym();
+        let bag = pos_bag(Decimal::from(10)); // long 10 @ avg 100
+        let s0 = snap(Decimal::new(9995, 2), Decimal::new(10005, 2)); // mid 100
+        let a0 = w.on_event(
+            &make_ctx(&sm, &s0, &bag, &[], 0),
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
+        assert!(
+            !a0.iter().any(|x| matches!(x, Action::CancelAll)),
+            "no flatten while NET is 0"
+        );
+        let s1 = snap(Decimal::new(10045, 2), Decimal::new(10055, 2)); // mid 100.5
+        let a1 = w.on_event(
+            &make_ctx(&sm, &s1, &bag, &[], 1_000_000_000),
+            &MarketEvent::BookUpdate {
+                snapshot: s1.clone(),
+            },
+        );
+        assert!(
+            a1.iter().any(|x| matches!(x, Action::CancelAll)),
+            "NET ≥ target must cancel all: {a1:?}"
+        );
+        assert!(
+            a1.iter().any(|x| matches!(x, Action::Quote(q)
+                if q.side == Side::Ask && q.tif == TimeInForce::IOC)),
+            "flatten must emit an IOC ask close for the long bag: {a1:?}"
+        );
+        assert!(
+            w.lattice_step.is_none(),
+            "lattice must reset after a profit-flatten"
+        );
     }
 
     #[test]

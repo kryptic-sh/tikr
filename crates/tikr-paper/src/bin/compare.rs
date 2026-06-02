@@ -886,6 +886,11 @@ struct Args {
     #[arg(long, default_value_t = 0u32)]
     wave_forced_refill_secs: u32,
 
+    /// Wave: flatten (cancel all + IOC-close the bag + reset) when NET profit
+    /// since the last flatten reaches this many quote units. `0` (default) = off.
+    #[arg(long, default_value = "0")]
+    wave_profit_flatten_usdt: Decimal,
+
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
     #[arg(long, default_value = "10")]
@@ -2418,6 +2423,7 @@ async fn run_sweep_collect(
                                         step_volatility_mult: vmult,
                                         trend_depth_candles: trend_depth,
                                         forced_refill_secs: args.wave_forced_refill_secs,
+                                        profit_flatten_usdt: args.wave_profit_flatten_usdt,
                                     }),
                                     fees,
                                     skim_cfg,

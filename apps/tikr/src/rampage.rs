@@ -452,6 +452,7 @@ fn spawn_one_bot(
             step_volatility_mult,
             trend_depth_candles,
             forced_refill_secs,
+            profit_flatten_usdt,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -470,6 +471,7 @@ fn spawn_one_bot(
                     step_volatility_mult: *step_volatility_mult,
                     trend_depth_candles: *trend_depth_candles,
                     forced_refill_secs: *forced_refill_secs,
+                    profit_flatten_usdt: *profit_flatten_usdt,
                 }),
                 tide: None,
                 sg: None,

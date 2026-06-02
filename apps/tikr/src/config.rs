@@ -361,6 +361,10 @@ pub struct WaveParams {
     /// side-empty fired. `0` (default) = off.
     #[serde(default)]
     pub forced_refill_secs: u32,
+    /// Flatten (cancel all + IOC-close the bag + reset) when NET profit since the
+    /// last flatten reaches this many quote units. `0` (default) = off.
+    #[serde(default)]
+    pub profit_flatten_usdt: Decimal,
 }
 
 fn wave_default_refill_threshold() -> u32 {
@@ -691,6 +695,8 @@ pub enum RampageStrategy {
         trend_depth_candles: u32,
         #[serde(default)]
         forced_refill_secs: u32,
+        #[serde(default)]
+        profit_flatten_usdt: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {
