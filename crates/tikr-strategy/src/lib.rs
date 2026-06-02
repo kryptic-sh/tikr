@@ -51,6 +51,7 @@ pub mod tidal;
 pub mod tide;
 pub mod top_of_book;
 pub mod volatility;
+pub mod volley;
 pub mod wave;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
@@ -74,6 +75,7 @@ pub use tidal::{Tidal, TidalConfig};
 pub use tide::{Tide, TideConfig};
 pub use top_of_book::{TopOfBook, TopOfBookConfig};
 pub use volatility::{EwmaConfig, EwmaVolatility};
+pub use volley::{Volley, VolleyConfig};
 pub use wave::{Wave, WaveConfig};
 
 use tikr_core::{

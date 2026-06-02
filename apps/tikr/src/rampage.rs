@@ -485,6 +485,7 @@ fn spawn_one_bot(
                 joker: None,
                 rsi_mr: None,
                 mantis: None,
+                volley: None,
             };
             (bc, "wave", format!("{symbol}/wave"))
         }
@@ -523,6 +524,7 @@ fn spawn_one_bot(
                 joker: None,
                 rsi_mr: None,
                 mantis: None,
+                volley: None,
             };
             (bc, "tide", format!("{symbol}/tide"))
         }

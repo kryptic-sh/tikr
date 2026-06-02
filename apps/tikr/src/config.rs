@@ -308,6 +308,9 @@ pub struct BotConfig {
     /// Mantis params (only honored when `strategy = "mantis"`).
     #[serde(default)]
     pub mantis: Option<MantisParams>,
+    /// Volley params (only honored when `strategy = "volley"`).
+    #[serde(default)]
+    pub volley: Option<VolleyParams>,
 }
 
 /// Wave — frozen fixed-step lattice with round-trip refill.
@@ -531,6 +534,43 @@ pub struct JokerParams {
 }
 
 fn joker_default_order_tick_tolerance() -> u32 {
+    5
+}
+
+/// Volley — timed batched book-flooding. `step_size` / `tick_size` /
+/// `min_notional` come from venue exchangeInfo.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct VolleyParams {
+    /// Per-order notional in quote currency. Account-derived if unset.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Orders per side per volley. Default 10.
+    #[serde(default = "volley_default_levels")]
+    pub levels: u32,
+    /// Fire a fresh volley (cancel all + re-place) this often, in seconds.
+    /// `0` = every event. Default 1.
+    #[serde(default = "volley_default_interval_secs")]
+    pub interval_secs: u32,
+    /// Tick gap between consecutive orders on a side. Default 1.
+    #[serde(default = "volley_default_step_ticks")]
+    pub step_ticks: u32,
+    /// Dead-zone in ticks: first order on each side sits this far off the touch.
+    /// Default 5.
+    #[serde(default = "volley_default_inner_ticks")]
+    pub inner_ticks: u32,
+}
+
+fn volley_default_levels() -> u32 {
+    10
+}
+fn volley_default_interval_secs() -> u32 {
+    1
+}
+fn volley_default_step_ticks() -> u32 {
+    1
+}
+fn volley_default_inner_ticks() -> u32 {
     5
 }
 

@@ -12,7 +12,7 @@ use tikr_paper::{BotSpec, InventoryBoostConfig, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MantisConfig,
     MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
-    TideConfig, WaveConfig,
+    TideConfig, VolleyConfig, WaveConfig,
 };
 use tokio::sync::watch;
 
@@ -81,9 +81,10 @@ pub fn to_spec(
         "rsi-mr" | "rsimr" => build_rsi_mr(cfg, &symbol, venue, default_notional)?,
         "wave" | "wv" => build_wave(cfg, &symbol, venue, default_notional)?,
         "mantis" | "mn" => build_mantis(cfg, &symbol, venue, default_notional)?,
+        "volley" | "vl" => build_volley(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, mantis)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, mantis, volley)"
             ));
         }
     };
@@ -195,6 +196,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "rsi-mr" | "rsimr" => Ok(cfg.rsi_mr.as_ref().and_then(|p| p.notional)),
         "wave" | "wv" => Ok(cfg.wave.as_ref().and_then(|p| p.notional)),
         "mantis" | "mn" => Ok(cfg.mantis.as_ref().and_then(|p| p.notional)),
+        "volley" | "vl" => Ok(cfg.volley.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -226,7 +228,9 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "wave"
         | "wv"
         | "mantis"
-        | "mn" => None,
+        | "mn"
+        | "volley"
+        | "vl" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -245,6 +249,8 @@ fn max_open_orders_for(cfg: &BotConfig) -> usize {
         "joker" | "jk" => 0,
         "rsi-mr" | "rsimr" => 0,
         "wave" | "wv" => 0,
+        // Volley keeps a wall of `2 × levels` orders and refreshes it itself.
+        "volley" | "vl" => 0,
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
@@ -447,6 +453,34 @@ fn build_joker(
         max_order_age_secs,
         order_tick_offset,
         order_tick_tolerance,
+    }))
+}
+
+fn build_volley(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let v = cfg.volley.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=volley but [bot.volley] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(v.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::Volley(VolleyConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        levels: v.levels,
+        interval_secs: v.interval_secs,
+        step_ticks: v.step_ticks,
+        inner_ticks: v.inner_ticks,
     }))
 }
 

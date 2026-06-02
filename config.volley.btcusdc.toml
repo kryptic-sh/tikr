@@ -1,0 +1,29 @@
+# ─── Volley on BTCUSDC — MAINNET ──────────────────────────────────────────
+#
+# Every `interval_secs`, cancel everything and re-place a fence of `levels`
+# bids + `levels` asks, `step_ticks` apart, starting `inner_ticks` off the
+# touch. A continuously-refreshed wall — NO inventory cap inside the strategy,
+# so `max_position_pct` at the account layer is the only backstop.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in the Futures wallet
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/volley-btcusdc"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"   # volley has no internal cap — this is the only inventory backstop
+leverage = 5
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "volley"
+
+[bot.volley]
+levels = 10          # 10 bids + 10 asks per volley
+interval_secs = 1    # fire a fresh wall every second (0 = every event)
+step_ticks = 1       # consecutive orders 1 tick apart
+inner_ticks = 5      # first order each side sits 5 ticks off the touch
