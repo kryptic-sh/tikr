@@ -43,7 +43,7 @@ enabled = true
 min_volume_usdt = "2000000" # $2M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDT"
-top_n = 5
+top_n = 10
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.1" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 
@@ -59,4 +59,4 @@ kind = "wave" # "wave" | "tide"
 levels = 10
 round_trips = 5
 steps_bps = 30
-steps_inner = 1
+steps_inner = 0
