@@ -1,0 +1,17 @@
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tide-zecusdc"
+asset = "USDC"
+order_balance_pct = "10"
+max_position_pct = "0"
+leverage = 10
+
+[[bot]]
+symbol = "ZECUSDC"
+strategy = "tide"
+
+[bot.tide]
+grid_levels = 10
+inner_steps = 0
+step_bps = 10
+chase = true
