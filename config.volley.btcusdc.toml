@@ -15,7 +15,7 @@ env = "futures-mainnet"
 state_dir = "./state/volley-btcusdc"
 asset = "USDC"
 order_balance_pct = "1"
-max_position_pct = "100"   # volley has no internal cap — this is the only inventory backstop
+max_position_pct = "0"               # volley has no internal cap — this is the only inventory backstop
 leverage = 5
 
 [[bot]]
@@ -23,7 +23,7 @@ symbol = "BTCUSDC"
 strategy = "volley"
 
 [bot.volley]
-levels = 10          # 10 bids + 10 asks per volley
-interval_secs = 1    # fire a fresh wall every second (0 = every event)
-step_ticks = 1       # consecutive orders 1 tick apart
-inner_ticks = 5      # first order each side sits 5 ticks off the touch
+levels = 1        # 10 bids + 10 asks per volley
+interval_secs = 1 # fire a fresh wall every second (0 = every event)
+step_ticks = 50   # consecutive orders 1 tick apart
+inner_ticks = 50  # first order each side sits 5 ticks off the touch

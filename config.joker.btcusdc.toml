@@ -1,0 +1,30 @@
+# ─── Joker on BTCUSDC — MAINNET ───────────────────────────────────────────
+#
+# Single Joker bot on BTCUSDC: join/lag the touch on every event, dedupe by
+# same-side price within `order_tick_tolerance` ticks, reap orders older than
+# `max_order_age_secs`. No grid, no close-on-fill, NO inventory cap inside the
+# strategy — so the account-layer `max_position_pct` is the ONLY backstop.
+#
+# Best on USDC promo (0 bps maker): any touch fill banks pure spread.
+#
+# Pre-flight:
+#   1. TIKR_BINANCE_ENABLE_MAINNET=1
+#   2. .env with TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET
+#   3. Funded USDC balance in the Futures wallet
+
+[account]
+env = "futures-mainnet"
+state_dir = "./state/joker-btcusdc"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "100"            # joker has no internal cap — this is the only inventory backstop
+leverage = 5
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "joker"
+
+[bot.joker]
+max_order_age_secs = 10  # reap stale orders left behind by book moves
+order_tick_offset = 1    # lag 1 tick behind the touch (bid = best_bid - tick, ask = best_ask + tick)
+order_tick_tolerance = 5 # one resting order covers a 5-tick band → don't spam on a wiggle
