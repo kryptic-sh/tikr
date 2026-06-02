@@ -1,8 +1,8 @@
-//! Volley — timed batched book-flooding market-making.
+//! Volley — timed batched liquidity spray.
 //!
-//! Every `interval_secs`, fire a fresh "volley": cancel everything, then place
-//! `levels` bids and `levels` asks as a fence. The first order on each side sits
-//! `inner_ticks` off the touch (a dead-zone), and consecutive orders are
+//! Every `interval_secs`, fire a "volley": place `levels` bids and `levels` asks
+//! as a fence, WITHOUT cancelling anything first. The first order on each side
+//! sits `inner_ticks` off the touch (a dead-zone), and consecutive orders are
 //! `step_ticks` apart:
 //!
 //! ```text
@@ -10,14 +10,19 @@
 //!   ask[i] = best_ask + (inner_ticks + i*step_ticks) * tick
 //! ```
 //!
-//! The whole wall is cancelled and re-placed at the current touch each interval,
-//! so it always tracks the book — at the cost of resetting queue priority every
-//! cycle (the point: a continuously-refreshed wall, not patient resting orders).
+//! Nothing is cancelled — each volley ADDS `levels` fresh orders per side, so
+//! resting depth accumulates over time (a high-frequency liquidity provider that
+//! keeps refreshing queue position with new orders rather than re-pricing old
+//! ones). On a static book this stacks duplicate-price orders; as the touch
+//! moves, new volleys land at the new touch.
 //!
-//! Post-only (maker). No inventory cap inside the strategy — bound it with
-//! `max_position_pct` at the account layer. Best on zero/low-fee venues.
+//! ⚠ With no cancel, open orders grow until the venue's per-symbol cap (~200 on
+//! Binance USD-M) — past that, placements reject. Bound it with the account-layer
+//! `max_position_pct` (inventory) and a tolerable `levels × interval` rate; an
+//! age-based reaper can be added if you need the wall to self-trim.
 //!
-//! State is just the last-volley timestamp that gates the interval.
+//! Post-only (maker). No inventory cap inside the strategy. Best on
+//! zero/low-fee venues. State is just the last-volley timestamp.
 
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
@@ -134,8 +139,9 @@ impl Strategy for Volley {
         let inner = i64::from(self.config.inner_ticks);
         let step = i64::from(self.config.step_ticks.max(1));
 
-        // Fresh volley: cancel the previous wall, re-place at the current touch.
-        let mut actions: Vec<Action> = vec![Action::CancelAll];
+        // Fresh volley: ADD `levels` orders per side at the current touch — no
+        // cancel, so resting depth accumulates.
+        let mut actions: Vec<Action> = Vec::new();
         for i in 0..levels {
             let off = Decimal::from(inner + i * step) * tick;
             // Bid below the touch; never cross to/above the ask.
@@ -235,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn first_volley_places_full_wall_and_cancels() {
+    fn volley_places_levels_per_side_without_cancelling() {
         let mut s = Volley::new(cfg());
         let snap = book(Decimal::from(100), Decimal::new(1001, 1)); // bid 100, ask 100.1
         let p = pos();
@@ -246,13 +252,10 @@ mod tests {
                 snapshot: snap.clone(),
             },
         );
-        // 1 CancelAll + 10 bids + 10 asks.
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|a| matches!(a, Action::CancelAll))
-                .count(),
-            1
+        // No cancel — pure adds.
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::CancelAll)),
+            "volley must NOT cancel"
         );
         let bids = actions
             .iter()
@@ -262,7 +265,7 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Ask))
             .count();
-        assert_eq!((bids, asks), (10, 10), "10 per side");
+        assert_eq!((bids, asks), (10, 10), "exactly `levels` per side");
     }
 
     #[test]
@@ -305,14 +308,15 @@ mod tests {
         let snap = book(Decimal::from(100), Decimal::new(1001, 1));
         let p = pos();
         let symbol = sym();
-        // t=0: fires.
+        let fired = |a: &[Action]| a.iter().any(|x| matches!(x, Action::Quote(_)));
+        // t=0: fires (places orders).
         let a0 = s.on_event(
             &ctx(&symbol, &snap, &p, &[], 0),
             &MarketEvent::BookUpdate {
                 snapshot: snap.clone(),
             },
         );
-        assert!(a0.iter().any(|a| matches!(a, Action::CancelAll)));
+        assert!(fired(&a0));
         // t=0.5s (< 1s interval): NoOp, no new volley.
         let a1 = s.on_event(
             &ctx(&symbol, &snap, &p, &[], 500_000_000),
@@ -320,7 +324,7 @@ mod tests {
                 snapshot: snap.clone(),
             },
         );
-        assert!(!a1.iter().any(|a| matches!(a, Action::CancelAll)));
+        assert!(!fired(&a1));
         // t=1.0s: fires again.
         let a2 = s.on_event(
             &ctx(&symbol, &snap, &p, &[], 1_000_000_000),
@@ -328,6 +332,6 @@ mod tests {
                 snapshot: snap.clone(),
             },
         );
-        assert!(a2.iter().any(|a| matches!(a, Action::CancelAll)));
+        assert!(fired(&a2));
     }
 }
