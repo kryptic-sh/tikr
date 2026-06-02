@@ -69,10 +69,10 @@ inventory_boost_curve = "1"
 symbol = "NEARUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
-step_bps = 5
-inner_steps = 1
+levels = 4
+round_trips = 2
+steps_bps = 5
+steps_inner = 1
 
 # ─── ZECUSDC ($5 floor) ───────────────────────────────────────────────────
 # Swapped in for ETHUSDC (ETH min notional ~$20 on USDC perps, too large for
@@ -82,10 +82,10 @@ inner_steps = 1
 symbol = "ZECUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
-step_bps = 5
-inner_steps = 1
+levels = 4
+round_trips = 2
+steps_bps = 5
+steps_inner = 1
 
 # ─── WLDUSDC ──────────────────────────────────────────────────────────────
 # Replaces DOGEUSDC. Highest vol of the set (~28% 24h range, ~$21M vol) →
@@ -95,10 +95,10 @@ inner_steps = 1
 symbol = "WLDUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
-step_bps = 5
-inner_steps = 1
+levels = 4
+round_trips = 2
+steps_bps = 5
+steps_inner = 1
 
 # ─── SUIUSDC ($5 floor) ───────────────────────────────────────────────────
 # Replaces BCHUSDC (BCH lagged — its 24h range was a down-trend, not chop, so
@@ -108,7 +108,7 @@ inner_steps = 1
 symbol = "SUIUSDC"
 strategy = "wave"
 [bot.wave]
-grid_levels = 4
-refill_threshold = 2
-step_bps = 5
-inner_steps = 1
+levels = 4
+round_trips = 2
+steps_bps = 5
+steps_inner = 1

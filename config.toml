@@ -40,7 +40,7 @@ inventory_boost_curve = "1"
 
 [rampage]
 enabled = true
-min_volume_usdt = "0"      # $2M 24h quote volume floor
+min_volume_usdt = "2000000" # $2M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDT"
 top_n = 5
@@ -56,10 +56,7 @@ min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
-grid_levels = 10
-step_bps = 30
-refill_threshold = 5
-inner_steps = 1
-chase = true
-forced_refill_secs = 120
-#chase_to_avg = true
+levels = 10
+round_trips = 5
+steps_bps = 30
+steps_inner = 1

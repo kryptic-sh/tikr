@@ -539,22 +539,10 @@ fn build_wave(
         tick_size,
         step_size,
         min_notional,
-        grid_levels: wave.grid_levels,
-        step_bps: wave.step_bps,
-        inner_steps: wave.inner_steps,
-        refill_threshold: wave.refill_threshold,
-        // Account-derived cap arrives via on_max_position_updated (live
-        // channel); seed 0 = uncapped until the first update lands.
-        max_position_usdt: Decimal::ZERO,
-        chase_to_avg: wave.chase_to_avg,
-        chase: wave.chase,
-        candle_count: wave.candle_count,
-        candle_secs: wave.candle_secs,
-        lattice_adjust_secs: wave.lattice_adjust_secs,
-        step_volatility_mult: wave.step_volatility_mult,
-        trend_depth_candles: wave.trend_depth_candles,
-        forced_refill_secs: wave.forced_refill_secs,
-        profit_flatten_usdt: wave.profit_flatten_usdt,
+        levels: wave.levels,
+        steps_bps: wave.steps_bps,
+        steps_inner: wave.steps_inner,
+        round_trips: wave.round_trips,
     }))
 }
 

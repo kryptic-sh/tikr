@@ -313,81 +313,36 @@ pub struct BotConfig {
     pub volley: Option<VolleyParams>,
 }
 
-/// Wave — frozen fixed-step lattice with round-trip refill.
+/// Wave — frozen fixed-step lattice with round-trip refill (pure form).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaveParams {
     /// Per-order notional. Account-derived if unset.
     #[serde(default)]
     pub notional: Option<Decimal>,
-    /// Lattice slots per side. Default 12.
-    #[serde(default = "wave_default_grid_levels")]
-    pub grid_levels: u32,
+    /// Orders per side. Default 12.
+    #[serde(default = "wave_default_levels")]
+    pub levels: u32,
     /// Level spacing in bps — gap between consecutive levels. `0` = 1-tick.
     #[serde(default)]
-    pub step_bps: u32,
-    /// Inner dead-zone in STEPS (mid → first order = `inner_steps × step`),
-    /// matching Tide. `0` (default) = origins at the touch.
+    pub steps_bps: u32,
+    /// Inner dead-zone in STEPS (mid → first order = `steps_inner × step`).
+    /// `0` (default) = origins at the touch.
     #[serde(default)]
-    pub inner_steps: u32,
-    /// Refill only once ≥ N band slots are empty. Default 1 (refill any gap).
-    #[serde(default = "wave_default_refill_threshold")]
-    pub refill_threshold: u32,
-    /// Chase the reducing side only to cost basis (asks→avg+gap when long,
-    /// bids→avg−gap when short). Never sells/covers past cost. `false`
-    /// (default) = off (pure one-sided lattice).
-    #[serde(default)]
-    pub chase_to_avg: bool,
-    /// Market-chase: lattice follows the touch both ways (bids above origin,
-    /// asks below). The proven LOSING mode; off by default. Overrides
-    /// chase_to_avg.
-    #[serde(default)]
-    pub chase: bool,
-    /// Adaptive lattice: number of candle ranges to average. `0` → 10.
-    #[serde(default = "wave_default_candle_count")]
-    pub candle_count: u32,
-    /// Adaptive lattice: candle period in seconds. `0` → 60 (1-minute).
-    #[serde(default = "wave_default_candle_secs")]
-    pub candle_secs: u32,
-    /// Adaptive lattice: re-evaluate interval in seconds. `0` (default) = off.
-    #[serde(default)]
-    pub lattice_adjust_secs: u32,
-    /// Adaptive lattice: step_bps = `step_volatility_mult × avg_candle_range_bps`,
-    /// floored at `step_bps`. `0` (default) = off.
-    #[serde(default)]
-    pub step_volatility_mult: Decimal,
-    /// Adaptive lattice: regime threshold — bag underwater by N candle-ranges =
-    /// trend → anchor; under = oscillate → re-center. `0` → 4.
-    #[serde(default = "wave_default_trend_depth_candles")]
-    pub trend_depth_candles: u32,
-    /// When chase=true, force a refill every N seconds even if no round-trip /
-    /// side-empty fired. `0` (default) = off.
-    #[serde(default)]
-    pub forced_refill_secs: u32,
-    /// Flatten (cancel all + IOC-close the bag + reset) when NET profit since the
-    /// last flatten reaches this many quote units. `0` (default) = off.
-    #[serde(default)]
-    pub profit_flatten_usdt: Decimal,
+    pub steps_inner: u32,
+    /// Completed round-trips needed to trigger a refill (≥ N bids AND ≥ N asks
+    /// drained). A whole side emptying refills regardless. Default 1.
+    #[serde(default = "wave_default_round_trips")]
+    pub round_trips: u32,
 }
 
-fn wave_default_refill_threshold() -> u32 {
+fn wave_default_round_trips() -> u32 {
     1
 }
 
-fn wave_default_trend_depth_candles() -> u32 {
-    4
-}
-
-fn wave_default_grid_levels() -> u32 {
+fn wave_default_levels() -> u32 {
     12
-}
-
-fn wave_default_candle_count() -> u32 {
-    10
-}
-
-fn wave_default_candle_secs() -> u32 {
-    60
 }
 
 /// Mantis — symmetric touch scalper; rests a bid+ask at the touch.
@@ -676,9 +631,6 @@ fn wave_auto_default_step_bps() -> u32 {
 fn wave_auto_default_inner_steps() -> u32 {
     2
 }
-fn wave_auto_default_chase_to_avg() -> bool {
-    true
-}
 
 /// Scoring mode for the rampage auto-rotation manager.
 ///
@@ -711,32 +663,14 @@ pub enum ScoreMode {
 pub enum RampageStrategy {
     /// Spawn a Wave (frozen-lattice) bot.
     Wave {
-        #[serde(default = "wave_default_grid_levels")]
-        grid_levels: u32,
+        #[serde(default = "wave_default_levels")]
+        levels: u32,
         #[serde(default = "wave_auto_default_step_bps")]
-        step_bps: u32,
+        steps_bps: u32,
         #[serde(default = "wave_auto_default_inner_steps")]
-        inner_steps: u32,
-        #[serde(default = "wave_default_refill_threshold")]
-        refill_threshold: u32,
-        #[serde(default = "wave_auto_default_chase_to_avg")]
-        chase_to_avg: bool,
-        #[serde(default)]
-        chase: bool,
-        #[serde(default = "wave_default_candle_count")]
-        candle_count: u32,
-        #[serde(default = "wave_default_candle_secs")]
-        candle_secs: u32,
-        #[serde(default)]
-        lattice_adjust_secs: u32,
-        #[serde(default)]
-        step_volatility_mult: Decimal,
-        #[serde(default = "wave_default_trend_depth_candles")]
-        trend_depth_candles: u32,
-        #[serde(default)]
-        forced_refill_secs: u32,
-        #[serde(default)]
-        profit_flatten_usdt: Decimal,
+        steps_inner: u32,
+        #[serde(default = "wave_default_round_trips")]
+        round_trips: u32,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {
@@ -1479,12 +1413,10 @@ mod tests {
             [rampage.strategy]
             kind = "wave"
             [rampage.strategy.params]
-            grid_levels = 10
-            step_bps = 30
-            inner_steps = 2
-            refill_threshold = 5
-            chase_to_avg = false
-            chase = true
+            levels = 10
+            steps_bps = 30
+            steps_inner = 2
+            round_trips = 5
         "#;
         let cfg: DashboardConfig = toml::from_str(s).unwrap();
         let r = cfg.rampage.as_ref().expect("rampage must be present");
@@ -1502,14 +1434,15 @@ mod tests {
         }
         match &r.strategy {
             RampageStrategy::Wave {
-                grid_levels,
-                step_bps,
-                chase,
-                ..
+                levels,
+                steps_bps,
+                steps_inner,
+                round_trips,
             } => {
-                assert_eq!(*grid_levels, 10);
-                assert_eq!(*step_bps, 30);
-                assert!(*chase);
+                assert_eq!(*levels, 10);
+                assert_eq!(*steps_bps, 30);
+                assert_eq!(*steps_inner, 2);
+                assert_eq!(*round_trips, 5);
             }
             other => panic!("expected Wave, got {other:?}"),
         }

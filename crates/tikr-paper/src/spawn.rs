@@ -63,7 +63,7 @@ pub enum StrategyChoice {
     Joker(JokerConfig),
     /// [`RsiMr`] — long-only RSI mean-reversion with KER regime gate.
     RsiMr(RsiMrConfig),
-    /// [`Wave`] — lazy-recenter lattice, ATR-adaptive step.
+    /// [`Wave`] — frozen fixed-step lattice with round-trip refill.
     Wave(WaveConfig),
     /// [`Mantis`] — symmetric touch scalper; rests bid+ask at the touch.
     Mantis(MantisConfig),

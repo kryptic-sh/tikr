@@ -40,8 +40,7 @@ inventory_boost_curve = "1"
 symbol = "GUNUSDT"
 strategy = "wave"
 [bot.wave]
-grid_levels = 10
-refill_threshold = 5
-step_bps = 10
-inner_steps = 0
-chase_to_avg = true
+levels = 10
+round_trips = 5
+steps_bps = 10
+steps_inner = 0

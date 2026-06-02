@@ -1,32 +1,18 @@
-# ─── Rampage AUTO-rotation — Wave + ADAPTIVE candle-vol lattice (iter2) ────────
+# ─── Rampage AUTO-rotation — Wave (pure frozen lattice) ───────────────────────
 #
-# Same auto-rotation as config.toml, but the Wave strategy runs the ADAPTIVE
-# volatility-sized lattice ("iter2"): the level spacing is re-sized to recent
-# volatility instead of a fixed step.
+# Same auto-rotation as config.toml: rank markets by avg 1m candle height, run a
+# Wave bot on the top `top_n`. Wave is the pure frozen fixed-step lattice — the
+# grid is computed once at start and never recenters, resizes, or chases.
 #
-# How the adaptive lattice works:
-#   - Track the last `candle_count` candles of `candle_secs` each (here 10 × 60s
-#     = a 10-minute rolling window) and average their (high−low)/low range in bps.
-#   - effective step bps = step_volatility_mult × avg_candle_range_bps, floored
-#     at `step_bps` and coarse-quantized (so noise doesn't nudge it).
-#   - Every `lattice_adjust_secs`, if that step moved past a 30% hysteresis band
-#     (a real vol regime shift), fully re-lattice: cancel all + re-freeze the grid
-#     at the current touch with the new step (the cover side clamps to cost so it
-#     never rests sells below break-even).
-#   - Calm market → tight step (more fills); volatile → wide step (slower
-#     accumulation, smaller bag). step_bps is the FLOOR.
+# Geometry knobs (the only four):
+#   - steps_bps   — bps of mid per lattice step (level spacing).
+#   - steps_inner — lattice slots skipped between mid and the first order/side.
+#   - levels      — orders per side.
+#   - round_trips — completed round-trips (≥ N bids AND ≥ N asks drained) before
+#                   a refill; a whole side emptying refills regardless.
 #
-# Set step_volatility_mult = "0" OR lattice_adjust_secs = 0 to disable adaptive
-# and fall back to a plain frozen lattice at `step_bps`.
-#
-# NOTE vs config.toml: chase = false here (one-sided hold-and-revert — the mode
-# the adaptive lattice was backtested in), and step_bps is the FLOOR (10), not a
-# fixed 30.
-#
-# ⚠ Live, real money. Backtested on NEAR/SUI/WLD/ZEC 72h windows; the apparent
-# edge is concentrated in volatile oscillators and holds larger bags than the
-# chase=true frozen baseline (peak ≈ a few hundred to ~$3.4k notional, well under
-# the balance×leverage margin cap). Watch the first sessions.
+# ⚠ Live, real money. One-sided accumulation is bounded only by step width ×
+# order size on a one-way move — keep steps_bps wide enough and notional small.
 
 [account]
 env = "futures-mainnet"
@@ -56,14 +42,7 @@ min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
-grid_levels = 10
-step_bps = 10        # FLOOR — adaptive sizes the step UP from here with volatility
-inner_steps = 0
-refill_threshold = 5
-chase_to_avg = false
-chase = false
-# ─── adaptive vol-sized lattice (iter2) ───
-step_volatility_mult = "0.5"  # step_bps = mult × avg candle range bps; "0" = adaptive OFF
-lattice_adjust_secs = 15      # re-evaluate the step this often (seconds); 0 = adaptive OFF
-candle_count = 10             # candles in the rolling vol window
-candle_secs = 60              # candle period → 10 × 60s = 10-minute window
+levels = 10
+steps_bps = 10       # bps of mid per lattice step (level spacing)
+steps_inner = 0      # slots skipped mid → first order (0 = at the touch)
+round_trips = 5      # round-trips before a refill (side-empty refills regardless)
