@@ -58,7 +58,7 @@ kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 grid_levels = 10
 step_bps = 20
-inner_steps = 0
+inner_steps = 1
 refill_threshold = 5
 chase_to_avg = false
 forced_refill_secs = 10
