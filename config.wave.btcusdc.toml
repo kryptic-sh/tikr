@@ -1,0 +1,18 @@
+[account]
+env = "futures-mainnet"
+state_dir = "./state/wave-btcusdc"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "0"
+leverage = 10
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "wave"
+
+[bot.wave]
+grid_levels = 10
+inner_steps = 0
+step_bps = 1
+refill_threshold = 5
+chase = true

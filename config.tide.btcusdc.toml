@@ -1,0 +1,17 @@
+[account]
+env = "futures-mainnet"
+state_dir = "./state/tide-btcusdc"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "0"
+leverage = 10
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "tide"
+
+[bot.tide]
+grid_levels = 10
+inner_steps = 0
+step_bps = 1
+chase_to_avg = true
