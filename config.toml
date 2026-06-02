@@ -61,4 +61,5 @@ step_bps = 20
 inner_steps = 0
 refill_threshold = 5
 chase_to_avg = false
+forced_refill_secs = 10
 chase = true

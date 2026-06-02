@@ -340,9 +340,12 @@ pub struct WaveParams {
     /// chase_to_avg.
     #[serde(default)]
     pub chase: bool,
-    /// Adaptive lattice: number of 1-minute candle ranges to average. `0` → 10.
+    /// Adaptive lattice: number of candle ranges to average. `0` → 10.
     #[serde(default = "wave_default_candle_count")]
     pub candle_count: u32,
+    /// Adaptive lattice: candle period in seconds. `0` → 60 (1-minute).
+    #[serde(default = "wave_default_candle_secs")]
+    pub candle_secs: u32,
     /// Adaptive lattice: re-evaluate interval in seconds. `0` (default) = off.
     #[serde(default)]
     pub lattice_adjust_secs: u32,
@@ -350,10 +353,22 @@ pub struct WaveParams {
     /// floored at `step_bps`. `0` (default) = off.
     #[serde(default)]
     pub step_volatility_mult: Decimal,
+    /// Adaptive lattice: regime threshold — bag underwater by N candle-ranges =
+    /// trend → anchor; under = oscillate → re-center. `0` → 4.
+    #[serde(default = "wave_default_trend_depth_candles")]
+    pub trend_depth_candles: u32,
+    /// When chase=true, force a refill every N seconds even if no round-trip /
+    /// side-empty fired. `0` (default) = off.
+    #[serde(default)]
+    pub forced_refill_secs: u32,
 }
 
 fn wave_default_refill_threshold() -> u32 {
     1
+}
+
+fn wave_default_trend_depth_candles() -> u32 {
+    4
 }
 
 fn wave_default_grid_levels() -> u32 {
@@ -362,6 +377,10 @@ fn wave_default_grid_levels() -> u32 {
 
 fn wave_default_candle_count() -> u32 {
     10
+}
+
+fn wave_default_candle_secs() -> u32 {
+    60
 }
 
 /// Mantis — symmetric touch scalper; rests a bid+ask at the touch.
@@ -662,10 +681,16 @@ pub enum RampageStrategy {
         chase: bool,
         #[serde(default = "wave_default_candle_count")]
         candle_count: u32,
+        #[serde(default = "wave_default_candle_secs")]
+        candle_secs: u32,
         #[serde(default)]
         lattice_adjust_secs: u32,
         #[serde(default)]
         step_volatility_mult: Decimal,
+        #[serde(default = "wave_default_trend_depth_candles")]
+        trend_depth_candles: u32,
+        #[serde(default)]
+        forced_refill_secs: u32,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {

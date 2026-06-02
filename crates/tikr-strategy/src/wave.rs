@@ -28,6 +28,14 @@ use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
 
+/// Adaptive step is coarse-quantized to this bps increment so small drift in
+/// the rolling candle-range average can't nudge the computed step.
+const STEP_QUANT_BPS: i64 = 5;
+/// Adaptive re-lattice fires only when the new step moves more than this
+/// fraction of the current step (regime shift). Re-centering banks the bag, so
+/// we hold the frozen lattice through ordinary vol noise.
+const STEP_HYSTERESIS_PCT: f64 = 0.30;
+
 /// Configuration for [`Wave`].
 #[derive(Debug, Clone)]
 pub struct WaveConfig {
@@ -84,15 +92,32 @@ pub struct WaveConfig {
     /// (default) = frozen one-sided. Overrides `chase_to_avg` when set.
     pub chase: bool,
 
-    /// Adaptive lattice: number of 1-minute candle ranges to average for the
+    /// Adaptive lattice: number of candle ranges to average for the
     /// volatility estimate. `0`/unset → 10.
     pub candle_count: u32,
+    /// Adaptive lattice: candle period in seconds. `0`/unset → 60 (1-minute).
+    /// `candle_count × candle_secs` = the rolling volatility window length.
+    pub candle_secs: u32,
     /// Adaptive lattice: re-evaluate + (if the step changed) re-lattice this
     /// often, in seconds. `0` (default) = adaptive OFF (static `step_bps`).
     pub lattice_adjust_secs: u32,
     /// Adaptive lattice: effective step bps = `step_volatility_mult × average
     /// 1-minute candle range (bps)`, floored at `step_bps`. `0` (default) = off.
     pub step_volatility_mult: Decimal,
+    /// Regime discriminator: if the bag is underwater by MORE than this many
+    /// typical candle-ranges (vol units, step-independent), treat it as a
+    /// sustained TREND → anchor the adding side and only widen. At or under it,
+    /// the market is OSCILLATING around our entries → re-center to capture the
+    /// swings. Lower = anchor sooner (smaller bags, less capture); higher =
+    /// re-center more (more capture, bigger bags). `0` → 4.
+    pub trend_depth_candles: u32,
+    /// When `chase` is true, force a refill of the lattice this often (seconds)
+    /// even if no round-trip completed and no side emptied. On a slow market the
+    /// natural triggers rarely fire, so the chase band can go stale as price
+    /// drifts; a forced refill re-emits the band at the current touch to keep it
+    /// tracking. `0` (default) = off (refills only on round-trip / side-empty).
+    /// No effect when `chase` is false.
+    pub forced_refill_secs: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,10 +143,12 @@ pub struct Wave {
     candles: VecDeque<Decimal>,
     /// In-progress candle: (minute_bucket, high, low).
     cur_candle: Option<(u64, Decimal, Decimal)>,
-    /// ctx.now.0 (ns) of the last adaptive re-evaluation.
+    /// ctx.now.0 (ns) of the last adaptive re-evaluation (timer cadence).
     last_adjust_ns: Option<u64>,
     /// Current volatility-derived step bps (None until first adjust → uses config.step_bps).
     adaptive_step_bps: Option<u32>,
+    /// ctx.now.0 (ns) of the last refill (any trigger). Drives `forced_refill_secs`.
+    last_refill_ns: Option<u64>,
 }
 
 impl Wave {
@@ -420,6 +447,7 @@ impl Strategy for Wave {
             cur_candle: None,
             last_adjust_ns: None,
             adaptive_step_bps: None,
+            last_refill_ns: None,
         }
     }
 
@@ -446,8 +474,9 @@ impl Strategy for Wave {
         {
             let mid = (b.0 + a.0) / Decimal::from(2);
 
-            // Track 1-minute candle ranges.
-            let minute = ctx.now.0 / 60_000_000_000;
+            // Track candle ranges over `candle_secs`-wide buckets.
+            let bucket_ns = u64::from(self.config.candle_secs.max(1)) * 1_000_000_000;
+            let minute = ctx.now.0 / bucket_ns;
             match &mut self.cur_candle {
                 None => self.cur_candle = Some((minute, mid, mid)),
                 Some((m, hi, lo)) if minute > *m => {
@@ -472,7 +501,12 @@ impl Strategy for Wave {
                 }
             }
 
-            // Adaptive re-lattice: only when enabled and candles are available.
+            // Adaptive re-lattice: re-evaluated on a fixed timer (every
+            // `lattice_adjust_secs`). When a vol regime-shift is detected, fully
+            // re-lattice — cancel all, drop the step+origins → the init block below
+            // re-freezes both at the touch with the new vol-sized step (clamping the
+            // cover side to cost). Frequent timer re-centering is what lets a
+            // volatile market's swings be captured.
             let due = self.last_adjust_ns.is_none_or(|t| {
                 ctx.now.0.saturating_sub(t)
                     >= u64::from(self.config.lattice_adjust_secs) * 1_000_000_000
@@ -484,21 +518,33 @@ impl Strategy for Wave {
             {
                 self.last_adjust_ns = Some(ctx.now.0);
                 let sum: Decimal = self.candles.iter().copied().sum();
-                let avg = sum / Decimal::from(self.candles.len() as u64);
+                let candle_avg = sum / Decimal::from(self.candles.len() as u64);
                 // effective step bps = mult × avg candle bps, floored at config.step_bps,
-                // clamped to a sane ceiling.
-                let raw = (self.config.step_volatility_mult * avg).round();
+                // coarse-quantized to STEP_QUANT_BPS, clamped to a sane ceiling.
+                // Coarse quantization stops ±1bp avg drift from nudging the step.
+                let raw = self.config.step_volatility_mult * candle_avg;
                 let floor = self.config.step_bps.max(1);
                 let new_bps = raw
                     .to_string()
                     .parse::<f64>()
                     .ok()
-                    .map(|f| (f as i64).clamp(floor as i64, 5_000))
+                    .map(|f| {
+                        let q = ((f / STEP_QUANT_BPS as f64).round() as i64) * STEP_QUANT_BPS;
+                        q.clamp(floor as i64, 5_000)
+                    })
                     .unwrap_or(floor as i64) as u32;
-                // Re-lattice ONLY when the rounded step actually changes (no churn in
-                // stable vol): cancel all + reset the lattice so the next event
-                // re-freezes at the new step around the current mid.
-                if Some(new_bps) != self.adaptive_step_bps {
+                // Re-lattice ONLY on a real regime shift, not on noise: fire when the
+                // step is unset (first time) or moves by more than STEP_HYSTERESIS_PCT
+                // relative to the current step.
+                let regime_shift = match self.adaptive_step_bps {
+                    None => true,
+                    Some(cur) => {
+                        let cur_f = cur as f64;
+                        cur_f > 0.0
+                            && ((new_bps as f64 - cur_f).abs() / cur_f) > STEP_HYSTERESIS_PCT
+                    }
+                };
+                if regime_shift && Some(new_bps) != self.adaptive_step_bps {
                     self.adaptive_step_bps = Some(new_bps);
                     if self.lattice_step.is_some() {
                         actions.push(Action::CancelAll);
@@ -520,8 +566,27 @@ impl Strategy for Wave {
             let mid = (b.0 + a.0) / Decimal::from(2);
             let base = self.compute_step(mid);
             self.lattice_step = Some(base);
-            self.bid_lattice_origin = Some(b.0);
-            self.ask_lattice_origin = Some(a.0);
+            // Cover-side origin clamp: when re-freezing the lattice while holding a
+            // bag (e.g. an adaptive re-lattice mid-trend), do NOT reset the reducing
+            // side's origin to the touch if that is the wrong side of cost — that
+            // would rest covers below entry and realize a loss when they fill. Keep
+            // the cover origin at/above (long) or at/below (short) avg_entry so the
+            // bag is still covered no-worse-than cost. The adding side re-centers to
+            // the touch freely (a wider step there just slows accumulation).
+            let pos = ctx.position.size.0;
+            let avg = ctx.position.avg_entry.0;
+            self.bid_lattice_origin = Some(if pos < Decimal::ZERO && avg > Decimal::ZERO {
+                // Short bag: bids are the cover side → never buy back above cost.
+                b.0.min(avg)
+            } else {
+                b.0
+            });
+            self.ask_lattice_origin = Some(if pos > Decimal::ZERO && avg > Decimal::ZERO {
+                // Long bag: asks are the cover side → never sell below cost.
+                a.0.max(avg)
+            } else {
+                a.0
+            });
             tracing::info!(
                 symbol = %ctx.symbol.base.0,
                 mid = %mid,
@@ -659,7 +724,19 @@ impl Strategy for Wave {
             // moves, not an option.
             let round_trip = bid_drained >= thr && ask_drained >= thr;
             let side_empty = bid_drained >= full || ask_drained >= full;
-            if round_trip || side_empty {
+            // Forced refill (chase only): on a slow market neither natural trigger
+            // fires for a long time and the chase band goes stale as price drifts.
+            // After `forced_refill_secs` since the last refill, force one to re-emit
+            // the band at the current touch. Armed (None) → first refill is allowed
+            // immediately as usual.
+            let forced = self.config.chase
+                && self.config.forced_refill_secs > 0
+                && self.last_refill_ns.is_some_and(|t| {
+                    ctx.now.0.saturating_sub(t)
+                        >= u64::from(self.config.forced_refill_secs) * 1_000_000_000
+                });
+            if round_trip || side_empty || forced {
+                self.last_refill_ns = Some(ctx.now.0);
                 let mid = match (best_bid, best_ask) {
                     (Some(b), Some(a)) if a.0 > b.0 => (b.0 + a.0) / Decimal::from(2),
                     _ => Decimal::ZERO,
@@ -746,8 +823,11 @@ mod tests {
             chase_to_avg: false,
             chase: false,
             candle_count: 10,
+            candle_secs: 60,
             lattice_adjust_secs: 0,
             step_volatility_mult: Decimal::ZERO,
+            trend_depth_candles: 4,
+            forced_refill_secs: 0,
         }
     }
 
@@ -775,6 +855,16 @@ mod tests {
             symbol: sym(),
             size: SignedSize(Decimal::ZERO),
             avg_entry: Price(Decimal::ZERO),
+            realized_pnl: Notional(Decimal::ZERO),
+        }
+    }
+
+    /// Long bag of `size` base units (notional = size × ~100 mid).
+    fn pos_bag(size: Decimal) -> Position {
+        Position {
+            symbol: sym(),
+            size: SignedSize(size),
+            avg_entry: Price(Decimal::from(100)),
             realized_pnl: Notional(Decimal::ZERO),
         }
     }
@@ -885,6 +975,96 @@ mod tests {
         );
         // 6 bids + 6 asks
         assert_eq!(actions.len(), 12);
+    }
+
+    #[test]
+    fn forced_refill_fires_after_interval_when_chase() {
+        // chase=true, forced_refill_secs=2. Seed the band, then replay with the
+        // band INTACT (no natural round-trip / side-empty). Before the interval no
+        // refill fires; at/after it the forced refill fires (last_refill_ns
+        // advances). With chase=false it never fires.
+        let mut c = cfg();
+        c.chase = true;
+        c.forced_refill_secs = 2;
+        let mut w = Wave::new(c);
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos_flat();
+        let sm = sym();
+        // t=0: seed band (first side-empty refill sets last_refill_ns = 0).
+        let seeded = w.on_event(
+            &make_ctx(&sm, &s, &p, &[], 0),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let open: Vec<(QuoteId, QuoteIntent)> = seeded
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some((QuoteId::new(), q.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(w.last_refill_ns, Some(0), "seed should set last_refill_ns");
+        // t=1s, band intact, before the 2s interval → no refill.
+        let _ = w.on_event(
+            &make_ctx(&sm, &s, &p, &open, 1_000_000_000),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        assert_eq!(
+            w.last_refill_ns,
+            Some(0),
+            "before the interval no forced refill should fire"
+        );
+        // t=3s, band intact, ≥ 2s since last refill → forced refill fires.
+        let _ = w.on_event(
+            &make_ctx(&sm, &s, &p, &open, 3_000_000_000),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        assert_eq!(
+            w.last_refill_ns,
+            Some(3_000_000_000),
+            "forced refill must fire after the interval"
+        );
+    }
+
+    #[test]
+    fn forced_refill_off_when_chase_false() {
+        // Same setup but chase=false → forced refill never fires regardless of time.
+        let mut c = cfg();
+        c.chase = false;
+        c.forced_refill_secs = 2;
+        let mut w = Wave::new(c);
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos_flat();
+        let sm = sym();
+        let seeded = w.on_event(
+            &make_ctx(&sm, &s, &p, &[], 0),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let open: Vec<(QuoteId, QuoteIntent)> = seeded
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some((QuoteId::new(), q.clone())),
+                _ => None,
+            })
+            .collect();
+        let _ = w.on_event(
+            &make_ctx(&sm, &s, &p, &open, 10_000_000_000),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        assert_eq!(
+            w.last_refill_ns,
+            Some(0),
+            "chase=false must never force a refill"
+        );
     }
 
     #[test]
@@ -1066,6 +1246,149 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(a, Action::Quote(_))),
             "re-seed quotes must follow CancelAll in same event: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_relattice_clamps_cover_origin_to_cost() {
+        // Re-latticing while LONG with price BELOW cost must NOT reset the ask
+        // (cover) origin down to the touch — that would rest sells below entry and
+        // realize a loss. The ask origin must clamp to ≥ avg_entry. The bid (adding)
+        // side re-centers to the touch freely.
+        let mut c = cfg();
+        c.step_bps = 10;
+        c.step_volatility_mult = Decimal::ONE;
+        c.lattice_adjust_secs = 60;
+        c.candle_count = 1;
+        c.tick_size = Decimal::new(1, 1); // 0.1
+        let mut w = Wave::new(c);
+        let sm = sym();
+        // Long bag, avg_entry = 100, but price has fallen to ~94-95 (underwater).
+        let bag = pos_bag(Decimal::ONE);
+        let minute_ns = 60_000_000_000u64;
+
+        // Minute 0: candle hi≈95, lo≈93 (≈215bps range), price below cost.
+        let s_hi = snap(Decimal::new(9495, 2), Decimal::new(9505, 2)); // mid≈95
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_hi, &bag, &[], 10_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_hi.clone(),
+            },
+        );
+        let s_lo = snap(Decimal::new(9295, 2), Decimal::new(9305, 2)); // mid≈93
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_lo, &bag, &[], 30_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_lo.clone(),
+            },
+        );
+        // Minute 1 (t65s): closes the ≈215bps candle → first adjust fires, re-lattice
+        // at mid≈94 (still below cost 100).
+        let s_mid = snap(Decimal::new(9395, 2), Decimal::new(9405, 2)); // mid≈94
+        let actions = w.on_event(
+            &make_ctx(&sm, &s_mid, &bag, &[], minute_ns + 5_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_mid.clone(),
+            },
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::CancelAll)),
+            "re-lattice must fire even while holding a bag: {actions:?}"
+        );
+        // Cover side (ask, since long) origin must be clamped to cost, not the touch.
+        let ask_origin = w.ask_lattice_origin.expect("ask origin set");
+        assert!(
+            ask_origin >= Decimal::from(100),
+            "ask (cover) origin {ask_origin} must clamp to avg_entry 100, not the ~94 touch"
+        );
+        // Adding side (bid) re-centers freely near the touch (≈94, well below cost).
+        let bid_origin = w.bid_lattice_origin.expect("bid origin set");
+        assert!(
+            bid_origin < Decimal::from(95),
+            "bid (adding) origin {bid_origin} should re-center to the ~94 touch"
+        );
+    }
+
+    #[test]
+    fn adaptive_oscillating_bag_recenters_and_resizes() {
+        // A SHALLOW bag (price near cost → oscillating around our entries) takes the
+        // re-center path: the lattice fully re-centers at the touch with the new
+        // step, capturing the swings — including narrowing when vol falls. Set a wide
+        // step via a flat resize, then hold a shallow bag and feed a tight candle:
+        // the step narrows and the lattice re-centers.
+        let mut c = cfg();
+        c.step_bps = 10;
+        c.step_volatility_mult = Decimal::ONE;
+        c.lattice_adjust_secs = 60;
+        c.candle_count = 1;
+        c.tick_size = Decimal::new(1, 1); // 0.1
+        let mut w = Wave::new(c);
+        let sm = sym();
+        let flat = pos_flat();
+        let minute_ns = 60_000_000_000u64;
+
+        // Minute 0 (FLAT): wide candle hi≈101, lo≈99 → ≈202bps.
+        let s_hi = snap(Decimal::new(10095, 2), Decimal::new(10105, 2));
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_hi, &flat, &[], 10_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_hi.clone(),
+            },
+        );
+        let s_lo = snap(Decimal::new(9895, 2), Decimal::new(9905, 2));
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_lo, &flat, &[], 30_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_lo.clone(),
+            },
+        );
+        // Minute 1 (t65s, FLAT): closes ≈202bps candle → flat resize sets abps≈202.
+        let s_mid = snap(Decimal::new(9995, 2), Decimal::new(10005, 2));
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_mid, &flat, &[], minute_ns + 5_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_mid.clone(),
+            },
+        );
+        let wide = w.adaptive_step_bps.expect("abps set after flat resize");
+        assert!(
+            wide > 100,
+            "flat resize should set a wide step ~202, got {wide}"
+        );
+
+        // Hold a bag; minute 1 tight ticks → ≈10bps candle.
+        let bag = pos_bag(Decimal::ONE);
+        let s_h = snap(Decimal::new(10000, 2), Decimal::new(10010, 2)); // mid≈100.05
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_h, &bag, &[], minute_ns + 20_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_h.clone(),
+            },
+        );
+        let s_l = snap(Decimal::new(9990, 2), Decimal::new(10000, 2)); // mid≈99.95
+        let _ = w.on_event(
+            &make_ctx(&sm, &s_l, &bag, &[], minute_ns + 40_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_l.clone(),
+            },
+        );
+        // Minute 2 (t125s): closes ≈10bps candle. Bag is shallow (price ≈ cost) →
+        // oscillating → re-center + narrow.
+        let s_c = snap(Decimal::new(9995, 2), Decimal::new(10005, 2));
+        let a = w.on_event(
+            &make_ctx(&sm, &s_c, &bag, &[], 2 * minute_ns + 5_000_000_000u64),
+            &MarketEvent::BookUpdate {
+                snapshot: s_c.clone(),
+            },
+        );
+        assert!(
+            a.iter().any(|x| matches!(x, Action::CancelAll)),
+            "oscillating bag must re-lattice: {a:?}"
+        );
+        let narrowed = w.adaptive_step_bps.expect("abps set");
+        assert!(
+            narrowed < wide,
+            "oscillating bag should narrow the step: {narrowed} not < {wide}"
         );
     }
 
