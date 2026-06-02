@@ -263,6 +263,37 @@ pub fn validate_qty(
     Ok(())
 }
 
+/// Bump `size` up by whole lot steps until `price × size` reaches the symbol's
+/// minNotional. Rounding price/size to tick/step (or a strategy off-by-one-lot)
+/// can leave an order a hair under min (e.g. 4.992 < 5) — a venue reject just
+/// drops the quote, so instead rest a min-sized order. No-op when the symbol is
+/// unknown, the filters are zero, or the price is non-positive. Bounded.
+pub fn bump_size_for_min_notional(
+    cache: &ExchangeInfoCache,
+    symbol: &str,
+    size: Size,
+    price: Price,
+) -> Size {
+    let Ok(filters) = get_filters(cache, symbol) else {
+        return size;
+    };
+    if filters.min_notional <= Decimal::ZERO
+        || filters.step_size <= Decimal::ZERO
+        || price.0 <= Decimal::ZERO
+    {
+        return size;
+    }
+    let mut s = size.0;
+    // Bounded loop: a handful of lots in practice; guard against runaway.
+    for _ in 0..4096 {
+        if price.0 * s >= filters.min_notional {
+            break;
+        }
+        s += filters.step_size;
+    }
+    Size(s)
+}
+
 fn get_filters<'a>(
     cache: &'a ExchangeInfoCache,
     symbol: &str,
@@ -343,6 +374,45 @@ mod tests {
         let s = Size(Decimal::from_str("0.000019").unwrap());
         let rounded = round_size(&cache, "BTCUSDT", s).unwrap();
         assert_eq!(rounded.0, Decimal::from_str("0.00001").unwrap());
+    }
+
+    #[test]
+    fn bump_size_clears_min_notional() {
+        // ESPORTS-style: 100 lots × 0.04992 = 4.992 < min 5 → bump to clear it.
+        let mut m = HashMap::new();
+        m.insert(
+            "ESPORTSUSDT".to_string(),
+            SymbolFilters {
+                tick_size: Decimal::from_str("0.00001").unwrap(),
+                step_size: Decimal::from_str("1").unwrap(),
+                min_qty: Decimal::from_str("1").unwrap(),
+                min_notional: Decimal::from_str("5").unwrap(),
+            },
+        );
+        let price = Price(Decimal::from_str("0.04992").unwrap());
+        let size = Size(Decimal::from_str("100").unwrap()); // notional 4.992 < 5
+        let bumped = bump_size_for_min_notional(&m, "ESPORTSUSDT", size, price);
+        assert!(
+            price.0 * bumped.0 >= Decimal::from_str("5").unwrap(),
+            "notional {} must clear min 5",
+            price.0 * bumped.0
+        );
+        assert!(
+            bumped.0 > size.0,
+            "size must increase past 100, got {}",
+            bumped.0
+        );
+        // validate_qty must now accept.
+        assert!(validate_qty(&m, "ESPORTSUSDT", bumped, price).is_ok());
+    }
+
+    #[test]
+    fn bump_size_noop_when_already_above_min() {
+        let cache = make_cache();
+        let price = Price(Decimal::from_str("30000.0").unwrap());
+        let size = Size(Decimal::from_str("0.001").unwrap()); // notional 30 ≥ 10
+        let out = bump_size_for_min_notional(&cache, "BTCUSDT", size, price);
+        assert_eq!(out.0, size.0, "already-compliant size must be unchanged");
     }
 
     #[test]

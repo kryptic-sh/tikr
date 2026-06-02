@@ -62,7 +62,8 @@ pub use sign::BinanceKeyMaterial;
 use async_trait::async_trait;
 use depth_stream::binance_symbol;
 use exchange_info::{
-    ExchangeInfoCache, parse_exchange_info, round_price_for_side, round_size, validate_qty,
+    ExchangeInfoCache, bump_size_for_min_notional, parse_exchange_info, round_price_for_side,
+    round_size, validate_qty,
 };
 use futures::stream::BoxStream;
 use reqwest::Client as HttpClient;
@@ -611,7 +612,13 @@ impl Venue for BinanceClient {
             intent.price,
             intent.side,
         )?;
-        let size = round_size(&self.exchange_info_cache, &sym_str, intent.size)?;
+        let rounded = round_size(&self.exchange_info_cache, &sym_str, intent.size)?;
+        // Min-notional safety net: rounding price/size to tick/step (and any
+        // strategy-side off-by-one-lot) can leave the order a hair under
+        // minNotional (e.g. 4.992 < 5). A reject just drops the quote and leaves
+        // a hole in the grid; instead bump the size up by whole lots until the
+        // notional clears the floor, so the order actually rests at min size.
+        let size = bump_size_for_min_notional(&self.exchange_info_cache, &sym_str, rounded, price);
         validate_qty(&self.exchange_info_cache, &sym_str, size, price)?;
 
         // The `clientOrderId` we send at place-time is derived from a random
