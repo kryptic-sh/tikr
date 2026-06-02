@@ -34,32 +34,32 @@ state_dir = "./state/wave-auto"
 asset = "USDT"
 order_balance_pct = "0.1"
 max_position_pct = "0"
-leverage = 5
+leverage = 10
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 
 [rampage]
 enabled = true
-min_volume_usdt = "100000" # $100k 24h quote volume floor
+min_volume_usdt = "0"      # $2M 24h quote volume floor
 recheck_interval_secs = 30
 quote_asset = "USDT"
-top_n = 4
+top_n = 8
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.1" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 
 [rampage.score]
 mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
 [rampage.score.params]
-candle_count = 10    # average the last 60 one-minute candles (~1h window)
+candle_count = 60    # average the last 60 one-minute candles (~1h window)
 min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 grid_levels = 10
-step_bps = 50
-inner_steps = 1
+step_bps = 30
 refill_threshold = 5
-forced_refill_secs = 60
+inner_steps = 1
 chase = true
-# chase_to_avg = true
+# forced_refill_secs = 60
+#chase_to_avg = true
