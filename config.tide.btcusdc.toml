@@ -12,6 +12,6 @@ strategy = "tide"
 
 [bot.tide]
 grid_levels = 10
-inner_steps = 0
-step_bps = 1
-chase_to_avg = true
+inner_steps = 1
+step_bps = 5
+chase = true

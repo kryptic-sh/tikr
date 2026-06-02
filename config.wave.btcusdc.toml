@@ -12,7 +12,7 @@ strategy = "wave"
 
 [bot.wave]
 grid_levels = 10
-inner_steps = 0
-step_bps = 1
 refill_threshold = 5
+inner_steps = 1
+step_bps = 5
 chase = true
