@@ -1694,25 +1694,30 @@ fn draw_chart(
         ));
     }
 
-    // Sort by price descending (top of chart = highest price), then walk
-    // top-down assigning each a row at or below its true row, never sharing a
-    // row with the previous one. If the stack runs past the bottom, shift it up.
+    // Sort by price descending (top of chart = highest price), then assign each
+    // line a DISTINCT row so labels never overlap, even when prices are close
+    // or one line sits far from the rest.
     refs.sort_by_key(|e| std::cmp::Reverse(e.0));
     let max_row = plot_h.saturating_sub(1);
     let mut rows: Vec<u16> = Vec::with_capacity(refs.len());
+    // Pass 1 (top-down): each line at its true row, but never on the previous
+    // line's row — push collisions down. Rows may pile past the bottom here.
     let mut min_row = 0u16;
     for (price, _, _, _) in &refs {
         let r = row_of(dec_to_f64(*price)).max(min_row);
         rows.push(r);
         min_row = r.saturating_add(1);
     }
-    if let Some(&last) = rows.last()
-        && last > max_row
-    {
-        let shift = last - max_row;
-        for r in rows.iter_mut() {
-            *r = r.saturating_sub(shift);
+    // Pass 2 (bottom-up): pull rows back inside the plot, each strictly above the
+    // line below it. A uniform shift would saturate the clustered top lines onto
+    // the same row (the LIQ-far / SELL-near collision) — this redistributes
+    // instead, keeping every row distinct and in-bounds (for n ≤ plot_h lines).
+    let mut max_allowed = max_row;
+    for r in rows.iter_mut().rev() {
+        if *r > max_allowed {
+            *r = max_allowed;
         }
+        max_allowed = r.saturating_sub(1);
     }
     for ((_, label, dash, color), &row) in refs.iter().zip(rows.iter()) {
         let ry = plot_y0 + row;
