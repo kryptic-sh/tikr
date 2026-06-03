@@ -514,6 +514,23 @@ where
 {
     let mut liq_window = LiqWindow::new(external_liqs, config.liq_window_secs);
 
+    // Live mode: real venue fills feed the tracker (vs FillSim driving backtest).
+    let live_mode = external_fills.is_some();
+
+    // Live restart resume: if the caller passed no explicit resume, reload this
+    // bot's latest persisted snapshot from its state dir so realized / fees /
+    // funding / counters continue across restarts (per-bot P&L persists). Only
+    // in live — a backtest's state_dir is per-preset scratch and must start cold.
+    // On `--clear` the session dir (incl. these snapshots) was wiped, so this
+    // naturally finds nothing and starts fresh.
+    let resume = resume.or_else(|| {
+        if live_mode {
+            state::load_latest_snapshot(&config.state_dir)
+        } else {
+            None
+        }
+    });
+
     // Reconstruct tracker from resume + optional seed_position.
     // - PaperReport `resume` carries running aggregates (realized/fees/
     //   funding) but NOT position size/avg_entry.
@@ -723,7 +740,15 @@ where
     // strategy). Static config; the live cap above is the curve denominator.
     let inventory_boost = config.inventory_boost;
     let mut last_funding_ts: Option<Timestamp> = None;
-    let run_id = make_run_id(&symbol);
+    // Live: a STABLE run_id so each bot keeps a single snapshot file in its
+    // per-symbol state dir (overwritten each write) — bounded, and trivially
+    // reloaded on restart by `load_latest_snapshot`. Backtest keeps a unique id
+    // so concurrent presets sharing a state dir don't clobber each other.
+    let run_id = if live_mode {
+        "session".to_string()
+    } else {
+        make_run_id(&symbol)
+    };
 
     // Equity-curve CSV writer. Lazy-opened on the first snapshot tick
     // (header gets written then). `None` when the feature is disabled or
@@ -786,10 +811,9 @@ where
         }
     };
 
-    // Whether we are in live mode (external fills) or paper mode (FillSim).
-    // In live mode the FillSim is still driven by actions for state tracking
-    // but its synthesized fills are discarded; real fills come from `external_fills`.
-    let live_mode = external_fills.is_some();
+    // `live_mode` computed above (external fills present). In live mode the
+    // FillSim is still driven by actions for state tracking but its synthesized
+    // fills are discarded; real fills come from `external_fills`.
 
     // 1 Hz status sampler. Only emits when something changed since the last
     // print — fills, open-quote counts, or position size. Idle ticks are

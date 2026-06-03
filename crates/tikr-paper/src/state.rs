@@ -13,6 +13,31 @@ pub fn write_snapshot(report: &PaperReport, dir: &Path, run_id: &str) -> io::Res
     fs::write(&path, json)
 }
 
+/// Load the most-recent snapshot in `dir` (newest `*.json` by mtime), parsed as
+/// a [`PaperReport`]. Used on a live restart to resume a bot's running P&L
+/// (realized / fees / funding / counters) so per-bot stats persist across
+/// restarts. `None` if the dir is missing/empty or nothing parses — a cold
+/// start. Per-bot dirs hold one symbol's snapshots, so the newest file is that
+/// bot's latest state.
+pub fn load_latest_snapshot(dir: &Path) -> Option<PaperReport> {
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            newest = Some((mtime, path));
+        }
+    }
+    let (_, path) = newest?;
+    let json = fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<PaperReport>(&json).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +82,25 @@ mod tests {
         write_snapshot(&fixture_report(), &dir, "test_run").unwrap();
         let path = dir.join("test_run.json");
         assert!(path.exists());
+    }
+
+    #[test]
+    fn load_latest_snapshot_round_trips_and_picks_newest() {
+        let temp = TempDir::new().unwrap();
+        // Empty dir → None (cold start).
+        assert!(load_latest_snapshot(temp.path()).is_none());
+        // Write a snapshot, then load it back.
+        let mut r = fixture_report();
+        r.realized = Notional(Decimal::from(42));
+        write_snapshot(&r, temp.path(), "session").unwrap();
+        let loaded = load_latest_snapshot(temp.path()).expect("should load the snapshot");
+        assert_eq!(loaded.realized.0, Decimal::from(42));
+        // A non-json sibling must be ignored (no panic / wrong pick).
+        fs::write(temp.path().join("notes.txt"), "ignore me").unwrap();
+        assert_eq!(
+            load_latest_snapshot(temp.path()).unwrap().realized.0,
+            Decimal::from(42)
+        );
     }
 
     #[test]
