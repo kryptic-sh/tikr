@@ -41,6 +41,16 @@ pub struct LiveSnapshot {
     pub open_buys: u32,
     /// Resting sell-side quotes.
     pub open_sells: u32,
+    /// Price of our best (highest) resting BUY order — the one nearest the
+    /// touch, most likely to fill. `0` when we have no resting buy.
+    pub best_buy_price: Decimal,
+    /// Total size resting at `best_buy_price`. `0` when no resting buy.
+    pub best_buy_size: Decimal,
+    /// Price of our best (lowest) resting SELL order — nearest the touch.
+    /// `0` when we have no resting sell.
+    pub best_sell_price: Decimal,
+    /// Total size resting at `best_sell_price`. `0` when no resting sell.
+    pub best_sell_size: Decimal,
     /// Timestamp (ns since epoch) of the most recent fill applied to
     /// this bot's tracker, if any.
     pub last_fill_ts: Option<u64>,

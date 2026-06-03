@@ -3033,10 +3033,33 @@ fn publish_live(
     let quotes = fill_sim.live_quotes_for(symbol);
     let mut open_buys: u32 = 0;
     let mut open_sells: u32 = 0;
+    // Best resting orders = nearest the touch: highest BUY price, lowest SELL
+    // price. Track the best price per side and sum the size resting at it.
+    let mut best_buy_price = Decimal::ZERO;
+    let mut best_buy_size = Decimal::ZERO;
+    let mut best_sell_price = Decimal::ZERO;
+    let mut best_sell_size = Decimal::ZERO;
     for (_, q) in &quotes {
+        let (price, size) = (q.price.0, q.size.0);
         match q.side {
-            tikr_core::Side::Bid => open_buys = open_buys.saturating_add(1),
-            tikr_core::Side::Ask => open_sells = open_sells.saturating_add(1),
+            tikr_core::Side::Bid => {
+                open_buys = open_buys.saturating_add(1);
+                if best_buy_price.is_zero() || price > best_buy_price {
+                    best_buy_price = price;
+                    best_buy_size = size;
+                } else if price == best_buy_price {
+                    best_buy_size += size;
+                }
+            }
+            tikr_core::Side::Ask => {
+                open_sells = open_sells.saturating_add(1);
+                if best_sell_price.is_zero() || price < best_sell_price {
+                    best_sell_price = price;
+                    best_sell_size = size;
+                } else if price == best_sell_price {
+                    best_sell_size += size;
+                }
+            }
         }
     }
     let last_bid = last_book
@@ -3062,6 +3085,10 @@ fn publish_live(
         open_quotes: open_buys.saturating_add(open_sells),
         open_buys,
         open_sells,
+        best_buy_price,
+        best_buy_size,
+        best_sell_price,
+        best_sell_size,
         last_fill_ts: last_fill.as_ref().map(|f| f.ts.0),
         last_fill_side: last_fill.as_ref().map(|f| f.side),
         last_fill_price: last_fill.as_ref().map(|f| f.price.0).unwrap_or_default(),

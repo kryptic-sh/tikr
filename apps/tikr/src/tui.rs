@@ -1520,7 +1520,21 @@ fn draw_chart(
         }
     }
 
-    // Y bounds over visible candles + in-window fills, with 2% padding.
+    // Our best resting orders (nearest the touch) from the live snapshot, so we
+    // can see how close the price is to filling them. `(price, size)`, zero when
+    // none.
+    let (best_buy, best_sell) = active
+        .and_then(|v| v.live.as_ref())
+        .map(|lv| {
+            (
+                (lv.best_buy_price, lv.best_buy_size),
+                (lv.best_sell_price, lv.best_sell_size),
+            )
+        })
+        .unwrap_or_default();
+
+    // Y bounds over visible candles + in-window fills + our resting orders, so
+    // the order lines are always on-screen. 2% padding.
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for c in candles.iter().flatten() {
         lo = lo.min(c.low);
@@ -1530,6 +1544,13 @@ fn draw_chart(
     for (t, p, _) in &hist.fills {
         if *t >= cutoff_ms {
             let v = dec_to_f64(*p);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    for (price, _) in [best_buy, best_sell] {
+        if price > Decimal::ZERO {
+            let v = dec_to_f64(price);
             lo = lo.min(v);
             hi = hi.max(v);
         }
@@ -1582,6 +1603,45 @@ fn draw_chart(
                 .set_style(Style::default().fg(color));
         }
     }
+
+    // Our best resting orders as horizontal reference lines: BUY low, SELL
+    // high, each labelled `price ×size` in the middle. The dash only fills
+    // empty cells so candles still show through; the centred label always
+    // draws. Buy = cyan, sell = yellow (matching the fill markers).
+    let plot_right = plot_x0 + plot_w;
+    let draw_order_line = |buf: &mut ratatui::buffer::Buffer,
+                           price: Decimal,
+                           size: Decimal,
+                           color: Color,
+                           tag: &str| {
+        if price <= Decimal::ZERO {
+            return;
+        }
+        let ry = inner.y + row_of(dec_to_f64(price));
+        // Dashed line through empty cells only.
+        for cx in plot_x0..plot_right {
+            let cell = &mut buf[(cx, ry)];
+            if cell.symbol() == " " {
+                cell.set_char('╌').set_style(Style::default().fg(color));
+            }
+        }
+        // Centred `tag price ×size` label. Resting prices/sizes sit on the
+        // symbol's tick/step, so `normalize` gives a clean exact string.
+        let label = format!(" {tag} {} ×{} ", price.normalize(), size.normalize());
+        let lw = label.chars().count() as u16;
+        let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
+        buf.set_string(
+            lx,
+            ry,
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        );
+    };
+    draw_order_line(buf, best_buy.0, best_buy.1, Color::Cyan, "BUY");
+    draw_order_line(buf, best_sell.0, best_sell.1, Color::Yellow, "SELL");
 
     // Fill markers overlaid at their column + price.
     for (t, p, is_buy) in &hist.fills {
