@@ -14,7 +14,6 @@ use hjkl_clipboard::{
 };
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 
 /// Mouse-drag selection state.
 #[derive(Debug, Clone, Copy, Default)]
@@ -105,10 +104,7 @@ pub fn apply_highlight(sel: &MouseSelection, buf: &mut Buffer) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let style = Style::default()
-        .bg(Color::Yellow)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD);
+    let style = crate::theme::th().selection;
     for y in rect.y..rect.y + rect.height {
         for x in rect.x..rect.x + rect.width {
             if let Some(cell) = buf.cell_mut((x, y)) {

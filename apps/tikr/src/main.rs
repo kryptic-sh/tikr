@@ -20,6 +20,7 @@ mod rampage;
 mod selection;
 mod state;
 mod supervisor;
+mod theme;
 mod tui;
 mod venue;
 

@@ -1,0 +1,39 @@
+# tikr TUI default theme.
+#
+# Parsed by `hjkl-theme` (palette + capture-style sections) and adapted to
+# ratatui via `hjkl-theme-tui`. Base palette is Catppuccin Mocha. Drop a TOML
+# with the same keys somewhere and point tikr at it to retheme the dashboard.
+#
+# Styled semantics (StyleSpec: fg/bg + modifiers) are top-level capture keys —
+# they MUST come before the [palette] table header, or TOML folds them into the
+# palette. Simple role colors live in [palette] and the TUI reads them by name
+# (see `TuiTheme` in src/theme.rs).
+
+"title"      = { fg = "$mauve", modifiers = ["bold"] }
+"selection"  = { fg = "$inverse", bg = "$yellow", modifiers = ["bold"] }
+"tab.active" = { fg = "$inverse", bg = "$cyan", modifiers = ["bold"] }
+
+[palette]
+# Text tiers.
+fg      = "#cdd6f4" # primary text (was White)
+muted   = "#a6adc8" # labels / secondary text (was Gray)
+dim     = "#6c7086" # axis labels, off/rotated, chrome (was DarkGray)
+inverse = "#11111b" # text drawn ON an accent block (was Black)
+
+# Accent colors.
+green   = "#a6e3a1" # up / running / positive PnL / buy fills border
+red     = "#f38ba8" # down / crashed / negative PnL
+yellow  = "#f9e2af" # restarting / sell marker
+cyan    = "#94e2d5" # starting / buy marker / active tab
+mauve   = "#cba6f7" # section titles
+orange  = "#fab387" # spare accent
+
+# Chrome.
+bar     = "#181825" # top tab bar + bottom help bar background
+
+# Log-stream tints (brighter foreground variants).
+lred    = "#eba0ac"
+lyellow = "#f9e2af"
+lgreen  = "#a6e3a1"
+lcyan   = "#89dceb"
+lblue   = "#89b4fa"
