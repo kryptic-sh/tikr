@@ -49,6 +49,8 @@ pub struct FuturesPositionRisk {
     pub mark_price: tikr_core::Decimal,
     /// Binance unrealized profit for this symbol.
     pub unrealized_profit: tikr_core::Decimal,
+    /// Binance estimated liquidation price (`0` when flat / no liq risk).
+    pub liquidation_price: tikr_core::Decimal,
 }
 
 /// USD-M futures 24h ticker stats for one symbol.
@@ -1382,6 +1384,7 @@ pub async fn get_position_risk(
             out.entry_price = parse("entryPrice")?;
             out.break_even_price = parse("breakEvenPrice")?;
             out.mark_price = parse("markPrice")?;
+            out.liquidation_price = parse("liquidationPrice")?;
         }
     }
     Ok(out)

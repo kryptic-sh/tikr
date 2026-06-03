@@ -1635,71 +1635,95 @@ fn draw_chart(
         }
     }
 
-    // Our best resting orders as horizontal reference lines: BUY low, SELL
-    // high, each labelled `price ×size` in the middle. The dash only fills
-    // empty cells so candles still show through; the centred label always
-    // draws. Buy = cyan, sell = yellow (matching the fill markers).
+    // Horizontal reference lines: best BUY/SELL resting orders, the venue
+    // break-even (BE), and the venue liquidation (LIQ). Collected, sorted by
+    // price (high → top), then assigned distinct rows so labels never overlap
+    // when prices are close. Break-even + liquidation come strictly from the
+    // API positionRisk (the local tracker can desync); BE/LIQ skipped when flat.
     let plot_right = plot_x0 + plot_w;
-    let draw_order_line = |buf: &mut ratatui::buffer::Buffer,
-                           price: Decimal,
-                           size: Decimal,
-                           color: Color,
-                           tag: &str| {
-        if price <= Decimal::ZERO {
-            return;
-        }
-        let ry = plot_y0 + row_of(dec_to_f64(price));
-        // Dashed line through empty cells only.
-        for cx in plot_x0..plot_right {
-            let cell = &mut buf[(cx, ry)];
-            if cell.symbol() == " " {
-                cell.set_char('╌').set_style(Style::default().fg(color));
-            }
-        }
-        // Centred `tag price ×size` label. Render the price at FULL precision
-        // (no `normalize` — that trims trailing zeros, making a round-tick price
-        // look truncated next to the break-even line). Size stays trimmed.
-        let label = format!(
-            " {tag} {} ×{} ",
-            fmt_price(price, price_dp),
-            size.normalize()
-        );
-        let lw = label.chars().count() as u16;
-        let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
-        buf.set_string(
-            lx,
-            ry,
-            label,
-            Style::default()
-                .fg(th().inverse)
-                .bg(color)
-                .add_modifier(Modifier::BOLD),
-        );
-    };
-    draw_order_line(buf, best_buy.0, best_buy.1, th().cyan, "BUY");
-    draw_order_line(buf, best_sell.0, best_sell.1, th().yellow, "SELL");
+    let api = active.and_then(|v| v.api_position.as_ref());
+    let be_price = api.and_then(|p| {
+        (!p.position_amount.is_zero() && p.break_even_price > Decimal::ZERO)
+            .then_some(p.break_even_price)
+    });
+    let liq_price = api.and_then(|p| {
+        (!p.position_amount.is_zero() && p.liquidation_price > Decimal::ZERO)
+            .then_some(p.liquidation_price)
+    });
 
-    // Break-even line — strictly the VENUE's reported break-even (the bot pane's
-    // "api be"). The local tracker can desync badly from the exchange (e.g. it
-    // thinks +long while the venue holds a -short), so its avg entry is NOT a
-    // trustworthy break-even; render nothing until a live API position lands
-    // rather than draw a misleading line. Skipped when flat. Does NOT feed the
-    // Y-bounds: `row_of` clamps an out-of-range price to the top/bottom edge.
-    let be_price = active
-        .and_then(|v| v.api_position.as_ref())
-        .and_then(|api| {
-            (!api.position_amount.is_zero() && api.break_even_price > Decimal::ZERO)
-                .then_some(api.break_even_price)
-        });
-    if let Some(avg) = be_price {
-        let ry = plot_y0 + row_of(dec_to_f64(avg));
+    // (price, label, dash char, accent color).
+    let mut refs: Vec<(Decimal, String, char, Color)> = Vec::new();
+    if best_buy.0 > Decimal::ZERO {
+        refs.push((
+            best_buy.0,
+            format!(
+                " BUY {} ×{} ",
+                fmt_price(best_buy.0, price_dp),
+                best_buy.1.normalize()
+            ),
+            '╌',
+            th().cyan,
+        ));
+    }
+    if best_sell.0 > Decimal::ZERO {
+        refs.push((
+            best_sell.0,
+            format!(
+                " SELL {} ×{} ",
+                fmt_price(best_sell.0, price_dp),
+                best_sell.1.normalize()
+            ),
+            '╌',
+            th().yellow,
+        ));
+    }
+    if let Some(be) = be_price {
+        refs.push((
+            be,
+            format!(" BE {} ", fmt_price(be, price_dp)),
+            '─',
+            th().fg,
+        ));
+    }
+    if let Some(liq) = liq_price {
+        refs.push((
+            liq,
+            format!(" LIQ {} ", fmt_price(liq, price_dp)),
+            '─',
+            th().red,
+        ));
+    }
+
+    // Sort by price descending (top of chart = highest price), then walk
+    // top-down assigning each a row at or below its true row, never sharing a
+    // row with the previous one. If the stack runs past the bottom, shift it up.
+    refs.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let max_row = plot_h.saturating_sub(1);
+    let mut rows: Vec<u16> = Vec::with_capacity(refs.len());
+    let mut min_row = 0u16;
+    for (price, _, _, _) in &refs {
+        let r = row_of(dec_to_f64(*price)).max(min_row);
+        rows.push(r);
+        min_row = r.saturating_add(1);
+    }
+    if let Some(&last) = rows.last()
+        && last > max_row
+    {
+        let shift = last - max_row;
+        for r in rows.iter_mut() {
+            *r = r.saturating_sub(shift);
+        }
+    }
+    for ((_, label, dash, color), &row) in refs.iter().zip(rows.iter()) {
+        let ry = plot_y0 + row;
+        // Dash through empty cells only — candles still show through.
         for cx in plot_x0..plot_right {
             let cell = &mut buf[(cx, ry)];
             if cell.symbol() == " " {
-                cell.set_char('─').set_style(Style::default().fg(th().fg));
+                cell.set_char(*dash).set_style(Style::default().fg(*color));
             }
         }
-        let label = format!(" BE {} ", fmt_price(avg, price_dp));
+        // Centred label block: dark glyph on the accent.
         let lw = label.chars().count() as u16;
         let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
         buf.set_string(
@@ -1708,7 +1732,7 @@ fn draw_chart(
             label,
             Style::default()
                 .fg(th().inverse)
-                .bg(th().fg)
+                .bg(*color)
                 .add_modifier(Modifier::BOLD),
         );
     }

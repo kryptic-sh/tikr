@@ -596,6 +596,7 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                                 break_even_price: pos.break_even_price,
                                 mark_price: pos.mark_price,
                                 unrealized_profit: pos.unrealized_profit,
+                                liquidation_price: pos.liquidation_price,
                                 fetched_at_ms: current_time_ms(),
                             },
                         );

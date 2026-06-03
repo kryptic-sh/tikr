@@ -37,6 +37,8 @@ pub struct ApiPositionSnapshot {
     pub mark_price: Decimal,
     /// Binance unrealized PnL for this symbol.
     pub unrealized_profit: Decimal,
+    /// Binance estimated liquidation price (`0` when flat / no liq risk).
+    pub liquidation_price: Decimal,
     /// Local unix timestamp in ms when this value was fetched.
     pub fetched_at_ms: u64,
 }
