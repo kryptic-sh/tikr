@@ -1,13 +1,18 @@
 //! Wave: fixed-lattice band-refill market-making (pure form).
 //!
-//! A frozen price lattice (origin + step) computed ONCE at bot start — the grid
-//! prices never move (no recenter, no relattice, no adaptive resize). The
-//! active `levels`-slot band on each side is a WINDOW over that fixed grid that
-//! SLIDES up and down to bracket the current touch: when the market rises the
-//! window rises (bids may sit above the bid origin), when it falls the window
-//! falls (asks may sit below the ask origin). Only which slots are active
-//! moves; the discrete prices orders land on stay on the original lattice, so
-//! fills always happen at consistent grid prices.
+//! A price lattice (origin + step) frozen at bot start. The active `levels`-slot
+//! band on each side is a WINDOW over that grid that SLIDES up and down to
+//! bracket the current touch: when the market rises the window rises (bids may
+//! sit above the bid origin), when it falls the window falls (asks may sit below
+//! the ask origin). Only which slots are active moves; the prices orders land on
+//! stay on the lattice, so fills happen at consistent grid prices.
+//!
+//! The grid is frozen in ABSOLUTE price, so as mid drifts the step measured in
+//! bps of the current mid drifts off `steps_bps`. A **relattice** event rebuilds
+//! the grid (new step + origins) at the current touch when that drift exceeds
+//! [`relattice_drift`] — bounded, infrequent, and self-arresting (after a
+//! relattice the effective bps is back at `steps_bps`, so it won't re-fire until
+//! mid drifts another 10%).
 //!
 //! ## Knobs
 //! - `steps_bps` — bps of mid per lattice step (snapped to tick, min 1 tick).
@@ -40,6 +45,12 @@ use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, Time
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
+
+/// Relattice when the frozen lattice step, expressed in bps of the CURRENT mid,
+/// drifts more than this fraction (10%) from the configured `steps_bps`.
+fn relattice_drift() -> Decimal {
+    Decimal::new(1, 1) // 0.10
+}
 
 /// Configuration for [`Wave`].
 #[derive(Debug, Clone)]
@@ -184,6 +195,74 @@ impl Wave {
             };
         }
         tick
+    }
+
+    /// If the frozen lattice step has drifted more than [`relattice_drift`] from
+    /// the step we'd freshly install at the current mid, rebuild the grid (fresh
+    /// step + origins) at the current touch and cancel every resting order so the
+    /// grid is a clean slate. Returns `true` if it relatticed.
+    ///
+    /// The comparison target is `compute_step(mid)` — the step that encodes
+    /// `steps_bps` of the CURRENT mid, snapped to tick. In the normal regime
+    /// (`steps_bps` of mid ≫ tick) this is exactly "effective bps drifted >10%
+    /// from `steps_bps`", but using the install-able step makes it
+    /// self-arresting (diff is 0 right after a relattice, so it can't re-fire
+    /// until mid drifts another 10%) and a correct no-op in the tick-dominated
+    /// regime where the bps target is unreachable (comparing raw effective bps
+    /// there would thrash every event). No-op when `steps_bps == 0` — a 1-tick
+    /// lattice has no bps target.
+    fn maybe_relattice(
+        &mut self,
+        ctx: &StrategyContext<'_>,
+        top_b: Option<Price>,
+        top_a: Option<Price>,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        let sbps = self.config.steps_bps;
+        let tick = self.config.tick_size;
+        if sbps == 0 || tick <= Decimal::ZERO {
+            return false;
+        }
+        let (Some(step), Some(b), Some(a)) = (self.lattice_step, top_b, top_a) else {
+            return false;
+        };
+        if !(b.0 > Decimal::ZERO && a.0 > b.0) {
+            return false;
+        }
+        let mid = (b.0 + a.0) / Decimal::from(2);
+        if mid <= Decimal::ZERO {
+            return false;
+        }
+        let fresh = self.compute_step(mid);
+        if fresh <= Decimal::ZERO {
+            return false;
+        }
+        let drift = (step - fresh).abs() / fresh;
+        if drift <= relattice_drift() {
+            return false;
+        }
+        // Relattice: cancel everything on the stale grid, then re-freeze at the
+        // current touch. Re-seeding happens via the normal refill path this same
+        // event (the new grid reads as fully drained).
+        for (id, _) in ctx.open_quotes {
+            actions.push(Action::Cancel(*id));
+        }
+        let eff_bps = step / mid * Decimal::from(10_000);
+        self.lattice_step = Some(fresh);
+        self.bid_lattice_origin = Some(b.0);
+        self.ask_lattice_origin = Some(a.0);
+        tracing::info!(
+            symbol = %ctx.symbol.base.0,
+            mid = %mid,
+            old_step = %step,
+            new_step = %fresh,
+            eff_bps = %eff_bps.round_dp(2),
+            steps_bps = sbps,
+            drift_pct = %(drift * Decimal::from(100)).round_dp(1),
+            cancelled = ctx.open_quotes.len(),
+            "wave: relattice"
+        );
+        true
     }
 
     /// BID slot price at index k (k=0 is the top/origin, larger k = lower).
@@ -430,6 +509,12 @@ impl Strategy for Wave {
             return actions;
         }
 
+        // 1b) Relattice: if the frozen step has drifted >10% (in bps of the
+        // current mid) from steps_bps, rebuild the grid at the current touch and
+        // cancel the stale orders. The re-seed happens via the refill path below
+        // (the fresh grid reads fully drained).
+        let relatticed = self.maybe_relattice(ctx, top_b, top_a, &mut actions);
+
         // 2) Round-trip refill on the FIXED lattice.
         //
         // Refill fires when BOTH sides of the band have drained by
@@ -487,7 +572,13 @@ impl Strategy for Wave {
             let full = self.config.levels.max(1);
             let round_trip = bid_drained >= thr && ask_drained >= thr;
             let side_empty = bid_drained >= full || ask_drained >= full;
-            if round_trip || side_empty {
+            // After a relattice the stale orders are already queued for cancel,
+            // so seed the fresh grid directly and skip prune (avoids a redundant
+            // double-cancel of those same ids).
+            if relatticed {
+                self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
+                self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
+            } else if round_trip || side_empty {
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
                 self.prune_outside_band(ctx, Side::Bid, bb, &mut actions);
@@ -932,6 +1023,120 @@ mod tests {
         assert!(
             !a2.is_empty(),
             "2 round-trips at round_trips=2 must refill: {a2:?}"
+        );
+    }
+
+    fn quotes_as_open(actions: &[Action]) -> Vec<(QuoteId, QuoteIntent)> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some((QuoteId::new(), q.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn relattice_rebuilds_grid_when_bps_drifts_and_self_arrests() {
+        // Freeze at mid ~100 (step = 10 bps). Double the market to ~200: the
+        // frozen step is now ~5 bps of the new mid → >10% drift → relattice must
+        // rebuild the grid at the new touch, cancel the stale orders, and re-seed.
+        let mut w = Wave::new(cfg());
+        let s0 = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos_flat();
+        let sm = sym();
+        let seeded = w.on_event(
+            &ctx(&sm, &s0, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
+        let open = quotes_as_open(&seeded);
+        let seeded_ids: std::collections::HashSet<QuoteId> =
+            open.iter().map(|(id, _)| *id).collect();
+        let step0 = w.lattice_step.unwrap();
+
+        let s_up = snap(Decimal::from(200), Decimal::new(2001, 1));
+        let a = w.on_event(
+            &ctx(&sm, &s_up, &p, &open),
+            &MarketEvent::BookUpdate {
+                snapshot: s_up.clone(),
+            },
+        );
+        let step1 = w.lattice_step.unwrap();
+        assert!(
+            step1 > step0,
+            "relattice must grow the absolute step (held bps at the higher mid): {step0} -> {step1}"
+        );
+        let cancelled: std::collections::HashSet<QuoteId> = a
+            .iter()
+            .filter_map(|x| match x {
+                Action::Cancel(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancelled, seeded_ids,
+            "relattice must cancel every order on the stale grid: {a:?}"
+        );
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::Quote(q) if q.side == Side::Bid)),
+            "relattice must re-seed the fresh grid: {a:?}"
+        );
+
+        // Self-arresting: replay the same book with the freshly seeded orders
+        // resting → no further relattice (step stays put, nothing cancelled).
+        let open2 = quotes_as_open(&a);
+        let a2 = w.on_event(
+            &ctx(&sm, &s_up, &p, &open2),
+            &MarketEvent::BookUpdate {
+                snapshot: s_up.clone(),
+            },
+        );
+        assert_eq!(
+            w.lattice_step.unwrap(),
+            step1,
+            "relattice must not re-fire at the same mid (self-arresting)"
+        );
+        assert!(
+            !a2.iter().any(|x| matches!(x, Action::Cancel(_))),
+            "no churn once relatticed and the band is intact: {a2:?}"
+        );
+    }
+
+    #[test]
+    fn relattice_skips_when_tick_limited() {
+        // tick=0.1, steps_bps=10 → bps target is one tick at mid 100 and below
+        // it for any lower mid. Freeze at mid ~50 (step already pinned to the 0.1
+        // tick) and drop to mid ~25: the ideal step stays below one tick, so the
+        // install-able step is still 0.1 — no improvement possible → no
+        // relattice (grid step stays fixed).
+        let mut w = Wave::new(cfg());
+        let s0 = snap(Decimal::from(50), Decimal::new(501, 1));
+        let p = pos_flat();
+        let sm = sym();
+        let seeded = w.on_event(
+            &ctx(&sm, &s0, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
+        let open = quotes_as_open(&seeded);
+        let step0 = w.lattice_step.unwrap();
+        assert_eq!(step0, Decimal::new(1, 1), "freeze should pin to the tick");
+
+        let s_dn = snap(Decimal::from(25), Decimal::new(251, 1));
+        let _ = w.on_event(
+            &ctx(&sm, &s_dn, &p, &open),
+            &MarketEvent::BookUpdate {
+                snapshot: s_dn.clone(),
+            },
+        );
+        assert_eq!(
+            w.lattice_step.unwrap(),
+            step0,
+            "tick-limited step must not relattice (cannot tighten below tick)"
         );
     }
 }
