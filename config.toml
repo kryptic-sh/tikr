@@ -33,7 +33,7 @@ env = "futures-mainnet"
 asset = "USDT"
 order_balance_pct = "0.1"
 max_position_pct = "0"
-take_profit_pct = "5"   # unrealized > 5% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
+take_profit_pct = "2"   # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 10
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
