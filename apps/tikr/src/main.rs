@@ -341,6 +341,9 @@ fn spawn_price_history_watcher(
                 if bid > Decimal::ZERO {
                     state.push_price_sample(&view.symbol, now_ms, bid);
                 }
+                // Advance the timeline even when the price didn't move, so quiet
+                // seconds push flat candles into storage (sliding old ones off).
+                state.advance_history(&view.symbol, now_ms);
                 // Detect new fill via last_fill_ts delta.
                 if let (Some(ts_ns), Some(side)) = (fill_ts, fill_side)
                     && fill_price > Decimal::ZERO

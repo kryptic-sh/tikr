@@ -131,7 +131,7 @@ impl PriceHistory {
 
     /// Push a price sample. Dedupes consecutive identical prices to keep the
     /// buffer tight when the book is quiet, then prunes everything older than
-    /// the 60s window (so we only ever hold ~60 candles' worth).
+    /// the retention window. Quiet seconds are filled by `advance`, not here.
     pub fn push_sample(&mut self, ts_ms: u64, price: Decimal) {
         if price <= Decimal::ZERO {
             return;
@@ -146,10 +146,30 @@ impl PriceHistory {
         self.prune(ts_ms);
     }
 
-    /// Push a fill marker, then prune to the 60s window.
+    /// Push a fill marker, then prune to the window.
     pub fn push_fill(&mut self, ts_ms: u64, price: Decimal, is_buy: bool) {
         self.fills.push((ts_ms, price, is_buy));
         self.prune(ts_ms.max(self.last_sample_ms));
+    }
+
+    /// Advance the timeline to `now_ms`: if no sample has landed in the current
+    /// second, seed a flat carry-forward sample (the last known price) at the
+    /// second boundary, then prune. Called on a steady tick so a quiet book
+    /// still emits blank (flat) candles into storage — the buffer keeps sliding
+    /// and candles older than the window drop off even with zero activity.
+    /// The seeded point is the second's OPEN; a real trade later in the same
+    /// second still updates high/low/close via `push_sample`.
+    pub fn advance(&mut self, now_ms: u64) {
+        let sec = now_ms / 1000;
+        let last = self.samples.last().copied();
+        if let Some((last_ts, last_price)) = last
+            && last_ts / 1000 < sec
+        {
+            // Open the new second at the prior close — a true flat candle.
+            self.samples.push((sec * 1000, last_price));
+            self.last_sample_ms = sec * 1000;
+        }
+        self.prune(now_ms);
     }
 
     /// Drop samples + fills older than `now_ms − WINDOW_MS`, then enforce the
@@ -581,6 +601,17 @@ impl SharedBotState {
         }
     }
 
+    /// Advance `symbol`'s chart timeline to `now_ms`, seeding a flat carry-
+    /// forward candle for any elapsed quiet second and pruning to the window.
+    /// No-op if the symbol has no history yet (nothing to carry forward).
+    pub fn advance_history(&self, symbol: &str, now_ms: u64) {
+        if let Ok(mut g) = self.history.write()
+            && let Some(h) = g.get_mut(symbol)
+        {
+            h.advance(now_ms);
+        }
+    }
+
     /// Append a fill marker for `symbol`.
     pub fn push_fill_marker(&self, symbol: &str, ts_ms: u64, price: Decimal, is_buy: bool) {
         if let Ok(mut g) = self.history.write() {
@@ -825,4 +856,58 @@ pub fn mark_unrealized(
         return mid_unrealized;
     }
     mid_unrealized + live.position_size * (mark_price - live.last_mid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advance_seeds_one_flat_candle_per_quiet_second() {
+        let mut h = PriceHistory::default();
+        h.push_sample(1_000, Decimal::from(100)); // a real sample in second 1
+
+        // Several ticks across second 2 with no price change → exactly one flat.
+        h.advance(2_100);
+        h.advance(2_400);
+        h.advance(2_900);
+        let in_sec2 = h.samples.iter().filter(|(t, _)| t / 1000 == 2).count();
+        assert_eq!(in_sec2, 1, "one flat candle seeded for the quiet second");
+        let (ts, px) = *h.samples.iter().find(|(t, _)| t / 1000 == 2).unwrap();
+        assert_eq!(ts, 2_000, "flat seeded at the second boundary (open)");
+        assert_eq!(
+            px,
+            Decimal::from(100),
+            "flat carries the prior close forward"
+        );
+
+        // A real sample later in a second is NOT overwritten by a flat seed.
+        h.push_sample(3_500, Decimal::from(101));
+        h.advance(3_900);
+        let in_sec3: Vec<_> = h.samples.iter().filter(|(t, _)| t / 1000 == 3).collect();
+        assert_eq!(in_sec3.len(), 1);
+        assert_eq!(in_sec3[0].1, Decimal::from(101));
+    }
+
+    #[test]
+    fn advance_prunes_candles_older_than_the_window() {
+        let mut h = PriceHistory::default();
+        h.push_sample(1_000, Decimal::from(50));
+        // Jump far past the window — the old candle must be pruned out.
+        let far = 1_000 + PriceHistory::WINDOW_MS + 10_000;
+        h.advance(far);
+        assert!(
+            h.samples
+                .iter()
+                .all(|(t, _)| *t >= far - PriceHistory::WINDOW_MS),
+            "samples older than the window are dropped"
+        );
+    }
+
+    #[test]
+    fn advance_noop_without_history() {
+        let mut h = PriceHistory::default();
+        h.advance(5_000); // nothing to carry forward
+        assert!(h.samples.is_empty());
+    }
 }
