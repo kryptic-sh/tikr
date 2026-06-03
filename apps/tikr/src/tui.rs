@@ -923,9 +923,9 @@ fn draw_body(
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(34), // left: bot detail
-            Constraint::Min(40),    // middle: logs
-            Constraint::Length(34), // right: account
+            Constraint::Length(34), // left: bot detail — fixed
+            Constraint::Fill(1),    // middle: logs — absorbs all resize
+            Constraint::Length(34), // right: account — fixed
         ])
         .split(area);
 
