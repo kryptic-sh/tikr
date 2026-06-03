@@ -302,23 +302,25 @@ fn spawn_price_history_watcher(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             for view in state.views() {
-                // Backfill the candle chart from 1s klines the first time we see
-                // a symbol, so the graph isn't blank on startup.
+                // Backfill the candle chart from recent agg trades the first
+                // time we see a symbol, so the graph isn't blank on startup.
                 if seeded.insert(view.symbol.clone()) {
                     let state = state.clone();
                     let http = http.clone();
                     let base_url = base_url.clone();
                     let symbol = view.symbol.clone();
                     tokio::spawn(async move {
-                        match tikr_binance::futs::get_1s_klines(&http, &base_url, &symbol, 300)
-                            .await
+                        match tikr_binance::futs::get_1s_agg_candles(
+                            &http, &base_url, &symbol, 1000,
+                        )
+                        .await
                         {
-                            Ok(klines) if !klines.is_empty() => {
-                                state.seed_history(&symbol, &klines);
+                            Ok(candles) if !candles.is_empty() => {
+                                state.seed_history(&symbol, &candles);
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                tracing::debug!(%symbol, error = %e, "chart kline backfill failed");
+                                tracing::debug!(%symbol, error = %e, "chart candle backfill failed");
                             }
                         }
                     });

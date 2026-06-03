@@ -979,12 +979,15 @@ pub async fn get_1m_closes(
     Ok(closes)
 }
 
-/// Fetch recent 1-second OHLC klines to backfill the TUI candle chart on
-/// startup, so the graph isn't blank until live samples accumulate. Returns
-/// `(open_time_ms, open, high, low, close)` oldest-first. `limit` is clamped to
-/// Binance's 1..=1000 range.
+/// Backfill the TUI candle chart on startup by aggregating recent aggregate
+/// trades into 1-second OHLC candles, so the graph isn't blank until live
+/// samples accumulate. Futures klines have no sub-minute interval (`1s` returns
+/// `-1120 Invalid interval`), so we bucket `/fapi/v1/aggTrades` by trade time
+/// instead. Returns `(open_time_ms, open, high, low, close)` oldest-first.
+/// `limit` is the aggTrades fetch size, clamped to Binance's 1..=1000 range —
+/// the candle span depends on how much time those trades cover.
 #[allow(clippy::type_complexity)]
-pub async fn get_1s_klines(
+pub async fn get_1s_agg_candles(
     http: &HttpClient,
     base_url: &str,
     symbol: &str,
@@ -999,9 +1002,10 @@ pub async fn get_1s_klines(
     )>,
     VenueError,
 > {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
     let limit = limit.clamp(1, 1000);
-    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1s&limit={limit}");
+    let url = format!("{base_url}/fapi/v1/aggTrades?symbol={symbol}&limit={limit}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
     let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
@@ -1010,30 +1014,43 @@ pub async fn get_1s_klines(
     let Some(rows) = body.as_array() else {
         return Ok(Vec::new());
     };
-    let dec = |c: &[Value], i: usize| -> Option<tikr_core::Decimal> {
-        c.get(i)
-            .and_then(Value::as_str)
-            .and_then(|s| tikr_core::Decimal::from_str(s).ok())
-    };
-    let mut out = Vec::with_capacity(rows.len());
+    // Bucket trades into 1-second OHLC. aggTrades come time-ordered ascending,
+    // so the first trade in a bucket is the open and the last is the close.
+    let mut buckets: BTreeMap<
+        u64,
+        (
+            tikr_core::Decimal,
+            tikr_core::Decimal,
+            tikr_core::Decimal,
+            tikr_core::Decimal,
+        ),
+    > = BTreeMap::new();
     for row in rows {
-        // kline cols: [openTime, open, high, low, close, ...]
-        let Some(cols) = row.as_array() else { continue };
-        let open_time = cols.first().and_then(Value::as_u64);
-        let (Some(t), Some(o), Some(h), Some(l), Some(c)) = (
-            open_time,
-            dec(cols, 1),
-            dec(cols, 2),
-            dec(cols, 3),
-            dec(cols, 4),
-        ) else {
+        let price = row
+            .get("p")
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok());
+        let ts = row.get("T").and_then(Value::as_u64);
+        let (Some(p), Some(t)) = (price, ts) else {
             continue;
         };
-        if o > tikr_core::Decimal::ZERO {
-            out.push((t, o, h, l, c));
+        if p <= tikr_core::Decimal::ZERO {
+            continue;
         }
+        let bucket = (t / 1000) * 1000;
+        buckets
+            .entry(bucket)
+            .and_modify(|c| {
+                c.1 = c.1.max(p);
+                c.2 = c.2.min(p);
+                c.3 = p;
+            })
+            .or_insert((p, p, p, p));
     }
-    Ok(out)
+    Ok(buckets
+        .into_iter()
+        .map(|(t, (o, h, l, c))| (t, o, h, l, c))
+        .collect())
 }
 
 /// Average full candle height over the last `limit` 1m candles, as a percent:
