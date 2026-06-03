@@ -277,13 +277,21 @@ struct AccountPollerConfig {
 /// Single source for the TUI price-chart panel — works across tide,
 /// SS, bagboy, etc. without touching the runner. Polls at bot-tick rate
 /// (100 ms) so chart resolution matches what strategies actually see.
-fn spawn_price_history_watcher(state: SharedBotState, mut shutdown: watch::Receiver<bool>) {
+fn spawn_price_history_watcher(
+    state: SharedBotState,
+    env: tikr_binance::BinanceEnv,
+    mut shutdown: watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
+        let http = reqwest::Client::new();
+        let base_url = env.rest_base_url().to_string();
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Per-symbol last_fill_ts seen, so we only push new fills.
         let mut last_fill_ts: HashMap<String, u64> = HashMap::new();
+        // Symbols whose chart history has been backfilled from klines already.
+        let mut seeded: HashSet<String> = HashSet::new();
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -294,6 +302,27 @@ fn spawn_price_history_watcher(state: SharedBotState, mut shutdown: watch::Recei
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             for view in state.views() {
+                // Backfill the candle chart from 1s klines the first time we see
+                // a symbol, so the graph isn't blank on startup.
+                if seeded.insert(view.symbol.clone()) {
+                    let state = state.clone();
+                    let http = http.clone();
+                    let base_url = base_url.clone();
+                    let symbol = view.symbol.clone();
+                    tokio::spawn(async move {
+                        match tikr_binance::futs::get_1s_klines(&http, &base_url, &symbol, 300)
+                            .await
+                        {
+                            Ok(klines) if !klines.is_empty() => {
+                                state.seed_history(&symbol, &klines);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!(%symbol, error = %e, "chart kline backfill failed");
+                            }
+                        }
+                    });
+                }
                 // Sample best_bid (fallback to last_mid).
                 let (bid, fill_ts, fill_side, fill_price) = match view.live.as_ref() {
                     Some(s) => (
@@ -736,7 +765,7 @@ async fn main() -> anyhow::Result<()> {
     let _bnb_price_rx_for_parser = bnb_price_rx.clone();
 
     // Price-history watcher — drives the TUI chart panel.
-    spawn_price_history_watcher(shared_state.clone(), global_shutdown_rx.clone());
+    spawn_price_history_watcher(shared_state.clone(), env, global_shutdown_rx.clone());
 
     // BNB-balance monitor — warns when balance drops below threshold.
     // No-ops when bnb_refill_enabled=false in TOML OR when the account

@@ -475,6 +475,29 @@ impl SharedBotState {
         }
     }
 
+    /// Seed `symbol`'s chart history from 1-second OHLC klines, so the candle
+    /// graph is populated on startup instead of building up from blank. Each
+    /// kline `(open_time_ms, o, h, l, c)` is expanded into four sub-second
+    /// samples (open, high, low, close) within its bucket so the chart's
+    /// per-second OHLC aggregation reconstructs the candle shape. No-op if the
+    /// symbol already has samples (don't clobber live data).
+    pub fn seed_history(&self, symbol: &str, klines: &[(u64, Decimal, Decimal, Decimal, Decimal)]) {
+        if let Ok(mut g) = self.history.write() {
+            let hist = g.entry(symbol.to_string()).or_default();
+            if !hist.samples.is_empty() {
+                return;
+            }
+            for &(t, o, h, l, c) in klines {
+                // Order open→high→low→close at +0/+250/+500/+750ms so the bucket
+                // keeps open first, close last, and max/min capture the wicks.
+                hist.push_sample(t, o);
+                hist.push_sample(t + 250, h);
+                hist.push_sample(t + 500, l);
+                hist.push_sample(t + 750, c);
+            }
+        }
+    }
+
     /// Append a fill marker for `symbol`.
     pub fn push_fill_marker(&self, symbol: &str, ts_ms: u64, price: Decimal, is_buy: bool) {
         if let Ok(mut g) = self.history.write() {

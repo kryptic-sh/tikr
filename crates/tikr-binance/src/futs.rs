@@ -979,6 +979,63 @@ pub async fn get_1m_closes(
     Ok(closes)
 }
 
+/// Fetch recent 1-second OHLC klines to backfill the TUI candle chart on
+/// startup, so the graph isn't blank until live samples accumulate. Returns
+/// `(open_time_ms, open, high, low, close)` oldest-first. `limit` is clamped to
+/// Binance's 1..=1000 range.
+#[allow(clippy::type_complexity)]
+pub async fn get_1s_klines(
+    http: &HttpClient,
+    base_url: &str,
+    symbol: &str,
+    limit: u32,
+) -> Result<
+    Vec<(
+        u64,
+        tikr_core::Decimal,
+        tikr_core::Decimal,
+        tikr_core::Decimal,
+        tikr_core::Decimal,
+    )>,
+    VenueError,
+> {
+    use std::str::FromStr;
+    let limit = limit.clamp(1, 1000);
+    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1s&limit={limit}");
+    let resp = http.get(&url).send().await.map_err(network_err)?;
+    let body: Value = read_json(resp).await?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let Some(rows) = body.as_array() else {
+        return Ok(Vec::new());
+    };
+    let dec = |c: &[Value], i: usize| -> Option<tikr_core::Decimal> {
+        c.get(i)
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok())
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        // kline cols: [openTime, open, high, low, close, ...]
+        let Some(cols) = row.as_array() else { continue };
+        let open_time = cols.first().and_then(Value::as_u64);
+        let (Some(t), Some(o), Some(h), Some(l), Some(c)) = (
+            open_time,
+            dec(cols, 1),
+            dec(cols, 2),
+            dec(cols, 3),
+            dec(cols, 4),
+        ) else {
+            continue;
+        };
+        if o > tikr_core::Decimal::ZERO {
+            out.push((t, o, h, l, c));
+        }
+    }
+    Ok(out)
+}
+
 /// Average full candle height over the last `limit` 1m candles, as a percent:
 /// the mean of `(high − low) / low × 100`. `high`/`low` are the kline extremes,
 /// so the wicks are included. A direct, responsive measure of recent
