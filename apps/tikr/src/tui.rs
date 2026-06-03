@@ -1451,6 +1451,9 @@ fn draw_chart(
     if plot_w == 0 {
         return;
     }
+    // One candle per column. History holds only the last 60s, so any column
+    // older than that has no sample and stays blank — the ≤60 candles
+    // naturally right-align against "now".
     let n = plot_w as usize;
 
     // Anchor the right edge to wall-clock NOW, not the last sample, so a quiet

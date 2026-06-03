@@ -119,14 +119,19 @@ pub struct PriceHistory {
 }
 
 impl PriceHistory {
-    /// Max samples retained (≈10 samples/sec * 3 min = 1800; chart
-    /// window is 60s so headroom for stalls).
+    /// Retention window: the chart shows at most 60 one-second candles, so we
+    /// never keep samples (or fills) older than 60s behind the newest. Anything
+    /// past this is pruned on every push — the buffer holds ≤ 1 minute of data.
+    pub const WINDOW_MS: u64 = 60_000;
+    /// Hard safety cap on retained samples (a burst within the 60s window
+    /// shouldn't grow unbounded). Time-pruning is the primary bound.
     pub const MAX_SAMPLES: usize = 1800;
-    /// Max fill markers retained.
+    /// Hard safety cap on retained fill markers within the window.
     pub const MAX_FILLS: usize = 500;
 
-    /// Push a price sample. Dedupes consecutive identical prices to
-    /// keep the buffer tight when the book is quiet. Trims to MAX_SAMPLES.
+    /// Push a price sample. Dedupes consecutive identical prices to keep the
+    /// buffer tight when the book is quiet, then prunes everything older than
+    /// the 60s window (so we only ever hold ~60 candles' worth).
     pub fn push_sample(&mut self, ts_ms: u64, price: Decimal) {
         if price <= Decimal::ZERO {
             return;
@@ -138,15 +143,31 @@ impl PriceHistory {
         }
         self.samples.push((ts_ms, price));
         self.last_sample_ms = ts_ms;
+        self.prune(ts_ms);
+    }
+
+    /// Push a fill marker, then prune to the 60s window.
+    pub fn push_fill(&mut self, ts_ms: u64, price: Decimal, is_buy: bool) {
+        self.fills.push((ts_ms, price, is_buy));
+        self.prune(ts_ms.max(self.last_sample_ms));
+    }
+
+    /// Drop samples + fills older than `now_ms − WINDOW_MS`, then enforce the
+    /// hard count caps. `samples`/`fills` are kept oldest-first (ascending ts).
+    fn prune(&mut self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(Self::WINDOW_MS);
+        let s = self.samples.partition_point(|(t, _)| *t < cutoff);
+        if s > 0 {
+            self.samples.drain(0..s);
+        }
+        let fcut = self.fills.partition_point(|(t, _, _)| *t < cutoff);
+        if fcut > 0 {
+            self.fills.drain(0..fcut);
+        }
         if self.samples.len() > Self::MAX_SAMPLES {
             let drop = self.samples.len() - Self::MAX_SAMPLES;
             self.samples.drain(0..drop);
         }
-    }
-
-    /// Push a fill marker. Trims to MAX_FILLS.
-    pub fn push_fill(&mut self, ts_ms: u64, price: Decimal, is_buy: bool) {
-        self.fills.push((ts_ms, price, is_buy));
         if self.fills.len() > Self::MAX_FILLS {
             let drop = self.fills.len() - Self::MAX_FILLS;
             self.fills.drain(0..drop);
