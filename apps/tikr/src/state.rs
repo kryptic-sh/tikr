@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use tikr_paper::{BotHandle, LiveSnapshot, PaperReport};
 use tokio::sync::watch;
 
@@ -216,6 +217,50 @@ impl SharedBotState {
     /// Running totals of departed (removed) bots, for the account summary.
     pub fn retired_totals(&self) -> RetiredTotals {
         self.retired.lock().ok().map(|t| *t).unwrap_or_default()
+    }
+
+    /// Snapshot the current manager-level state for persistence: balance
+    /// baselines, retired totals, and the live roster (every bot currently in
+    /// the dashboard, with its status tag).
+    pub fn session_state(&self) -> SessionState {
+        let roster = self
+            .views()
+            .into_iter()
+            .map(|v| SessionBot {
+                symbol: v.symbol,
+                strategy: v.strategy,
+                status: v.status.tag().to_string(),
+            })
+            .collect();
+        SessionState {
+            start_balance: self.start_balance(),
+            bnb_start_value_usdt: self.bnb_start_value_usdt(),
+            retired: self.retired_totals(),
+            roster,
+        }
+    }
+
+    /// Restore a persisted session (on restart, unless `--clear`). Pre-seeds the
+    /// balance baselines so the first live poll does NOT re-baseline to the
+    /// current wallet (keeping "$ since start" continuous), and restores the
+    /// retired totals. Returns the saved roster symbols so the caller can
+    /// re-spawn the rotation lineup. Does not insert bot views — managers do
+    /// that as they (re-)spawn.
+    pub fn restore_session(&self, s: SessionState) -> Vec<String> {
+        if let Some(bal) = s.start_balance
+            && let Ok(mut g) = self.start_balance.write()
+        {
+            *g = Some(bal);
+        }
+        if let Some(bnb) = s.bnb_start_value_usdt
+            && let Ok(mut g) = self.bnb_start_value_usdt.write()
+        {
+            *g = Some(bnb);
+        }
+        if let Ok(mut g) = self.retired.lock() {
+            *g = s.retired;
+        }
+        s.roster.into_iter().map(|b| b.symbol).collect()
     }
 
     /// Update the BNB state snapshot. Captures the starting BNB-value
@@ -466,7 +511,7 @@ pub struct BotViewSnapshot {
 /// wallet, so the account summary must keep counting it — otherwise the bot's
 /// totals drift below the API/wallet truth as symbols rotate. Folded in on
 /// [`SharedBotState::remove`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct RetiredTotals {
     /// Σ realized PnL of departed bots.
     pub realized: Decimal,
@@ -484,6 +529,52 @@ pub struct RetiredTotals {
     pub fills: u64,
     /// Number of departed bots folded in.
     pub count: usize,
+}
+
+/// One running bot recorded in the session manifest — enough to re-spawn it and
+/// show its last-known state on restart. Per-bot PnL itself resumes separately
+/// from the per-symbol snapshot files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBot {
+    pub symbol: String,
+    pub strategy: String,
+    /// Lifecycle tag at save time (`on` / `off` / …), for display continuity.
+    pub status: String,
+}
+
+/// Persisted manager-level session state, written to `<session_dir>/session.json`.
+/// Restored on restart (unless `--clear`) so the account summary stays continuous
+/// (balance baselines + retired totals) and the rotation lineup resumes. Decimals
+/// serialize natively via `rust_decimal/serde`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SessionState {
+    /// First wallet balance ever seen — the baseline for "$ since start" / NET.
+    pub start_balance: Option<Decimal>,
+    /// Starting BNB USDT-value baseline (BNB-fee accounting).
+    pub bnb_start_value_usdt: Option<Decimal>,
+    /// Running totals of bots rotated out + GC'd (account summary keeps these).
+    pub retired: RetiredTotals,
+    /// Bots that were running at save time (symbol + strategy + status).
+    pub roster: Vec<SessionBot>,
+}
+
+/// Manifest file name under the session dir.
+pub const SESSION_FILE: &str = "session.json";
+
+/// Load the session manifest from `<dir>/session.json`, or `None` if absent /
+/// unreadable / malformed (treated as a cold start — never fatal).
+pub fn load_session(dir: &std::path::Path) -> Option<SessionState> {
+    let path = dir.join(SESSION_FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write the session manifest to `<dir>/session.json`, creating `dir` if needed.
+pub fn save_session(dir: &std::path::Path, state: &SessionState) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let json =
+        serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(dir.join(SESSION_FILE), json)
 }
 
 #[derive(Default)]

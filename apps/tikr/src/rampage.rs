@@ -67,10 +67,25 @@ pub fn spawn_rampage_manager(
     account: RampageAccountCtx,
     shared_state: SharedBotState,
     mut global_shutdown: watch::Receiver<bool>,
+    initial_roster: Vec<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
         let mut active: HashMap<String, ActiveBot> = HashMap::new();
+
+        // Resume the saved lineup: re-spawn the symbols that were running at the
+        // last shutdown BEFORE the first discovery tick, so the bot comes back up
+        // managing the same markets (and their inherited positions) it left with.
+        // Normal rotation re-evaluates them next cycle — anything no longer
+        // qualifying rotates out then (when flat/green or within the loss gate).
+        for symbol in initial_roster {
+            if active.contains_key(&symbol) {
+                continue;
+            }
+            info!(symbol = %symbol, "rampage: resuming bot from saved session");
+            let bot = spawn_one_bot(&symbol, &account, &shared_state, &cfg);
+            active.insert(symbol, bot);
+        }
         // Off-bots (rotated out) → consecutive recheck cycles spent not-active.
         // Dropped from the dashboard once they hit RETIRE_AFTER_CYCLES.
         let mut retired: HashMap<String, u32> = HashMap::new();

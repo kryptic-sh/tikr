@@ -4966,6 +4966,7 @@ dependencies = [
  "rust_decimal",
  "rustls",
  "serde",
+ "serde_json",
  "tikr-backtest",
  "tikr-binance",
  "tikr-core",

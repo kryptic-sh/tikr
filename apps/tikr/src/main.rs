@@ -152,6 +152,61 @@ fn session_state_dir(config_path: &std::path::Path) -> PathBuf {
     base
 }
 
+/// Flatten EVERY open position on the futures account — used by `--clear` for a
+/// clean-slate start, including positions on symbols NOT in this config (e.g.
+/// left by a prior version / different config). Lists all open positions in one
+/// call, then per symbol cancels resting orders + reduce-only-closes the bag
+/// (dust-safe via `reset_symbol_state`). Awaited so it completes BEFORE the
+/// account poller records the session start balance — otherwise the realized
+/// PnL of the flatten (which can swing the wallet either way) would skew every
+/// session-relative stat.
+async fn flatten_all_open_positions(
+    env: tikr_binance::BinanceEnv,
+    api_key: &str,
+    key_material: &Arc<tikr_binance::BinanceKeyMaterial>,
+    leverage: u32,
+) {
+    let http = reqwest::Client::new();
+    let positions = match tikr_binance::futs::list_open_positions(
+        &http,
+        env.rest_base_url(),
+        api_key,
+        key_material,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = ?e, "--clear: failed to list open positions; skipping flatten");
+            return;
+        }
+    };
+    let open: Vec<(String, Decimal)> = positions
+        .into_iter()
+        .filter(|(_, amt)| *amt != Decimal::ZERO)
+        .collect();
+    if open.is_empty() {
+        tracing::info!("--clear: no open positions to flatten");
+        return;
+    }
+    tracing::info!(
+        count = open.len(),
+        "--clear: flattening all open positions before recording session start"
+    );
+    for (sym, amt) in open {
+        let symbol = venue::perp_symbol(&sym);
+        match venue::build_venue(env, api_key, key_material, &symbol, leverage).await {
+            Ok(v) => {
+                tracing::info!(symbol = %sym, amount = %amt, "--clear: cancel + flatten");
+                crate::supervisor::reset_symbol_state(&v, &symbol).await;
+            }
+            Err(e) => {
+                tracing::warn!(symbol = %sym, error = ?e, "--clear: venue build failed; position left open")
+            }
+        }
+    }
+}
+
 struct AccountPollerConfig {
     shared_state: SharedBotState,
     notional_tx: watch::Sender<Decimal>,
@@ -447,6 +502,27 @@ async fn main() -> anyhow::Result<()> {
     // Session/snapshot data lives under the XDG cache, in a dir auto-named from
     // a hash of the config file's full path (no manual `state_dir`).
     let base_state_dir = session_state_dir(&config_path);
+    // --clear wipes ALL session data (per-bot PnL snapshots + the manifest) for a
+    // true fresh start; otherwise everything persists and resumes. Done before
+    // anything reads/writes the dir.
+    if args.clear {
+        match std::fs::remove_dir_all(&base_state_dir) {
+            Ok(()) => {
+                tracing::info!(dir = %base_state_dir.display(), "--clear: wiped session data")
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = ?e, dir = %base_state_dir.display(), "--clear: could not wipe session dir")
+            }
+        }
+    }
+    // Load the persisted session manifest (skipped after --clear since the dir
+    // was just removed). Restored into shared_state once it exists.
+    let restored_session = if args.clear {
+        None
+    } else {
+        state::load_session(&base_state_dir)
+    };
     if let Some(pct) = args.order_balance_pct {
         cfg.account.order_balance_pct = pct;
     }
@@ -507,7 +583,26 @@ async fn main() -> anyhow::Result<()> {
     let (api_key, key_material) = venue::load_credentials(env, cfg.account.key_file.as_deref())?;
     let key_material: Arc<tikr_binance::BinanceKeyMaterial> = key_material;
 
+    // --clear: flatten EVERY open position account-wide BEFORE anything records a
+    // session-start balance, so the flatten's realized PnL (which can move the
+    // wallet up or down) does not skew session-relative stats. Awaited here, so
+    // the account poller's first reading below is the clean post-flatten wallet.
+    if args.clear {
+        flatten_all_open_positions(env, &api_key, &key_material, cfg.account.leverage).await;
+    }
+
     let shared_state = SharedBotState::new();
+
+    // Restore the persisted session: balance baselines + retired totals (so the
+    // account summary stays continuous across restarts) and the saved rotation
+    // lineup (re-spawned by the rampage manager before its first discovery tick).
+    let restored_roster = restored_session
+        .map(|s| {
+            let roster = shared_state.restore_session(s);
+            tracing::info!(bots = roster.len(), "restored session state");
+            roster
+        })
+        .unwrap_or_default();
 
     let rotation_enabled = cfg.scalp_rotation.as_ref().is_some_and(|r| r.enabled)
         || cfg.static_grid_rotation.as_ref().is_some_and(|r| r.enabled);
@@ -651,6 +746,7 @@ async fn main() -> anyhow::Result<()> {
             },
             shared_state.clone(),
             global_shutdown_rx.clone(),
+            restored_roster,
         ));
     }
     if !rotation_enabled {
@@ -674,6 +770,29 @@ async fn main() -> anyhow::Result<()> {
             let h = spawn_supervisor(ctx, shared_state.clone(), global_shutdown_rx.clone());
             supervisors.push(h);
         }
+    }
+
+    // Persist the session manifest periodically so a crash/kill still leaves a
+    // recent roster + baselines to resume from. A final save runs on graceful
+    // shutdown below.
+    {
+        let persist_state = shared_state.clone();
+        let persist_dir = base_state_dir.clone();
+        let mut persist_shutdown = global_shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if let Err(e) = state::save_session(&persist_dir, &persist_state.session_state()) {
+                            tracing::debug!(error = ?e, "session persist failed");
+                        }
+                    }
+                    _ = persist_shutdown.changed() => if *persist_shutdown.borrow() { return; }
+                }
+            }
+        });
     }
 
     if args.headless {
@@ -725,6 +844,12 @@ async fn main() -> anyhow::Result<()> {
         futures::future::join_all(supervisors),
     )
     .await;
+
+    // Final session save AFTER bots wound down, so the manifest reflects the
+    // last roster + retired totals (rotations folded in) for the next start.
+    if let Err(e) = state::save_session(&base_state_dir, &shared_state.session_state()) {
+        tracing::warn!(error = ?e, "final session save failed");
+    }
 
     Ok(())
 }
