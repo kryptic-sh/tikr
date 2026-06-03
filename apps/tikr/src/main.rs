@@ -302,6 +302,11 @@ fn spawn_price_history_watcher(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             for view in state.views() {
+                // A rotated-out bot's chart freezes in time — stop feeding it
+                // samples / flat candles so it stays as it was at rotation.
+                if matches!(view.status, BotStatus::Rotated) {
+                    continue;
+                }
                 // Backfill the candle chart from recent agg trades the first
                 // time we see a symbol, so the graph isn't blank on startup.
                 if seeded.insert(view.symbol.clone()) {

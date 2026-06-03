@@ -1488,13 +1488,19 @@ fn draw_chart(
 
     // Anchor the right edge to wall-clock NOW, not the last sample, so a quiet
     // book keeps scrolling with carried-forward flat candles instead of
-    // freezing on the last second that had activity.
+    // freezing on the last second that had activity. EXCEPT a rotated-out bot:
+    // its chart is frozen in time, so anchor to its last sample.
+    let frozen = matches!(active.map(|v| &v.status), Some(BotStatus::Rotated));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let last_ts = hist.samples.last().map(|(t, _)| *t).unwrap_or(0);
-    let last_bucket = (now_ms / 1000).max(last_ts / 1000);
+    let last_bucket = if frozen {
+        last_ts / 1000
+    } else {
+        (now_ms / 1000).max(last_ts / 1000)
+    };
     let start_bucket = last_bucket.saturating_sub(n as u64 - 1);
 
     // Aggregate samples into per-second OHLC buckets.
