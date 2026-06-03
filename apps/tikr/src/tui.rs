@@ -1769,9 +1769,10 @@ fn draw_logs(
     log_lines: &[LogLine],
     ui: &mut UiState,
 ) {
-    // Padding eats 2 rows (uniform 1); the in-pane title eats 1 more.
+    // Padding: top 1 + bottom 1 rows; the in-pane title eats 1 more. Left/right
+    // 2 each — matching the chart and sidebars so all panes align.
     let visible = area.height.saturating_sub(3) as usize;
-    let content_width = area.width.saturating_sub(2) as usize;
+    let content_width = area.width.saturating_sub(4) as usize;
     let (rendered_lines, tss) = format_log_lines(log_lines, content_width.max(1));
     let total = rendered_lines.len();
     let max_top = total.saturating_sub(visible);
@@ -1813,9 +1814,15 @@ fn draw_logs(
     ]));
     lines.extend(rendered_lines[start..end].iter().cloned());
     // Borderless — the divider to the chart above is the chart pane's BOTTOM
-    // border; left/right dividers belong to the neighbouring panes.
+    // border; left/right dividers belong to the neighbouring panes. Padding
+    // matches the chart/sidebars (left/right 2, top/bottom 1).
     let logs = Paragraph::new(lines)
-        .block(Block::default().padding(Padding::uniform(1)))
+        .block(Block::default().padding(Padding {
+            left: 2,
+            top: 1,
+            right: 2,
+            bottom: 1,
+        }))
         .wrap(Wrap { trim: false });
     f.render_widget(logs, area);
     ui.last_log_rect = Some(area);
