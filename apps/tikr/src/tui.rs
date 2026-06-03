@@ -688,7 +688,7 @@ fn draw(
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // tabs
+            Constraint::Length(1), // tabs (borderless, single compact row)
             Constraint::Min(0),    // body
             Constraint::Length(1), // footer
         ])
@@ -808,11 +808,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut UiState) {
-    // Custom render so we control click hit-boxes exactly.
-    let block = Block::default().borders(Borders::ALL).title(" tikr ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
+    // Borderless, single-row tab strip — each tab is a colored block, so
+    // active/inactive and the gaps between tabs read from background colour
+    // alone (no border, no title, no "│" separator). Custom render so we
+    // control click hit-boxes exactly.
+    let inner = area;
     let mut spans: Vec<Span> = Vec::new();
     let mut ranges: Vec<(usize, u16, u16)> = Vec::new();
     let mut x = inner.x;
@@ -868,18 +868,23 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
             truncated = true;
             break;
         }
+        // Active tab: bright cyan block. Inactive: dark-grey block with the
+        // status colour for the icon/text. The colour difference is the
+        // separator — no glyph between tabs.
         let style = if active {
             Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
+                .fg(Color::Black)
+                .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(color)
+            Style::default().fg(color).bg(Color::DarkGray)
         };
         spans.push(Span::styled(label, style));
         ranges.push((i, x, x.saturating_add(w).min(right)));
         x = x.saturating_add(w);
-        spans.push(Span::raw("│"));
+        // One blank (default-bg) column between tabs so adjacent blocks don't
+        // merge — keeps the width math (tab_width counts this +1).
+        spans.push(Span::raw(" "));
         x = x.saturating_add(1);
     }
 
@@ -896,8 +901,8 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
 
 fn tab_width(v: &BotViewSnapshot) -> u16 {
     // Must match draw_tabs' rendered label `" {icon} {symbol} ({strategy}) "`
-    // (the status icon is always 1 column) plus the "│" tab separator, else tab
-    // scroll/fit math drifts from what's drawn.
+    // (the status icon is always 1 column) plus the 1-column blank tab gap, else
+    // tab scroll/fit math drifts from what's drawn.
     (format!(" ● {} ({}) ", v.symbol, v.strategy).chars().count() + 1) as u16
 }
 
@@ -1583,15 +1588,18 @@ fn draw_chart(
         }
         let cx = plot_x0 + (b - start_bucket) as u16;
         let ry = row_of(dec_to_f64(*p));
-        // Bright green/red background with a dark glyph — pops against the candles.
-        let (ch, bg, fg) = if *is_buy {
-            ('▲', Color::Green, Color::Black)
+        // Green/red glyph on a cyan background — really pops against the candles.
+        let (ch, fg) = if *is_buy {
+            ('▲', Color::Green)
         } else {
-            ('▼', Color::Red, Color::Black)
+            ('▼', Color::Red)
         };
-        buf[(cx, inner.y + ry)]
-            .set_char(ch)
-            .set_style(Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD));
+        buf[(cx, inner.y + ry)].set_char(ch).set_style(
+            Style::default()
+                .fg(fg)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 
     // Y-axis labels in the gutter: hi at top, lo at bottom, last close mid.
