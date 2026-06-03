@@ -1576,14 +1576,15 @@ fn draw_chart(
         }
         let cx = plot_x0 + (b - start_bucket) as u16;
         let ry = row_of(dec_to_f64(*p));
-        let (ch, color) = if *is_buy {
-            ('▲', Color::Green)
+        // Bright green/red background with a dark glyph — pops against the candles.
+        let (ch, bg, fg) = if *is_buy {
+            ('▲', Color::Green, Color::Black)
         } else {
-            ('▼', Color::Red)
+            ('▼', Color::Red, Color::Black)
         };
         buf[(cx, inner.y + ry)]
             .set_char(ch)
-            .set_style(Style::default().fg(color).add_modifier(Modifier::BOLD));
+            .set_style(Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD));
     }
 
     // Y-axis labels in the gutter: hi at top, lo at bottom, last close mid.
