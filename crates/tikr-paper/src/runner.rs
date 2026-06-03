@@ -860,6 +860,18 @@ where
         // starve the event stream — safe for live too.
         tokio::select! {
             biased;
+            // Shutdown FIRST: `biased` polls top-to-bottom, so this must precede
+            // the market-event / fill branches. On an active symbol the event
+            // branch is almost always ready and would otherwise win every
+            // iteration, starving a trailing shutdown arm and making the bot take
+            // seconds to stop. Polling shutdown first makes teardown near-instant.
+            // (Never ready mid-replay in backtest, so determinism is unaffected.)
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("shutdown signal received");
+                    break;
+                }
+            }
             changed = async {
                 match notional_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -2138,12 +2150,6 @@ where
                     Err(e) => {
                         warn!(error = ?e, "order reconciliation: venue.open_orders failed");
                     }
-                }
-            }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    info!("shutdown signal received");
-                    break;
                 }
             }
         }
