@@ -22,7 +22,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tide-esports"
 
 # Per-order = wallet × 1% (single bot, no split).
 order_balance_pct = "1"

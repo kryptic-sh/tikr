@@ -117,6 +117,41 @@ fn resolve_config_path(cli: Option<&std::path::Path>) -> anyhow::Result<PathBuf>
     )
 }
 
+/// Base directory for session/snapshot data, derived automatically from the
+/// config file path — no manual `state_dir` configuration. Each distinct
+/// config gets its own session dir under the XDG cache:
+///
+///   `$XDG_CACHE_HOME/tikr/<hash>`   (defaults to `~/.cache/tikr/<hash>`)
+///
+/// where `<hash>` is a stable hash of the config file's CANONICAL (absolute)
+/// path — so the same config launched from any cwd maps to the same session
+/// dir, and two different configs never share state. Per-bot subdirs (keyed by
+/// symbol) are created under this base by `per_bot_state_dir`.
+fn session_state_dir(config_path: &std::path::Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    // Canonicalize so cwd-relative and absolute spellings of the same file
+    // collapse to one session dir; fall back to the raw path if the file can't
+    // be canonicalized (shouldn't happen — it was just opened).
+    let full = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    full.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let mut base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| {
+            let mut p = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            p.push(".cache");
+            p
+        });
+    base.push("tikr");
+    base.push(format!("{hash:016x}"));
+    base
+}
+
 struct AccountPollerConfig {
     shared_state: SharedBotState,
     notional_tx: watch::Sender<Decimal>,
@@ -409,6 +444,9 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config_path = resolve_config_path(args.config.as_deref())?;
     let mut cfg = config::load(&config_path)?;
+    // Session/snapshot data lives under the XDG cache, in a dir auto-named from
+    // a hash of the config file's full path (no manual `state_dir`).
+    let base_state_dir = session_state_dir(&config_path);
     if let Some(pct) = args.order_balance_pct {
         cfg.account.order_balance_pct = pct;
     }
@@ -554,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),
-                base_state_dir: cfg.account.state_dir.clone(),
+                base_state_dir: base_state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
                 leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
@@ -575,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),
-                base_state_dir: cfg.account.state_dir.clone(),
+                base_state_dir: base_state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
                 leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
@@ -602,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),
-                base_state_dir: cfg.account.state_dir.clone(),
+                base_state_dir: base_state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
                 leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,
@@ -623,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
                 env,
                 api_key: api_key.clone(),
                 key_material: key_material.clone(),
-                base_state_dir: cfg.account.state_dir.clone(),
+                base_state_dir: base_state_dir.clone(),
                 order_balance_pct: cfg.account.order_balance_pct,
                 leverage: cfg.account.leverage,
                 max_position_pct: cfg.account.max_position_pct,

@@ -27,7 +27,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/temp"
 asset = "USDC"
 order_balance_pct = "0.5"
 max_position_pct = "100"

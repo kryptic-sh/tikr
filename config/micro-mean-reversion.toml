@@ -3,7 +3,6 @@
 # "futures-testnet" | "futures-mainnet"
 env = "futures-testnet"
 
-state_dir = "./state"
 
 
 [[bot]]

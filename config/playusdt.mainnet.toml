@@ -30,7 +30,6 @@
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-mainnet"
-state_dir = "./state/doge-mainnet"
 
 # Credentials — pick ONE:
 #

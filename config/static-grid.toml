@@ -1,7 +1,6 @@
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-testnet"
-state_dir = "./state"
 
 # StaticGrid rotation: keep 3 bots on the most volatile USDT futures
 # markets, using the static-grid strategy.

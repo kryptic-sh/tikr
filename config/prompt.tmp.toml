@@ -1,6 +1,5 @@
 [account]
 env = "futures-testnet"
-state_dir = "./state"
 
 [[bot]]
 symbol = "PROMPTUSDT"

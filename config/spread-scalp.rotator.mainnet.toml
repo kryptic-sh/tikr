@@ -32,7 +32,6 @@
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-mainnet"
-state_dir = "./state/spread-scalp-rotator"
 
 # Credentials via .env (recommended) or shell env vars:
 #   TIKR_BINANCE_FUTURES_API_KEY

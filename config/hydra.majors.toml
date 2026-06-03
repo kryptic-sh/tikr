@@ -42,7 +42,6 @@
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-mainnet"
-state_dir = "./state"
 asset = "USDC"
 
 # 5 bots × 0.5% margin per bot = 2.5% of margin balance deployed per leg.

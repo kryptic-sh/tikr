@@ -29,7 +29,6 @@
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-testnet"
-state_dir = "./state"
 
 # 1% of margin balance split across 5 bots = 0.2% per bot per order.
 # Per-bot `notional` below overrides this when set explicitly.

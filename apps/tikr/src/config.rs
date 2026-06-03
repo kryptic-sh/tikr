@@ -145,10 +145,6 @@ pub struct AccountConfig {
     /// Ed25519 PEM if `key_type = "ed25519"`).
     #[serde(default)]
     pub key_file: Option<PathBuf>,
-    /// State directory shared across bots — each bot writes its
-    /// snapshots under a subdir keyed by symbol.
-    #[serde(default = "default_state_dir")]
-    pub state_dir: PathBuf,
     /// Percent of wallet balance each bot allocates to orders. PER-BOT,
     /// NOT split across bots — `1` means every bot orders 1% of wallet
     /// (mirrors `max_position_pct`). Applied when a bot's strategy does
@@ -222,10 +218,6 @@ impl AccountConfig {
             None
         }
     }
-}
-
-fn default_state_dir() -> PathBuf {
-    PathBuf::from("./state")
 }
 
 fn default_bnb_min_balance_usdt() -> Decimal {
@@ -1336,7 +1328,6 @@ mod tests {
         let s = r#"
             [account]
             env = "futures-testnet"
-            state_dir = "./state"
 
             [[bot]]
             symbol = "BTCUSDT"

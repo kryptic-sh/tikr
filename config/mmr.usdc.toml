@@ -59,7 +59,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/mmr-usdc-majors"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "80"

@@ -47,7 +47,6 @@
 # ─── Account ───────────────────────────────────────────────────────────────
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tick-floor"
 
 # Credentials: .env auto-loaded by dotenvy, OR shell env vars
 # TIKR_BINANCE_FUTURES_API_KEY / _API_SECRET.

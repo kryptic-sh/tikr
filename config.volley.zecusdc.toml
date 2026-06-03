@@ -12,7 +12,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/volley-zecusdc"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "0"               # volley has no internal cap — this is the only inventory backstop

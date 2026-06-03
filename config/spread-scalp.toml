@@ -3,7 +3,6 @@
 # "futures-testnet" | "futures-mainnet"
 env = "futures-testnet"
 
-state_dir = "./state"
 
 
 # Rotating scalp mode: keep 4 live SpreadScalp bots assigned to the most

@@ -14,7 +14,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/joker-btcusdc"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"            # joker has no internal cap — this is the only inventory backstop

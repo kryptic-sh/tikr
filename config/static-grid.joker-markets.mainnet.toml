@@ -15,7 +15,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/sg-joker-markets"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"

@@ -13,7 +13,6 @@
 
 [account]
 env = "futures-mainnet"   # ignored when no Binance bots configured
-state_dir = "./state/bagboy"
 asset = "USDT"
 
 [bagboy]

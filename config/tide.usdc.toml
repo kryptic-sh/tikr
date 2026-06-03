@@ -31,7 +31,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tide-usdc"
 asset = "USDC"
 order_balance_pct = "0.5"
 max_position_pct = "70"

@@ -1,6 +1,5 @@
 [account]
 env = "futures-mainnet"
-state_dir = "./state/sg-mainnet"
 order_balance_pct = "1"
 
 

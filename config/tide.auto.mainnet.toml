@@ -17,7 +17,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/tide-auto"
 order_balance_pct = "1"
 max_position_pct = "100"
 leverage = 5

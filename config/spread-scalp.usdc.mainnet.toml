@@ -17,7 +17,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/spread-scalp-usdc-v2"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "100"

@@ -16,7 +16,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/wave-auto-candle"
 asset = "USDT"
 order_balance_pct = "0.1"
 max_position_pct = "0"

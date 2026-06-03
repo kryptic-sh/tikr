@@ -26,7 +26,6 @@
 
 [account]
 env = "futures-mainnet"
-state_dir = "./state/rsi-mr-ethusdc"
 asset = "USDC"
 order_balance_pct = "5"
 max_position_pct = "50"
