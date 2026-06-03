@@ -1678,15 +1678,24 @@ fn draw_chart(
     draw_order_line(buf, best_buy.0, best_buy.1, Color::Cyan, "BUY");
     draw_order_line(buf, best_sell.0, best_sell.1, Color::Yellow, "SELL");
 
-    // Average entry / break-even line — shows when the position is near break
-    // even. It does NOT feed the Y-bounds: `row_of` clamps a price beyond the
-    // rendered range to the top/bottom edge, so an out-of-view break-even pins
-    // to the nearest edge instead of squashing the candles.
-    let avg = active
-        .and_then(|v| v.live.as_ref())
-        .map(|lv| lv.avg_entry)
-        .unwrap_or_default();
-    if avg > Decimal::ZERO {
+    // Break-even line. Prefer the VENUE's reported break-even (matches the bot
+    // pane's "api be") — the local tracker can desync badly from the exchange
+    // (e.g. local thinks +long while the venue holds a -short), so its avg entry
+    // is not a trustworthy break-even. Fall back to the local avg entry only
+    // when there is no live API position. Skipped when flat. Does NOT feed the
+    // Y-bounds: `row_of` clamps an out-of-range price to the top/bottom edge.
+    let be_price = active.and_then(|v| {
+        if let Some(api) = v.api_position.as_ref()
+            && !api.position_amount.is_zero()
+            && api.break_even_price > Decimal::ZERO
+        {
+            return Some(api.break_even_price);
+        }
+        v.live.as_ref().and_then(|lv| {
+            (!lv.position_size.is_zero() && lv.avg_entry > Decimal::ZERO).then_some(lv.avg_entry)
+        })
+    });
+    if let Some(avg) = be_price {
         let ry = plot_y0 + row_of(dec_to_f64(avg));
         for cx in plot_x0..plot_right {
             let cell = &mut buf[(cx, ry)];
