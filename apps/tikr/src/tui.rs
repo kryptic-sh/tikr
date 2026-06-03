@@ -890,9 +890,10 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
 }
 
 fn tab_width(v: &BotViewSnapshot) -> u16 {
-    format!(" {} ({}) [{}] │", v.symbol, v.strategy, v.status.tag())
-        .chars()
-        .count() as u16
+    // Must match draw_tabs' rendered label `" {icon} {symbol} ({strategy}) "`
+    // (the status icon is always 1 column) plus the "│" tab separator, else tab
+    // scroll/fit math drifts from what's drawn.
+    (format!(" ● {} ({}) ", v.symbol, v.strategy).chars().count() + 1) as u16
 }
 
 fn tabs_fit_active(
