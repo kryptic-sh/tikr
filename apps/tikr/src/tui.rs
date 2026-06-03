@@ -1303,11 +1303,12 @@ fn draw_account(
             (v.symbol.as_str(), net, real, &v.status)
         })
         .collect();
-    // Running bots first (like the tab bar), then by NET desc within each group
-    // so off / rotated / crashed bots sink to the bottom.
+    // Running bots first (like the tab bar), then by REALIZED desc within each
+    // group. Sorting on realized (not NET) keeps the order stable — it only
+    // moves on a fill, not on every mark tick — so rows don't jump around.
     rows.sort_by(|a, b| {
         let off = |s: &BotStatus| !matches!(s, BotStatus::Running);
-        off(a.3).cmp(&off(b.3)).then(b.1.cmp(&a.1))
+        off(a.3).cmp(&off(b.3)).then(b.2.cmp(&a.2))
     });
     // Record (line_idx, symbol) so click handler can map row → symbol.
     let mut per_symbol_lines: Vec<(usize, String)> = Vec::new();
