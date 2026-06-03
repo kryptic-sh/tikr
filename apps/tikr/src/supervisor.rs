@@ -93,6 +93,29 @@ pub fn spawn_supervisor(
                     return;
                 }
 
+                // Account-wide rate-limit gate: if ANY component (another bot's
+                // spawn, discovery, BNB refill, account poll) hit a venue
+                // RateLimited, hold off here too — Binance limits are
+                // per-account, so spawning into an active ban just extends it.
+                let gate_ms = shared_state.rate_limit_remaining_ms();
+                if gate_ms > 0 {
+                    warn!(
+                        wait_ms = gate_ms,
+                        "account rate-limited — holding spawn until the gate clears"
+                    );
+                    shared_state.set_status(
+                        &symbol_str,
+                        BotStatus::Restarting(format!("rate-limited {}s", gate_ms / 1000)),
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(gate_ms)) => {}
+                        _ = global_shutdown.changed() => {
+                            if *global_shutdown.borrow() { return; }
+                        }
+                    }
+                    continue;
+                }
+
                 shared_state.set_status(&symbol_str, BotStatus::Starting);
 
                 // Honored rate-limit respawn floor (ms): set when a spawn fails
@@ -163,6 +186,11 @@ pub fn spawn_supervisor(
                                 _ => None,
                             }
                         });
+                        // Publish to the account-wide gate so every OTHER bot's
+                        // supervisor (and the pollers) also waits this out.
+                        if let Some(ms) = rate_limit_delay_ms {
+                            shared_state.note_rate_limit(ms);
+                        }
                         shared_state.set_status(&symbol_str, BotStatus::Crashed(format!("spawn: {e}")));
                     }
                 }

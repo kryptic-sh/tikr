@@ -163,6 +163,18 @@ pub fn spawn_rampage_manager(
                 }
             }
 
+            // Account-wide rate-limit gate: skip discovery (no REST) while any
+            // component is waiting out a venue ban — hammering an active limit
+            // with the full-universe scan just extends it.
+            let gate_ms = shared_state.rate_limit_remaining_ms();
+            if gate_ms > 0 {
+                warn!(
+                    wait_ms = gate_ms,
+                    "rampage: account rate-limited — skipping discovery tick"
+                );
+                continue;
+            }
+
             // 1. Universe: every TRADING perp + its price (for the underwater
             // mark check) and 24h volume (liquidity pre-filter).
             let discovered = match tikr_binance::futs::list_perp_tick_info(
@@ -174,6 +186,9 @@ pub fn spawn_rampage_manager(
             {
                 Ok(rows) => rows,
                 Err(e) => {
+                    if let tikr_venue::VenueError::RateLimited { retry_after_ms } = &e {
+                        shared_state.note_rate_limit(*retry_after_ms);
+                    }
                     warn!(error = ?e, "rampage: discovery failed, retrying next cycle");
                     continue;
                 }

@@ -441,6 +441,15 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     }
                 }
             }
+            // Also honor the account-wide gate (another component may have hit a
+            // limit since our last cycle) before issuing any REST this cycle.
+            let gate_ms = cfg.shared_state.rate_limit_remaining_ms();
+            if gate_ms > 0 {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(gate_ms)) => {}
+                    _ = shutdown.changed() => if *shutdown.borrow() { return; }
+                }
+            }
             // Set when any call this cycle is rate limited → skip the rest and
             // back off for this long at the top of the next iteration.
             let mut limited: Option<std::time::Duration> = None;
@@ -610,7 +619,10 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
 
             // Rate limited this cycle → arm the cooldown and skip the normal
             // inter-cycle wait; the top of the loop backs off for `retry_after`.
+            // Also publish to the account-wide gate so every OTHER component
+            // (bot spawns, rampage discovery, BNB refill) waits it out too.
             if let Some(d) = limited {
+                cfg.shared_state.note_rate_limit(d.as_millis() as u64);
                 cooldown = Some(std::time::Instant::now() + d);
                 continue;
             }

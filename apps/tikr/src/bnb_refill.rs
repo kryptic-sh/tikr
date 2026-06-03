@@ -55,11 +55,13 @@ async fn live_bnb_value(
     base_url: &str,
     api_key: &str,
     key_material: &BinanceKeyMaterial,
+    shared: &SharedBotState,
 ) -> Option<(Decimal, Decimal)> {
     let balance =
         match tikr_binance::futs::get_balance(http, base_url, api_key, key_material, "BNB").await {
             Ok(b) => b.wallet_balance,
             Err(e) => {
+                note_if_rate_limited(&e, shared);
                 warn!(error = ?e, "bnb_refill: live BNB balance fetch failed — skipping tick");
                 return None;
             }
@@ -67,11 +69,20 @@ async fn live_bnb_value(
     let price = match tikr_binance::futs::get_book_ticker(http, base_url, "BNBUSDT").await {
         Ok(t) => (t.bid_price + t.ask_price) / Decimal::from(2),
         Err(e) => {
+            note_if_rate_limited(&e, shared);
             warn!(error = ?e, "bnb_refill: live BNBUSDT price fetch failed — skipping tick");
             return None;
         }
     };
     (price > Decimal::ZERO).then_some((balance, price))
+}
+
+/// Push a venue `RateLimited` onto the account-wide gate so every component
+/// holds off (per-account limit). No-op for other errors.
+fn note_if_rate_limited(e: &tikr_venue::VenueError, shared: &SharedBotState) {
+    if let tikr_venue::VenueError::RateLimited { retry_after_ms } = e {
+        shared.note_rate_limit(*retry_after_ms);
+    }
 }
 
 /// Spawn the BNB auto-refill task. Cheap — one timer + RwLock read per tick,
@@ -97,13 +108,22 @@ pub fn spawn_bnb_monitor(cfg: BnbMonitorConfig) {
             // shared snapshot, which can lag the poller and read stale-low (or
             // 0 before the BNB asset is first populated), which would otherwise
             // trigger an unnecessary convert on bad data.
-            if cfg.shared_state.bnb_snapshot().enabled {
+            // Account-wide rate-limit gate: skip the whole tick (no REST) while
+            // any component is waiting out a venue ban.
+            let gated = cfg.shared_state.rate_limit_remaining_ms() > 0;
+            if !gated && cfg.shared_state.bnb_snapshot().enabled {
                 let cooling = last_convert
                     .map(|t| t.elapsed() < CONVERT_COOLDOWN)
                     .unwrap_or(false);
                 if !cooling
-                    && let Some((balance, price)) =
-                        live_bnb_value(&http, base_url, &cfg.api_key, &cfg.key_material).await
+                    && let Some((balance, price)) = live_bnb_value(
+                        &http,
+                        base_url,
+                        &cfg.api_key,
+                        &cfg.key_material,
+                        &cfg.shared_state,
+                    )
+                    .await
                 {
                     let usdt_value = balance * price;
                     if usdt_value < cfg.min_balance_usdt {
@@ -155,6 +175,7 @@ pub fn spawn_bnb_monitor(cfg: BnbMonitorConfig) {
                                     // error (e.g. below-min convert amount)
                                     // doesn't retry every minute.
                                     last_convert = Some(Instant::now());
+                                    note_if_rate_limited(&e, &cfg.shared_state);
                                     warn!(error = ?e, "bnb_refill: convert USDT→BNB failed");
                                 }
                             }

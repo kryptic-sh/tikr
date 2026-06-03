@@ -103,7 +103,11 @@ pub async fn build_venue(
     };
     BinanceClient::with_credentials(env, api_key.to_string(), owned, Some(symbol), leverage)
         .await
-        .map_err(|e| anyhow::anyhow!("BinanceClient::with_credentials: {e}"))
+        // Preserve the typed VenueError in the chain (do NOT `anyhow!("{e}")` it
+        // into a string) so the supervisor can downcast to find a
+        // `RateLimited { retry_after_ms }` and wait out the ban instead of
+        // respawning every 60s into an active rate limit.
+        .map_err(|e| anyhow::Error::new(e).context("BinanceClient::with_credentials"))
 }
 
 /// Subscribe to userDataStream for `symbol`, returning the fill receiver.

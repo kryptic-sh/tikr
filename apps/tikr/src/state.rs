@@ -234,6 +234,21 @@ pub struct SharedBotState {
     /// Per-symbol price decimal places (from the venue's tick size), so the TUI
     /// renders prices at the coin's precision — matching what Binance shows.
     price_decimals: Arc<RwLock<HashMap<String, u32>>>,
+    /// Account-wide rate-limit gate: epoch-ms until which NO component should
+    /// issue REST requests. Binance limits are per-account/IP, so when ANY
+    /// requester (bot spawn, rampage discovery, BNB refill, account poll) gets a
+    /// `RateLimited { retry_after_ms }`, it pushes this forward and every other
+    /// component holds off until it clears — instead of each independently
+    /// retrying and keeping the ban alive. `0` = clear.
+    rate_limited_until_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Current unix time in milliseconds.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Default for SharedBotState {
@@ -258,7 +273,29 @@ impl SharedBotState {
             uptime_offset_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_dir: Arc::new(RwLock::new(None)),
             price_decimals: Arc::new(RwLock::new(HashMap::new())),
+            rate_limited_until_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Push the account-wide rate-limit gate forward by `retry_after_ms` from
+    /// now (monotonic — never shortens an existing, longer ban). Called by any
+    /// component that gets a venue `RateLimited`. Capped at 10min so a bogus
+    /// huge `retry_after` can't wedge the whole account indefinitely.
+    pub fn note_rate_limit(&self, retry_after_ms: u64) {
+        use std::sync::atomic::Ordering;
+        let until = now_ms().saturating_add(retry_after_ms.clamp(1_000, 600_000));
+        self.rate_limited_until_ms
+            .fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// Milliseconds remaining on the account-wide rate-limit gate (`0` = clear,
+    /// safe to issue requests). Every periodic REST caller checks this and holds
+    /// off while it's non-zero.
+    pub fn rate_limit_remaining_ms(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.rate_limited_until_ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(now_ms())
     }
 
     /// Record `symbol`'s price decimal places (derived from the venue tick
