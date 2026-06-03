@@ -121,9 +121,11 @@ pub struct AccountConfig {
     /// to bring the USDT-value up to this level. Default `$10`.
     #[serde(default = "default_bnb_target_balance_usdt")]
     pub bnb_target_balance_usdt: Decimal,
-    /// Master switch for BNB auto-refill. Defaults `true`. Has no
-    /// effect unless BNB-pays-fees is also enabled on the Binance
-    /// account (auto-detected via `GET /fapi/v1/feeBurn`).
+    /// Master switch for BNB auto-refill. Defaults `false` — enable on
+    /// exactly ONE process per account (uncoordinated monitors on a shared
+    /// account would convert concurrently). Has no effect unless BNB-pays-fees
+    /// is also enabled on the Binance account (auto-detected via
+    /// `GET /fapi/v1/feeBurn`).
     #[serde(default = "default_bnb_refill_enabled")]
     pub bnb_refill_enabled: bool,
     /// Per-symbol Binance Futures leverage. Sent via
@@ -178,7 +180,7 @@ fn default_bnb_target_balance_usdt() -> Decimal {
     Decimal::from(10)
 }
 fn default_bnb_refill_enabled() -> bool {
-    true
+    false
 }
 
 fn default_order_balance_pct() -> Decimal {

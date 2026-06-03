@@ -37,6 +37,9 @@ take_profit_pct = "2"   # unrealized > 2% of wallet → rest a reduce-only maker
 leverage = 10
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
+bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
+# bnb_min_balance_usdt = "1"     # refill trigger (default $1)
+# bnb_target_balance_usdt = "10" # top-up target (default $10)
 
 [rampage]
 enabled = true
