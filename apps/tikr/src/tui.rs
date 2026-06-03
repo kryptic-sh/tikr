@@ -1373,22 +1373,23 @@ fn draw_account(
     }
 
     let total = lines.len() as u16;
-    // Visible rows = area.height − 2 borders − 2 padding (top+bot).
-    let visible = area.height.saturating_sub(4);
+    // Visible rows = area.height − top pad (1) − bottom pad (1). No top/bottom
+    // border (the only border is the LEFT divider).
+    let visible = area.height.saturating_sub(2);
     ui.last_account_total = total;
     ui.last_account_visible = visible;
     ui.last_account_rect = Some(area);
     let scroll = UiState::clamp_scroll(ui.account_scroll, total, visible);
     ui.account_scroll = scroll;
     // Convert line_idx → absolute screen row for click hit-test.
-    // Paragraph: area.y + 1 (top border) + 1 (top pad) + line_idx - scroll.
-    let body_top = area.y.saturating_add(2);
+    // First content row = area.y + top pad (1).
+    let body_top = area.y.saturating_add(1);
     ui.per_symbol_rows = per_symbol_lines
         .into_iter()
         .filter_map(|(line_idx, sym)| {
             let row = body_top.checked_add(line_idx as u16)?.checked_sub(scroll)?;
             // Only include rows inside the visible body region.
-            let body_bot = area.y.saturating_add(area.height).saturating_sub(2);
+            let body_bot = area.y.saturating_add(area.height).saturating_sub(1);
             if row >= body_top && row < body_bot {
                 Some((row, sym))
             } else {
@@ -1399,12 +1400,14 @@ fn draw_account(
     let p = Paragraph::new(lines)
         .block(
             // Borderless except the LEFT edge — the divider to the middle pane.
-            // Padding keeps content geometry identical to the old full border.
+            // 2-space padding on every side (the divider side too) so content
+            // keeps a 2-space gap from both the outer edge and the divider; just
+            // 1 row above for the title.
             Block::default().borders(Borders::LEFT).padding(Padding {
-                left: 1,
-                top: 2,
+                left: 2,
+                top: 1,
                 right: 2,
-                bottom: 2,
+                bottom: 1,
             }),
         )
         .scroll((scroll, 0));
@@ -1938,12 +1941,14 @@ fn draw_bot_detail(
 ) {
     ui.last_bot_rect = Some(area);
     // Borderless except the RIGHT edge — the divider to the middle pane.
+    // 2-space padding on every side (the divider side too) so content keeps a
+    // 2-space gap from both the outer edge and the divider; 1 row above title.
     let bot_block = || {
         Block::default().borders(Borders::RIGHT).padding(Padding {
             left: 2,
-            top: 2,
-            right: 1,
-            bottom: 2,
+            top: 1,
+            right: 2,
+            bottom: 1,
         })
     };
     let Some(v) = active else {
@@ -2259,7 +2264,8 @@ fn draw_bot_detail(
     }
 
     let total = lines.len() as u16;
-    let visible = area.height.saturating_sub(4);
+    // top pad (1) + bottom pad (1); no top/bottom border.
+    let visible = area.height.saturating_sub(2);
     ui.last_bot_total = total;
     ui.last_bot_visible = visible;
     let scroll = UiState::clamp_scroll(ui.bot_scroll, total, visible);
@@ -2318,10 +2324,10 @@ fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {
     d.to_f64().unwrap_or(0.0)
 }
 
-/// Side panel content width = panel width (34) − 2 borders − 2 padding
-/// (1 char each side). Vertical layout uses the matching `area.height
-/// − 4` for the visible row count.
-const SIDE_PANEL_INNER: usize = 30;
+/// Side panel content width = panel width (34) − 1 divider border − 2 padding
+/// each side (the divider side adds 2 padding too, so content keeps a 2-space
+/// gap from BOTH the outer edge and the divider line). 34 − 1 − 2 − 2 = 29.
+const SIDE_PANEL_INNER: usize = 29;
 
 /// Build a label/value row that left-aligns the label and
 /// right-aligns the value to fill `SIDE_PANEL_INNER`. Inserts a
