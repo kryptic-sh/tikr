@@ -88,9 +88,6 @@ struct UiState {
     /// follows its bot as the tab list changes (bots rotate in/out). When the
     /// selected symbol is removed, the selection falls back to the first tab.
     active_symbol: Option<String>,
-    /// When the dashboard (≈ the session) started — drives the account-pane
-    /// uptime + $/hour figures.
-    session_start: Instant,
     tab_scroll: usize,
     /// Log viewport mode + anchor.
     log_view: LogView,
@@ -147,7 +144,6 @@ impl UiState {
         Self {
             active_tab: 0,
             active_symbol: None,
-            session_start: Instant::now(),
             tab_scroll: 0,
             log_view: LogView::Follow,
             last_tab_rect: None,
@@ -305,6 +301,7 @@ pub fn run(
                 let start_balance = state.start_balance();
                 let bnb = state.bnb_snapshot();
                 let bnb_start_value = state.bnb_start_value_usdt();
+                let uptime_secs = state.uptime_secs();
                 terminal.draw(|f| {
                     draw(
                         f,
@@ -317,6 +314,7 @@ pub fn run(
                         &log_lines,
                         &mut ui,
                         &config_path,
+                        uptime_secs,
                     )
                 })?;
                 // Mouse drag-up may have set pending_copy. Read text
@@ -688,6 +686,7 @@ fn draw(
     log_lines: &[LogLine],
     ui: &mut UiState,
     config_path: &std::path::Path,
+    uptime_secs: u64,
 ) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -711,6 +710,7 @@ fn draw(
         bnb_start_value_usdt,
         log_lines,
         ui,
+        uptime_secs,
     );
     draw_footer(f, outer[2], &ui.mode, config_path);
 
@@ -919,6 +919,7 @@ fn draw_body(
     bnb_start_value_usdt: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
+    uptime_secs: u64,
 ) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -957,6 +958,7 @@ fn draw_body(
         bnb,
         bnb_start_value_usdt,
         ui,
+        uptime_secs,
     );
 }
 
@@ -971,6 +973,7 @@ fn draw_account(
     bnb: Option<&crate::state::BnbState>,
     bnb_start_value_usdt: Option<Decimal>,
     ui: &mut UiState,
+    uptime_secs: u64,
 ) {
     let mut lines: Vec<Line> = Vec::new();
     lines.push(kv_line(
@@ -1059,8 +1062,10 @@ fn draw_account(
             pnl_style(agg.retired_net),
         ));
     }
-    // Session uptime + banked rate ($/hour off real NET).
-    let session_secs = ui.session_start.elapsed().as_secs();
+    // Account uptime + banked rate ($/hour off real NET). `uptime_secs` is the
+    // CUMULATIVE account uptime (this process + persisted prior sessions), so
+    // $/hour stays correct across restarts instead of spiking on a fresh timer.
+    let session_secs = uptime_secs;
     let (uh, um, us) = (
         session_secs / 3600,
         (session_secs % 3600) / 60,

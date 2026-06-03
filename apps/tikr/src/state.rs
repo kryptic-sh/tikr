@@ -191,6 +191,12 @@ pub struct SharedBotState {
     /// GC'd), so the account summary keeps counting their realized P&L (which
     /// the exchange wallet retains).
     retired: Arc<Mutex<RetiredTotals>>,
+    /// Wall-clock instant this process started (for account uptime).
+    process_started: std::time::Instant,
+    /// Accumulated account uptime from PRIOR sessions, in seconds. Total uptime
+    /// = this + `process_started.elapsed()`. Restored from the session manifest
+    /// so the `$/hour` rate divides NET by cumulative uptime across restarts.
+    uptime_offset_secs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for SharedBotState {
@@ -211,12 +217,23 @@ impl SharedBotState {
             bnb: Arc::new(RwLock::new(BnbState::default())),
             bnb_start_value_usdt: Arc::new(RwLock::new(None)),
             retired: Arc::new(Mutex::new(RetiredTotals::default())),
+            process_started: std::time::Instant::now(),
+            uptime_offset_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Running totals of departed (removed) bots, for the account summary.
     pub fn retired_totals(&self) -> RetiredTotals {
         self.retired.lock().ok().map(|t| *t).unwrap_or_default()
+    }
+
+    /// Total account uptime in seconds = prior-sessions offset + this process's
+    /// elapsed time. Drives the TUI uptime line + the `$/hour` rate so both span
+    /// cumulative runtime across restarts.
+    pub fn uptime_secs(&self) -> u64 {
+        self.uptime_offset_secs
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(self.process_started.elapsed().as_secs())
     }
 
     /// Snapshot the current manager-level state for persistence: balance
@@ -236,6 +253,7 @@ impl SharedBotState {
             start_balance: self.start_balance(),
             bnb_start_value_usdt: self.bnb_start_value_usdt(),
             retired: self.retired_totals(),
+            uptime_secs: self.uptime_secs(),
             roster,
         }
     }
@@ -260,6 +278,10 @@ impl SharedBotState {
         if let Ok(mut g) = self.retired.lock() {
             *g = s.retired;
         }
+        // Resume the uptime timer from the persisted cumulative total (this
+        // process's elapsed is added on top by `uptime_secs`).
+        self.uptime_offset_secs
+            .store(s.uptime_secs, std::sync::atomic::Ordering::Relaxed);
         s.roster.into_iter().map(|b| b.symbol).collect()
     }
 
@@ -554,6 +576,11 @@ pub struct SessionState {
     pub bnb_start_value_usdt: Option<Decimal>,
     /// Running totals of bots rotated out + GC'd (account summary keeps these).
     pub retired: RetiredTotals,
+    /// Accumulated ACCOUNT uptime in seconds across all sessions. On restart the
+    /// uptime timer resumes from this offset so the `$/hour` rate stays correct
+    /// (it divides cumulative NET by cumulative uptime, not just this session's).
+    #[serde(default)]
+    pub uptime_secs: u64,
     /// Bots that were running at save time (symbol + strategy + status).
     pub roster: Vec<SessionBot>,
 }
