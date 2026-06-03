@@ -1296,7 +1296,12 @@ fn draw_account(
             (v.symbol.as_str(), net, real, &v.status)
         })
         .collect();
-    rows.sort_by_key(|(_, net, _, _)| std::cmp::Reverse(*net));
+    // Running bots first (like the tab bar), then by NET desc within each group
+    // so off / rotated / crashed bots sink to the bottom.
+    rows.sort_by(|a, b| {
+        let off = |s: &BotStatus| !matches!(s, BotStatus::Running);
+        off(a.3).cmp(&off(b.3)).then(b.1.cmp(&a.1))
+    });
     // Record (line_idx, symbol) so click handler can map row → symbol.
     let mut per_symbol_lines: Vec<(usize, String)> = Vec::new();
     for (symbol, net, real, status) in rows {
