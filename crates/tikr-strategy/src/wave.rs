@@ -140,6 +140,10 @@ pub struct Wave {
     /// Auto-sized inner dead-zone in steps. Starts at 0, recomputed on each
     /// candle close. Ignored when `config.auto_inner == false`.
     dyn_inner_steps: u32,
+    /// Set when `dyn_inner_steps` changed on a candle close; consumed by
+    /// `on_event` to force a refill so the resting lattice re-places at the new
+    /// inner offset immediately (not on the next round-trip/side-empty).
+    inner_dirty: bool,
 }
 
 impl Wave {
@@ -240,20 +244,25 @@ impl Wave {
     /// divide by — inner stays 0).
     fn recompute_dyn_inner(&mut self) {
         let sbps = self.config.steps_bps;
-        if sbps == 0 || self.candle_bps.is_empty() {
-            self.dyn_inner_steps = 0;
-            return;
+        let steps = if sbps == 0 || self.candle_bps.is_empty() {
+            0
+        } else {
+            let sum: Decimal = self.candle_bps.iter().copied().sum();
+            let avg = sum / Decimal::from(self.candle_bps.len() as u64);
+            let target_bps = avg * auto_inner_fraction();
+            (target_bps / Decimal::from(sbps))
+                .round()
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(0)
+                .clamp(0, MAX_AUTO_INNER as i64) as u32
+        };
+        if steps != self.dyn_inner_steps {
+            self.dyn_inner_steps = steps;
+            // Force a refill this event so the lattice re-places at the new
+            // inner offset immediately.
+            self.inner_dirty = true;
         }
-        let sum: Decimal = self.candle_bps.iter().copied().sum();
-        let avg = sum / Decimal::from(self.candle_bps.len() as u64);
-        let target_bps = avg * auto_inner_fraction();
-        let steps = (target_bps / Decimal::from(sbps))
-            .round()
-            .to_string()
-            .parse::<i64>()
-            .unwrap_or(0)
-            .clamp(0, MAX_AUTO_INNER as i64) as u32;
-        self.dyn_inner_steps = steps;
     }
 
     /// Compute `(top_bid_override, top_ask_override)`, pushing the origins
@@ -577,6 +586,7 @@ impl Strategy for Wave {
             cur_candle_low: Decimal::ZERO,
             candle_bps: std::collections::VecDeque::with_capacity(CANDLE_WINDOW),
             dyn_inner_steps: 0,
+            inner_dirty: false,
         }
     }
 
@@ -643,6 +653,10 @@ impl Strategy for Wave {
         // (the fresh grid reads fully drained).
         let relatticed = self.maybe_relattice(ctx, top_b, top_a, &mut actions);
 
+        // Auto-inner just changed → re-place the lattice at the new offset this
+        // event (consume the flag regardless of whether a band is computable).
+        let inner_dirty = std::mem::take(&mut self.inner_dirty);
+
         // 2) Round-trip refill on the FIXED lattice.
         //
         // Refill fires when BOTH sides of the band have drained by
@@ -706,7 +720,9 @@ impl Strategy for Wave {
             if relatticed {
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
-            } else if round_trip || side_empty {
+            } else if inner_dirty || round_trip || side_empty {
+                // `inner_dirty`: auto-inner changed → the window shifted, so
+                // re-emit at the new offset and prune the tail that fell outside.
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
                 self.prune_outside_band(ctx, Side::Bid, bb, &mut actions);
@@ -792,9 +808,19 @@ mod tests {
         p: &'a Position,
         open: &'a [(QuoteId, QuoteIntent)],
     ) -> StrategyContext<'a> {
+        ctx_at(symbol, s, p, open, 1)
+    }
+
+    fn ctx_at<'a>(
+        symbol: &'a Symbol,
+        s: &'a Snapshot,
+        p: &'a Position,
+        open: &'a [(QuoteId, QuoteIntent)],
+        now_ns: u64,
+    ) -> StrategyContext<'a> {
         StrategyContext {
             symbol,
-            now: Timestamp(1),
+            now: Timestamp(now_ns),
             position: p,
             recent_fills: &[],
             latest_book: s,
@@ -1352,5 +1378,55 @@ mod tests {
         // ~2000bps gap at mid 100 → half=1000bps / 1bps = 1000 steps, capped.
         feed_candles(&mut w, Decimal::from(110), Decimal::from(90), 70);
         assert_eq!(w.dyn_inner_steps, MAX_AUTO_INNER);
+    }
+
+    #[test]
+    fn auto_inner_change_forces_refill() {
+        // When the auto-sized inner changes, the lattice must re-place at the new
+        // offset that same event (cancel the old band + emit the new), not wait
+        // for a round-trip / side-empty.
+        let mut c = cfg();
+        c.auto_inner = true;
+        c.steps_bps = 10;
+        c.levels = 6;
+        let sm = sym();
+        let p = pos_flat();
+        let mut w = Wave::new(c);
+
+        // Seed at mid ~100.05 with inner still 0 (no candle has closed yet).
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let seeded = w.on_event(
+            &ctx_at(&sm, &s, &p, &[], 1),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let open = quotes_as_open(&seeded);
+        assert!(!open.is_empty(), "seed should place a band");
+        assert_eq!(w.effective_inner(), 0);
+
+        // Roll 60bps candles → inner jumps to 3 and marks dirty.
+        feed_candles(&mut w, Decimal::new(1003, 1), Decimal::new(997, 1), 5);
+        assert_eq!(w.dyn_inner_steps, 3);
+        assert!(w.inner_dirty, "inner change must mark the lattice dirty");
+
+        // Same book, same second as the last candle (no new close) → the refill
+        // is driven purely by the inner change, not a slide or round-trip.
+        let now = 4 * CANDLE_NANOS + 5;
+        let acted = w.on_event(
+            &ctx_at(&sm, &s, &p, &open, now),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        assert!(!w.inner_dirty, "inner_dirty must be consumed");
+        assert!(
+            acted.iter().any(|a| matches!(a, Action::Cancel(_))),
+            "must prune the old inner=0 band: {acted:?}"
+        );
+        assert!(
+            acted.iter().any(|a| matches!(a, Action::Quote(_))),
+            "must re-emit at the new inner=3 offset: {acted:?}"
+        );
     }
 }

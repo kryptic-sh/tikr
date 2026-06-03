@@ -839,7 +839,7 @@ struct Args {
     /// mean high→low gap of the last 60 1s candles ÷ steps_bps). `true`
     /// (default, matches live) ignores `--wave-inner-steps-list` and starts the
     /// inner at 0. Pass `--wave-auto-inner false` to A/B the fixed-inner sweep.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     wave_auto_inner: bool,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
