@@ -73,8 +73,6 @@ impl BotStatus {
 
 /// Per-bot live view used by the TUI.
 pub struct BotView {
-    /// Display label (e.g. `"BTCUSDT/static-grid"`).
-    pub label: String,
     /// Symbol string (e.g. `"BTCUSDT"`).
     pub symbol: String,
     /// Strategy tag.
@@ -89,14 +87,6 @@ pub struct BotView {
     pub shutdown_tx: Option<watch::Sender<bool>>,
     /// Last Binance REST positionRisk snapshot for this symbol.
     pub api_position: Arc<RwLock<Option<ApiPositionSnapshot>>>,
-}
-
-impl BotView {
-    /// Read the current snapshot, if any.
-    #[allow(dead_code)]
-    pub fn snapshot(&self) -> Option<PaperReport> {
-        self.snapshot.read().ok().and_then(|g| g.clone())
-    }
 }
 
 /// Account-wide BNB-fee mode snapshot. When `enabled = true`, every
@@ -114,9 +104,6 @@ pub struct BnbState {
     pub balance: Decimal,
     /// Most recent BNBUSDT mid (USDT per BNB).
     pub price_usdt: Decimal,
-    /// Local unix timestamp in ms when these values were fetched.
-    #[allow(dead_code)]
-    pub fetched_at_ms: u64,
 }
 
 /// Per-symbol rolling price + fill-marker history for the TUI chart.
@@ -441,7 +428,6 @@ impl SharedBotState {
                 let history = hist.as_ref().and_then(|h| h.get(&sym).cloned());
                 Some(BotViewSnapshot {
                     symbol: v.symbol.clone(),
-                    label: v.label.clone(),
                     strategy: v.strategy.clone(),
                     status: v.status.clone(),
                     snapshot: v.snapshot.read().ok().and_then(|g| g.clone()),
@@ -497,12 +483,6 @@ impl SharedBotState {
                 .push_fill(ts_ms, price, is_buy);
         }
     }
-
-    /// Clone the current price history for `symbol` for read-only render.
-    #[allow(dead_code)]
-    pub fn price_history(&self, symbol: &str) -> Option<PriceHistory> {
-        self.history.read().ok()?.get(symbol).cloned()
-    }
 }
 
 /// Cloneable point-in-time view for the renderer.
@@ -510,9 +490,6 @@ impl SharedBotState {
 pub struct BotViewSnapshot {
     /// Symbol.
     pub symbol: String,
-    /// Display label.
-    #[allow(dead_code)]
-    pub label: String,
     /// Strategy tag.
     pub strategy: String,
     /// Current lifecycle status.

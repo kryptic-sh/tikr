@@ -585,7 +585,7 @@ fn spawn_one_bot(
     template: Option<&BotConfig>,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (bot_cfg, strategy_name, label): (BotConfig, String, String) = match &cfg.strategy {
+    let (bot_cfg, strategy_name): (BotConfig, String) = match &cfg.strategy {
         RampageStrategy::Wave {
             levels,
             steps_bps,
@@ -616,7 +616,7 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
             };
-            (bc, "wave".to_string(), format!("{symbol}/wave"))
+            (bc, "wave".to_string())
         }
         RampageStrategy::Tide {
             grid_levels,
@@ -655,7 +655,7 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
             };
-            (bc, "tide".to_string(), format!("{symbol}/tide"))
+            (bc, "tide".to_string())
         }
         RampageStrategy::Template { name } => {
             // Clone the resolved `[[bot]]` template, swap in this symbol. The
@@ -664,13 +664,12 @@ fn spawn_one_bot(
                 .expect("Template strategy resolved at manager start")
                 .clone();
             bc.symbol = symbol.to_string();
-            (bc, name.clone(), format!("{symbol}/{name}"))
+            (bc, name.clone())
         }
     };
     shared_state.insert(
         symbol,
         BotView {
-            label,
             symbol: symbol.to_string(),
             strategy: strategy_name.to_string(),
             status: BotStatus::Starting,

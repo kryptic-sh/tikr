@@ -8,7 +8,6 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 /// Top-level dashboard config.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DashboardConfig {
     /// Account-wide settings (env, keys, leverage, etc).
@@ -34,7 +33,6 @@ pub struct DashboardConfig {
 
 /// Bagboy = MEXC spot accumulator. Maintains 1 limit BUY at best_bid
 /// for the configured symbol; refills on fill or book move.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct BagboyConfig {
     #[serde(default)]
@@ -84,7 +82,6 @@ fn bagboy_default_ladder_step_bps() -> u32 {
 }
 
 /// Account-wide settings.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountConfig {
     /// Binance environment: `"futures-testnet"` or `"futures-mainnet"`.
@@ -206,7 +203,6 @@ fn default_max_position_pct() -> Decimal {
 }
 
 /// Per-bot configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
     /// Binance-style symbol, e.g. `"BTCUSDT"`.
@@ -260,7 +256,6 @@ pub struct BotConfig {
 }
 
 /// Wave — frozen fixed-step lattice with round-trip refill (pure form).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaveParams {
@@ -292,7 +287,6 @@ fn wave_default_levels() -> u32 {
 }
 
 /// Mantis — symmetric touch scalper; rests a bid+ask at the touch.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MantisParams {
     /// Per-order notional. Account-derived if unset.
@@ -320,7 +314,6 @@ fn mantis_default_reopen_distance_ticks() -> u32 {
 }
 
 /// RSI mean-reversion + KER regime gate, long-only.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RsiMrParams {
     /// Per-order notional in quote currency. Account-derived if unset.
@@ -410,7 +403,6 @@ fn rsi_mr_default_max_hold_bars() -> u32 {
 /// Joker — join touch, dedupe by exact price, never cancel.
 /// `step_size` / `tick_size` / `min_notional` come from venue
 /// exchangeInfo. Nothing else to tune.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct JokerParams {
     /// Per-order notional in quote currency. When omitted, the
@@ -440,7 +432,6 @@ fn joker_default_order_tick_tolerance() -> u32 {
 
 /// Volley — timed batched book-flooding. `step_size` / `tick_size` /
 /// `min_notional` come from venue exchangeInfo.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct VolleyParams {
     /// Per-order notional in quote currency. Account-derived if unset.
@@ -478,7 +469,6 @@ fn volley_default_inner_ticks() -> u32 {
 /// Tide — grid-only at-touch MM with optional N-level depth.
 /// `step_size` / `tick_size` / `min_notional` come from venue
 /// exchangeInfo.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct TideParams {
     /// Per-order notional in USDT. When omitted, the account-derived
@@ -661,7 +651,6 @@ pub enum RampageStrategy {
 /// mode, takes the top `top_n`, and runs the configured `strategy` (Wave or
 /// Tide) on each. Preserves all wave_auto features: orphan adoption,
 /// defer_underwater, retired-tab GC, graceful shutdown that leaves positions.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct RampageConfig {
     /// Master switch.
@@ -722,7 +711,6 @@ fn rampage_default_big_bag_pct() -> Decimal {
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus
 /// `arm_window_secs` which sets the runner-side rolling buffer length.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LiqFadeParams {
     /// Fiat notional per fade entry.
@@ -790,7 +778,6 @@ fn liq_default_window_secs() -> u32 {
 }
 
 /// Hydra configuration — knobs match `HydraConfig` 1:1.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct HydraParams {
     /// Distance from mid each straddle leg posts, in bps.
@@ -875,7 +862,6 @@ fn hydra_default_dca_size_mult() -> Decimal {
 }
 
 /// StaticGrid configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SgParams {
     /// Fiat notional per order. Defaults to account-level balance percent (per-bot).
@@ -967,7 +953,6 @@ fn sg_default_regime_trend_threshold() -> u32 {
 }
 
 /// LayeredGrid configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LgParams {
     /// Notional per order.
@@ -1001,7 +986,6 @@ fn lg_default_bps() -> u32 {
 }
 
 /// LadderReentry configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct LadderReentryParams {
     /// Notional per order.
@@ -1041,7 +1025,6 @@ fn ladder_reentry_default_continuation_bps() -> u32 {
 }
 
 /// SimpleGap configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SimpleGapParams {
     /// Notional per order.
@@ -1057,7 +1040,6 @@ fn simple_gap_default_gap_bps() -> u32 {
 }
 
 /// MicroMeanReversion configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MicroMeanReversionParams {
     /// Notional per order.
@@ -1136,7 +1118,6 @@ fn mmr_default_entry_from_touch() -> bool {
 }
 
 /// SpreadScalp configuration.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpreadScalpParams {
     /// Notional per order.

@@ -399,7 +399,6 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     enabled: true,
                     balance: bnb_balance,
                     price_usdt: bnb_price,
-                    fetched_at_ms: current_time_ms(),
                 });
                 if bnb_price > Decimal::ZERO && bnb_price != *cfg.bnb_price_tx.borrow() {
                     let _ = cfg.bnb_price_tx.send(bnb_price);
@@ -657,7 +656,6 @@ async fn main() -> anyhow::Result<()> {
     if !rotation_enabled {
         for b in &cfg.bots {
             let view = BotView {
-                label: format!("{}/{}", b.symbol, b.strategy),
                 symbol: b.symbol.clone(),
                 strategy: b.strategy.clone(),
                 status: BotStatus::Starting,

@@ -79,7 +79,6 @@ pub fn spawn_bagboy(
         shared_state.insert(
             &symbol,
             BotView {
-                label: format!("{symbol}/bagboy"),
                 symbol: symbol.clone(),
                 strategy: "bagboy".to_string(),
                 status: BotStatus::Starting,
