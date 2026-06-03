@@ -137,20 +137,16 @@ pub fn spawn_bnb_monitor(cfg: BnbMonitorConfig) {
                             {
                                 Ok(bnb_received) => {
                                     last_convert = Some(Instant::now());
-                                    // Re-read so the log reflects the real new
-                                    // balance, not just the quoted amount.
-                                    let new_val = live_bnb_value(
-                                        &http,
-                                        base_url,
-                                        &cfg.api_key,
-                                        &cfg.key_material,
-                                    )
-                                    .await;
+                                    // Project the new balance from the delivered
+                                    // amount — an immediate API re-read races
+                                    // Binance's balance settlement (lags a few
+                                    // seconds) and would log a stale 0.
+                                    let new_balance = balance + bnb_received;
                                     info!(
                                         bnb_received = %bnb_received,
                                         usdt_spent = %from_amount,
-                                        new_bnb_balance = ?new_val.map(|(b, _)| b),
-                                        new_value_usdt = ?new_val.map(|(b, p)| (b * p).round_dp(4)),
+                                        new_bnb_balance = %new_balance,
+                                        new_value_usdt = %(new_balance * price).round_dp(4),
                                         "bnb_refill: convert succeeded"
                                     );
                                 }
