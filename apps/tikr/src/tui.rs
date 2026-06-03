@@ -1591,16 +1591,17 @@ fn draw_chart(
         }
         let cx = plot_x0 + (b - start_bucket) as u16;
         let ry = row_of(dec_to_f64(*p));
-        // Green/red glyph on a cyan background — really pops against the candles.
-        let (ch, fg) = if *is_buy {
-            ('▲', Color::Green)
+        // Black glyph on a bright cyan (buy) / yellow (sell) block — high-
+        // luminance, and well clear of the candle green/red/grey palette.
+        let (ch, bg) = if *is_buy {
+            ('▲', Color::Cyan)
         } else {
-            ('▼', Color::Red)
+            ('▼', Color::Yellow)
         };
         buf[(cx, inner.y + ry)].set_char(ch).set_style(
             Style::default()
-                .fg(fg)
-                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(bg)
                 .add_modifier(Modifier::BOLD),
         );
     }
