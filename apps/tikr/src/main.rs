@@ -366,6 +366,18 @@ fn spawn_price_history_watcher(
     });
 }
 
+/// If `e` is a rate-limit error, the duration to back off before the next
+/// request — honoring the venue's `retry_after_ms` (floored at 1s so a `0`
+/// doesn't busy-loop, capped at 10min so a wild value can't wedge the poller).
+fn rate_limit_backoff(e: &tikr_venue::VenueError) -> Option<std::time::Duration> {
+    match e {
+        tikr_venue::VenueError::RateLimited { retry_after_ms } => Some(
+            std::time::Duration::from_millis((*retry_after_ms).clamp(1_000, 600_000)),
+        ),
+        _ => None,
+    }
+}
+
 fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
@@ -408,7 +420,31 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
             }
         };
 
+        // Honored rate-limit cooldown: when a poll returns RateLimited we wait
+        // out its `retry_after_ms` before issuing ANY further requests, instead
+        // of hammering the API on the fixed cadence (which just keeps the limit
+        // armed). Set on the first rate-limited call of a cycle.
+        let mut cooldown: Option<std::time::Instant> = None;
         loop {
+            // Wait out an active rate-limit cooldown before doing any requests.
+            if let Some(until) = cooldown.take() {
+                let now = std::time::Instant::now();
+                if until > now {
+                    let wait = until - now;
+                    tracing::warn!(
+                        wait_ms = wait.as_millis() as u64,
+                        "rate limited — backing off before next account poll cycle"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = shutdown.changed() => if *shutdown.borrow() { return; }
+                    }
+                }
+            }
+            // Set when any call this cycle is rate limited → skip the rest and
+            // back off for this long at the top of the next iteration.
+            let mut limited: Option<std::time::Duration> = None;
+
             // BNB-aware accounting block — only fires when feeBurn is on.
             // Fetches BNB futures-wallet balance + BNBUSDT mark, publishes
             // to SharedState + price watch channel. The user-stream parser
@@ -417,7 +453,7 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
             if bnb_fee_enabled {
                 let mut bnb_balance = Decimal::ZERO;
                 let mut bnb_price = Decimal::ZERO;
-                if let Ok(b) = tikr_binance::futs::get_balance(
+                match tikr_binance::futs::get_balance(
                     &http,
                     cfg.env.rest_base_url(),
                     &cfg.api_key,
@@ -426,7 +462,8 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                 )
                 .await
                 {
-                    bnb_balance = b.wallet_balance;
+                    Ok(b) => bnb_balance = b.wallet_balance,
+                    Err(e) => limited = limited.or_else(|| rate_limit_backoff(&e)),
                 }
                 if let Ok(t) =
                     tikr_binance::futs::get_book_ticker(&http, cfg.env.rest_base_url(), "BNBUSDT")
@@ -515,7 +552,10 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                         );
                     }
                 }
-                Err(e) => tracing::warn!(error = ?e, "account balance poll failed"),
+                Err(e) => {
+                    limited = limited.or_else(|| rate_limit_backoff(&e));
+                    tracing::warn!(error = ?e, "account balance poll failed");
+                }
             }
 
             let symbols = cfg.shared_state.symbols();
@@ -525,6 +565,10 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                 symbols
             };
             for symbol in &symbols {
+                // Stop polling the moment a call is rate limited this cycle.
+                if limited.is_some() {
+                    break;
+                }
                 match tikr_binance::futs::get_position_risk(
                     &http,
                     cfg.env.rest_base_url(),
@@ -556,8 +600,18 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                             },
                         );
                     }
-                    Err(e) => tracing::warn!(symbol, error = ?e, "position risk poll failed"),
+                    Err(e) => {
+                        limited = limited.or_else(|| rate_limit_backoff(&e));
+                        tracing::warn!(symbol, error = ?e, "position risk poll failed");
+                    }
                 }
+            }
+
+            // Rate limited this cycle → arm the cooldown and skip the normal
+            // inter-cycle wait; the top of the loop backs off for `retry_after`.
+            if let Some(d) = limited {
+                cooldown = Some(std::time::Instant::now() + d);
+                continue;
             }
 
             tokio::select! {

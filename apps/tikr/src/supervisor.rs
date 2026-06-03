@@ -95,6 +95,11 @@ pub fn spawn_supervisor(
 
                 shared_state.set_status(&symbol_str, BotStatus::Starting);
 
+                // Honored rate-limit respawn floor (ms): set when a spawn fails
+                // with a venue RateLimited so we wait out `retry_after` instead
+                // of the (shorter) exponential backoff, which would just re-hit
+                // the limit.
+                let mut rate_limit_delay_ms: Option<u64> = None;
                 let handle_result = run_once(&ctx).await;
                 match handle_result {
                     Ok(spawned) => {
@@ -146,12 +151,27 @@ pub fn spawn_supervisor(
                     }
                     Err(e) => {
                         warn!("bot spawn failed: {e}");
+                        // Find a venue RateLimited anywhere in the error chain.
+                        rate_limit_delay_ms = e.chain().find_map(|c| {
+                            match c.downcast_ref::<tikr_venue::VenueError>() {
+                                Some(tikr_venue::VenueError::RateLimited { retry_after_ms }) => {
+                                    Some(*retry_after_ms)
+                                }
+                                _ => None,
+                            }
+                        });
                         shared_state.set_status(&symbol_str, BotStatus::Crashed(format!("spawn: {e}")));
                     }
                 }
 
-                // Exponential backoff: 2^attempt seconds, capped at 60.
-                let delay = (1u64 << attempt.min(6)).min(60);
+                // Exponential backoff: 2^attempt seconds, capped at 60. If the
+                // spawn was rate limited, honor `retry_after` as a floor (capped
+                // at 10min) so we don't respawn into the same active limit.
+                let backoff = (1u64 << attempt.min(6)).min(60);
+                let delay = match rate_limit_delay_ms {
+                    Some(ms) => backoff.max((ms / 1000).clamp(1, 600)),
+                    None => backoff,
+                };
                 warn!(delay_secs = delay, "respawning bot in {delay}s");
                 shared_state.set_status(
                     &symbol_str,
