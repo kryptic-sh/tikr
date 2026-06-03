@@ -1690,16 +1690,20 @@ fn draw_bot_detail(
             Style::default().fg(Color::Gray),
             pnl_style(r.realized.0),
         ));
-        let unreal_display = v
-            .api_position
-            .as_ref()
-            .map(|api| api.unrealized_profit)
-            .unwrap_or(r.unrealized.0);
-        let net_display = v
-            .api_position
-            .as_ref()
-            .map(|_| r.realized.0 + unreal_display - r.fees.0 + r.funding.0)
-            .unwrap_or(r.net.0);
+        // Mark unrealized LIVE so this pane updates per-event (as fast as the
+        // account pane), not on the ~6s positionRisk poll. Same `mark_unrealized`
+        // the account pane uses (1Hz snapshot base + per-event live-mid drift +
+        // api mark); falls back to a pure live-mid mark (paper / pre-poll), then
+        // api, then the raw snapshot.
+        let unreal_display = match (v.api_position.as_ref(), v.live.as_ref()) {
+            (Some(api), Some(lv)) => mark_unrealized(r.unrealized.0, lv, api.mark_price),
+            (None, Some(lv)) if lv.last_mid > Decimal::ZERO && lv.avg_entry > Decimal::ZERO => {
+                (lv.last_mid - lv.avg_entry) * lv.position_size
+            }
+            (Some(api), None) => api.unrealized_profit,
+            _ => r.unrealized.0,
+        };
+        let net_display = r.realized.0 + unreal_display - r.fees.0 + r.funding.0;
         lines.push(kv_line(
             "unreal",
             format!("{:>+.4}", dec_to_f64(unreal_display)),
