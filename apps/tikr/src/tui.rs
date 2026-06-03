@@ -1281,7 +1281,7 @@ fn draw_account(
     //   REAL = realized − fees               (banked round-trip profit)
     // Sorted DESC by NET so the biggest winners are at the top; the line is
     // colored by NET's sign.
-    let mut rows: Vec<(&str, Decimal, Decimal)> = views
+    let mut rows: Vec<(&str, Decimal, Decimal, &BotStatus)> = views
         .iter()
         .map(|v| {
             let (net, real) = v
@@ -1291,20 +1291,42 @@ fn draw_account(
                     let real = r.realized.0 - r.fees.0;
                     (real + r.unrealized.0, real)
                 });
-            (v.symbol.as_str(), net, real)
+            (v.symbol.as_str(), net, real, &v.status)
         })
         .collect();
-    rows.sort_by_key(|(_, net, _)| std::cmp::Reverse(*net));
+    rows.sort_by_key(|(_, net, _, _)| std::cmp::Reverse(*net));
     // Record (line_idx, symbol) so click handler can map row → symbol.
     let mut per_symbol_lines: Vec<(usize, String)> = Vec::new();
-    for (symbol, net, real) in rows {
+    for (symbol, net, real, status) in rows {
         per_symbol_lines.push((lines.len(), symbol.to_string()));
-        lines.push(kv_line(
-            format!("  {symbol}"),
-            format!("{:>+.2} ({:>+.2})", dec_to_f64(net), dec_to_f64(real)),
-            Style::default().fg(Color::White),
-            pnl_style(net),
-        ));
+        // Left status icon: ● running, ◌ starting/restarting, ○ stopped/rotated.
+        let (icon, icon_color) = match status {
+            BotStatus::Running => ("●", Color::Green),
+            BotStatus::Starting => ("◌", Color::Cyan),
+            BotStatus::Restarting(_) => ("◌", Color::Yellow),
+            BotStatus::Crashed(_) => ("○", Color::Red),
+            BotStatus::Rotated => ("○", Color::DarkGray),
+        };
+        let value = format!("{:>+.2} ({:>+.2})", dec_to_f64(net), dec_to_f64(real));
+        // `{icon} {symbol}` left, value right-aligned (matches kv_line padding).
+        let label_len = 1 + 1 + symbol.chars().count(); // icon + space + symbol
+        let pad = SIDE_PANEL_INNER.saturating_sub(label_len + value.chars().count());
+        // Selected bot (== active tab): highlight the whole row + bold, keeping
+        // each span's fg so the icon / PnL colors still read.
+        let selected = ui.active_symbol.as_deref() == Some(symbol);
+        let deco = |s: Style| {
+            if selected {
+                s.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            } else {
+                s
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{icon} "), deco(Style::default().fg(icon_color))),
+            Span::styled(symbol.to_string(), deco(Style::default().fg(Color::White))),
+            Span::styled(" ".repeat(pad), deco(Style::default())),
+            Span::styled(value, deco(pnl_style(net))),
+        ]));
     }
 
     let total = lines.len() as u16;
