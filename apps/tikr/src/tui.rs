@@ -1287,12 +1287,18 @@ fn draw_account(
     let mut rows: Vec<(&str, Decimal, Decimal, &BotStatus)> = views
         .iter()
         .map(|v| {
+            // Venue-flat (rotated / closed) → drop the stale snapshot unrealized.
+            let flat = v
+                .api_position
+                .as_ref()
+                .is_some_and(|api| api.position_amount.is_zero());
             let (net, real) = v
                 .snapshot
                 .as_ref()
                 .map_or((Decimal::ZERO, Decimal::ZERO), |r| {
                     let real = r.realized.0 - r.fees.0;
-                    (real + r.unrealized.0, real)
+                    let unreal = if flat { Decimal::ZERO } else { r.unrealized.0 };
+                    (real + unreal, real)
                 });
             (v.symbol.as_str(), net, real, &v.status)
         })
@@ -1702,6 +1708,9 @@ fn draw_bot_detail(
         // api mark); falls back to a pure live-mid mark (paper / pre-poll), then
         // api, then the raw snapshot.
         let unreal_display = match (v.api_position.as_ref(), v.live.as_ref()) {
+            // Venue says flat (rotated / closed) → no unrealized. Ignore the
+            // stale live tap a stopped bot leaves behind.
+            (Some(api), _) if api.position_amount.is_zero() => Decimal::ZERO,
             (Some(api), Some(lv)) => mark_unrealized(r.unrealized.0, lv, api.mark_price),
             (None, Some(lv)) if lv.last_mid > Decimal::ZERO && lv.avg_entry > Decimal::ZERO => {
                 (lv.last_mid - lv.avg_entry) * lv.position_size

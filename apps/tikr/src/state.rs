@@ -683,7 +683,12 @@ impl AccountAggregate {
             if let Some(ref api) = v.api_position {
                 a.has_api_positions = true;
                 a.api_unrealized += api.unrealized_profit;
-                if let (Some(r), Some(lv)) = (&v.snapshot, &v.live) {
+                // Only mark a position that the venue still holds. A flat /
+                // rotated bot has no unrealized — its stale live tap would
+                // otherwise contribute a bogus mark.
+                if !api.position_amount.is_zero()
+                    && let (Some(r), Some(lv)) = (&v.snapshot, &v.live)
+                {
                     a.mark_unrealized += mark_unrealized(r.unrealized.0, lv, api.mark_price);
                 }
             }
@@ -697,5 +702,12 @@ pub fn mark_unrealized(
     live: &tikr_paper::live::LiveSnapshot,
     mark_price: Decimal,
 ) -> Decimal {
+    // A zero / invalid mark (e.g. a flat or just-rotated position whose
+    // positionRisk reports mark=0) would turn the (mark − last_mid) drift into
+    // −last_mid × size — a huge bogus "unrealized". Skip the adjustment and fall
+    // back to the mid-marked value when the mark isn't usable.
+    if mark_price <= Decimal::ZERO || live.last_mid <= Decimal::ZERO {
+        return mid_unrealized;
+    }
     mid_unrealized + live.position_size * (mark_price - live.last_mid)
 }
