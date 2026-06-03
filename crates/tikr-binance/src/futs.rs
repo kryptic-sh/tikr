@@ -170,9 +170,14 @@ pub async fn place_market_order(
         Side::Ask => "SELL",
     };
     let client_order_id = format!("mc_{}", Uuid::new_v4().as_simple());
+    // reduceOnly=true: this primitive only ever CLOSES a position. It (a) makes
+    // the order exempt from the MIN_NOTIONAL filter so a sub-minNotional dust
+    // position can actually be closed (a plain MARKET order rejects with -4164),
+    // and (b) guarantees it can never open/flip a position if the size races the
+    // live position read.
     let params = format!(
         "symbol={symbol}&side={side_str}&type=MARKET\
-         &quantity={quantity}\
+         &quantity={quantity}&reduceOnly=true\
          &newClientOrderId={client_order_id}"
     );
     let signed = append_auth_dispatch(&params, key_material);

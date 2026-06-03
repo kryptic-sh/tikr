@@ -364,13 +364,22 @@ pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core
                 && avg_entry_known
                 && notional_approx < min_n
             {
+                // Dust (below minNotional). Do NOT route through the limit
+                // fallback — its `quote()` would bump the size back UP to
+                // minNotional and OVER-close (flip the position). Close it
+                // directly with a reduce-only MARKET order, which is exempt
+                // from the minNotional filter. Leaving it (the old behavior)
+                // orphaned dust on the account when the bot rotated out.
                 info!(
                     qty = %qty,
                     entry = %pos.avg_entry.0,
                     notional = %notional_approx,
                     min_notional = %min_n,
-                    "skipping flatten: dust position below minNotional — bot will trade on top"
+                    "flattening dust position below minNotional via reduce-only market"
                 );
+                if let Err(e) = venue.market_close(symbol, close_side, Size(qty)).await {
+                    warn!(error = ?e, qty = %qty, "dust reduce-only market close FAILED — position left open");
+                }
                 return;
             }
             flatten_with_limit_fallback(venue, symbol, close_side, Size(qty)).await;
