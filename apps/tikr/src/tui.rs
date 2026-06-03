@@ -1276,29 +1276,32 @@ fn draw_account(
         "per symbol",
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     ));
-    // Per-symbol = realized − fees only. Unrealized is excluded on
-    // purpose: this panel exists to show whether each bot is actually
-    // turning over profitable round-trips, not how its current open
-    // inventory is marked. Unrealized is captured at the global level.
-    // Sorted DESC by net so the biggest winners are at the top.
-    let mut rows: Vec<(&str, Decimal)> = views
+    // Per-symbol shows two figures: NET (REAL), where
+    //   NET  = realized + unrealized − fees  (mark-to-market, full picture)
+    //   REAL = realized − fees               (banked round-trip profit)
+    // Sorted DESC by NET so the biggest winners are at the top; the line is
+    // colored by NET's sign.
+    let mut rows: Vec<(&str, Decimal, Decimal)> = views
         .iter()
         .map(|v| {
-            let net = v
+            let (net, real) = v
                 .snapshot
                 .as_ref()
-                .map_or(Decimal::ZERO, |r| r.realized.0 - r.fees.0);
-            (v.symbol.as_str(), net)
+                .map_or((Decimal::ZERO, Decimal::ZERO), |r| {
+                    let real = r.realized.0 - r.fees.0;
+                    (real + r.unrealized.0, real)
+                });
+            (v.symbol.as_str(), net, real)
         })
         .collect();
-    rows.sort_by_key(|(_, net)| std::cmp::Reverse(*net));
+    rows.sort_by_key(|(_, net, _)| std::cmp::Reverse(*net));
     // Record (line_idx, symbol) so click handler can map row → symbol.
     let mut per_symbol_lines: Vec<(usize, String)> = Vec::new();
-    for (symbol, net) in rows {
+    for (symbol, net, real) in rows {
         per_symbol_lines.push((lines.len(), symbol.to_string()));
         lines.push(kv_line(
             format!("  {symbol}"),
-            format!("{:>+.2}", dec_to_f64(net)),
+            format!("{:>+.2} ({:>+.2})", dec_to_f64(net), dec_to_f64(real)),
             Style::default().fg(Color::White),
             pnl_style(net),
         ));
