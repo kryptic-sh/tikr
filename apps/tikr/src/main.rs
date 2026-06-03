@@ -154,12 +154,13 @@ fn session_state_dir(config_path: &std::path::Path) -> PathBuf {
 
 /// Flatten EVERY open position on the futures account — used by `--clear` for a
 /// clean-slate start, including positions on symbols NOT in this config (e.g.
-/// left by a prior version / different config). Lists all open positions in one
-/// call, then per symbol cancels resting orders + reduce-only-closes the bag
-/// (dust-safe via `reset_symbol_state`). Awaited so it completes BEFORE the
-/// account poller records the session start balance — otherwise the realized
-/// PnL of the flatten (which can swing the wallet either way) would skew every
-/// session-relative stat.
+/// left by a prior version / different config). Two passes, each concurrent:
+/// PASS 1 cancels ALL open orders account-wide (so nothing can fill mid-flatten
+/// and re-open a position — covers order-only symbols too); PASS 2 reduce-only
+/// closes every position (dust-safe via `reset_symbol_state`). Awaited so it
+/// completes BEFORE the account poller records the session start balance —
+/// otherwise the realized PnL of the flatten (which can swing the wallet either
+/// way) would skew every session-relative stat.
 async fn flatten_all_open_positions(
     env: tikr_binance::BinanceEnv,
     api_key: &str,
@@ -167,9 +168,49 @@ async fn flatten_all_open_positions(
     leverage: u32,
 ) {
     let http = reqwest::Client::new();
+    let base_url = env.rest_base_url();
+
+    // PASS 1 — cancel EVERY open order account-wide FIRST, before touching any
+    // position. If we closed positions first and cancelled after, a resting
+    // order could fill in the gap and re-open a position. Covers symbols that
+    // have orders but no position too. Cancels run concurrently.
+    match tikr_binance::futs::list_open_order_symbols(&http, base_url, api_key, key_material).await
+    {
+        Ok(symbols) if !symbols.is_empty() => {
+            tracing::info!(
+                count = symbols.len(),
+                "--clear: cancelling all open orders before flatten"
+            );
+            let cancels = symbols.into_iter().map(|sym| {
+                let http = http.clone();
+                let key_material = key_material.clone();
+                async move {
+                    if let Err(e) = tikr_binance::futs::cancel_all_orders(
+                        &http,
+                        base_url,
+                        api_key,
+                        &key_material,
+                        &sym,
+                    )
+                    .await
+                    {
+                        tracing::warn!(symbol = %sym, error = ?e, "--clear: cancel_all_orders failed");
+                    }
+                }
+            });
+            futures::future::join_all(cancels).await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = ?e, "--clear: list open orders failed; proceeding to flatten anyway")
+        }
+    }
+
+    // PASS 2 — flatten every open position (reduce-only, dust-safe). All orders
+    // are already cancelled, so nothing can fill underneath. Runs concurrently.
     let positions = match tikr_binance::futs::list_open_positions(
         &http,
-        env.rest_base_url(),
+        base_url,
         api_key,
         key_material,
     )
@@ -193,18 +234,22 @@ async fn flatten_all_open_positions(
         count = open.len(),
         "--clear: flattening all open positions before recording session start"
     );
-    for (sym, amt) in open {
-        let symbol = venue::perp_symbol(&sym);
-        match venue::build_venue(env, api_key, key_material, &symbol, leverage).await {
-            Ok(v) => {
-                tracing::info!(symbol = %sym, amount = %amt, "--clear: cancel + flatten");
-                crate::supervisor::reset_symbol_state(&v, &symbol).await;
-            }
-            Err(e) => {
-                tracing::warn!(symbol = %sym, error = ?e, "--clear: venue build failed; position left open")
+    let closes = open.into_iter().map(|(sym, amt)| {
+        let key_material = key_material.clone();
+        async move {
+            let symbol = venue::perp_symbol(&sym);
+            match venue::build_venue(env, api_key, &key_material, &symbol, leverage).await {
+                Ok(v) => {
+                    tracing::info!(symbol = %sym, amount = %amt, "--clear: flatten position");
+                    crate::supervisor::reset_symbol_state(&v, &symbol).await;
+                }
+                Err(e) => {
+                    tracing::warn!(symbol = %sym, error = ?e, "--clear: venue build failed; position left open")
+                }
             }
         }
-    }
+    });
+    futures::future::join_all(closes).await;
 }
 
 struct AccountPollerConfig {

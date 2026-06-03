@@ -127,9 +127,11 @@ pub fn spawn_rampage_manager(
                         // start cancels the orphan orders (clear_on_start=false)
                         // and resumes managing the inherited position.
                         info!("rampage: global shutdown — stopping bots (orders + positions left intact)");
-                        for (_, bot) in active.drain() {
-                            stop_bot(bot).await;
-                        }
+                        // Stop ALL bots concurrently so manager teardown is near
+                        // instant — sequential awaits would sum each bot's stop
+                        // latency. Nothing is cancelled/flattened here.
+                        let stops = active.drain().map(|(_, bot)| stop_bot(bot));
+                        futures::future::join_all(stops).await;
                         return;
                     }
                 }

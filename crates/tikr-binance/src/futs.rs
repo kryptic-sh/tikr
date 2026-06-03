@@ -1058,6 +1058,47 @@ pub async fn get_open_orders(
     Ok(out)
 }
 
+/// List the distinct symbols that currently have ANY open order on Futures, in
+/// ONE call. Endpoint: `GET /fapi/v1/openOrders` with NO symbol filter (weight
+/// 40). Used by `--clear` to cancel every open order account-wide BEFORE
+/// flattening positions (so no resting order can fill mid-flatten and re-open a
+/// position), including symbols that have orders but no position.
+pub async fn list_open_order_symbols(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+) -> Result<Vec<String>, VenueError> {
+    let signed = append_auth_dispatch("", key_material);
+    let url = format!("{base_url}/fapi/v1/openOrders?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let body: Value = read_json(resp).await?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(
+            "openOrders(all): expected array",
+        )))
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for ord in arr {
+        if let Some(sym) = ord.get("symbol").and_then(Value::as_str)
+            && seen.insert(sym.to_string())
+        {
+            out.push(sym.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch the net position size for `symbol` on Futures. Positive = long.
 pub async fn get_position_amount(
     http: &HttpClient,
