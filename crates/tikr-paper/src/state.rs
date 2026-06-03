@@ -65,6 +65,8 @@ mod tests {
             base_asset: String::new(),
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
+            buy_fills: 7,
+            sell_fills: 9,
             peak_position_usdt: Notional(Decimal::ZERO),
             mean_position_usdt: Notional(Decimal::ZERO),
             full_fills: 0,
@@ -113,5 +115,9 @@ mod tests {
         assert_eq!(parsed.realized.0, original.realized.0);
         assert_eq!(parsed.events_processed, original.events_processed);
         assert_eq!(parsed.fills_emitted, original.fills_emitted);
+        // Volume + buy/sell fill counters must round-trip (account-sidebar resume).
+        assert_eq!(parsed.buy_fills, 7);
+        assert_eq!(parsed.sell_fills, 9);
+        assert_eq!(parsed.buy_volume_usdt.0, original.buy_volume_usdt.0);
     }
 }

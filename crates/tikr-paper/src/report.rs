@@ -71,6 +71,12 @@ pub struct PaperReport {
     pub buy_volume_usdt: Notional,
     /// Total Ask-side USDT notional crossed. See `buy_volume_usdt`.
     pub sell_volume_usdt: Notional,
+    /// Count of Bid-side fills observed. Persisted (via the wire struct's
+    /// `#[serde(default)]`) so the account sidebar's `fills` (buy/sell) row
+    /// resumes across restarts; older snapshots load as 0.
+    pub buy_fills: u64,
+    /// Count of Ask-side fills observed. See `buy_fills`.
+    pub sell_fills: u64,
     /// Peak absolute position value seen during the run, in USDT
     /// (`|size| × last_mid` sampled on every event). Shows how close
     /// the strategy came to its `max_position_usdt` cap.
@@ -143,6 +149,10 @@ struct PaperReportWire {
     #[serde(default)]
     sell_volume_usdt: String,
     #[serde(default)]
+    buy_fills: u64,
+    #[serde(default)]
+    sell_fills: u64,
+    #[serde(default)]
     peak_position_usdt: String,
     #[serde(default)]
     mean_position_usdt: String,
@@ -180,6 +190,8 @@ impl Serialize for PaperReport {
             base_asset: self.base_asset.clone(),
             buy_volume_usdt: self.buy_volume_usdt.0.to_string(),
             sell_volume_usdt: self.sell_volume_usdt.0.to_string(),
+            buy_fills: self.buy_fills,
+            sell_fills: self.sell_fills,
             peak_position_usdt: self.peak_position_usdt.0.to_string(),
             mean_position_usdt: self.mean_position_usdt.0.to_string(),
             full_fills: self.full_fills,
@@ -250,6 +262,8 @@ impl<'de> Deserialize<'de> for PaperReport {
             } else {
                 parse(&wire.sell_volume_usdt)?
             },
+            buy_fills: wire.buy_fills,
+            sell_fills: wire.sell_fills,
             peak_position_usdt: if wire.peak_position_usdt.is_empty() {
                 Notional(Decimal::ZERO)
             } else {

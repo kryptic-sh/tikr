@@ -604,15 +604,21 @@ where
     // Seed counters from resume.
     let mut events_processed: u64 = resume.as_ref().map(|r| r.events_processed).unwrap_or(0);
     let mut fills_emitted: u64 = resume.as_ref().map(|r| r.fills_emitted).unwrap_or(0);
-    // Buy/sell fill counters drive the periodic status line. Not yet persisted
-    // to PaperReport — resume always starts these at 0.
-    let mut buy_fills: u64 = 0;
-    let mut sell_fills: u64 = 0;
+    // Buy/sell fill counters + volume + full/partial split — seeded from resume
+    // so the account sidebar's `fills` and `vol` rows persist across restarts.
+    let mut buy_fills: u64 = resume.as_ref().map(|r| r.buy_fills).unwrap_or(0);
+    let mut sell_fills: u64 = resume.as_ref().map(|r| r.sell_fills).unwrap_or(0);
     // Full vs partial fill split (Fill.is_full). fills_emitted = full + partial.
-    let mut full_fills: u64 = 0;
-    let mut partial_fills: u64 = 0;
-    let mut buy_volume: Decimal = Decimal::ZERO;
-    let mut sell_volume: Decimal = Decimal::ZERO;
+    let mut full_fills: u64 = resume.as_ref().map(|r| r.full_fills).unwrap_or(0);
+    let mut partial_fills: u64 = resume.as_ref().map(|r| r.partial_fills).unwrap_or(0);
+    let mut buy_volume: Decimal = resume
+        .as_ref()
+        .map(|r| r.buy_volume_usdt.0)
+        .unwrap_or(Decimal::ZERO);
+    let mut sell_volume: Decimal = resume
+        .as_ref()
+        .map(|r| r.sell_volume_usdt.0)
+        .unwrap_or(Decimal::ZERO);
     // Peak absolute position notional (|size| × mid) seen during the
     // run. Sampled on BookUpdate events so a strategy that grew to its
     // cap then traded out still shows the high-water mark in the
@@ -804,6 +810,8 @@ where
                 &symbol,
                 buy_volume,
                 sell_volume,
+                buy_fills,
+                sell_fills,
                 peak_position_usdt,
                 position_usdt_sum,
                 position_samples,
@@ -1691,6 +1699,8 @@ where
                         &symbol,
                         buy_volume,
                         sell_volume,
+                        buy_fills,
+                        sell_fills,
                         peak_position_usdt,
                         position_usdt_sum,
                         position_samples,
@@ -1842,6 +1852,8 @@ where
                         &symbol,
                         buy_volume,
                         sell_volume,
+                        buy_fills,
+                        sell_fills,
                         peak_position_usdt,
                         position_usdt_sum,
                         position_samples,
@@ -1978,6 +1990,8 @@ where
                         &symbol,
                         buy_volume,
                         sell_volume,
+                        buy_fills,
+                        sell_fills,
                         peak_position_usdt,
                         position_usdt_sum,
                         position_samples,
@@ -2323,6 +2337,8 @@ where
         &symbol,
         buy_volume,
         sell_volume,
+        buy_fills,
+        sell_fills,
         peak_position_usdt,
         position_usdt_sum,
         position_samples,
@@ -2918,6 +2934,8 @@ fn finalize(
     symbol: &Symbol,
     buy_volume: Decimal,
     sell_volume: Decimal,
+    buy_fills: u64,
+    sell_fills: u64,
     peak_position_usdt: Decimal,
     position_usdt_sum: Decimal,
     position_samples: u64,
@@ -2969,6 +2987,8 @@ fn finalize(
         },
         buy_volume_usdt: Notional(buy_volume),
         sell_volume_usdt: Notional(sell_volume),
+        buy_fills,
+        sell_fills,
         peak_position_usdt: Notional(peak_position_usdt),
         mean_position_usdt: Notional(mean_position_usdt),
         full_fills,
@@ -3787,6 +3807,8 @@ mod tests {
             base_asset: String::new(),
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
+            buy_fills: 0,
+            sell_fills: 0,
             peak_position_usdt: Notional(Decimal::ZERO),
             mean_position_usdt: Notional(Decimal::ZERO),
             full_fills: 0,
@@ -3843,6 +3865,8 @@ mod tests {
             base_asset: String::new(),
             buy_volume_usdt: Notional(Decimal::ZERO),
             sell_volume_usdt: Notional(Decimal::ZERO),
+            buy_fills: 0,
+            sell_fills: 0,
             peak_position_usdt: Notional(Decimal::ZERO),
             mean_position_usdt: Notional(Decimal::ZERO),
             full_fills: 0,
