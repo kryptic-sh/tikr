@@ -310,10 +310,9 @@ fn spawn_price_history_watcher(
                     let base_url = base_url.clone();
                     let symbol = view.symbol.clone();
                     tokio::spawn(async move {
-                        match tikr_binance::futs::get_1s_agg_candles(
-                            &http, &base_url, &symbol, 1000,
-                        )
-                        .await
+                        // 300s = 5 minutes of 1s candles (paged from aggTrades).
+                        match tikr_binance::futs::get_1s_agg_candles(&http, &base_url, &symbol, 300)
+                            .await
                         {
                             Ok(candles) if !candles.is_empty() => {
                                 state.seed_history(&symbol, &candles);

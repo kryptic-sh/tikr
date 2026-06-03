@@ -119,15 +119,15 @@ pub struct PriceHistory {
 }
 
 impl PriceHistory {
-    /// Retention window: the chart shows at most 60 one-second candles, so we
-    /// never keep samples (or fills) older than 60s behind the newest. Anything
-    /// past this is pruned on every push — the buffer holds ≤ 1 minute of data.
-    pub const WINDOW_MS: u64 = 60_000;
-    /// Hard safety cap on retained samples (a burst within the 60s window
-    /// shouldn't grow unbounded). Time-pruning is the primary bound.
-    pub const MAX_SAMPLES: usize = 1800;
+    /// Retention window: the chart shows up to 5 minutes of one-second candles,
+    /// so we never keep samples (or fills) older than 300s behind the newest.
+    /// Anything past this is pruned on every push.
+    pub const WINDOW_MS: u64 = 300_000;
+    /// Hard safety cap on retained samples (a burst within the window shouldn't
+    /// grow unbounded). Time-pruning is the primary bound.
+    pub const MAX_SAMPLES: usize = 12_000;
     /// Hard safety cap on retained fill markers within the window.
-    pub const MAX_FILLS: usize = 500;
+    pub const MAX_FILLS: usize = 2_000;
 
     /// Push a price sample. Dedupes consecutive identical prices to keep the
     /// buffer tight when the book is quiet, then prunes everything older than

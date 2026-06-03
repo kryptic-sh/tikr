@@ -984,14 +984,19 @@ pub async fn get_1m_closes(
 /// samples accumulate. Futures klines have no sub-minute interval (`1s` returns
 /// `-1120 Invalid interval`), so we bucket `/fapi/v1/aggTrades` by trade time
 /// instead. Returns `(open_time_ms, open, high, low, close)` oldest-first.
-/// `limit` is the aggTrades fetch size, clamped to Binance's 1..=1000 range —
-/// the candle span depends on how much time those trades cover.
+///
+/// One aggTrades page is capped at 1000 trades — only ~20s on a busy symbol —
+/// so to cover `window_secs` we page BACKWARD via `endTime`, oldest call last,
+/// until the earliest trade seen reaches `latest − window_secs` (or we hit the
+/// page cap, a safety bound on request weight). Trades within a second from
+/// different pages all land in the same 1s bucket, so paging never distorts a
+/// candle.
 #[allow(clippy::type_complexity)]
 pub async fn get_1s_agg_candles(
     http: &HttpClient,
     base_url: &str,
     symbol: &str,
-    limit: u32,
+    window_secs: u64,
 ) -> Result<
     Vec<(
         u64,
@@ -1004,52 +1009,114 @@ pub async fn get_1s_agg_candles(
 > {
     use std::collections::BTreeMap;
     use std::str::FromStr;
-    let limit = limit.clamp(1, 1000);
-    let url = format!("{base_url}/fapi/v1/aggTrades?symbol={symbol}&limit={limit}");
-    let resp = http.get(&url).send().await.map_err(network_err)?;
-    let body: Value = read_json(resp).await?;
-    if let Some(err) = try_parse_error(&body) {
-        return Err(err);
+
+    // Hard cap on pages so a very busy symbol can't fan out into dozens of
+    // weight-20 requests at startup.
+    const MAX_PAGES: u32 = 24;
+    let window_ms = window_secs.saturating_mul(1000);
+
+    // Per-bucket OHLC tracked WITH open/close timestamps, so merging trades from
+    // pages fetched out of order (newest page first) still picks the true
+    // earliest trade as open and latest as close.
+    struct Ohlc {
+        open_ts: u64,
+        open: tikr_core::Decimal,
+        high: tikr_core::Decimal,
+        low: tikr_core::Decimal,
+        close_ts: u64,
+        close: tikr_core::Decimal,
     }
-    let Some(rows) = body.as_array() else {
-        return Ok(Vec::new());
-    };
-    // Bucket trades into 1-second OHLC. aggTrades come time-ordered ascending,
-    // so the first trade in a bucket is the open and the last is the close.
-    let mut buckets: BTreeMap<
-        u64,
-        (
-            tikr_core::Decimal,
-            tikr_core::Decimal,
-            tikr_core::Decimal,
-            tikr_core::Decimal,
-        ),
-    > = BTreeMap::new();
-    for row in rows {
-        let price = row
-            .get("p")
-            .and_then(Value::as_str)
-            .and_then(|s| tikr_core::Decimal::from_str(s).ok());
-        let ts = row.get("T").and_then(Value::as_u64);
-        let (Some(p), Some(t)) = (price, ts) else {
-            continue;
+    let mut buckets: BTreeMap<u64, Ohlc> = BTreeMap::new();
+    // Newest trade time across all pages — fixes the window's right edge. Set on
+    // the first (most-recent) page.
+    let mut latest_ts: Option<u64> = None;
+    // Earliest trade time seen so far — the next page fetches strictly older.
+    let mut earliest_ts: Option<u64> = None;
+
+    for _ in 0..MAX_PAGES {
+        let url = match earliest_ts {
+            // First page: the most recent 1000 trades.
+            None => format!("{base_url}/fapi/v1/aggTrades?symbol={symbol}&limit=1000"),
+            // Subsequent pages: the 1000 trades ending just before the oldest
+            // one we already have.
+            Some(min_t) => format!(
+                "{base_url}/fapi/v1/aggTrades?symbol={symbol}&endTime={}&limit=1000",
+                min_t.saturating_sub(1)
+            ),
         };
-        if p <= tikr_core::Decimal::ZERO {
-            continue;
+        let resp = http.get(&url).send().await.map_err(network_err)?;
+        let body: Value = read_json(resp).await?;
+        if let Some(err) = try_parse_error(&body) {
+            return Err(err);
         }
-        let bucket = (t / 1000) * 1000;
-        buckets
-            .entry(bucket)
-            .and_modify(|c| {
-                c.1 = c.1.max(p);
-                c.2 = c.2.min(p);
-                c.3 = p;
-            })
-            .or_insert((p, p, p, p));
+        let Some(rows) = body.as_array() else { break };
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut page_min = u64::MAX;
+        let mut page_max = 0u64;
+        for row in rows {
+            let price = row
+                .get("p")
+                .and_then(Value::as_str)
+                .and_then(|s| tikr_core::Decimal::from_str(s).ok());
+            let ts = row.get("T").and_then(Value::as_u64);
+            let (Some(p), Some(t)) = (price, ts) else {
+                continue;
+            };
+            if p <= tikr_core::Decimal::ZERO {
+                continue;
+            }
+            page_min = page_min.min(t);
+            page_max = page_max.max(t);
+            // Open = smallest-ts trade, close = largest-ts trade in the second;
+            // high/low track regardless of order, so cross-page merges are
+            // order-independent.
+            let bucket = (t / 1000) * 1000;
+            buckets
+                .entry(bucket)
+                .and_modify(|c| {
+                    c.high = c.high.max(p);
+                    c.low = c.low.min(p);
+                    if t < c.open_ts {
+                        c.open_ts = t;
+                        c.open = p;
+                    }
+                    if t > c.close_ts {
+                        c.close_ts = t;
+                        c.close = p;
+                    }
+                })
+                .or_insert(Ohlc {
+                    open_ts: t,
+                    open: p,
+                    high: p,
+                    low: p,
+                    close_ts: t,
+                    close: p,
+                });
+        }
+        if page_max == 0 {
+            break; // no usable rows
+        }
+        latest_ts.get_or_insert(page_max);
+        earliest_ts = Some(match earliest_ts {
+            Some(prev) => prev.min(page_min),
+            None => page_min,
+        });
+
+        // Covered the window? (latest_ts is set by now.)
+        if let (Some(latest), Some(earliest)) = (latest_ts, earliest_ts)
+            && latest.saturating_sub(earliest) >= window_ms
+        {
+            break;
+        }
     }
+
     Ok(buckets
         .into_iter()
-        .map(|(t, (o, h, l, c))| (t, o, h, l, c))
+        .map(|(t, c)| (t, c.open, c.high, c.low, c.close))
         .collect())
 }
 
