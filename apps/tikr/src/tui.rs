@@ -15,11 +15,8 @@ use crossterm::{ExecutableCommand, event};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Padding, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
 use tokio::sync::watch;
@@ -100,7 +97,7 @@ struct UiState {
     /// captured so chord actions can compute "page up / page down" in
     /// proportion to what the user actually sees.
     last_log_visible: usize,
-    /// Show the price chart in the top 1/3 of the log area. Default true.
+    /// Show the price chart in the top 1/2 of the log area. Default true.
     show_chart: bool,
     /// Last drawn log line count for the active tab — captured so the
     /// scroll handlers can compute a valid anchor when transitioning
@@ -842,7 +839,8 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
     {
         ui.tab_scroll += 1;
     }
-    while ui.tab_scroll > 0 && tabs_fit_active(views, ui.tab_scroll - 1, right_target, inner.width) {
+    while ui.tab_scroll > 0 && tabs_fit_active(views, ui.tab_scroll - 1, right_target, inner.width)
+    {
         ui.tab_scroll -= 1;
     }
 
@@ -941,12 +939,12 @@ fn draw_body(
         .split(area);
 
     draw_bot_detail(f, cols[0], views.get(active), ui);
-    // Split the middle column: top 1/3 chart (if enabled), bottom 2/3 logs.
+    // Split the middle column: top 1/2 chart (if enabled), bottom 1/2 logs.
     let active_view = views.get(active);
     if ui.show_chart && cols[1].height >= 9 {
         let middle = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
             .split(cols[1]);
         draw_chart(
             f,
@@ -1393,6 +1391,17 @@ fn draw_account(
     f.render_widget(p, area);
 }
 
+/// One-second OHLC candle.
+#[derive(Clone, Copy)]
+struct Candle {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    /// True when no sample landed in this second — carried-forward flat candle.
+    flat: bool,
+}
+
 fn draw_chart(
     f: &mut Frame<'_>,
     area: Rect,
@@ -1400,8 +1409,8 @@ fn draw_chart(
     history: Option<&crate::state::PriceHistory>,
 ) {
     let title = match active {
-        Some(v) => format!(" {} price ", v.symbol),
-        None => " price ".to_string(),
+        Some(v) => format!(" {} price (1s) ", v.symbol),
+        None => " price (1s) ".to_string(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1422,42 +1431,92 @@ fn draw_chart(
         return;
     }
 
-    // Window the chart to the last 60 seconds.
-    const WINDOW_MS: u64 = 60_000;
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width < 6 || inner.height < 2 {
+        return;
+    }
+
+    // Left gutter for price labels; rest of width plots one 1s candle per column,
+    // most recent on the right.
+    let gutter: u16 = 9;
+    let plot_x0 = inner.x + gutter;
+    let plot_w = inner.width.saturating_sub(gutter);
+    let plot_h = inner.height;
+    if plot_w == 0 {
+        return;
+    }
+    let n = plot_w as usize;
+
     let last_ts = hist.samples.last().map(|(t, _)| *t).unwrap_or(0);
-    let cutoff = last_ts.saturating_sub(WINDOW_MS);
-    let line_pts: Vec<(f64, f64)> = hist
+    let last_bucket = last_ts / 1000;
+    let start_bucket = last_bucket.saturating_sub(n as u64 - 1);
+
+    // Aggregate samples into per-second OHLC buckets.
+    use std::collections::BTreeMap;
+    let mut by_bucket: BTreeMap<u64, (f64, f64, f64, f64)> = BTreeMap::new();
+    for (t, p) in &hist.samples {
+        let b = t / 1000;
+        if b < start_bucket {
+            continue;
+        }
+        let v = dec_to_f64(*p);
+        by_bucket
+            .entry(b)
+            .and_modify(|c| {
+                c.1 = c.1.max(v);
+                c.2 = c.2.min(v);
+                c.3 = v;
+            })
+            .or_insert((v, v, v, v));
+    }
+    // Seed carry-forward close from the last sample before the window.
+    let mut last_close = hist
         .samples
         .iter()
-        .filter(|(t, _)| *t >= cutoff)
-        .map(|(t, p)| {
-            // X = seconds-ago (negative left, 0 right) for intuitive read.
-            let x = -((last_ts.saturating_sub(*t)) as f64 / 1000.0);
-            (x, dec_to_f64(*p))
-        })
-        .collect();
-    let map_x = |fill_ts: u64| -> f64 { -((last_ts.saturating_sub(fill_ts)) as f64 / 1000.0) };
-    let buy_pts: Vec<(f64, f64)> = hist
-        .fills
-        .iter()
-        .filter(|(t, _, is_buy)| *is_buy && *t >= cutoff)
-        .map(|(ts, p, _)| (map_x(*ts), dec_to_f64(*p)))
-        .collect();
-    let sell_pts: Vec<(f64, f64)> = hist
-        .fills
-        .iter()
-        .filter(|(t, _, is_buy)| !*is_buy && *t >= cutoff)
-        .map(|(ts, p, _)| (map_x(*ts), dec_to_f64(*p)))
-        .collect();
+        .rev()
+        .find(|(t, _)| t / 1000 < start_bucket)
+        .map(|(_, p)| dec_to_f64(*p));
 
-    // Y-axis bounds: min/max over samples + fills with 1% padding.
-    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-    for (_, y) in line_pts.iter().chain(buy_pts.iter()).chain(sell_pts.iter()) {
-        if *y < lo {
-            lo = *y;
+    // Build the candle column for each second; empty seconds carry the prior
+    // close forward as a flat candle.
+    let mut candles: Vec<Option<Candle>> = Vec::with_capacity(n);
+    for i in 0..n as u64 {
+        let bucket = start_bucket + i;
+        if let Some(&(o, h, l, c)) = by_bucket.get(&bucket) {
+            last_close = Some(c);
+            candles.push(Some(Candle {
+                open: o,
+                high: h,
+                low: l,
+                close: c,
+                flat: false,
+            }));
+        } else if let Some(c) = last_close {
+            candles.push(Some(Candle {
+                open: c,
+                high: c,
+                low: c,
+                close: c,
+                flat: true,
+            }));
+        } else {
+            candles.push(None);
         }
-        if *y > hi {
-            hi = *y;
+    }
+
+    // Y bounds over visible candles + in-window fills, with 2% padding.
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for c in candles.iter().flatten() {
+        lo = lo.min(c.low);
+        hi = hi.max(c.high);
+    }
+    let cutoff_ms = start_bucket * 1000;
+    for (t, p, _) in &hist.fills {
+        if *t >= cutoff_ms {
+            let v = dec_to_f64(*p);
+            lo = lo.min(v);
+            hi = hi.max(v);
         }
     }
     if !lo.is_finite() || !hi.is_finite() || lo == hi {
@@ -1467,50 +1526,83 @@ fn draw_chart(
     let pad = (hi - lo) * 0.02;
     let y_lo = lo - pad;
     let y_hi = hi + pad;
-    // X bounds: -60s to 0s. Always show the full minute window for
-    // consistent scale even when fewer samples exist.
-    let x_lo = -(WINDOW_MS as f64 / 1000.0);
-    let x_hi = 0.0_f64;
+    let span = (y_hi - y_lo).max(f64::MIN_POSITIVE);
 
-    let datasets = vec![
-        Dataset::default()
-            .name("bid")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(Color::Cyan))
-            .data(&line_pts),
-        Dataset::default()
-            .name("buy")
-            .marker(Marker::Dot)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(Color::Green))
-            .data(&buy_pts),
-        Dataset::default()
-            .name("sell")
-            .marker(Marker::Dot)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(Color::Red))
-            .data(&sell_pts),
-    ];
+    let buf = f.buffer_mut();
+    let rows = plot_h as f64;
+    // price -> row index (0 = top). Clamped to the plot.
+    let row_of = |v: f64| -> u16 {
+        let frac = (y_hi - v) / span;
+        let r = (frac * (rows - 1.0)).round();
+        r.clamp(0.0, rows - 1.0) as u16
+    };
 
-    let chart = Chart::new(datasets)
-        .block(block)
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([x_lo, x_hi])
-                .labels(vec![Line::from("-60s"), Line::from("now")]),
-        )
-        .y_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([y_lo, y_hi])
-                .labels(vec![
-                    Line::from(format!("{y_lo:.4}")),
-                    Line::from(format!("{y_hi:.4}")),
-                ]),
-        );
-    f.render_widget(chart, area);
+    // Draw candles.
+    for (i, cell) in candles.iter().enumerate() {
+        let Some(c) = cell else { continue };
+        let cx = plot_x0 + i as u16;
+        let r_high = row_of(c.high);
+        let r_low = row_of(c.low);
+        let color = if c.flat {
+            Color::DarkGray
+        } else if c.close >= c.open {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        // Wick: high..=low.
+        for ry in r_high..=r_low {
+            buf[(cx, inner.y + ry)]
+                .set_char('│')
+                .set_style(Style::default().fg(color));
+        }
+        // Body: open..=close (at least one cell).
+        let r_o = row_of(c.open);
+        let r_c = row_of(c.close);
+        let (b_top, b_bot) = (r_o.min(r_c), r_o.max(r_c));
+        let body = if c.flat { '─' } else { '█' };
+        for ry in b_top..=b_bot {
+            buf[(cx, inner.y + ry)]
+                .set_char(body)
+                .set_style(Style::default().fg(color));
+        }
+    }
+
+    // Fill markers overlaid at their column + price.
+    for (t, p, is_buy) in &hist.fills {
+        let b = t / 1000;
+        if b < start_bucket || b > last_bucket {
+            continue;
+        }
+        let cx = plot_x0 + (b - start_bucket) as u16;
+        let ry = row_of(dec_to_f64(*p));
+        let (ch, color) = if *is_buy {
+            ('▲', Color::Green)
+        } else {
+            ('▼', Color::Red)
+        };
+        buf[(cx, inner.y + ry)]
+            .set_char(ch)
+            .set_style(Style::default().fg(color).add_modifier(Modifier::BOLD));
+    }
+
+    // Y-axis labels in the gutter: hi at top, lo at bottom, last close mid.
+    let label_style = Style::default().fg(Color::DarkGray);
+    let put_label = |buf: &mut ratatui::buffer::Buffer, row: u16, val: f64| {
+        let s = format!("{val:>8.4}");
+        let s: String = s.chars().take(gutter as usize).collect();
+        buf.set_string(inner.x, inner.y + row, s, label_style);
+    };
+    put_label(buf, 0, y_hi);
+    put_label(buf, plot_h - 1, y_lo);
+    if let Some(c) = last_close
+        && plot_h >= 3
+    {
+        let mid = row_of(c);
+        if mid != 0 && mid != plot_h - 1 {
+            put_label(buf, mid, c);
+        }
+    }
 }
 
 fn draw_logs(
