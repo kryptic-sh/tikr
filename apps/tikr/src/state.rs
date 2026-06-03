@@ -184,6 +184,10 @@ pub struct SharedBotState {
     /// = this + `process_started.elapsed()`. Restored from the session manifest
     /// so the `$/hour` rate divides NET by cumulative uptime across restarts.
     uptime_offset_secs: Arc<std::sync::atomic::AtomicU64>,
+    /// Base session/snapshot dir, set once at startup. Lets `remove` delete a
+    /// retired bot's per-symbol snapshot so its realized P&L can't be resumed
+    /// (double-counting it once it's already folded into the retired totals).
+    state_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
 }
 
 impl Default for SharedBotState {
@@ -206,6 +210,40 @@ impl SharedBotState {
             retired: Arc::new(Mutex::new(RetiredTotals::default())),
             process_started: std::time::Instant::now(),
             uptime_offset_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            state_dir: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Record the base session/snapshot dir so `remove` can delete a retired
+    /// bot's per-symbol snapshot. Per-bot snapshots live at
+    /// `<base>/<symbol_lowercase>/` (see `per_bot_state_dir`).
+    pub fn set_state_dir(&self, dir: std::path::PathBuf) {
+        if let Ok(mut g) = self.state_dir.write() {
+            *g = Some(dir);
+        }
+    }
+
+    /// Delete a symbol's per-bot snapshot dir, so a future incarnation of the
+    /// same symbol starts fresh instead of resuming P&L already banked into the
+    /// retired totals. No-op if the base dir isn't set or the dir is absent.
+    fn delete_bot_snapshot(&self, symbol: &str) {
+        if let Ok(g) = self.state_dir.read()
+            && let Some(base) = g.as_ref()
+        {
+            let bot_dir = base.join(symbol.to_lowercase());
+            let _ = std::fs::remove_dir_all(&bot_dir);
+        }
+    }
+
+    /// Delete per-symbol snapshots for every bot currently ROTATED out. Called
+    /// at shutdown so a graceful restart (which banks lingering-rotated bots
+    /// into the retired totals and drops them from the roster) can't later
+    /// resume their already-counted P&L if the symbol rotates back in.
+    pub fn purge_rotated_snapshots(&self) {
+        for v in self.views() {
+            if matches!(v.status, BotStatus::Rotated) {
+                self.delete_bot_snapshot(&v.symbol);
+            }
         }
     }
 
@@ -224,22 +262,43 @@ impl SharedBotState {
     }
 
     /// Snapshot the current manager-level state for persistence: balance
-    /// baselines, retired totals, and the live roster (every bot currently in
-    /// the dashboard, with its status tag).
+    /// baselines, retired totals, and the live roster.
+    ///
+    /// A bot that has ROTATED out but is still lingering in `views` (awaiting
+    /// GC) is folded into the PERSISTED retired totals here and left OUT of the
+    /// roster — mirroring exactly what the TUI shows (`AccountAggregate::compute`
+    /// display-folds the same lingering-rotated bots). Without this the persisted
+    /// retired only counted GC'd bots, so the retired line dropped after a
+    /// restart while the rotated bot got re-spawned and its P&L moved back into
+    /// the running total. Excluding rotated bots from the roster also stops them
+    /// being re-spawned (and resuming their already-banked P&L) on restart.
     pub fn session_state(&self) -> SessionState {
-        let roster = self
-            .views()
-            .into_iter()
-            .map(|v| SessionBot {
+        let mut retired = self.retired_totals();
+        let mut roster = Vec::new();
+        for v in self.views() {
+            if matches!(v.status, BotStatus::Rotated) {
+                if let Some(r) = v.snapshot.as_ref() {
+                    retired.realized += r.realized.0;
+                    retired.unrealized += r.unrealized.0;
+                    retired.fees += r.fees.0;
+                    retired.funding += r.funding.0;
+                    retired.net += r.net.0;
+                    retired.events = retired.events.saturating_add(r.events_processed);
+                    retired.fills = retired.fills.saturating_add(r.fills_emitted);
+                    retired.count += 1;
+                }
+                continue; // rotated → banked into retired, not the roster
+            }
+            roster.push(SessionBot {
                 symbol: v.symbol,
                 strategy: v.strategy,
                 status: v.status.tag().to_string(),
-            })
-            .collect();
+            });
+        }
         SessionState {
             start_balance: self.start_balance(),
             bnb_start_value_usdt: self.bnb_start_value_usdt(),
-            retired: self.retired_totals(),
+            retired,
             uptime_secs: self.uptime_secs(),
             roster,
         }
@@ -338,6 +397,8 @@ impl SharedBotState {
     /// Remove a symbol from the dashboard state. Folds the departing bot's
     /// realized P&L into the retired totals first, so the account summary keeps
     /// counting it (the exchange wallet does) instead of dropping it on rotation.
+    /// Then deletes its per-symbol snapshot so the same realized P&L can't be
+    /// resumed (and double-counted) if the symbol later rotates back in.
     pub fn remove(&self, symbol: &str) {
         if let Ok(mut g) = self.inner.lock()
             && let Some(view) = g.remove(symbol)
@@ -357,6 +418,7 @@ impl SharedBotState {
         if let Ok(mut o) = self.order.lock() {
             o.retain(|s| s != symbol);
         }
+        self.delete_bot_snapshot(symbol);
     }
 
     /// Current NET PnL (`realized + unrealized − fees`) for `symbol`, read from

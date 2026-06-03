@@ -664,6 +664,8 @@ async fn main() -> anyhow::Result<()> {
     let key_material: Arc<tikr_binance::BinanceKeyMaterial> = key_material;
 
     let shared_state = SharedBotState::new();
+    // Let `remove`/`purge_rotated_snapshots` find per-symbol snapshot dirs.
+    shared_state.set_state_dir(base_state_dir.clone());
 
     // Restore the persisted session: balance baselines + retired totals (so the
     // account summary stays continuous across restarts) and the saved rotation
@@ -903,6 +905,11 @@ async fn main() -> anyhow::Result<()> {
         futures::future::join_all(supervisors),
     )
     .await;
+
+    // Drop snapshots of rotated-out bots BEFORE the final save: session_state
+    // banks their P&L into the retired totals and leaves them off the roster, so
+    // a leftover snapshot must not resume that already-counted P&L next start.
+    shared_state.purge_rotated_snapshots();
 
     // Final session save AFTER bots wound down, so the manifest reflects the
     // last roster + retired totals (rotations folded in) for the next start.
