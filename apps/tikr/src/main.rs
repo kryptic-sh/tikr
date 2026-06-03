@@ -17,7 +17,6 @@ mod build;
 mod config;
 mod logs;
 mod rampage;
-mod scalp_rotation;
 mod selection;
 mod state;
 mod supervisor;
@@ -647,8 +646,10 @@ async fn main() -> anyhow::Result<()> {
         })
         .unwrap_or_default();
 
-    let rotation_enabled = cfg.scalp_rotation.as_ref().is_some_and(|r| r.enabled)
-        || cfg.static_grid_rotation.as_ref().is_some_and(|r| r.enabled);
+    // rampage owns the symbol set when enabled, so the static `[[bot]]` loop
+    // must NOT also spawn those bots — a rampage Template config carries `[[bot]]`
+    // templates that rampage clones; spawning them statically too would double up.
+    let rotation_enabled = cfg.rampage.as_ref().is_some_and(|r| r.enabled);
 
     // Pre-seed static BotViews so the TUI has tabs from frame 1. Rotating
     // modes insert real active symbols after the volatility scan; do not
@@ -752,54 +753,8 @@ async fn main() -> anyhow::Result<()> {
         shutdown: global_shutdown_rx.clone(),
     });
 
-    // Spawn supervisors. Each enabled rotation type gets its own manager.
+    // Spawn supervisors. rampage is the single auto-rotation manager.
     let mut supervisors = Vec::new();
-    if let Some(rotation) = cfg.scalp_rotation.clone().filter(|r| r.enabled) {
-        supervisors.push(scalp_rotation::spawn_rotation_manager(
-            rotation,
-            cfg.bots.clone(),
-            scalp_rotation::RotationAccountCtx {
-                env,
-                api_key: api_key.clone(),
-                key_material: key_material.clone(),
-                base_state_dir: base_state_dir.clone(),
-                order_balance_pct: cfg.account.order_balance_pct,
-                leverage: cfg.account.leverage,
-                max_position_pct: cfg.account.max_position_pct,
-                inventory_boost: cfg.account.inventory_boost(),
-                notional_rx: notional_rx.clone(),
-                max_position_rx: max_position_rx.clone(),
-                wallet_rx: wallet_rx.clone(),
-                take_profit_pct: cfg.account.take_profit_pct,
-                bnb_price_rx: bnb_price_rx.clone(),
-            },
-            shared_state.clone(),
-            global_shutdown_rx.clone(),
-        ));
-    }
-    if let Some(rotation) = cfg.static_grid_rotation.clone().filter(|r| r.enabled) {
-        supervisors.push(scalp_rotation::spawn_rotation_manager(
-            rotation,
-            cfg.bots.clone(),
-            scalp_rotation::RotationAccountCtx {
-                env,
-                api_key: api_key.clone(),
-                key_material: key_material.clone(),
-                base_state_dir: base_state_dir.clone(),
-                order_balance_pct: cfg.account.order_balance_pct,
-                leverage: cfg.account.leverage,
-                max_position_pct: cfg.account.max_position_pct,
-                inventory_boost: cfg.account.inventory_boost(),
-                notional_rx: notional_rx.clone(),
-                max_position_rx: max_position_rx.clone(),
-                wallet_rx: wallet_rx.clone(),
-                take_profit_pct: cfg.account.take_profit_pct,
-                bnb_price_rx: bnb_price_rx.clone(),
-            },
-            shared_state.clone(),
-            global_shutdown_rx.clone(),
-        ));
-    }
     if let Some(bagboy_cfg) = cfg.bagboy.clone().filter(|c| c.enabled) {
         supervisors.push(bagboy::spawn_bagboy(
             bagboy_cfg,
@@ -828,6 +783,7 @@ async fn main() -> anyhow::Result<()> {
             shared_state.clone(),
             global_shutdown_rx.clone(),
             restored_roster,
+            cfg.bots.clone(),
         ));
     }
     if !rotation_enabled {

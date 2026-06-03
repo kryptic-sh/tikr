@@ -17,15 +17,11 @@ pub struct DashboardConfig {
     /// `[[bot]]` array-of-tables syntax.
     #[serde(rename = "bot", default)]
     pub bots: Vec<BotConfig>,
-    /// Optional rotating SpreadScalp manager.
-    #[serde(default)]
-    pub scalp_rotation: Option<ScalpRotationConfig>,
-    /// Optional rotating StaticGrid manager.
-    #[serde(default)]
-    pub static_grid_rotation: Option<ScalpRotationConfig>,
-    /// Optional unified auto-rotation manager. Replaces the old `[wave_auto]`
-    /// and `[tide_auto]` sections. Selects symbols by `score` mode and runs
-    /// the configured `strategy` on the top N qualifiers.
+    /// The single auto-rotation manager. Selects symbols by `score` mode and
+    /// runs the configured `strategy` (Wave / Tide / any `[[bot]]` template via
+    /// `kind = "template"`) on the top N qualifiers. Replaced the old
+    /// `[scalp_rotation]` / `[static_grid_rotation]` / `[wave_auto]` /
+    /// `[tide_auto]` managers.
     #[serde(default)]
     pub rampage: Option<RampageConfig>,
     /// Optional MEXC spot accumulator (bagboy). Places a single
@@ -85,54 +81,6 @@ fn bagboy_default_ladder_levels() -> u32 {
 }
 fn bagboy_default_ladder_step_bps() -> u32 {
     5
-}
-
-/// Rotating SpreadScalp manager configuration.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScalpRotationConfig {
-    /// Enable rotating scalp mode.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Bot strategy template name to match in the `[[bot]]` list, e.g.
-    /// `"spread-scalp"` or `"static-grid"`.
-    #[serde(default = "scalp_rotation_default_strategy")]
-    pub strategy: String,
-    /// Number of active bots to keep running.
-    #[serde(default = "scalp_rotation_default_slots")]
-    pub slots: usize,
-    /// How often to rescan volatility and rotate symbols.
-    #[serde(default = "scalp_rotation_default_refresh_secs")]
-    pub refresh_secs: u64,
-    /// Quote asset suffix to include.
-    #[serde(default = "scalp_rotation_default_quote_asset")]
-    pub quote_asset: String,
-    /// Minimum quote volume filter.
-    #[serde(default)]
-    pub min_quote_volume: Decimal,
-    /// Minimum `tick_bps = tick_size / price × 10000` filter. Symbols
-    /// below this threshold are excluded before volatility ranking.
-    /// `0` (default) = filter disabled. `6` recommended to ensure each
-    /// round-trip clears USDT-M maker fees (~3.6 bps BNB-discounted RT)
-    /// with edge to spare.
-    #[serde(default)]
-    pub min_tick_bps: Decimal,
-    /// Optional allow-list. Empty means all matching quote assets.
-    #[serde(default)]
-    pub candidates: Vec<String>,
-}
-
-fn scalp_rotation_default_slots() -> usize {
-    4
-}
-fn scalp_rotation_default_strategy() -> String {
-    "spread-scalp".to_string()
-}
-fn scalp_rotation_default_refresh_secs() -> u64 {
-    300
-}
-fn scalp_rotation_default_quote_asset() -> String {
-    "USDT".to_string()
 }
 
 /// Account-wide settings.
@@ -651,6 +599,16 @@ pub enum ScoreMode {
         #[serde(default = "tide_auto_default_min_tick_bps")]
         min_tick_bps: Decimal,
     },
+    /// Score by realized volatility (1-minute close-to-close range, bps) minus
+    /// taker fee (bps) — prefers high-volatility, low-fee symbols. Mirrors the
+    /// old `scalp_rotation` ranking. Fetches 1m klines + the commission rate per
+    /// candidate (extra HTTP), gated by `min_tick_bps`.
+    RealizedVol {
+        #[serde(default = "wave_auto_default_candle_count")]
+        candle_count: u32,
+        #[serde(default = "tide_auto_default_min_tick_bps")]
+        min_tick_bps: Decimal,
+    },
 }
 
 /// Strategy spawned by the rampage manager for each qualifying symbol.
@@ -686,6 +644,15 @@ pub enum RampageStrategy {
         /// (two-sided window prune). Default `true`.
         #[serde(default = "tide_prune_default")]
         prune_stragglers: bool,
+    },
+    /// Spawn ANY strategy by cloning a `[[bot]]` template whose `strategy`
+    /// matches `name` (e.g. `spread-scalp`, `static-grid`). Lets rampage rotate
+    /// strategies that aren't Wave/Tide — the params live in the `[[bot]]` block,
+    /// the rampage manager just picks the symbol. Replaces the old
+    /// `scalp_rotation` / `static_grid_rotation` managers.
+    Template {
+        /// Strategy name to match against a `[[bot]]` template's `strategy`.
+        name: String,
     },
 }
 

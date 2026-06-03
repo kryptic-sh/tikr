@@ -2,15 +2,24 @@
 [account]
 env = "futures-testnet"
 
-# StaticGrid rotation: keep 3 bots on the most volatile USDT futures
-# markets, using the static-grid strategy.
-[static_grid_rotation]
+# Rampage auto-rotation (migrated from [static_grid_rotation]): runs the
+# static-grid [[bot]] template on the top `top_n` symbols by realized_vol − fee.
+[rampage]
 enabled = true
-strategy = "static-grid"
-slots = 4
-refresh_secs = 3600
+top_n = 4
+recheck_interval_secs = 3600
 quote_asset = "USDT"
-min_quote_volume = 50000000
+min_volume_usdt = "50000000"
+
+[rampage.score]
+mode = "realized_vol"
+[rampage.score.params]
+min_tick_bps = "0"
+
+[rampage.strategy]
+kind = "template"
+[rampage.strategy.params]
+name = "static-grid"
 
 # StaticGrid template. Rotation copies these params onto each selected symbol.
 [[bot]]

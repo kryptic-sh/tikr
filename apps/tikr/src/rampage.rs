@@ -70,10 +70,29 @@ pub fn spawn_rampage_manager(
     shared_state: SharedBotState,
     mut global_shutdown: watch::Receiver<bool>,
     initial_roster: Vec<String>,
+    // `[[bot]]` templates, for `RampageStrategy::Template` (run an arbitrary
+    // strategy by cloning its template). Empty for Wave/Tide configs.
+    bots: Vec<BotConfig>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
         let mut active: HashMap<String, ActiveBot> = HashMap::new();
+
+        // For `RampageStrategy::Template`, resolve the `[[bot]]` template ONCE.
+        // Fail fast (manager idles) if the named strategy has no template — every
+        // spawned bot clones this and just swaps the symbol. None for Wave/Tide.
+        let template: Option<BotConfig> = if let RampageStrategy::Template { name } = &cfg.strategy
+        {
+            match bots.iter().find(|b| &b.strategy == name).cloned() {
+                Some(t) => Some(t),
+                None => {
+                    warn!(strategy = %name, "rampage: Template strategy has no matching [[bot]] template — manager idle");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         // Resume the saved lineup: re-spawn the symbols that were running at the
         // last shutdown BEFORE the first discovery tick, so the bot comes back up
@@ -85,7 +104,7 @@ pub fn spawn_rampage_manager(
                 continue;
             }
             info!(symbol = %symbol, "rampage: resuming bot from saved session");
-            let bot = spawn_one_bot(&symbol, &account, &shared_state, &cfg);
+            let bot = spawn_one_bot(&symbol, &account, &shared_state, &cfg, template.as_ref());
             active.insert(symbol, bot);
         }
         // Off-bots (rotated out) → consecutive recheck cycles spent not-active.
@@ -103,10 +122,15 @@ pub fn spawn_rampage_manager(
             ScoreMode::TickBps { min_tick_bps } => {
                 format!("tick_bps(min={min_tick_bps})")
             }
+            ScoreMode::RealizedVol {
+                candle_count,
+                min_tick_bps,
+            } => format!("realized_vol(count={candle_count}, min_tick_bps={min_tick_bps})"),
         };
         let strategy_label = match &cfg.strategy {
             RampageStrategy::Wave { .. } => "wave",
             RampageStrategy::Tide { .. } => "tide",
+            RampageStrategy::Template { name } => name.as_str(),
         };
         info!(
             min_volume_usdt = %cfg.min_volume_usdt,
@@ -218,6 +242,62 @@ pub fn spawn_rampage_manager(
                         })
                         .collect()
                 }
+                ScoreMode::RealizedVol {
+                    candle_count,
+                    min_tick_bps,
+                } => {
+                    // Gate by tick_bps (round-trip viability), then score by
+                    // realized 1m volatility (bps) minus taker fee (bps): prefers
+                    // high-vol, low-fee symbols. Fetches klines + commission per
+                    // candidate (concurrent, cap 16).
+                    let tick_map: HashMap<String, Decimal> = discovered
+                        .iter()
+                        .map(|r| (r.symbol.clone(), r.tick_bps))
+                        .collect();
+                    let min_tick = *min_tick_bps;
+                    let gated: Vec<String> = candidates
+                        .into_iter()
+                        .filter(|s| tick_map.get(s).copied().unwrap_or_default() >= min_tick)
+                        .collect();
+                    let base_url = account.env.rest_base_url().to_string();
+                    let n = *candle_count;
+                    let http_ref = &http;
+                    let api_key = account.api_key.as_str();
+                    let key_material = account.key_material.as_ref();
+                    let raw: Vec<(String, Decimal)> = futures::stream::iter(gated)
+                        .map(|sym| {
+                            let base = base_url.clone();
+                            async move {
+                                let rv = match tikr_binance::futs::get_1m_closes(
+                                    http_ref, &base, &sym, n,
+                                )
+                                .await
+                                {
+                                    Ok(closes) => realized_vol_bps(&closes),
+                                    Err(_) => Decimal::ZERO,
+                                };
+                                let fee_bps = match tikr_binance::futs::get_commission_rate(
+                                    http_ref,
+                                    &base,
+                                    api_key,
+                                    key_material,
+                                    &sym,
+                                )
+                                .await
+                                {
+                                    Ok(c) => c.taker * Decimal::from(10_000),
+                                    Err(_) => Decimal::ZERO,
+                                };
+                                (sym, rv - fee_bps)
+                            }
+                        })
+                        .buffer_unordered(16)
+                        .collect()
+                        .await;
+                    raw.into_iter()
+                        .filter(|(_, s)| *s > Decimal::ZERO)
+                        .collect()
+                }
             };
 
             // 4. Rank desc, take top_n.
@@ -269,7 +349,8 @@ pub fn spawn_rampage_manager(
                             notional = %(amt.abs() * mark),
                             "rampage: adopting orphan position (no active bot) — spawning manager"
                         );
-                        let bot = spawn_one_bot(&sym, &account, &shared_state, &cfg);
+                        let bot =
+                            spawn_one_bot(&sym, &account, &shared_state, &cfg, template.as_ref());
                         active.insert(sym.clone(), bot);
                         retired.remove(&sym); // it's live again — stop the GC clock
                     }
@@ -331,7 +412,7 @@ pub fn spawn_rampage_manager(
                 if active.contains_key(symbol) {
                     continue;
                 }
-                let bot = spawn_one_bot(symbol, &account, &shared_state, &cfg);
+                let bot = spawn_one_bot(symbol, &account, &shared_state, &cfg, template.as_ref());
                 info!(symbol = %symbol, "rampage: spawned new bot");
                 active.insert(symbol.clone(), bot);
             }
@@ -474,14 +555,37 @@ async fn flatten_symbols(symbols: &[String], account: &RampageAccountCtx) {
     }
 }
 
+/// Mean absolute 1-minute close-to-close return, in bps — the realized-vol
+/// score for [`ScoreMode::RealizedVol`].
+fn realized_vol_bps(closes: &[Decimal]) -> Decimal {
+    if closes.len() < 2 {
+        return Decimal::ZERO;
+    }
+    let mut total = Decimal::ZERO;
+    let mut n = Decimal::ZERO;
+    for pair in closes.windows(2) {
+        if pair[0] <= Decimal::ZERO || pair[1] <= Decimal::ZERO {
+            continue;
+        }
+        total += ((pair[1] - pair[0]) / pair[0]).abs() * Decimal::from(10_000);
+        n += Decimal::ONE;
+    }
+    if n <= Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        total / n
+    }
+}
+
 fn spawn_one_bot(
     symbol: &str,
     account: &RampageAccountCtx,
     shared_state: &SharedBotState,
     cfg: &RampageConfig,
+    template: Option<&BotConfig>,
 ) -> ActiveBot {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (bot_cfg, strategy_name, label) = match &cfg.strategy {
+    let (bot_cfg, strategy_name, label): (BotConfig, String, String) = match &cfg.strategy {
         RampageStrategy::Wave {
             levels,
             steps_bps,
@@ -512,7 +616,7 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
             };
-            (bc, "wave", format!("{symbol}/wave"))
+            (bc, "wave".to_string(), format!("{symbol}/wave"))
         }
         RampageStrategy::Tide {
             grid_levels,
@@ -551,7 +655,16 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
             };
-            (bc, "tide", format!("{symbol}/tide"))
+            (bc, "tide".to_string(), format!("{symbol}/tide"))
+        }
+        RampageStrategy::Template { name } => {
+            // Clone the resolved `[[bot]]` template, swap in this symbol. The
+            // template is guaranteed Some here (resolved + fail-fast at start).
+            let mut bc = template
+                .expect("Template strategy resolved at manager start")
+                .clone();
+            bc.symbol = symbol.to_string();
+            (bc, name.clone(), format!("{symbol}/{name}"))
         }
     };
     shared_state.insert(

@@ -9,15 +9,25 @@ env = "futures-testnet"
 # volatile USDT futures markets. On rotation, old symbols are stopped,
 # open orders are canceled, and any open position is flattened before the
 # next assignment starts.
-[scalp_rotation]
+# Rampage auto-rotation (migrated from [scalp_rotation]): runs the spread-scalp
+# [[bot]] template on the top `top_n` symbols by realized_vol − fee.
+[rampage]
 enabled = true
-slots = 4
-refresh_secs = 120
+top_n = 4
+recheck_interval_secs = 120
 quote_asset = "USDT"
-min_quote_volume = 50000000
+min_volume_usdt = "50000000"
+# symbols_allowlist = ["DOGEUSDT", "HYPERUSDT", "PROMPTUSDT", "XRPUSDT", "1000PEPEUSDT"]
 
-# Optional allow-list. Empty = scan all USDT futures symbols.
-# candidates = ["DOGEUSDT", "HYPERUSDT", "PROMPTUSDT", "XRPUSDT", "1000PEPEUSDT"]
+[rampage.score]
+mode = "realized_vol"
+[rampage.score.params]
+min_tick_bps = "0"
+
+[rampage.strategy]
+kind = "template"
+[rampage.strategy.params]
+name = "spread-scalp"
 
 
 # SpreadScalp template. Rotation copies these params onto each selected symbol.

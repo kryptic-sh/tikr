@@ -58,34 +58,28 @@ max_position_pct = "100"
 # `min_quote_volume = 100M USDT` filters out illiquid mid-caps where
 # SS would sit idle (per 2026-05-25 alt-candidates probe).
 
-[scalp_rotation]
+# Rampage auto-rotation (the single rotation manager). Runs the spread-scalp
+# [[bot]] template below on the top `top_n` symbols, ranked by realized
+# volatility minus taker fee. (Migrated from the old [scalp_rotation].)
+[rampage]
 enabled = true
-slots = 4
-refresh_secs = 300
+top_n = 4
+recheck_interval_secs = 300
 quote_asset = "USDT"
-# min_quote_volume = 100000000
-# Only spawn on symbols where tick_size / price × 10000 ≥ N bps.
-# Ensures each round-trip clears USDT-M maker fees (~3.6 bps BNB-discounted
-# RT) with edge to spare. `0` (default) disables the filter.
-min_tick_bps = 4
+# min_volume_usdt = "100000000"
+# symbols_allowlist = []   # empty = scan all USDT futures above min_volume_usdt
 
-# Optional allow-list. Empty (default) = scan all USDT futures symbols
-# above min_quote_volume. Curate to symbols with tick_bps >= 1.0 so the
-# 8bps trigger has natural cascade events to capture (per 2026-05-25
-# probe of mainnet alts).
-candidates = [
-  # "DOGEUSDT",    # confirmed winner — 0.97bps tick, 279M vol
-  # "NEARUSDT",    # 3.62bps tick, 777M vol, +14.7% / 20.9% range
-  # "SUIUSDT",     # 0.95bps tick, 213M vol
-  # "ONDOUSDT",    # 2.30bps tick, 177M vol
-  # "NILUSDT",     # 1.14bps tick, 359M vol, high volatility
-  # "INJUSDT",     # 1.74bps tick, 114M vol, +10% / 14% range
-  # "WLDUSDT",     # 3.27bps tick, 133M vol
-  # "1000SHIBUSDT", # 1.78bps tick, 26M vol (borderline)
-  # "ADAUSDT",     # 4.08bps tick, 122M vol (wide tick)
-  # "AVAXUSDT",    # 1.06bps tick, 92M vol
-  # "LINKUSDT",    # 1.04bps tick, 82M vol
-]
+[rampage.score]
+mode = "realized_vol"
+[rampage.score.params]
+# Only spawn where tick_size / price × 10000 ≥ N bps so a round-trip clears
+# USDT-M maker fees with edge. Ranks survivors by realized_vol − fee.
+min_tick_bps = "4"
+
+[rampage.strategy]
+kind = "template"   # run the [[bot]] template whose strategy matches `name`
+[rampage.strategy.params]
+name = "spread-scalp"
 
 
 # ─── SpreadScalp template ─────────────────────────────────────────────────
