@@ -1322,10 +1322,14 @@ fn draw_account(
             BotStatus::Crashed(_) => ("○", Color::Red),
             BotStatus::Rotated => ("○", Color::DarkGray),
         };
-        let value = format!("{:>+.2} ({:>+.2})", dec_to_f64(net), dec_to_f64(real));
+        // Value = "NET (REAL)" with NET and REAL each colored by their OWN sign.
+        let net_str = format!("{:>+.2}", dec_to_f64(net));
+        let real_str = format!("{:>+.2}", dec_to_f64(real));
         // `{icon} {symbol}` left, value right-aligned (matches kv_line padding).
+        // Value width = net + " (" + real + ")".
         let label_len = 1 + 1 + symbol.chars().count(); // icon + space + symbol
-        let pad = SIDE_PANEL_INNER.saturating_sub(label_len + value.chars().count());
+        let value_len = net_str.chars().count() + 2 + real_str.chars().count() + 1;
+        let pad = SIDE_PANEL_INNER.saturating_sub(label_len + value_len);
         // Selected bot (== active tab): highlight the whole row + bold, keeping
         // each span's fg so the icon / PnL colors still read.
         let selected = ui.active_symbol.as_deref() == Some(symbol);
@@ -1340,7 +1344,10 @@ fn draw_account(
             Span::styled(format!("{icon} "), deco(Style::default().fg(icon_color))),
             Span::styled(symbol.to_string(), deco(Style::default().fg(Color::White))),
             Span::styled(" ".repeat(pad), deco(Style::default())),
-            Span::styled(value, deco(pnl_style(net))),
+            Span::styled(net_str, deco(pnl_style(net))),
+            Span::styled(" (", deco(Style::default().fg(Color::Gray))),
+            Span::styled(real_str, deco(pnl_style(real))),
+            Span::styled(")", deco(Style::default().fg(Color::Gray))),
         ]));
     }
 
