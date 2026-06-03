@@ -43,13 +43,17 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # hjkl vim-like primitives
 hjkl-picker = "0.27"
 hjkl-keymap = "0.27"
 hjkl-clipboard = "0.27"
+
+# Theming — unified theme schema + ratatui adapter
+hjkl-theme = "0.29"
+hjkl-theme-tui = "0.29"
 
 # Logging
 tracing = "0.1"
