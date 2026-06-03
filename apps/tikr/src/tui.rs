@@ -1670,6 +1670,37 @@ fn draw_chart(
     draw_order_line(buf, best_buy.0, best_buy.1, Color::Cyan, "BUY");
     draw_order_line(buf, best_sell.0, best_sell.1, Color::Yellow, "SELL");
 
+    // Average entry / break-even line — shows when the position is near break
+    // even. It does NOT feed the Y-bounds: `row_of` clamps a price beyond the
+    // rendered range to the top/bottom edge, so an out-of-view break-even pins
+    // to the nearest edge instead of squashing the candles.
+    let avg = active
+        .and_then(|v| v.live.as_ref())
+        .map(|lv| lv.avg_entry)
+        .unwrap_or_default();
+    if avg > Decimal::ZERO {
+        let ry = plot_y0 + row_of(dec_to_f64(avg));
+        for cx in plot_x0..plot_right {
+            let cell = &mut buf[(cx, ry)];
+            if cell.symbol() == " " {
+                cell.set_char('─')
+                    .set_style(Style::default().fg(Color::White));
+            }
+        }
+        let label = format!(" BE {} ", avg.normalize());
+        let lw = label.chars().count() as u16;
+        let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
+        buf.set_string(
+            lx,
+            ry,
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+
     // Fill markers overlaid at their column + price.
     for (t, p, is_buy) in &hist.fills {
         let b = t / 1000;
