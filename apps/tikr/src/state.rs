@@ -669,6 +669,15 @@ impl AccountAggregate {
                 a.net += r.net.0;
                 a.events = a.events.saturating_add(r.events_processed);
                 a.fills = a.fills.saturating_add(r.fills_emitted);
+                // A rotated bot still lingering in the list is already "done" —
+                // surface it in the retired line immediately (not only after GC
+                // folds it into RetiredTotals). Display-only: its P&L is already
+                // in the grand total above, so this never double-counts, and the
+                // count/total are continuous when GC later folds it in.
+                if matches!(v.status, BotStatus::Rotated) {
+                    a.retired_net += r.net.0;
+                    a.retired_count += 1;
+                }
             }
             if let Some(ref lv) = v.live {
                 a.buy_fills = a.buy_fills.saturating_add(lv.buy_fills);
