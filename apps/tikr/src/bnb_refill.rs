@@ -1,10 +1,13 @@
 //! BNB auto-refill for live BNB-pays-fees accounts.
 //!
-//! Reads the latest BNB state from `SharedBotState` every 60s. When the
-//! USDT-equivalent value falls below `min_balance_usdt`, it tops the wallet
-//! back up to `target_balance_usdt` by converting USDT → BNB **directly on the
-//! futures wallet** via Binance's Futures Convert API (`/fapi/v1/convert/*`) —
-//! no spot buy or spot→futures transfer required.
+//! Every 60s, when BNB-pays-fees is on, it does a **live** API read of the
+//! BNB futures-wallet balance + BNBUSDT mid (not the shared snapshot, which can
+//! lag stale-low). When the USDT-equivalent value falls below `min_balance_usdt`
+//! it tops the wallet back up to `target_balance_usdt` by converting USDT → BNB
+//! **directly on the futures wallet** via Binance's Futures Convert API
+//! (`/fapi/v1/convert/*`) — no spot buy or spot→futures transfer required. The
+//! buy is capped at `target_balance_usdt` so a bad reading can never size a
+//! runaway convert.
 //!
 //! All work no-ops when:
 //!   - BNB-fee mode is off (auto-detected at startup)
@@ -35,10 +38,41 @@ pub struct BnbMonitorConfig {
     pub shutdown: watch::Receiver<bool>,
 }
 
-/// Don't convert again within this window of a prior convert — the BNB snapshot
-/// (refreshed by the account poller) can lag the convert, and if that poll is
-/// itself rate-limited the value would read stale-low; this stops a re-buy.
+/// Don't convert again within this window of a prior convert — even with a live
+/// balance re-read, the Convert API can take a moment to settle; this is a
+/// second backstop against a re-buy.
 const CONVERT_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Floor on a single convert. Below this there's nothing meaningful to top up
+/// (and it's near Binance's dust/minimum-convert size), so we skip.
+const MIN_CONVERT_USDT: Decimal = Decimal::ONE;
+
+/// Live BNB futures-wallet balance + BNBUSDT mid, fetched directly from the API.
+/// Returns `None` (skip the tick — never convert on uncertainty) if either call
+/// fails or the price is non-positive.
+async fn live_bnb_value(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+) -> Option<(Decimal, Decimal)> {
+    let balance =
+        match tikr_binance::futs::get_balance(http, base_url, api_key, key_material, "BNB").await {
+            Ok(b) => b.wallet_balance,
+            Err(e) => {
+                warn!(error = ?e, "bnb_refill: live BNB balance fetch failed — skipping tick");
+                return None;
+            }
+        };
+    let price = match tikr_binance::futs::get_book_ticker(http, base_url, "BNBUSDT").await {
+        Ok(t) => (t.bid_price + t.ask_price) / Decimal::from(2),
+        Err(e) => {
+            warn!(error = ?e, "bnb_refill: live BNBUSDT price fetch failed — skipping tick");
+            return None;
+        }
+    };
+    (price > Decimal::ZERO).then_some((balance, price))
+}
 
 /// Spawn the BNB auto-refill task. Cheap — one timer + RwLock read per tick,
 /// and a Convert API round-trip only when actually refilling.
@@ -54,54 +88,79 @@ pub fn spawn_bnb_monitor(cfg: BnbMonitorConfig) {
             "bnb_refill: started (auto-convert USDT→BNB on the futures wallet)"
         );
         let http = reqwest::Client::new();
+        let base_url = cfg.env.rest_base_url();
         let mut shutdown = cfg.shutdown;
         let mut last_convert: Option<Instant> = None;
         loop {
-            let bnb = cfg.shared_state.bnb_snapshot();
-            if bnb.enabled && bnb.price_usdt > Decimal::ZERO {
-                let usdt_value = bnb.balance * bnb.price_usdt;
+            // Gate on the poller's feeBurn detection only. The conversion
+            // decision itself uses a LIVE balance + price read below — never the
+            // shared snapshot, which can lag the poller and read stale-low (or
+            // 0 before the BNB asset is first populated), which would otherwise
+            // trigger an unnecessary convert on bad data.
+            if cfg.shared_state.bnb_snapshot().enabled {
                 let cooling = last_convert
                     .map(|t| t.elapsed() < CONVERT_COOLDOWN)
                     .unwrap_or(false);
-                if usdt_value < cfg.min_balance_usdt && !cooling {
-                    // Buy enough to reach target (e.g. value $0.5, target $10 →
-                    // convert $9.50 of USDT into BNB).
-                    let needed = (cfg.target_balance_usdt - usdt_value).max(Decimal::ZERO);
-                    if needed > Decimal::ZERO {
-                        let from_amount = format!("{needed:.2}"); // USDT, 2 dp
-                        info!(
-                            bnb_balance = %bnb.balance,
-                            bnb_value_usdt = %usdt_value.round_dp(4),
-                            low_usdt = %cfg.min_balance_usdt,
-                            target_usdt = %cfg.target_balance_usdt,
-                            buy_usdt = %from_amount,
-                            "BNB low — auto-converting USDT→BNB on futures"
-                        );
-                        match tikr_binance::futs::convert_futures(
-                            &http,
-                            cfg.env.rest_base_url(),
-                            &cfg.api_key,
-                            &cfg.key_material,
-                            "USDT",
-                            "BNB",
-                            &from_amount,
-                        )
-                        .await
-                        {
-                            Ok(bnb_received) => {
-                                last_convert = Some(Instant::now());
-                                info!(
-                                    bnb_received = %bnb_received,
-                                    usdt_spent = %from_amount,
-                                    "bnb_refill: convert succeeded"
-                                );
-                            }
-                            Err(e) => {
-                                // Brief cooldown on failure too so a hard error
-                                // (e.g. below-min convert amount) doesn't retry
-                                // every minute.
-                                last_convert = Some(Instant::now());
-                                warn!(error = ?e, "bnb_refill: convert USDT→BNB failed");
+                if !cooling
+                    && let Some((balance, price)) =
+                        live_bnb_value(&http, base_url, &cfg.api_key, &cfg.key_material).await
+                {
+                    let usdt_value = balance * price;
+                    if usdt_value < cfg.min_balance_usdt {
+                        // Top up to target (e.g. value $0.5, target $10 → buy
+                        // $9.50). Capped at `target` so a bad reading can never
+                        // size a runaway buy, and floored at MIN_CONVERT_USDT.
+                        let needed = (cfg.target_balance_usdt - usdt_value)
+                            .max(Decimal::ZERO)
+                            .min(cfg.target_balance_usdt);
+                        if needed >= MIN_CONVERT_USDT {
+                            let from_amount = format!("{needed:.2}"); // USDT, 2 dp
+                            info!(
+                                bnb_balance = %balance,
+                                bnb_price = %price,
+                                bnb_value_usdt = %usdt_value.round_dp(4),
+                                low_usdt = %cfg.min_balance_usdt,
+                                target_usdt = %cfg.target_balance_usdt,
+                                buy_usdt = %from_amount,
+                                "BNB low — auto-converting USDT→BNB on futures (live read)"
+                            );
+                            match tikr_binance::futs::convert_futures(
+                                &http,
+                                base_url,
+                                &cfg.api_key,
+                                &cfg.key_material,
+                                "USDT",
+                                "BNB",
+                                &from_amount,
+                            )
+                            .await
+                            {
+                                Ok(bnb_received) => {
+                                    last_convert = Some(Instant::now());
+                                    // Re-read so the log reflects the real new
+                                    // balance, not just the quoted amount.
+                                    let new_val = live_bnb_value(
+                                        &http,
+                                        base_url,
+                                        &cfg.api_key,
+                                        &cfg.key_material,
+                                    )
+                                    .await;
+                                    info!(
+                                        bnb_received = %bnb_received,
+                                        usdt_spent = %from_amount,
+                                        new_bnb_balance = ?new_val.map(|(b, _)| b),
+                                        new_value_usdt = ?new_val.map(|(b, p)| (b * p).round_dp(4)),
+                                        "bnb_refill: convert succeeded"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Brief cooldown on failure too so a hard
+                                    // error (e.g. below-min convert amount)
+                                    // doesn't retry every minute.
+                                    last_convert = Some(Instant::now());
+                                    warn!(error = ?e, "bnb_refill: convert USDT→BNB failed");
+                                }
                             }
                         }
                     }
