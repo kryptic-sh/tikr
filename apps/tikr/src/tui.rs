@@ -846,15 +846,17 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
 
     let mut truncated = false;
     for (i, v) in views.iter().enumerate().skip(ui.tab_scroll) {
-        let (color, tag) = match &v.status {
-            BotStatus::Running => (Color::Green, v.status.tag()),
-            BotStatus::Crashed(_) => (Color::Red, v.status.tag()),
-            BotStatus::Restarting(_) => (Color::Yellow, v.status.tag()),
-            BotStatus::Starting => (Color::Cyan, v.status.tag()),
-            BotStatus::Rotated => (Color::Green, v.status.tag()),
+        // Status icon matches the account-sidebar per-symbol rows: ● running,
+        // ◌ starting/restarting, ○ stopped/rotated.
+        let (color, icon) = match &v.status {
+            BotStatus::Running => (Color::Green, "●"),
+            BotStatus::Crashed(_) => (Color::Red, "○"),
+            BotStatus::Restarting(_) => (Color::Yellow, "◌"),
+            BotStatus::Starting => (Color::Cyan, "◌"),
+            BotStatus::Rotated => (Color::Green, "○"),
         };
         let active = i == ui.active_tab;
-        let label = format!(" {} ({}) [{}] ", v.symbol, v.strategy, tag);
+        let label = format!(" {icon} {} ({}) ", v.symbol, v.strategy);
         let w = label.chars().count() as u16;
         let sep_w = 1;
         if i != ui.active_tab && x.saturating_add(w).saturating_add(sep_w) > right {
