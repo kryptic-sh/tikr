@@ -828,14 +828,21 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
     }
 
     ui.active_tab = ui.active_tab.min(views.len() - 1);
-    ui.tab_scroll = ui.tab_scroll.min(ui.active_tab);
+    let last = views.len() - 1;
+    // Keep one tab of context on each side of the active tab (when it exists):
+    // fit through `active + 1` so the right neighbour shows (selecting the last
+    // visible tab then reveals the next), and start at/below `active - 1` so the
+    // left neighbour shows. Active itself must always stay visible, so the
+    // right-scroll never advances past `active` — if the neighbour can't fit on a
+    // narrow terminal, the active tab wins.
+    let right_target = (ui.active_tab + 1).min(last);
+    ui.tab_scroll = ui.tab_scroll.min(ui.active_tab.saturating_sub(1));
     while ui.tab_scroll < ui.active_tab
-        && !tabs_fit_active(views, ui.tab_scroll, ui.active_tab, inner.width)
+        && !tabs_fit_active(views, ui.tab_scroll, right_target, inner.width)
     {
         ui.tab_scroll += 1;
     }
-    while ui.tab_scroll > 0 && tabs_fit_active(views, ui.tab_scroll - 1, ui.active_tab, inner.width)
-    {
+    while ui.tab_scroll > 0 && tabs_fit_active(views, ui.tab_scroll - 1, right_target, inner.width) {
         ui.tab_scroll -= 1;
     }
 
