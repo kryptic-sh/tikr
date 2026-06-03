@@ -833,13 +833,15 @@ async fn main() -> anyhow::Result<()> {
     // Price-history watcher — drives the TUI chart panel.
     spawn_price_history_watcher(shared_state.clone(), env, global_shutdown_rx.clone());
 
-    // BNB-balance monitor — warns when balance drops below threshold.
-    // No-ops when bnb_refill_enabled=false in TOML OR when the account
-    // doesn't have BNB-pays-fees enabled. Refill is monitor-only for
-    // now; spot buy + transfer wiring will land in a follow-up commit
-    // once tikr-binance has a SAPI module.
+    // BNB auto-refill — when BNB-pays-fees is on and the BNB value drops below
+    // the low bound, converts USDT→BNB on the futures wallet (Convert API) up to
+    // the target. No-ops when bnb_refill_enabled=false OR the account doesn't
+    // have BNB-pays-fees enabled.
     bnb_refill::spawn_bnb_monitor(bnb_refill::BnbMonitorConfig {
         shared_state: shared_state.clone(),
+        env,
+        api_key: api_key.clone(),
+        key_material: key_material.clone(),
         min_balance_usdt: cfg.account.bnb_min_balance_usdt,
         target_balance_usdt: cfg.account.bnb_target_balance_usdt,
         refill_enabled: cfg.account.bnb_refill_enabled,

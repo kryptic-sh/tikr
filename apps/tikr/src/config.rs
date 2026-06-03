@@ -117,8 +117,8 @@ pub struct AccountConfig {
     /// `bnb_balance × bnb_price < bnb_min_balance_usdt`. Default `$1`.
     #[serde(default = "default_bnb_min_balance_usdt")]
     pub bnb_min_balance_usdt: Decimal,
-    /// BNB-refill target in USDT-equivalent. Refill buys enough BNB
-    /// to bring the USDT-value up to this level. Default `$50`.
+    /// BNB-refill target in USDT-equivalent. Refill converts enough USDT→BNB
+    /// to bring the USDT-value up to this level. Default `$10`.
     #[serde(default = "default_bnb_target_balance_usdt")]
     pub bnb_target_balance_usdt: Decimal,
     /// Master switch for BNB auto-refill. Defaults `true`. Has no
@@ -175,7 +175,7 @@ fn default_bnb_min_balance_usdt() -> Decimal {
     Decimal::ONE
 }
 fn default_bnb_target_balance_usdt() -> Decimal {
-    Decimal::from(50)
+    Decimal::from(10)
 }
 fn default_bnb_refill_enabled() -> bool {
     true

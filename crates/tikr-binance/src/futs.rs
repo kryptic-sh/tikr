@@ -1619,6 +1619,126 @@ pub async fn get_fee_burn_status(
     Ok(burn)
 }
 
+/// A USDⓈ-M Futures Convert quote (e.g. USDT → BNB), valid for ~10s. Used to
+/// top up BNB for fee payment directly on the futures wallet — no spot leg or
+/// transfer needed.
+#[derive(Debug, Clone)]
+pub struct ConvertQuote {
+    /// Opaque quote id to pass to [`convert_accept_quote`].
+    pub quote_id: String,
+    /// `to_asset` amount this quote yields for the requested `from_amount`.
+    pub to_amount: tikr_core::Decimal,
+}
+
+/// Request a Futures Convert quote: `from_amount` of `from_asset` → `to_asset`.
+///
+/// Endpoint: `POST /fapi/v1/convert/getQuote` (signed). The returned quote is
+/// valid briefly and must be accepted via [`convert_accept_quote`].
+pub async fn convert_get_quote(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    from_asset: &str,
+    to_asset: &str,
+    from_amount: &str,
+) -> Result<ConvertQuote, VenueError> {
+    use std::str::FromStr;
+    let params =
+        format!("fromAsset={from_asset}&toAsset={to_asset}&fromAmount={from_amount}&validTime=10s");
+    let signed = append_auth_dispatch(&params, key_material);
+    let url = format!("{base_url}/fapi/v1/convert/getQuote?{signed}");
+    let resp = http
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+    let body: Value = read_json(resp).await?;
+    if let Some(e) = try_parse_error(&body) {
+        return Err(e);
+    }
+    let quote_id = body
+        .get("quoteId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            VenueError::Internal(Box::new(std::io::Error::other(format!(
+                "convert getQuote: missing quoteId in response: {body}"
+            ))))
+        })?;
+    // `toAmount` is a string; absent/garbage → 0 (caller logs the received qty).
+    let to_amount = body
+        .get("toAmount")
+        .and_then(Value::as_str)
+        .and_then(|s| tikr_core::Decimal::from_str(s).ok())
+        .unwrap_or(tikr_core::Decimal::ZERO);
+    Ok(ConvertQuote {
+        quote_id,
+        to_amount,
+    })
+}
+
+/// Accept a Futures Convert quote by id.
+///
+/// Endpoint: `POST /fapi/v1/convert/acceptQuote` (signed). A returned
+/// `orderStatus` of `FAIL` is surfaced as an error; `PROCESS` / `ACCEPT_SUCCESS`
+/// / `SUCCESS` are treated as accepted.
+pub async fn convert_accept_quote(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    quote_id: &str,
+) -> Result<(), VenueError> {
+    let params = format!("quoteId={quote_id}");
+    let signed = append_auth_dispatch(&params, key_material);
+    let url = format!("{base_url}/fapi/v1/convert/acceptQuote?{signed}");
+    let resp = http
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+    let body: Value = read_json(resp).await?;
+    if let Some(e) = try_parse_error(&body) {
+        return Err(e);
+    }
+    if let Some(status) = body.get("orderStatus").and_then(Value::as_str)
+        && status.eq_ignore_ascii_case("FAIL")
+    {
+        return Err(VenueError::Internal(Box::new(std::io::Error::other(
+            format!("convert acceptQuote returned FAIL: {body}"),
+        ))));
+    }
+    Ok(())
+}
+
+/// Convert `from_amount` of `from_asset` into `to_asset` on the futures wallet
+/// (quote + accept in one call). Returns the quoted `to_asset` amount.
+pub async fn convert_futures(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    from_asset: &str,
+    to_asset: &str,
+    from_amount: &str,
+) -> Result<tikr_core::Decimal, VenueError> {
+    let quote = convert_get_quote(
+        http,
+        base_url,
+        api_key,
+        key_material,
+        from_asset,
+        to_asset,
+        from_amount,
+    )
+    .await?;
+    convert_accept_quote(http, base_url, api_key, key_material, &quote.quote_id).await?;
+    Ok(quote.to_amount)
+}
+
 /// Per-symbol commission rate from Binance.
 #[derive(Debug, Clone, Copy)]
 pub struct CommissionRate {
