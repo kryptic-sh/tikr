@@ -762,6 +762,9 @@ where
     let take_profit_pct = config.take_profit_pct;
     let take_profit_enabled = live_mode && take_profit_pct > Decimal::ZERO;
     let mut tp_quote_id: Option<QuoteId> = None;
+    // Price the resting take-profit order is currently pegged at, so we can
+    // re-peg it to the touch when the market drifts away.
+    let mut tp_price: Option<Decimal> = None;
 
     let mut last_funding_ts: Option<Timestamp> = None;
     // Live: a STABLE run_id so each bot keeps a single snapshot file in its
@@ -2034,33 +2037,64 @@ where
                         .unwrap_or(Decimal::ZERO);
                     let threshold = wallet * take_profit_pct / Decimal::from(100);
 
+                    // Reducing side + touch: long → sell at best ask, short →
+                    // buy at best bid.
+                    let (tp_side, touch) = if size > Decimal::ZERO {
+                        (
+                            tikr_core::Side::Ask,
+                            current_book.asks.first().map(|l| l.price.0),
+                        )
+                    } else {
+                        (
+                            tikr_core::Side::Bid,
+                            current_book.bids.first().map(|l| l.price.0),
+                        )
+                    };
+
                     // Clear a resolved order (filled / cancelled → gone from mirror).
                     if let Some(id) = tp_quote_id
                         && !quotes.iter().any(|(qid, _)| *qid == id)
                     {
                         tp_quote_id = None;
+                        tp_price = None;
                     }
 
+                    // Manage a resting profit-lock. Cancel it if the move reversed
+                    // back under the threshold (don't sell the bag cheaply), OR
+                    // re-peg it when the market has drifted too far (>10 bps) from
+                    // where it rests — cancel here and let the placement block
+                    // below re-rest it at the fresh touch on this same tick.
                     if let Some(id) = tp_quote_id {
-                        // Resting profit-lock: pull it if the move reversed back
-                        // under the threshold (don't sell off the bag cheaply).
-                        if unrealized < threshold {
+                        let repeg_tol = Decimal::new(1, 3); // 0.001 = 10 bps
+                        let drifted = match (touch, tp_price) {
+                            (Some(t), Some(p)) if t > Decimal::ZERO => {
+                                (t - p).abs() / t > repeg_tol
+                            }
+                            _ => false,
+                        };
+                        if unrealized < threshold || drifted {
                             let _ = venue.cancel(id).await;
                             fill_sim.drop_quote(id);
                             tp_quote_id = None;
+                            tp_price = None;
+                            if drifted && unrealized >= threshold {
+                                info!(
+                                    touch = ?touch,
+                                    "take-profit: re-pegging to the touch (price drifted)"
+                                );
+                            }
                         }
-                    } else if threshold > Decimal::ZERO
+                    }
+
+                    // Place a fresh order (or re-rest one just cancelled for a
+                    // re-peg) when we hold a winning bag past the threshold and
+                    // nothing is currently resting. Reduce-only maker at the touch.
+                    if tp_quote_id.is_none()
+                        && threshold > Decimal::ZERO
                         && unrealized >= threshold
                         && size != Decimal::ZERO
                     {
-                        // Reduce-only maker at the touch on the reducing side:
-                        // long → sell at best ask, short → buy at best bid.
                         let half = size.abs() / Decimal::from(2);
-                        let (tp_side, touch) = if size > Decimal::ZERO {
-                            (tikr_core::Side::Ask, current_book.asks.first().map(|l| l.price.0))
-                        } else {
-                            (tikr_core::Side::Bid, current_book.bids.first().map(|l| l.price.0))
-                        };
                         if half > Decimal::ZERO
                             && let Some(px) = touch
                             && px > Decimal::ZERO
@@ -2084,6 +2118,7 @@ where
                                         id,
                                     );
                                     tp_quote_id = Some(id);
+                                    tp_price = Some(px);
                                     info!(
                                         unrealized = %unrealized,
                                         threshold = %threshold,
