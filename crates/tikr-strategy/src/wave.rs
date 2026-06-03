@@ -52,6 +52,21 @@ fn relattice_drift() -> Decimal {
     Decimal::new(1, 1) // 0.10
 }
 
+/// Auto-inner: number of trailing 1-second candles averaged to size the inner
+/// dead-zone.
+const CANDLE_WINDOW: usize = 60;
+/// Auto-inner: candle bucket width in nanoseconds (1 second).
+const CANDLE_NANOS: u64 = 1_000_000_000;
+/// Auto-inner: hard cap on the auto-sized inner (steps), so a volatility spike
+/// can't push the first order absurdly far from the touch.
+const MAX_AUTO_INNER: u32 = 50;
+
+/// Auto-inner target as a fraction of the average candle range: the inner
+/// dead-zone (half-spread) aims for ~half the mean high→low candle gap.
+fn auto_inner_fraction() -> Decimal {
+    Decimal::new(5, 1) // 0.5
+}
+
 /// Configuration for [`Wave`].
 #[derive(Debug, Clone)]
 pub struct WaveConfig {
@@ -75,7 +90,15 @@ pub struct WaveConfig {
     /// `steps_inner × step` from mid (where the frozen origins are anchored).
     /// e.g. `steps_inner=2, steps_bps=5` → first order 10bps off mid, levels
     /// 5bps apart. `0` (default) = origins at the touch. Snapped to tick.
+    /// Used only when `auto_inner == false`.
     pub steps_inner: u32,
+
+    /// Auto-size the inner dead-zone from recent volatility. When `true`
+    /// (default behavior), `steps_inner` is ignored: the inner starts at 0 and
+    /// tracks ~half the average high→low gap of the last [`CANDLE_WINDOW`]
+    /// one-second candles (in bps), divided by `steps_bps` to convert to steps.
+    /// When `false`, the fixed `steps_inner` is used.
+    pub auto_inner: bool,
 
     /// Completed round-trips needed to trigger a refill: refill once ≥ this
     /// many slots have drained on the bid AND ≥ this many on the ask (each
@@ -104,6 +127,19 @@ pub struct Wave {
     /// Per-event dedupe (in case Quote action sequence has duplicates).
     emitted_this_event_bid: HashSet<i64>,
     emitted_this_event_ask: HashSet<i64>,
+
+    // --- Auto-inner volatility tracking (1-second candles of mid) ---
+    /// Current candle's second bucket (`now_ns / CANDLE_NANOS`).
+    cur_candle_sec: Option<u64>,
+    /// Current candle's running high/low of mid.
+    cur_candle_high: Decimal,
+    cur_candle_low: Decimal,
+    /// Closed-candle high→low gaps in bps, newest at the back, capped at
+    /// [`CANDLE_WINDOW`].
+    candle_bps: std::collections::VecDeque<Decimal>,
+    /// Auto-sized inner dead-zone in steps. Starts at 0, recomputed on each
+    /// candle close. Ignored when `config.auto_inner == false`.
+    dyn_inner_steps: u32,
 }
 
 impl Wave {
@@ -146,6 +182,80 @@ impl Wave {
         })
     }
 
+    /// The inner dead-zone in steps actually used this event: the auto-sized
+    /// value when `auto_inner`, else the fixed config knob.
+    fn effective_inner(&self) -> u32 {
+        if self.config.auto_inner {
+            self.dyn_inner_steps
+        } else {
+            self.config.steps_inner
+        }
+    }
+
+    /// Fold the current mid into the 1-second candle tracker. On a second
+    /// rollover the just-closed candle's high→low gap (bps) is pushed into the
+    /// rolling window and the auto-inner is recomputed. No-op unless
+    /// `auto_inner` (avoids the work when the feature is off).
+    fn update_candles(&mut self, mid: Decimal, now_ns: u64) {
+        if !self.config.auto_inner || mid <= Decimal::ZERO {
+            return;
+        }
+        let sec = now_ns / CANDLE_NANOS;
+        match self.cur_candle_sec {
+            Some(cur) if cur == sec => {
+                if mid > self.cur_candle_high {
+                    self.cur_candle_high = mid;
+                }
+                if mid < self.cur_candle_low {
+                    self.cur_candle_low = mid;
+                }
+            }
+            Some(_) => {
+                // Second rolled over → close the prior candle.
+                let cmid = (self.cur_candle_high + self.cur_candle_low) / Decimal::from(2);
+                if cmid > Decimal::ZERO {
+                    let gap_bps =
+                        (self.cur_candle_high - self.cur_candle_low) / cmid * Decimal::from(10_000);
+                    if self.candle_bps.len() == CANDLE_WINDOW {
+                        self.candle_bps.pop_front();
+                    }
+                    self.candle_bps.push_back(gap_bps);
+                    self.recompute_dyn_inner();
+                }
+                self.cur_candle_sec = Some(sec);
+                self.cur_candle_high = mid;
+                self.cur_candle_low = mid;
+            }
+            None => {
+                self.cur_candle_sec = Some(sec);
+                self.cur_candle_high = mid;
+                self.cur_candle_low = mid;
+            }
+        }
+    }
+
+    /// Recompute the auto-sized inner: ~half the mean candle gap (bps) over the
+    /// window, divided by `steps_bps` to convert bps → steps, clamped to
+    /// `[0, MAX_AUTO_INNER]`. No-op when `steps_bps == 0` (no bps-per-step to
+    /// divide by — inner stays 0).
+    fn recompute_dyn_inner(&mut self) {
+        let sbps = self.config.steps_bps;
+        if sbps == 0 || self.candle_bps.is_empty() {
+            self.dyn_inner_steps = 0;
+            return;
+        }
+        let sum: Decimal = self.candle_bps.iter().copied().sum();
+        let avg = sum / Decimal::from(self.candle_bps.len() as u64);
+        let target_bps = avg * auto_inner_fraction();
+        let steps = (target_bps / Decimal::from(sbps))
+            .round()
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(0)
+            .clamp(0, MAX_AUTO_INNER as i64) as u32;
+        self.dyn_inner_steps = steps;
+    }
+
     /// Compute `(top_bid_override, top_ask_override)`, pushing the origins
     /// apart to honor the inner dead-zone (`steps_inner × step` off mid each
     /// side, clamped to the touch).
@@ -155,7 +265,8 @@ impl Wave {
         best_ask: Option<Price>,
     ) -> (Option<Price>, Option<Price>) {
         let tick = self.config.tick_size;
-        let spread_active = self.config.steps_bps > 0 || self.config.steps_inner > 0;
+        let inner = self.effective_inner();
+        let spread_active = self.config.steps_bps > 0 || inner > 0;
         if let (Some(bp), Some(ap)) = (best_bid, best_ask)
             && bp.0 > Decimal::ZERO
             && ap.0 > bp.0
@@ -164,9 +275,9 @@ impl Wave {
         {
             let mid = (bp.0 + ap.0) / Decimal::from(2);
             // Distance from mid to the first order on each side =
-            // `steps_inner × step`. `steps_inner=0` → offset 0 → origins clamp
-            // to the touch via the .min(bp)/.max(ap) below.
-            let required_half = Decimal::from(self.config.steps_inner) * self.compute_step(mid);
+            // `inner × step`. `inner=0` → offset 0 → origins clamp to the touch
+            // via the .min(bp)/.max(ap) below.
+            let required_half = Decimal::from(inner) * self.compute_step(mid);
             let raw_top_bid = mid - required_half;
             let raw_top_ask = mid + required_half;
             let snapped_bid = (raw_top_bid / tick).floor() * tick;
@@ -461,6 +572,11 @@ impl Strategy for Wave {
             lattice_step: None,
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
+            cur_candle_sec: None,
+            cur_candle_high: Decimal::ZERO,
+            cur_candle_low: Decimal::ZERO,
+            candle_bps: std::collections::VecDeque::with_capacity(CANDLE_WINDOW),
+            dyn_inner_steps: 0,
         }
     }
 
@@ -475,6 +591,17 @@ impl Strategy for Wave {
 
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
+
+        // Auto-inner: fold this event's mid into the 1s candle tracker before
+        // computing the window so the inner dead-zone reflects current vol.
+        if let (Some(bp), Some(ap)) = (best_bid, best_ask)
+            && bp.0 > Decimal::ZERO
+            && ap.0 > bp.0
+        {
+            let mid = (bp.0 + ap.0) / Decimal::from(2);
+            self.update_candles(mid, ctx.now.0);
+        }
+
         let (top_b, top_a) = self.top_overrides(best_bid, best_ask);
         let tick = self.config.tick_size;
 
@@ -495,7 +622,8 @@ impl Strategy for Wave {
                 mid = %mid,
                 tick = %self.config.tick_size,
                 steps_bps = self.config.steps_bps,
-                steps_inner = self.config.steps_inner,
+                auto_inner = self.config.auto_inner,
+                inner_steps = self.effective_inner(),
                 step = %base,
                 inner_offset = %(self.bid_lattice_origin.map(|o| mid - o).unwrap_or_default()),
                 "wave: lattice frozen"
@@ -627,6 +755,9 @@ mod tests {
             levels: 6,
             steps_bps: 10,
             steps_inner: 0,
+            // Existing tests exercise the fixed-inner (manual) path; auto-inner
+            // has its own dedicated tests.
+            auto_inner: false,
             round_trips: 1,
         }
     }
@@ -1138,5 +1269,88 @@ mod tests {
             step0,
             "tick-limited step must not relattice (cannot tighten below tick)"
         );
+    }
+
+    /// Feed `secs` one-second candles each spanning `[low, high]` (two ticks per
+    /// second forces the high then the low), so the prior candle closes.
+    fn feed_candles(w: &mut Wave, high: Decimal, low: Decimal, secs: u64) {
+        for s in 0..secs {
+            let t = s * CANDLE_NANOS + 1;
+            w.update_candles(high, t);
+            w.update_candles(low, t);
+        }
+    }
+
+    #[test]
+    fn auto_inner_starts_zero_and_tracks_half_candle_gap() {
+        // steps_bps=10. A 20bps avg candle gap → inner target = half = 10bps =
+        // 1 step. A 60bps gap → 30bps = 3 steps.
+        let mut c = cfg();
+        c.auto_inner = true;
+        c.steps_bps = 10;
+        let mut w = Wave::new(c.clone());
+        assert_eq!(w.dyn_inner_steps, 0, "auto-inner must start at 0");
+        assert_eq!(w.effective_inner(), 0);
+
+        // 20 bps gap at mid 100 → 100.1 / 99.9.
+        feed_candles(&mut w, Decimal::new(1001, 1), Decimal::new(999, 1), 5);
+        assert_eq!(
+            w.dyn_inner_steps, 1,
+            "20bps gap → half=10bps / 10bps = 1 step"
+        );
+
+        // 60 bps gap at mid 100 → 100.3 / 99.7. Refill the window with the wider
+        // range; the rolling mean climbs toward 60bps → 3 steps.
+        let mut w2 = Wave::new(c);
+        feed_candles(&mut w2, Decimal::new(1003, 1), Decimal::new(997, 1), 70);
+        assert_eq!(
+            w2.dyn_inner_steps, 3,
+            "60bps gap → half=30bps / 10bps = 3 steps"
+        );
+    }
+
+    #[test]
+    fn auto_inner_noop_when_steps_bps_zero() {
+        // No bps-per-step to divide by → inner stays 0 (1-tick lattice).
+        let mut c = cfg();
+        c.auto_inner = true;
+        c.steps_bps = 0;
+        let mut w = Wave::new(c);
+        feed_candles(&mut w, Decimal::new(1010, 1), Decimal::new(990, 1), 10);
+        assert_eq!(w.dyn_inner_steps, 0);
+        assert_eq!(w.effective_inner(), 0);
+    }
+
+    #[test]
+    fn fixed_inner_ignores_candles_when_auto_off() {
+        // auto_inner=false → effective_inner is the fixed knob, candle tracking
+        // is a no-op.
+        let mut c = cfg();
+        c.auto_inner = false;
+        c.steps_inner = 4;
+        c.steps_bps = 10;
+        let mut w = Wave::new(c);
+        feed_candles(&mut w, Decimal::new(1005, 1), Decimal::new(995, 1), 10);
+        assert_eq!(
+            w.dyn_inner_steps, 0,
+            "auto tracker idle when auto_inner off"
+        );
+        assert_eq!(
+            w.effective_inner(),
+            4,
+            "fixed knob used when auto_inner off"
+        );
+    }
+
+    #[test]
+    fn auto_inner_caps_at_max() {
+        // A huge candle gap must clamp the inner to MAX_AUTO_INNER.
+        let mut c = cfg();
+        c.auto_inner = true;
+        c.steps_bps = 1; // tiny step → bps/step ratio explodes the step count
+        let mut w = Wave::new(c);
+        // ~2000bps gap at mid 100 → half=1000bps / 1bps = 1000 steps, capped.
+        feed_candles(&mut w, Decimal::from(110), Decimal::from(90), 70);
+        assert_eq!(w.dyn_inner_steps, MAX_AUTO_INNER);
     }
 }

@@ -549,6 +549,7 @@ fn build_wave(
         levels: wave.levels,
         steps_bps: wave.steps_bps,
         steps_inner: wave.steps_inner,
+        auto_inner: wave.auto_inner,
         round_trips: wave.round_trips,
     }))
 }

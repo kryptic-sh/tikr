@@ -590,6 +590,7 @@ fn spawn_one_bot(
             levels,
             steps_bps,
             steps_inner,
+            auto_inner,
             round_trips,
         } => {
             let bc = BotConfig {
@@ -600,6 +601,7 @@ fn spawn_one_bot(
                     levels: *levels,
                     steps_bps: *steps_bps,
                     steps_inner: *steps_inner,
+                    auto_inner: *auto_inner,
                     round_trips: *round_trips,
                 }),
                 tide: None,

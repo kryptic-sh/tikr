@@ -271,13 +271,23 @@ pub struct WaveParams {
     #[serde(default)]
     pub steps_bps: u32,
     /// Inner dead-zone in STEPS (mid → first order = `steps_inner × step`).
-    /// `0` (default) = origins at the touch.
+    /// `0` (default) = origins at the touch. Used only when `auto_inner=false`.
     #[serde(default)]
     pub steps_inner: u32,
+    /// Auto-size the inner dead-zone from recent volatility (~half the mean
+    /// high→low gap of the last 60 one-second candles, in bps, ÷ `steps_bps`).
+    /// `true` (default) ignores `steps_inner` and starts the inner at 0,
+    /// adapting as candles roll. Set `false` to pin the fixed `steps_inner`.
+    #[serde(default = "wave_default_auto_inner")]
+    pub auto_inner: bool,
     /// Completed round-trips needed to trigger a refill (≥ N bids AND ≥ N asks
     /// drained). A whole side emptying refills regardless. Default 1.
     #[serde(default = "wave_default_round_trips")]
     pub round_trips: u32,
+}
+
+fn wave_default_auto_inner() -> bool {
+    true
 }
 
 fn wave_default_round_trips() -> u32 {
@@ -617,6 +627,8 @@ pub enum RampageStrategy {
         steps_bps: u32,
         #[serde(default = "wave_auto_default_inner_steps")]
         steps_inner: u32,
+        #[serde(default = "wave_default_auto_inner")]
+        auto_inner: bool,
         #[serde(default = "wave_default_round_trips")]
         round_trips: u32,
     },
@@ -1396,11 +1408,13 @@ mod tests {
                 levels,
                 steps_bps,
                 steps_inner,
+                auto_inner,
                 round_trips,
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
                 assert_eq!(*steps_inner, 2);
+                assert!(*auto_inner, "auto_inner defaults true");
                 assert_eq!(*round_trips, 5);
             }
             other => panic!("expected Wave, got {other:?}"),

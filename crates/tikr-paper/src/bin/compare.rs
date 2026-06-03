@@ -830,9 +830,17 @@ struct Args {
     wave_refill_threshold: u32,
 
     /// Wave sweep: comma-separated inner dead-zone values in STEPS (mid → first
-    /// order = `steps_inner × step`). `0` = origins at the touch.
+    /// order = `steps_inner × step`). `0` = origins at the touch. Ignored when
+    /// `--wave-auto-inner` is true (the default).
     #[arg(long, default_value = "0")]
     wave_inner_steps_list: String,
+
+    /// Wave: auto-size the inner dead-zone from candle volatility (~half the
+    /// mean high→low gap of the last 60 1s candles ÷ steps_bps). `true`
+    /// (default, matches live) ignores `--wave-inner-steps-list` and starts the
+    /// inner at 0. Pass `--wave-auto-inner false` to A/B the fixed-inner sweep.
+    #[arg(long, default_value_t = true)]
+    wave_auto_inner: bool,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -2303,12 +2311,23 @@ async fn run_sweep_collect(
     if included("wave", &allow) {
         let wave_steps = parse_u32_list(&args.wave_step_bps_list)?;
         let wave_levels = parse_u32_list(&args.wave_grid_levels_list)?;
-        let wave_inner_sweep = parse_u32_list(&args.wave_inner_steps_list)?;
+        // When auto-inner is on the fixed inner sweep is meaningless — collapse
+        // it to a single preset to avoid running N identical configs.
+        let wave_inner_sweep = if args.wave_auto_inner {
+            vec![0]
+        } else {
+            parse_u32_list(&args.wave_inner_steps_list)?
+        };
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &inner in &wave_inner_sweep {
+                    let inner_label = if args.wave_auto_inner {
+                        "auto".to_string()
+                    } else {
+                        inner.to_string()
+                    };
                     let label = format!(
-                        "Wave lv={levels} steps_bps={step} inner={inner} rt={}",
+                        "Wave lv={levels} steps_bps={step} inner={inner_label} rt={}",
                         args.wave_refill_threshold,
                     );
                     spawn_preset(
@@ -2324,6 +2343,7 @@ async fn run_sweep_collect(
                             levels,
                             steps_bps: step,
                             steps_inner: inner,
+                            auto_inner: args.wave_auto_inner,
                             round_trips: args.wave_refill_threshold,
                         }),
                         fees,
