@@ -2940,6 +2940,8 @@ async fn run_one<S: Strategy>(
     let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
     let runner_config = RunnerConfig {
         state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
+        wallet_rx: None,
+        take_profit_pct: tikr_core::Decimal::ZERO,
         // Equity-curve export needs snapshot ticks; default `0` (no
         // ticks) → no rows. Force a modest cadence when CSV requested
         // so the curve has resolution without spamming dashboards.
@@ -3033,6 +3035,8 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
         let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
         let runner_config = RunnerConfig {
             state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
+            wallet_rx: None,
+            take_profit_pct: tikr_core::Decimal::ZERO,
             snapshot_every_n_events: if equity_csv_path.is_some() { 1000 } else { 0 },
             skim,
             funding,

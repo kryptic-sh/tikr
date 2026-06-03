@@ -227,6 +227,24 @@ pub trait Venue: Send + Sync {
         let _ = self.quote(intent).await?;
         Ok(())
     }
+
+    /// Place a reduce-only, post-only LIMIT order on `symbol` — a passive maker
+    /// order that can only REDUCE the position (never open/flip it). Used by the
+    /// runner's take-profit to lock in part of a large winning bag at the touch.
+    /// Returns the `QuoteId` so the caller can track / cancel it.
+    ///
+    /// Default: unsupported (paper/backtest don't place real orders).
+    async fn reduce_only_limit(
+        &self,
+        _symbol: &Symbol,
+        _side: Side,
+        _price: Price,
+        _size: Size,
+    ) -> Result<QuoteId, VenueError> {
+        Err(VenueError::Rejected {
+            reason: "reduce_only_limit not supported by this venue".to_string(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

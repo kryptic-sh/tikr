@@ -52,6 +52,8 @@ pub struct RampageAccountCtx {
     pub inventory_boost: Option<tikr_paper::InventoryBoostConfig>,
     pub notional_rx: watch::Receiver<Decimal>,
     pub max_position_rx: watch::Receiver<Decimal>,
+    pub wallet_rx: watch::Receiver<Decimal>,
+    pub take_profit_pct: Decimal,
     pub bnb_price_rx: watch::Receiver<Decimal>,
 }
 
@@ -578,6 +580,8 @@ fn spawn_one_bot(
             inventory_boost: account.inventory_boost,
             notional_rx: account.notional_rx.clone(),
             max_position_rx: account.max_position_rx.clone(),
+            wallet_rx: account.wallet_rx.clone(),
+            take_profit_pct: account.take_profit_pct,
             bnb_price_rx: account.bnb_price_rx.clone(),
             // Restart cancels orphan orders but PRESERVES the open position
             // (clear_on_start=true would flatten). A symbol that re-enters the

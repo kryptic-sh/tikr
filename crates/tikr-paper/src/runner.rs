@@ -145,6 +145,14 @@ pub struct RunnerConfig {
     /// `max_position_usdt` update their config via `on_max_position_updated`.
     /// `None` (default) = static cap (set once at spawn).
     pub max_position_rx: Option<watch::Receiver<Decimal>>,
+    /// Optional live account wallet balance (same poll as `notional_rx`).
+    /// Drives the take-profit threshold (`take_profit_pct` of this). `None` =
+    /// take-profit disabled regardless of `take_profit_pct`.
+    pub wallet_rx: Option<watch::Receiver<Decimal>>,
+    /// Take-profit: when a bot's UNREALIZED P&L exceeds this percent of the
+    /// account wallet balance, place a reduce-only maker limit at the touch to
+    /// close HALF the position and lock in profit. `0` (default) = disabled.
+    pub take_profit_pct: Decimal,
     /// Rolling-window length (seconds) for `StrategyContext::recent_liqs`.
     /// `0` (default) disables the liq window — the slice exposed to
     /// strategies is always empty even when `external_liqs` is set.
@@ -286,6 +294,8 @@ impl Default for RunnerConfig {
             live_tap: None,
             notional_rx: None,
             max_position_rx: None,
+            wallet_rx: None,
+            take_profit_pct: Decimal::ZERO,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
@@ -739,6 +749,14 @@ where
     // Runner-side inventory-aware order-size boost (applies to every
     // strategy). Static config; the live cap above is the curve denominator.
     let inventory_boost = config.inventory_boost;
+
+    // Take-profit: live account wallet balance + threshold + the id of the
+    // currently-resting profit-lock order (at most one at a time).
+    let mut wallet_rx = config.wallet_rx;
+    let take_profit_pct = config.take_profit_pct;
+    let take_profit_enabled = live_mode && take_profit_pct > Decimal::ZERO;
+    let mut tp_quote_id: Option<QuoteId> = None;
+
     let mut last_funding_ts: Option<Timestamp> = None;
     // Live: a STABLE run_id so each bot keeps a single snapshot file in its
     // per-symbol state dir (overwritten each write) — bounded, and trivially
@@ -1975,6 +1993,96 @@ where
                         resumed_sim_duration_secs.saturating_add(heartbeat.sim_duration_secs);
                     if let Ok(mut guard) = tap.try_write() {
                         *guard = Some(heartbeat);
+                    }
+                }
+                // Take-profit: when unrealized P&L exceeds `take_profit_pct` of
+                // the wallet, rest a reduce-only maker limit at the touch to lock
+                // in HALF the bag. At most one such order at a time; it's tracked
+                // in FillSim so it resolves cleanly (fill drops it; we cancel +
+                // drop it if the move reverses back under the threshold).
+                if take_profit_enabled {
+                    let size = pos.size.0;
+                    let avg = pos.avg_entry.0;
+                    let mark = if last_mark.0 > Decimal::ZERO {
+                        last_mark.0
+                    } else {
+                        last_mid.0
+                    };
+                    // Signed unrealized (mark − avg)·size: >0 = winning (long or short).
+                    let unrealized = if avg > Decimal::ZERO && mark > Decimal::ZERO {
+                        (mark - avg) * size
+                    } else {
+                        Decimal::ZERO
+                    };
+                    let wallet = wallet_rx
+                        .as_mut()
+                        .map(|rx| *rx.borrow_and_update())
+                        .unwrap_or(Decimal::ZERO);
+                    let threshold = wallet * take_profit_pct / Decimal::from(100);
+
+                    // Clear a resolved order (filled / cancelled → gone from mirror).
+                    if let Some(id) = tp_quote_id
+                        && !quotes.iter().any(|(qid, _)| *qid == id)
+                    {
+                        tp_quote_id = None;
+                    }
+
+                    if let Some(id) = tp_quote_id {
+                        // Resting profit-lock: pull it if the move reversed back
+                        // under the threshold (don't sell off the bag cheaply).
+                        if unrealized < threshold {
+                            let _ = venue.cancel(id).await;
+                            fill_sim.drop_quote(id);
+                            tp_quote_id = None;
+                        }
+                    } else if threshold > Decimal::ZERO
+                        && unrealized >= threshold
+                        && size != Decimal::ZERO
+                    {
+                        // Reduce-only maker at the touch on the reducing side:
+                        // long → sell at best ask, short → buy at best bid.
+                        let half = size.abs() / Decimal::from(2);
+                        let (tp_side, touch) = if size > Decimal::ZERO {
+                            (tikr_core::Side::Ask, current_book.asks.first().map(|l| l.price.0))
+                        } else {
+                            (tikr_core::Side::Bid, current_book.bids.first().map(|l| l.price.0))
+                        };
+                        if half > Decimal::ZERO
+                            && let Some(px) = touch
+                            && px > Decimal::ZERO
+                        {
+                            match venue
+                                .reduce_only_limit(&symbol, tp_side, Price(px), tikr_core::Size(half))
+                                .await
+                            {
+                                Ok(id) => {
+                                    let now_ts = last_event_ts.unwrap_or(Timestamp(0));
+                                    fill_sim.enqueue_place_with_id(
+                                        QuoteIntent {
+                                            symbol: symbol.clone(),
+                                            side: tp_side,
+                                            price: Price(px),
+                                            size: tikr_core::Size(half),
+                                            tif: tikr_core::TimeInForce::PostOnly,
+                                            kind: tikr_core::QuoteKind::Point,
+                                        },
+                                        now_ts,
+                                        id,
+                                    );
+                                    tp_quote_id = Some(id);
+                                    info!(
+                                        unrealized = %unrealized,
+                                        threshold = %threshold,
+                                        half = %half,
+                                        price = %px,
+                                        "take-profit: resting reduce-only maker to lock in half the bag"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(error = ?e, "take-profit: reduce_only_limit failed")
+                                }
+                            }
+                        }
                     }
                 }
                 let fingerprint = (fills_emitted, open_buys, open_sells, pos.size.0);
@@ -3310,6 +3418,8 @@ mod tests {
             live_tap: None,
             notional_rx: None,
             max_position_rx: None,
+            wallet_rx: None,
+            take_profit_pct: Decimal::ZERO,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
@@ -3907,6 +4017,8 @@ mod tests {
             live_tap: None,
             notional_rx: None,
             max_position_rx: None,
+            wallet_rx: None,
+            take_profit_pct: Decimal::ZERO,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,
@@ -4007,6 +4119,8 @@ mod tests {
             live_tap: None,
             notional_rx: None,
             max_position_rx: None,
+            wallet_rx: None,
+            take_profit_pct: Decimal::ZERO,
             liq_window_secs: 0,
             seed_position: None,
             equity_csv_path: None,

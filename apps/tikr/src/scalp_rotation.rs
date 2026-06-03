@@ -39,6 +39,10 @@ pub struct RotationAccountCtx {
     pub notional_rx: watch::Receiver<Decimal>,
     /// Account-derived per-bot position cap updates.
     pub max_position_rx: watch::Receiver<Decimal>,
+    /// Live account wallet balance — drives the take-profit threshold.
+    pub wallet_rx: watch::Receiver<Decimal>,
+    /// Take-profit threshold as a percent of wallet (`0` = disabled).
+    pub take_profit_pct: Decimal,
     /// Live BNBUSDT mid for fee conversion (BNB → USDT-equivalent).
     /// Zero when BNB-fee mode is off.
     pub bnb_price_rx: watch::Receiver<Decimal>,
@@ -262,6 +266,8 @@ fn spawn_one_bot(
             inventory_boost: account.inventory_boost,
             notional_rx: account.notional_rx.clone(),
             max_position_rx: account.max_position_rx.clone(),
+            wallet_rx: account.wallet_rx.clone(),
+            take_profit_pct: account.take_profit_pct,
             bnb_price_rx: account.bnb_price_rx.clone(),
             // Rotation always starts a fresh symbol — leftover state
             // from a different bot in this slot would be stale.

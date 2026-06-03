@@ -670,6 +670,45 @@ impl Venue for BinanceClient {
         Ok(venue_qid)
     }
 
+    async fn reduce_only_limit(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        price: Price,
+        size: Size,
+    ) -> Result<QuoteId, VenueError> {
+        self.check_mainnet_gate()?;
+        if !self.env.is_futures() {
+            return Err(VenueError::Rejected {
+                reason: "reduce_only_limit only supported on futures".to_string(),
+            });
+        }
+        let sym_str = binance_symbol(symbol);
+        let price = round_price_for_side(&self.exchange_info_cache, &sym_str, price, side)?;
+        let size = round_size(&self.exchange_info_cache, &sym_str, size)?;
+        // reduce-only is exempt from MIN_NOTIONAL, so no bump needed.
+        let placement_qid = QuoteId::new();
+        let coid = Self::client_order_id(placement_qid);
+        let price_str = Self::format_decimal(price.0);
+        let size_str = Self::format_decimal(size.0);
+        let venue_qid = crate::futs::place_reduce_only_limit(
+            &self.http,
+            self.env.rest_base_url(),
+            &self.api_key,
+            &self.key_material,
+            &sym_str,
+            side,
+            &price_str,
+            &size_str,
+            &coid,
+        )
+        .await?;
+        if let Ok(mut map) = self.quote_symbols.lock() {
+            map.insert(venue_qid, (sym_str.clone(), coid));
+        }
+        Ok(venue_qid)
+    }
+
     async fn market_close(&self, symbol: &Symbol, side: Side, qty: Size) -> Result<(), VenueError> {
         self.check_mainnet_gate()?;
         let sym_str = binance_symbol(symbol);

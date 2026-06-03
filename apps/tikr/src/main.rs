@@ -256,6 +256,7 @@ struct AccountPollerConfig {
     shared_state: SharedBotState,
     notional_tx: watch::Sender<Decimal>,
     max_position_tx: watch::Sender<Decimal>,
+    wallet_tx: watch::Sender<Decimal>,
     max_position_pct: Decimal,
     env: tikr_binance::BinanceEnv,
     api_key: String,
@@ -462,6 +463,11 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     if max_position != *cfg.max_position_tx.borrow() {
                         let _ = cfg.max_position_tx.send(max_position);
                     }
+                    // Publish wallet balance for the take-profit threshold
+                    // (`take_profit_pct` of this). Same wallet+BNB base as sizing.
+                    if total_balance != *cfg.wallet_tx.borrow() {
+                        let _ = cfg.wallet_tx.send(total_balance);
+                    }
                     for symbol in &symbols {
                         tracing::info!(
                             symbol,
@@ -667,6 +673,8 @@ async fn main() -> anyhow::Result<()> {
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
     let (notional_tx, notional_rx) = watch::channel(Decimal::ZERO);
     let (max_position_tx, max_position_rx) = watch::channel(Decimal::ZERO);
+    // Live account wallet balance (wallet + BNB value); drives take-profit.
+    let (wallet_tx, wallet_rx) = watch::channel(Decimal::ZERO);
     // Live BNBUSDT mid; account poller refreshes when feeBurn is on.
     // Subscribers (user_stream parser, refill task) read latest via `borrow()`.
     let (bnb_price_tx, bnb_price_rx) = watch::channel(Decimal::ZERO);
@@ -714,6 +722,7 @@ async fn main() -> anyhow::Result<()> {
         shared_state: shared_state.clone(),
         notional_tx,
         max_position_tx,
+        wallet_tx,
         max_position_pct: cfg.account.max_position_pct,
         env,
         api_key: api_key.clone(),
@@ -760,6 +769,8 @@ async fn main() -> anyhow::Result<()> {
                 inventory_boost: cfg.account.inventory_boost(),
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                wallet_rx: wallet_rx.clone(),
+                take_profit_pct: cfg.account.take_profit_pct,
                 bnb_price_rx: bnb_price_rx.clone(),
             },
             shared_state.clone(),
@@ -781,6 +792,8 @@ async fn main() -> anyhow::Result<()> {
                 inventory_boost: cfg.account.inventory_boost(),
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                wallet_rx: wallet_rx.clone(),
+                take_profit_pct: cfg.account.take_profit_pct,
                 bnb_price_rx: bnb_price_rx.clone(),
             },
             shared_state.clone(),
@@ -808,6 +821,8 @@ async fn main() -> anyhow::Result<()> {
                 inventory_boost: cfg.account.inventory_boost(),
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                wallet_rx: wallet_rx.clone(),
+                take_profit_pct: cfg.account.take_profit_pct,
                 bnb_price_rx: bnb_price_rx.clone(),
             },
             shared_state.clone(),
@@ -830,6 +845,8 @@ async fn main() -> anyhow::Result<()> {
                 inventory_boost: cfg.account.inventory_boost(),
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
+                wallet_rx: wallet_rx.clone(),
+                take_profit_pct: cfg.account.take_profit_pct,
                 bnb_price_rx: bnb_price_rx.clone(),
                 clear_on_start: args.clear,
             };

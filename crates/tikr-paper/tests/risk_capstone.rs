@@ -371,6 +371,8 @@ async fn risk_resume_alerting_capstone() {
         live_tap: None,
         notional_rx: None,
         max_position_rx: None,
+        wallet_rx: None,
+        take_profit_pct: tikr_core::Decimal::ZERO,
         liq_window_secs: 0,
         seed_position: None,
         equity_csv_path: None,

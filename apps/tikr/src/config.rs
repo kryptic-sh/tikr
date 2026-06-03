@@ -160,6 +160,12 @@ pub struct AccountConfig {
     /// Default `80`.
     #[serde(default = "default_max_position_pct")]
     pub max_position_pct: Decimal,
+    /// Take-profit: when ANY bot's UNREALIZED P&L exceeds this percent of the
+    /// account wallet balance, the runner rests a reduce-only maker limit at the
+    /// touch to close HALF that bot's position, locking in profit. Account-level
+    /// (all bots/strategies). `0` (default) = disabled.
+    #[serde(default)]
+    pub take_profit_pct: Decimal,
     /// BNB-refill trigger in USDT-equivalent. When BNB-pays-fees is
     /// enabled on the account AND `bnb_refill_enabled = true`, the
     /// refill task tops up BNB whenever

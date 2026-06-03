@@ -33,6 +33,8 @@ pub fn to_spec(
     max_position_rx: Option<watch::Receiver<Decimal>>,
     max_position_usdt_default: Decimal,
     inventory_boost: Option<InventoryBoostConfig>,
+    wallet_rx: Option<watch::Receiver<Decimal>>,
+    take_profit_pct: Decimal,
 ) -> Result<BotSpec> {
     let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
@@ -139,6 +141,11 @@ pub fn to_spec(
         // Inventory-aware order-size boost — account-level, applied to every
         // strategy by the runner (scales the reducing side up on a curve).
         inventory_boost,
+        // Take-profit — account-level, applied to every strategy: when
+        // unrealized > take_profit_pct% of wallet, rest a reduce-only maker
+        // limit to lock in half the bag.
+        wallet_rx,
+        take_profit_pct,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

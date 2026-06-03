@@ -150,6 +150,58 @@ pub async fn place_order(
     Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
 }
 
+/// Place a reduce-only, post-only (GTX) LIMIT order on USD-M Futures. The
+/// `reduceOnly=true` flag means it can only shrink the position and is exempt
+/// from the MIN_NOTIONAL filter; GTX makes it a maker order (rejected if it
+/// would cross). Used by the take-profit to lock in part of a winning bag.
+#[allow(clippy::too_many_arguments)]
+pub async fn place_reduce_only_limit(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    side: Side,
+    price: &str,
+    quantity: &str,
+    client_order_id: &str,
+) -> Result<QuoteId, VenueError> {
+    let side_str = match side {
+        Side::Bid => "BUY",
+        Side::Ask => "SELL",
+    };
+    let params = format!(
+        "symbol={symbol}&side={side_str}&type=LIMIT&timeInForce=GTX\
+         &quantity={quantity}&price={price}&reduceOnly=true\
+         &newClientOrderId={client_order_id}"
+    );
+    let signed = append_auth_dispatch(&params, key_material);
+    info!(
+        symbol,
+        side = side_str,
+        price,
+        quantity,
+        "futures: placing reduce-only maker limit"
+    );
+    let url = format!("{base_url}/fapi/v1/order?{signed}");
+    let resp = http
+        .post(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+    let body: Value = read_json(resp).await?;
+    if let Some(e) = try_parse_error(&body) {
+        return Err(e);
+    }
+    let order_id = body.get("orderId").and_then(Value::as_u64).ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures place_reduce_only_limit: missing orderId in response: {body}"
+        ))))
+    })?;
+    Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
+}
+
 /// Place a market order on USD-M Futures.
 ///
 /// Endpoint: `POST /fapi/v1/order`

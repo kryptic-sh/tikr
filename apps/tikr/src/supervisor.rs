@@ -52,6 +52,13 @@ pub struct SupervisorCtx {
     /// `max_position_usdt` tracks compounded wallet growth, not just
     /// per-order size.
     pub max_position_rx: watch::Receiver<Decimal>,
+    /// Live account wallet balance from the poller — drives the take-profit
+    /// threshold (`take_profit_pct` of this).
+    pub wallet_rx: watch::Receiver<Decimal>,
+    /// Take-profit threshold as a percent of wallet (`0` = disabled). When a
+    /// bot's unrealized P&L exceeds this, the runner rests a reduce-only maker
+    /// limit to lock in half the bag.
+    pub take_profit_pct: Decimal,
     /// Live BNBUSDT mid; user-stream parser uses this to convert BNB
     /// commissions → USDT-equivalent fee_quote. When BNB-fee mode is
     /// off (or autodetect fails), this stays at ZERO and the parser
@@ -259,6 +266,8 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         Some(ctx.max_position_rx.clone()),
         max_pos_default,
         ctx.inventory_boost,
+        Some(ctx.wallet_rx.clone()),
+        ctx.take_profit_pct,
     )?;
 
     // Resume path (--clear OFF): seed the strategy's local position
