@@ -273,11 +273,13 @@ pub fn spawn_rampage_manager(
                 .cloned()
                 .collect();
             for symbol in dropped {
-                if should_defer_rotation(&symbol, &cfg, &shared_state) {
+                if let Some(reason) = should_defer_rotation(&symbol, &cfg, &shared_state) {
                     info!(
                         symbol = %symbol,
                         net = ?shared_state.net_for(&symbol),
-                        "rampage: out of top set but NET loss exceeds rotate_loss_pct — deferring rotation"
+                        bag = ?shared_state.bag_for(&symbol),
+                        reason,
+                        "rampage: out of top set — deferring rotation"
                     );
                     continue; // keep the bot; it holds its slot until recovered
                 }
@@ -341,33 +343,55 @@ pub fn spawn_rampage_manager(
 }
 
 /// Decide whether `symbol`'s bot should DEFER rotation rather than rotate out
-/// now. A bot rotates only when its NET PnL (`realized + unrealized − fees`, as
-/// reported by the bot) is green, OR its NET loss is within the acceptable
-/// `rotate_loss_pct` of total wallet balance. A NET loss larger than that
-/// defers (returns `true`) — the bot keeps managing the bag until it recovers,
-/// so rotation never crystallizes more than the tolerated loss.
+/// now, returning `Some(reason)` to defer or `None` to rotate. Two holds:
+///
+/// 1. **Underwater hold:** a bot rotates only when its NET PnL (`realized +
+///    unrealized − fees`) is green or its NET loss is within `rotate_loss_pct`
+///    of total wallet; a larger NET loss defers, so rotation never crystallizes
+///    more than the tolerated loss.
+/// 2. **Big-bag hold:** even a bot that would otherwise rotate is held when it
+///    sits on a POSITIVE unrealized PnL and its gross position notional is ≥
+///    `big_bag_pct` of total wallet — let it work a large profitable bag down
+///    instead of market-closing it. Gated on unrealized only (NET-independent).
 ///
 /// Conservative: when `defer_underwater` is off, never defer. When the bot has
-/// no snapshot yet (NET unknown), defer — we can't confirm it's safe to realize.
+/// no NET snapshot yet, defer — we can't confirm it's safe to realize.
 fn should_defer_rotation(
     symbol_str: &str,
     cfg: &RampageConfig,
     shared_state: &SharedBotState,
-) -> bool {
+) -> Option<&'static str> {
     if !cfg.defer_underwater {
-        return false; // deferral disabled → always rotate
+        return None; // deferral disabled → always rotate
     }
+
+    // Big-bag hold: large position currently in profit → keep working it down
+    // rather than dump it. Checked first so it applies even to NET-green bots.
+    if cfg.big_bag_pct > Decimal::ZERO
+        && let Some((unrealized, gross_notional)) = shared_state.bag_for(symbol_str)
+        && unrealized > Decimal::ZERO
+    {
+        let big = total_wallet_balance(shared_state) * cfg.big_bag_pct / Decimal::from(100);
+        if big > Decimal::ZERO && gross_notional >= big {
+            return Some("big bag in profit — working it down");
+        }
+    }
+
     let net = match shared_state.net_for(symbol_str) {
         Some(n) => n,
-        None => return true, // no snapshot yet → can't confirm → defer
+        None => return Some("no NET snapshot yet"), // can't confirm → defer
     };
     if net >= Decimal::ZERO {
-        return false; // green NET → safe to rotate
+        return None; // green NET → safe to rotate
     }
     // Underwater: tolerate a NET loss up to rotate_loss_pct % of total wallet.
     let total_wallet = total_wallet_balance(shared_state);
     let tolerance = total_wallet * cfg.rotate_loss_pct / Decimal::from(100);
-    -net > tolerance // defer only if the NET loss EXCEEDS the tolerance
+    if -net > tolerance {
+        Some("NET loss exceeds rotate_loss_pct")
+    } else {
+        None // within tolerance → rotate
+    }
 }
 
 /// Total wallet balance for the `rotate_loss_pct` tolerance: futures wallet

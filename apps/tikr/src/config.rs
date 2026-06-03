@@ -729,6 +729,14 @@ pub struct RampageConfig {
     /// Only consulted when `defer_underwater` is on. Default `1` (= 1% of wallet).
     #[serde(default = "rampage_default_rotate_loss_pct")]
     pub rotate_loss_pct: Decimal,
+    /// Big-bag hold: when a bot that would otherwise rotate out is sitting on a
+    /// POSITIVE unrealized PnL and its gross position notional (`|position| ×
+    /// mark`) is at least this PERCENT of total wallet, defer rotation and let
+    /// the bot work the bag down instead of market-closing a large profitable
+    /// position. Gates on unrealized only (independent of NET sign). Only
+    /// consulted when `defer_underwater` is on. `0` = disabled. Default `25`.
+    #[serde(default = "rampage_default_big_bag_pct")]
+    pub big_bag_pct: Decimal,
     /// Optional explicit symbol allowlist. When non-empty, only these symbols
     /// are considered (volume + score filters still apply).
     #[serde(default)]
@@ -741,6 +749,10 @@ pub struct RampageConfig {
 
 fn rampage_default_rotate_loss_pct() -> Decimal {
     Decimal::from(1)
+}
+
+fn rampage_default_big_bag_pct() -> Decimal {
+    Decimal::from(25)
 }
 
 /// LiqFade configuration — knobs match `LiqFadeConfig` 1:1 plus

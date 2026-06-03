@@ -315,6 +315,18 @@ impl SharedBotState {
         snap.as_ref().map(|r| r.net.0)
     }
 
+    /// Live `(unrealized_pnl, gross_bag_notional)` for `symbol` from its latest
+    /// Binance positionRisk snapshot. Gross notional = `|position| × mark`.
+    /// `None` if the symbol is unknown or no API position snapshot has landed.
+    /// Used by the rampage rotator's big-bag hold.
+    pub fn bag_for(&self, symbol: &str) -> Option<(Decimal, Decimal)> {
+        let g = self.inner.lock().ok()?;
+        let view = g.get(symbol)?;
+        let pos = view.api_position.read().ok()?;
+        pos.as_ref()
+            .map(|p| (p.unrealized_profit, p.position_amount.abs() * p.mark_price))
+    }
+
     /// Update status for a symbol.
     pub fn set_status(&self, symbol: &str, status: BotStatus) {
         if let Ok(mut g) = self.inner.lock()
