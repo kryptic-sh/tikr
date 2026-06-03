@@ -1561,6 +1561,8 @@ fn draw_chart(
             )
         })
         .unwrap_or_default();
+    // Coin price precision (venue tick), so chart prices match Binance.
+    let price_dp = active.and_then(|v| v.price_decimals);
 
     // Y bounds over visible candles + in-window fills + our resting orders, so
     // the order lines are always on-screen. 2% padding.
@@ -1657,7 +1659,11 @@ fn draw_chart(
         // Centred `tag price ×size` label. Render the price at FULL precision
         // (no `normalize` — that trims trailing zeros, making a round-tick price
         // look truncated next to the break-even line). Size stays trimmed.
-        let label = format!(" {tag} {price} ×{} ", size.normalize());
+        let label = format!(
+            " {tag} {} ×{} ",
+            fmt_price(price, price_dp),
+            size.normalize()
+        );
         let lw = label.chars().count() as u16;
         let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
         buf.set_string(
@@ -1698,7 +1704,7 @@ fn draw_chart(
                 cell.set_char('─').set_style(Style::default().fg(th().fg));
             }
         }
-        let label = format!(" BE {avg} ");
+        let label = format!(" BE {} ", fmt_price(avg, price_dp));
         let lw = label.chars().count() as u16;
         let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
         buf.set_string(
@@ -1736,9 +1742,11 @@ fn draw_chart(
     }
 
     // Y-axis labels in the gutter: hi at top, lo at bottom, last close mid.
+    // Render at the coin's precision (default 4 dp) to match the venue.
+    let axis_dp = price_dp.unwrap_or(4) as usize;
     let label_style = Style::default().fg(th().dim);
     let put_label = |buf: &mut ratatui::buffer::Buffer, row: u16, val: f64| {
-        let s = format!("{val:>8.4}");
+        let s = format!("{val:>8.*}", axis_dp);
         let s: String = s.chars().take(gutter as usize).collect();
         buf.set_string(inner.x, plot_y0 + row, s, label_style);
     };
@@ -2313,6 +2321,16 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &ModeState, config_path: &st
 fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
     d.to_f64().unwrap_or(0.0)
+}
+
+/// Format a price at the coin's tick precision so it matches the venue display
+/// (e.g. `0.0215709532862` → `0.0216` at 4 dp). Falls back to the value's own
+/// trimmed form when the precision isn't known yet (bot not spawned).
+fn fmt_price(price: rust_decimal::Decimal, decimals: Option<u32>) -> String {
+    match decimals {
+        Some(n) => format!("{:.*}", n as usize, price),
+        None => price.normalize().to_string(),
+    }
 }
 
 /// Side panel content width = panel width (34) − 1 divider border − 2 padding

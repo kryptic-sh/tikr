@@ -229,6 +229,9 @@ pub struct SharedBotState {
     /// retired bot's per-symbol snapshot so its realized P&L can't be resumed
     /// (double-counting it once it's already folded into the retired totals).
     state_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
+    /// Per-symbol price decimal places (from the venue's tick size), so the TUI
+    /// renders prices at the coin's precision — matching what Binance shows.
+    price_decimals: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl Default for SharedBotState {
@@ -252,6 +255,15 @@ impl SharedBotState {
             process_started: std::time::Instant::now(),
             uptime_offset_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_dir: Arc::new(RwLock::new(None)),
+            price_decimals: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Record `symbol`'s price decimal places (derived from the venue tick
+    /// size), surfaced on [`BotViewSnapshot`] for coin-precision price rendering.
+    pub fn set_price_decimals(&self, symbol: &str, decimals: u32) {
+        if let Ok(mut g) = self.price_decimals.write() {
+            g.insert(symbol.to_string(), decimals);
         }
     }
 
@@ -524,11 +536,13 @@ impl SharedBotState {
             Err(_) => return Vec::new(),
         };
         let hist = self.history.read().ok();
+        let decimals = self.price_decimals.read().ok();
         let mut out: Vec<BotViewSnapshot> = order
             .into_iter()
             .filter_map(|sym| {
                 let v = map.get(&sym)?;
                 let history = hist.as_ref().and_then(|h| h.get(&sym).cloned());
+                let price_decimals = decimals.as_ref().and_then(|d| d.get(&sym).copied());
                 Some(BotViewSnapshot {
                     symbol: v.symbol.clone(),
                     strategy: v.strategy.clone(),
@@ -537,6 +551,7 @@ impl SharedBotState {
                     live: v.live.read().ok().and_then(|g| g.clone()),
                     api_position: v.api_position.read().ok().and_then(|g| g.clone()),
                     history,
+                    price_decimals,
                 })
             })
             .collect();
@@ -639,6 +654,9 @@ pub struct BotViewSnapshot {
     pub api_position: Option<ApiPositionSnapshot>,
     /// Rolling price + fill history for the chart panel.
     pub history: Option<PriceHistory>,
+    /// Price decimal places for this symbol (venue tick size), for coin-precision
+    /// price rendering. `None` until the bot has spawned at least once.
+    pub price_decimals: Option<u32>,
 }
 
 /// Account-wide aggregate computed from all bot views.

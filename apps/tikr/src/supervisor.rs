@@ -104,6 +104,9 @@ pub fn spawn_supervisor(
                 match handle_result {
                     Ok(spawned) => {
                         attempt = 0; // reset backoff on successful spawn
+                        if let Some(d) = spawned.price_decimals {
+                            shared_state.set_price_decimals(&symbol_str, d);
+                        }
                         shared_state.attach_handle(&symbol_str, &spawned.handle);
                         let shutdown_tx = spawned.handle.shutdown_tx.clone();
                         let us_shutdown_tx = spawned.us_shutdown_tx;
@@ -202,6 +205,14 @@ pub fn spawn_supervisor(
 struct SpawnedBot {
     handle: BotHandle,
     us_shutdown_tx: watch::Sender<bool>,
+    /// Price decimal places from the venue tick size, for coin-precision
+    /// rendering in the TUI. `None` if the venue had no tick for the symbol.
+    price_decimals: Option<u32>,
+}
+
+/// Decimal places implied by a price tick size (e.g. `0.0001` → 4, `1` → 0).
+fn decimals_from_tick(tick: tikr_core::Decimal) -> u32 {
+    tick.normalize().scale()
 }
 
 /// One spawn cycle: build venue, subscribe fills, spawn bot.
@@ -357,10 +368,13 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     } else {
         None
     };
+    // Capture the coin's price precision before the venue is moved into the bot.
+    let price_decimals = venue_for_run.tick_size(&symbol).map(decimals_from_tick);
     let handle = tikr_paper::spawn_bot(spec, venue_for_run, Some(fill_rx), external_liqs);
     Ok(SpawnedBot {
         handle,
         us_shutdown_tx,
+        price_decimals,
     })
 }
 
