@@ -111,8 +111,9 @@ pub fn spawn_bagboy(
                 _ = tick.tick() => {}
                 _ = global_shutdown.changed() => {
                     if *global_shutdown.borrow() {
-                        info!(symbol = %symbol, "bagboy: shutdown — canceling all orders");
-                        let _ = client.cancel_all(&symbol).await;
+                        // Leave resting orders intact on shutdown — they persist
+                        // across restarts. Closing is not a shutdown side effect.
+                        info!(symbol = %symbol, "bagboy: shutdown — leaving orders intact");
                         return;
                     }
                 }

@@ -119,7 +119,9 @@ pub fn spawn_rotation_manager(
                 _ = global_shutdown.changed() => {
                     if *global_shutdown.borrow() {
                         if let Some(old) = active.take() {
-                            stop_bots(old.bots, &account).await;
+                            // Shutdown leaves orders + positions intact (resumed
+                            // next start) — do NOT flatten here.
+                            stop_bots_only(old.bots).await;
                         }
                         return;
                     }
@@ -177,8 +179,10 @@ async fn update_active_set(
     }
 }
 
-async fn stop_bots(bots: HashMap<String, ActiveBot>, account: &RotationAccountCtx) {
-    let symbols = bots.keys().cloned().collect::<Vec<_>>();
+/// Stop bots WITHOUT touching the venue. Used on global shutdown so resting
+/// orders + open positions persist across restarts (resumed / re-adopted next
+/// start) — killing a bot never closes anything.
+async fn stop_bots_only(bots: HashMap<String, ActiveBot>) {
     let handles = bots
         .into_values()
         .map(|bot| {
@@ -187,6 +191,13 @@ async fn stop_bots(bots: HashMap<String, ActiveBot>, account: &RotationAccountCt
         })
         .collect::<Vec<_>>();
     let _ = tokio::time::timeout(Duration::from_secs(8), futures::future::join_all(handles)).await;
+}
+
+/// Stop bots AND flatten their positions. ROTATION teardown ONLY — the manager
+/// is intentionally closing a rotated-out symbol. Never call on plain shutdown.
+async fn stop_bots(bots: HashMap<String, ActiveBot>, account: &RotationAccountCtx) {
+    let symbols = bots.keys().cloned().collect::<Vec<_>>();
+    stop_bots_only(bots).await;
     flatten_symbols(&symbols, account).await;
 }
 

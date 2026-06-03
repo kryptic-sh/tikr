@@ -583,14 +583,6 @@ async fn main() -> anyhow::Result<()> {
     let (api_key, key_material) = venue::load_credentials(env, cfg.account.key_file.as_deref())?;
     let key_material: Arc<tikr_binance::BinanceKeyMaterial> = key_material;
 
-    // --clear: flatten EVERY open position account-wide BEFORE anything records a
-    // session-start balance, so the flatten's realized PnL (which can move the
-    // wallet up or down) does not skew session-relative stats. Awaited here, so
-    // the account poller's first reading below is the clean post-flatten wallet.
-    if args.clear {
-        flatten_all_open_positions(env, &api_key, &key_material, cfg.account.leverage).await;
-    }
-
     let shared_state = SharedBotState::new();
 
     // Restore the persisted session: balance baselines + retired totals (so the
@@ -644,6 +636,35 @@ async fn main() -> anyhow::Result<()> {
         .filter(|c| c.enabled)
         .map(|c| c.quote_asset.clone())
         .unwrap_or_else(|| cfg.account.asset.clone());
+
+    // Bring the TUI up FIRST so it renders immediately and the (potentially
+    // slow) --clear flatten streams its progress into the dashboard log panel
+    // instead of blocking on a blank screen. Headless has no TUI. The flatten
+    // still runs BEFORE the trading managers + account poller spawn below, so a
+    // fresh-start clear can't race a bot re-opening a position we're closing,
+    // and the session-start balance is still captured post-flatten.
+    let tui_handle = if args.headless {
+        None
+    } else {
+        let tui_state = shared_state.clone();
+        let tui_logs = log_store.clone();
+        let tui_shutdown = global_shutdown_tx.clone();
+        let tui_config_path = config_path.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("tikr-tui".into())
+                .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown, tui_config_path))?,
+        )
+    };
+
+    // --clear: flatten EVERY open position account-wide (reduce-only, dust-safe,
+    // incl. symbols not in this config). Runs with the TUI already live; the
+    // flatten's realized PnL must not skew session stats, so it completes before
+    // the account poller below records the session-start balance.
+    if args.clear {
+        flatten_all_open_positions(env, &api_key, &key_material, cfg.account.leverage).await;
+    }
+
     spawn_account_balance_poller(AccountPollerConfig {
         shared_state: shared_state.clone(),
         notional_tx,
@@ -817,20 +838,11 @@ async fn main() -> anyhow::Result<()> {
             let _ = ctrl_c.await;
             tracing::info!("Ctrl-C received");
         }
-    } else {
-        // Run the TUI on a dedicated OS thread, OFF the tokio runtime.
-        // crossterm event-poll and ratatui draws are sync I/O — running
-        // them inside a tokio task would block a worker that should be
-        // servicing bot futures. The dedicated thread also gets its own
-        // OS-level scheduling so render frames aren't gated on tokio
-        // wakeups.
-        let tui_state = shared_state.clone();
-        let tui_logs = log_store.clone();
-        let tui_shutdown = global_shutdown_tx.clone();
-        let tui_config_path = config_path.clone();
-        let tui_thread = std::thread::Builder::new()
-            .name("tikr-tui".into())
-            .spawn(move || tui::run(tui_state, tui_logs, tui_shutdown, tui_config_path))?;
+    } else if let Some(tui_thread) = tui_handle {
+        // The TUI thread was started earlier (so it renders during startup /
+        // --clear). It runs on a dedicated OS thread OFF the tokio runtime —
+        // crossterm event-poll + ratatui draws are sync I/O. Wait for it to
+        // exit (user `q`), which flips the global shutdown.
         let _ = tokio::task::spawn_blocking(move || tui_thread.join()).await;
     }
 

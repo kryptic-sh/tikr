@@ -180,9 +180,13 @@ pub trait Strategy: Send {
 
     /// Called once when the executor is shutting down.
     ///
-    /// Default: cancels all open quotes to avoid orphaned resting orders.
+    /// Default: NOTHING. Killing/turning off a bot must leave its resting orders
+    /// AND open position intact on the venue — they persist across restarts and
+    /// are resumed (or re-adopted by the manager) on the next start. Closing is
+    /// exclusively the manager's job during rotation (`reset_symbol_state` /
+    /// `flatten_symbols`), never a side effect of a bot stopping.
     fn on_shutdown(&mut self, _ctx: &StrategyContext<'_>) -> Vec<Action> {
-        vec![Action::CancelAll]
+        Vec::new()
     }
 
     /// Called by the runner when a `Quote` action it just dispatched was
