@@ -1635,16 +1635,15 @@ fn draw_chart(
         }
     }
 
-    // Horizontal reference lines: best BUY/SELL resting orders, the venue
-    // break-even (BE), and the venue liquidation (LIQ). Collected, sorted by
+    // Horizontal reference lines: best BUY/SELL resting orders, the average
+    // entry (AVG), and the venue liquidation (LIQ). Collected, sorted by
     // price (high → top), then assigned distinct rows so labels never overlap
-    // when prices are close. Break-even + liquidation come strictly from the
-    // API positionRisk (the local tracker can desync); BE/LIQ skipped when flat.
+    // when prices are close. Avg entry + liquidation come strictly from the
+    // API positionRisk (the local tracker can desync); skipped when flat.
     let plot_right = plot_x0 + plot_w;
     let api = active.and_then(|v| v.api_position.as_ref());
-    let be_price = api.and_then(|p| {
-        (!p.position_amount.is_zero() && p.break_even_price > Decimal::ZERO)
-            .then_some(p.break_even_price)
+    let avg_entry = api.and_then(|p| {
+        (!p.position_amount.is_zero() && p.entry_price > Decimal::ZERO).then_some(p.entry_price)
     });
     let liq_price = api.and_then(|p| {
         (!p.position_amount.is_zero() && p.liquidation_price > Decimal::ZERO)
@@ -1677,10 +1676,10 @@ fn draw_chart(
             th().yellow,
         ));
     }
-    if let Some(be) = be_price {
+    if let Some(avg) = avg_entry {
         refs.push((
-            be,
-            format!(" BE {} ", fmt_price(be, price_dp)),
+            avg,
+            format!(" AVG {} ", fmt_price(avg, price_dp)),
             '─',
             th().fg,
         ));
