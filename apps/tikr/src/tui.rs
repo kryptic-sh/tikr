@@ -807,6 +807,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+/// Bold, distinct colour for the section titles now rendered INSIDE each pane
+/// (panes are borderless; only the shared edges between panes draw a line).
+fn title_style() -> Style {
+    Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// A pane title as a styled first content line.
+fn pane_title(text: &str) -> Line<'static> {
+    Line::from(Span::styled(text.to_string(), title_style()))
+}
+
 fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut UiState) {
     // Borderless, single-row tab strip — each tab is a colored block, so
     // active/inactive and the gaps between tabs read from background colour
@@ -988,7 +1001,7 @@ fn draw_account(
     ui: &mut UiState,
     uptime_secs: u64,
 ) {
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line> = vec![pane_title("account"), Line::from("")];
     lines.push(kv_line(
         "bots",
         format!("{}", views.len()),
@@ -1387,10 +1400,14 @@ fn draw_account(
         .collect();
     let p = Paragraph::new(lines)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(Padding::uniform(1))
-                .title(" account "),
+            // Borderless except the LEFT edge — the divider to the middle pane.
+            // Padding keeps content geometry identical to the old full border.
+            Block::default().borders(Borders::LEFT).padding(Padding {
+                left: 1,
+                top: 2,
+                right: 2,
+                bottom: 2,
+            }),
         )
         .scroll((scroll, 0));
     f.render_widget(p, area);
@@ -1414,40 +1431,53 @@ fn draw_chart(
     history: Option<&crate::state::PriceHistory>,
 ) {
     let title = match active {
-        Some(v) => format!(" {} price (1s) ", v.symbol),
-        None => " price (1s) ".to_string(),
+        Some(v) => format!("{} price (1s)", v.symbol),
+        None => "price (1s)".to_string(),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .padding(Padding::horizontal(1));
+    // Borderless pane; the BOTTOM border is the divider to the logs pane below.
+    // Padding compensates for the removed L/R/top borders so content geometry is
+    // unchanged.
+    let block = Block::default().borders(Borders::BOTTOM).padding(Padding {
+        left: 2,
+        right: 2,
+        top: 1,
+        bottom: 0,
+    });
+    let inner = block.inner(area);
 
     let Some(hist) = history else {
-        f.render_widget(block, area);
+        let p = Paragraph::new(vec![pane_title(&title)]).block(block);
+        f.render_widget(p, area);
         return;
     };
     if hist.samples.is_empty() {
-        let p = Paragraph::new(Line::from(Span::styled(
-            "no price samples yet",
-            Style::default().fg(Color::DarkGray),
-        )))
+        let p = Paragraph::new(vec![
+            pane_title(&title),
+            Line::from(Span::styled(
+                "no price samples yet",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
         .block(block);
         f.render_widget(p, area);
         return;
     }
 
-    let inner = block.inner(area);
     f.render_widget(block, area);
-    if inner.width < 6 || inner.height < 2 {
+    if inner.width < 6 || inner.height < 3 {
         return;
     }
+    // Title inside the pane, first row; the plot fills the rows below it.
+    f.buffer_mut()
+        .set_string(inner.x, inner.y, &title, title_style());
+    let plot_y0 = inner.y + 1;
 
     // Left gutter for price labels; rest of width plots one 1s candle per column,
     // most recent on the right.
     let gutter: u16 = 9;
     let plot_x0 = inner.x + gutter;
     let plot_w = inner.width.saturating_sub(gutter);
-    let plot_h = inner.height;
+    let plot_h = inner.height.saturating_sub(1);
     if plot_w == 0 {
         return;
     }
@@ -1588,7 +1618,7 @@ fn draw_chart(
         };
         // Wick: high..=low.
         for ry in r_high..=r_low {
-            buf[(cx, inner.y + ry)]
+            buf[(cx, plot_y0 + ry)]
                 .set_char('│')
                 .set_style(Style::default().fg(color));
         }
@@ -1598,7 +1628,7 @@ fn draw_chart(
         let (b_top, b_bot) = (r_o.min(r_c), r_o.max(r_c));
         let body = if c.flat { '─' } else { '█' };
         for ry in b_top..=b_bot {
-            buf[(cx, inner.y + ry)]
+            buf[(cx, plot_y0 + ry)]
                 .set_char(body)
                 .set_style(Style::default().fg(color));
         }
@@ -1617,7 +1647,7 @@ fn draw_chart(
         if price <= Decimal::ZERO {
             return;
         }
-        let ry = inner.y + row_of(dec_to_f64(price));
+        let ry = plot_y0 + row_of(dec_to_f64(price));
         // Dashed line through empty cells only.
         for cx in plot_x0..plot_right {
             let cell = &mut buf[(cx, ry)];
@@ -1658,7 +1688,7 @@ fn draw_chart(
         } else {
             ('▼', Color::Yellow)
         };
-        buf[(cx, inner.y + ry)].set_char(ch).set_style(
+        buf[(cx, plot_y0 + ry)].set_char(ch).set_style(
             Style::default()
                 .fg(Color::Black)
                 .bg(bg)
@@ -1671,7 +1701,7 @@ fn draw_chart(
     let put_label = |buf: &mut ratatui::buffer::Buffer, row: u16, val: f64| {
         let s = format!("{val:>8.4}");
         let s: String = s.chars().take(gutter as usize).collect();
-        buf.set_string(inner.x, inner.y + row, s, label_style);
+        buf.set_string(inner.x, plot_y0 + row, s, label_style);
     };
     put_label(buf, 0, y_hi);
     put_label(buf, plot_h - 1, y_lo);
@@ -1692,7 +1722,8 @@ fn draw_logs(
     log_lines: &[LogLine],
     ui: &mut UiState,
 ) {
-    let visible = area.height.saturating_sub(2) as usize; // borders eat 2 rows
+    // Padding eats 2 rows (uniform 1); the in-pane title eats 1 more.
+    let visible = area.height.saturating_sub(3) as usize;
     let content_width = area.width.saturating_sub(2) as usize;
     let rendered_lines = format_log_lines(log_lines, content_width.max(1));
     let total = rendered_lines.len();
@@ -1722,13 +1753,20 @@ fn draw_logs(
     };
     let end = (start + visible).min(total);
 
-    let title = match active {
-        Some(v) => format!(" {} logs{scroll_label}", v.symbol),
-        None => " logs ".to_string(),
+    let title_txt = match active {
+        Some(v) => format!("{} logs", v.symbol),
+        None => "logs".to_string(),
     };
-    let lines: Vec<Line> = rendered_lines[start..end].to_vec();
+    let mut lines: Vec<Line> = Vec::with_capacity(end - start + 1);
+    lines.push(Line::from(vec![
+        Span::styled(title_txt, title_style()),
+        Span::styled(scroll_label, Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.extend(rendered_lines[start..end].iter().cloned());
+    // Borderless — the divider to the chart above is the chart pane's BOTTOM
+    // border; left/right dividers belong to the neighbouring panes.
     let logs = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(Block::default().padding(Padding::uniform(1)))
         .wrap(Wrap { trim: false });
     f.render_widget(logs, area);
     ui.last_log_rect = Some(area);
@@ -1844,17 +1882,26 @@ fn draw_bot_detail(
     ui: &mut UiState,
 ) {
     ui.last_bot_rect = Some(area);
+    // Borderless except the RIGHT edge — the divider to the middle pane.
+    let bot_block = || {
+        Block::default().borders(Borders::RIGHT).padding(Padding {
+            left: 2,
+            top: 2,
+            right: 1,
+            bottom: 2,
+        })
+    };
     let Some(v) = active else {
-        let p = Paragraph::new("no bot").block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(Padding::uniform(1))
-                .title(" bot "),
-        );
+        let p = Paragraph::new(vec![
+            pane_title("bot"),
+            Line::from(""),
+            Line::from("no bot"),
+        ])
+        .block(bot_block());
         f.render_widget(p, area);
         return;
     };
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line> = vec![pane_title("bot"), Line::from("")];
     lines.push(kv_line(
         "symbol",
         v.symbol.clone(),
@@ -2163,12 +2210,7 @@ fn draw_bot_detail(
     let scroll = UiState::clamp_scroll(ui.bot_scroll, total, visible);
     ui.bot_scroll = scroll;
     let p = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .padding(Padding::uniform(1))
-                .title(" bot "),
-        )
+        .block(bot_block())
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
