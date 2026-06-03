@@ -68,14 +68,17 @@ enum ModeState {
 
 /// Log viewport anchor — sticky semantics for the log pane.
 ///
-/// `Follow` auto-pins to the newest line (default). `Anchored(top)`
-/// keeps the first visible line at absolute index `top` even as new
-/// log lines arrive — so scrolling up and then receiving new entries
-/// doesn't shift the display.
+/// `Follow` auto-pins to the newest line (default). `Anchored(ts_ns)` pins the
+/// top of the viewport to the log line whose timestamp is `ts_ns`, resolved
+/// fresh every frame against the (ts-sorted) rendered lines. New lines arriving
+/// at the tail don't move it, and old lines dropping off the ring don't drag it
+/// along either. If the anchored line itself has scrolled off the top of the
+/// ring, it resolves to the new top of the buffer. `Anchored(0)` is the
+/// top-of-buffer sentinel (older than any real line).
 #[derive(Debug, Clone, Copy)]
 enum LogView {
     Follow,
-    Anchored(usize),
+    Anchored(u64),
 }
 
 /// UI state owned by the render loop.
@@ -88,21 +91,17 @@ struct UiState {
     tab_scroll: usize,
     /// Log viewport mode + anchor.
     log_view: LogView,
+    /// Pending scroll delta (in rendered lines) accumulated by scroll handlers
+    /// and applied in `draw_logs`, where the ts-sorted line list is available to
+    /// turn the result back into a `ts_ns` anchor. Negative = up (older).
+    log_scroll_pending: i64,
     /// Last-drawn rects so mouse events can hit-test.
     last_tab_rect: Option<Rect>,
     last_log_rect: Option<Rect>,
     /// Per-visible-tab `(global_index, start_x, end_x)` in absolute terminal coords.
     last_tab_ranges: Vec<(usize, u16, u16)>,
-    /// Last drawn log pane height (visible row count incl. borders) —
-    /// captured so chord actions can compute "page up / page down" in
-    /// proportion to what the user actually sees.
-    last_log_visible: usize,
     /// Show the price chart in the top 1/2 of the log area. Default true.
     show_chart: bool,
-    /// Last drawn log line count for the active tab — captured so the
-    /// scroll handlers can compute a valid anchor when transitioning
-    /// from Follow → Anchored without waiting for a render.
-    last_log_total: usize,
     /// Last drawn rects for the left (bot detail) and right (account)
     /// side panels — used for mouse hit-testing scroll wheel events.
     last_bot_rect: Option<Rect>,
@@ -143,12 +142,11 @@ impl UiState {
             active_symbol: None,
             tab_scroll: 0,
             log_view: LogView::Follow,
+            log_scroll_pending: 0,
             last_tab_rect: None,
             last_log_rect: None,
             last_tab_ranges: Vec::new(),
-            last_log_visible: 0,
             show_chart: true,
-            last_log_total: 0,
             last_bot_rect: None,
             last_account_rect: None,
             bot_scroll: 0,
@@ -425,12 +423,14 @@ fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mu
             ui.active_tab = (cur + views.len() - 1) % views.len();
             ui.active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
             ui.log_view = LogView::Follow;
+            ui.log_scroll_pending = 0;
         }
         NormalAction::TabNext if !views.is_empty() => {
             let cur = current_tab_index(views, ui);
             ui.active_tab = (cur + 1) % views.len();
             ui.active_symbol = views.get(ui.active_tab).map(|v| v.symbol.clone());
             ui.log_view = LogView::Follow;
+            ui.log_scroll_pending = 0;
         }
         NormalAction::LeaderPicker => {
             ui.mode = ModeState::Picker {
@@ -441,36 +441,24 @@ fn apply_normal_action(action: &NormalAction, views: &[BotViewSnapshot], ui: &mu
         NormalAction::LogPageUp => scroll_log(ui, -10),
         NormalAction::LogPageDown => scroll_log(ui, 10),
         NormalAction::ToggleChart => ui.show_chart = !ui.show_chart,
-        NormalAction::LogTop => ui.log_view = LogView::Anchored(0),
-        NormalAction::LogBottom => ui.log_view = LogView::Follow,
+        NormalAction::LogTop => {
+            ui.log_view = LogView::Anchored(0); // 0 = top-of-buffer sentinel
+            ui.log_scroll_pending = 0;
+        }
+        NormalAction::LogBottom => {
+            ui.log_view = LogView::Follow;
+            ui.log_scroll_pending = 0;
+        }
         _ => {}
     }
     false
 }
 
-/// Move the log viewport by `delta` lines. Negative = scroll up
-/// (toward older lines), positive = scroll down (toward newest).
+/// Queue a log-viewport scroll of `delta` lines. Negative = scroll up (toward
+/// older lines), positive = scroll down (toward newest). The actual move +
+/// re-anchoring happens in `draw_logs`, which has the ts-sorted line list.
 fn scroll_log(ui: &mut UiState, delta: i64) {
-    let visible = ui.last_log_visible.max(1);
-    let total = ui.last_log_total;
-    let max_top = total.saturating_sub(visible);
-    let current_top = match ui.log_view {
-        LogView::Follow => max_top,
-        LogView::Anchored(t) => t.min(max_top),
-    };
-    let new_top = if delta < 0 {
-        current_top.saturating_sub((-delta) as usize)
-    } else {
-        current_top.saturating_add(delta as usize)
-    };
-    // If we've caught up to (or moved past) the tail going DOWN, snap
-    // back to Follow so new lines stream in. Otherwise pin to the
-    // anchor so the viewport sticks even as new lines arrive.
-    if delta >= 0 && new_top >= max_top {
-        ui.log_view = LogView::Follow;
-    } else {
-        ui.log_view = LogView::Anchored(new_top);
-    }
+    ui.log_scroll_pending = ui.log_scroll_pending.saturating_add(delta);
 }
 
 fn handle_key(
@@ -519,6 +507,7 @@ fn handle_key(
                         ui.active_tab = *idx;
                         ui.active_symbol = views.get(*idx).map(|v| v.symbol.clone());
                         ui.log_view = LogView::Follow;
+                        ui.log_scroll_pending = 0;
                     }
                     ui.mode = ModeState::Normal;
                 }
@@ -626,6 +615,7 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
                 ui.active_tab = idx;
                 ui.active_symbol = views.get(idx).map(|v| v.symbol.clone());
                 ui.log_view = LogView::Follow;
+                ui.log_scroll_pending = 0;
             } else if ui.in_account_pane(mev.column, mev.row)
                 && let Some(sym) = ui.per_symbol_rows.iter().find_map(|(row, s)| {
                     if *row == mev.row {
@@ -639,6 +629,7 @@ fn handle_mouse(mev: MouseEvent, views: &[BotViewSnapshot], ui: &mut UiState) {
                 ui.active_tab = idx;
                 ui.active_symbol = views.get(idx).map(|v| v.symbol.clone());
                 ui.log_view = LogView::Follow;
+                ui.log_scroll_pending = 0;
             }
         }
         MouseEventKind::ScrollUp if ui.in_log_pane(mev.column, mev.row) => {
@@ -1731,31 +1722,33 @@ fn draw_logs(
     // Padding eats 2 rows (uniform 1); the in-pane title eats 1 more.
     let visible = area.height.saturating_sub(3) as usize;
     let content_width = area.width.saturating_sub(2) as usize;
-    let rendered_lines = format_log_lines(log_lines, content_width.max(1));
+    let (rendered_lines, tss) = format_log_lines(log_lines, content_width.max(1));
     let total = rendered_lines.len();
-    ui.last_log_visible = visible;
-    ui.last_log_total = total;
-
-    // Resolve viewport. Anchored(top) is sticky — new lines arriving don't
-    // shift the displayed range. Snap back to Follow when the anchor has
-    // caught up to the tail (i.e. the bottom visible line IS the last
-    // line). max_top is the largest valid `top` that still fills the
-    // window without leaving blank space below — beyond it, we auto-snap.
     let max_top = total.saturating_sub(visible);
-    let (start, scroll_label) = match ui.log_view {
-        LogView::Follow => (max_top, " (live) ".to_string()),
-        LogView::Anchored(top) => {
-            let clamped = top.min(max_top);
-            if clamped >= max_top {
-                // Caught up to tail → resume live follow.
-                ui.log_view = LogView::Follow;
-                (max_top, " (live) ".to_string())
-            } else {
-                ui.log_view = LogView::Anchored(clamped);
-                let from_tail = total.saturating_sub(clamped + visible);
-                (clamped, format!(" ↑{from_tail} "))
-            }
-        }
+
+    // Resolve the current top line. Anchored pins to a `ts_ns` — found fresh by
+    // binary search every frame, so new lines at the tail don't shift it and old
+    // lines dropping off the ring don't drag it along. If the anchored line has
+    // itself scrolled off the top of the ring, the search lands at index 0 (the
+    // new top of the buffer).
+    let base_top = match ui.log_view {
+        LogView::Follow => max_top,
+        LogView::Anchored(anchor_ts) => tss.partition_point(|t| *t < anchor_ts),
+    };
+    // Apply any queued scroll, then clamp to the valid range.
+    let pending = std::mem::take(&mut ui.log_scroll_pending);
+    let top = (base_top as i64 + pending).clamp(0, max_top as i64) as usize;
+
+    // Re-derive the view state from the resolved top. Reaching the tail snaps
+    // back to live Follow; otherwise re-anchor on the ts of the new top line.
+    let (start, scroll_label) = if top >= max_top {
+        ui.log_view = LogView::Follow;
+        (max_top, " (live) ".to_string())
+    } else {
+        let anchor_ts = tss.get(top).copied().unwrap_or(0);
+        ui.log_view = LogView::Anchored(anchor_ts);
+        let from_tail = total.saturating_sub(top + visible);
+        (top, format!(" ↑{from_tail} "))
     };
     let end = (start + visible).min(total);
 
@@ -1778,12 +1771,20 @@ fn draw_logs(
     ui.last_log_rect = Some(area);
 }
 
-fn format_log_lines(log_lines: &[LogLine], width: usize) -> Vec<Line<'static>> {
+/// Render the log lines to wrapped display lines, returning a parallel vector
+/// of each wrapped line's source `ts_ns` (ascending — the merge sort key) so the
+/// viewport can anchor on a timestamp instead of a drift-prone ring index.
+fn format_log_lines(log_lines: &[LogLine], width: usize) -> (Vec<Line<'static>>, Vec<u64>) {
     let mut out = Vec::new();
+    let mut ts = Vec::new();
     for ln in log_lines {
-        out.extend(format_log_line_wrapped(ln, width));
+        let wrapped = format_log_line_wrapped(ln, width);
+        for line in wrapped {
+            out.push(line);
+            ts.push(ln.ts_ns);
+        }
     }
-    out
+    (out, ts)
 }
 
 fn format_log_line_wrapped(ln: &LogLine, width: usize) -> Vec<Line<'static>> {
