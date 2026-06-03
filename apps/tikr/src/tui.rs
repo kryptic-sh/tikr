@@ -798,6 +798,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(vert[1])[1]
 }
 
+/// Background for the top tab bar and bottom help bar, so both read as distinct
+/// chrome against the (terminal-default) pane backgrounds.
+const BAR_BG: Color = Color::Indexed(236);
+
 /// Bold, distinct colour for the section titles now rendered INSIDE each pane
 /// (panes are borderless; only the shared edges between panes draw a line).
 fn title_style() -> Style {
@@ -817,6 +821,9 @@ fn draw_tabs(f: &mut Frame<'_>, area: Rect, views: &[BotViewSnapshot], ui: &mut 
     // alone (no border, no title, no "│" separator). Custom render so we
     // control click hit-boxes exactly.
     let inner = area;
+    // Fill the whole bar with the chrome background first; tab blocks + gaps
+    // draw on top (default-styled cells keep this bg).
+    f.render_widget(Block::default().style(Style::default().bg(BAR_BG)), area);
     let mut spans: Vec<Span> = Vec::new();
     let mut ranges: Vec<(usize, u16, u16)> = Vec::new();
     let mut x = inner.x;
@@ -1652,9 +1659,10 @@ fn draw_chart(
                 cell.set_char('╌').set_style(Style::default().fg(color));
             }
         }
-        // Centred `tag price ×size` label. Resting prices/sizes sit on the
-        // symbol's tick/step, so `normalize` gives a clean exact string.
-        let label = format!(" {tag} {} ×{} ", price.normalize(), size.normalize());
+        // Centred `tag price ×size` label. Render the price at FULL precision
+        // (no `normalize` — that trims trailing zeros, making a round-tick price
+        // look truncated next to the break-even line). Size stays trimmed.
+        let label = format!(" {tag} {price} ×{} ", size.normalize());
         let lw = label.chars().count() as u16;
         let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
         buf.set_string(
@@ -1687,7 +1695,7 @@ fn draw_chart(
                     .set_style(Style::default().fg(Color::White));
             }
         }
-        let label = format!(" BE {} ", avg.normalize());
+        let label = format!(" BE {avg} ");
         let lw = label.chars().count() as u16;
         let lx = plot_x0 + plot_w.saturating_sub(lw) / 2;
         buf.set_string(
@@ -2282,10 +2290,15 @@ fn draw_footer(f: &mut Frame<'_>, area: Rect, mode: &ModeState, config_path: &st
         .constraints([Constraint::Min(0), Constraint::Length(right_width)])
         .split(area);
 
-    f.render_widget(Paragraph::new(left_text).style(left_style), cols[0]);
+    // Chrome background across the whole row, matching the top tab bar.
+    f.render_widget(Block::default().style(Style::default().bg(BAR_BG)), area);
+    f.render_widget(
+        Paragraph::new(left_text).style(left_style.bg(BAR_BG)),
+        cols[0],
+    );
     if right_width > 0 {
         f.render_widget(
-            Paragraph::new(right_text).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(right_text).style(Style::default().fg(Color::Gray).bg(BAR_BG)),
             cols[1],
         );
     }
