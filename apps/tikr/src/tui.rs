@@ -1106,6 +1106,20 @@ fn draw_account(
         Style::default().fg(th().muted),
         pnl_style(per_hour),
     ));
+    // Traded volume per hour (quote currency), off the same live buy+sell
+    // volume shown in the `vol` stat — a throughput companion to $/hour.
+    let vol_total = agg.buy_volume + agg.sell_volume;
+    let vol_per_hour = if session_secs > 0 {
+        vol_total * Decimal::from(3600) / Decimal::from(session_secs)
+    } else {
+        Decimal::ZERO
+    };
+    lines.push(kv_line(
+        "vol/hour",
+        format!("{:>.0}", dec_to_f64(vol_per_hour)),
+        Style::default().fg(th().muted),
+        Style::default().fg(th().fg),
+    ));
     lines.push(Line::from(""));
     lines.push(Line::styled(
         "api account",
