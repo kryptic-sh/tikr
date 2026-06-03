@@ -84,6 +84,14 @@ struct LoadedEvent {
     ts_ns: u64,
     symbol_idx: usize,
     payload: EventPayload,
+    /// Deterministic source position: `(file_rank << 32) | row_idx`, where
+    /// `file_rank` is the file's index in the path-sorted task list and
+    /// `row_idx` is the row's position within that file. Used as the final
+    /// sort tie-breaker so events sharing `(ts_ns, symbol, payload-kind)` keep a
+    /// total, load-order-independent order — without it the parallel loader's
+    /// nondeterministic append order leaks through the stable sort and the
+    /// replay (hence fills/PnL) varies run-to-run.
+    src: u64,
 }
 
 #[derive(Debug)]
@@ -146,7 +154,7 @@ impl LoadedReplayData {
             // can be thousands of small parquet files; sequential
             // open+decode dominated load time, so fan the decode out across
             // cores (the final sort below makes load order irrelevant).
-            let mut tasks: Vec<(PathBuf, bool, usize)> = Vec::new();
+            let mut tasks: Vec<(PathBuf, bool, usize, u32)> = Vec::new();
             for (symbol_idx, symbol) in cfg.symbols.iter().enumerate() {
                 let base = symbol.base.0.as_ref();
                 let book_prefix = format!("book_{}_", base);
@@ -172,11 +180,21 @@ impl LoadedReplayData {
                         continue;
                     }
                     if name.starts_with(&book_prefix) {
-                        tasks.push((path, true, symbol_idx));
+                        tasks.push((path, true, symbol_idx, 0));
                     } else if name.starts_with(&trade_prefix) {
-                        tasks.push((path, false, symbol_idx));
+                        tasks.push((path, false, symbol_idx, 0));
                     }
                 }
+            }
+
+            // Sort tasks by path (deterministic; `read_dir` order is OS-defined)
+            // and stamp each with a file_rank. Filenames embed the recording
+            // timestamp, so path order is chronological → file_rank matches seq
+            // order across files. This rank feeds each event's `src` so the
+            // final sort is a total order independent of thread/load timing.
+            tasks.sort_by(|a, b| a.0.cmp(&b.0));
+            for (rank, t) in tasks.iter_mut().enumerate() {
+                t.3 = rank as u32;
             }
 
             let tick = cfg.tick_size;
@@ -191,11 +209,11 @@ impl LoadedReplayData {
                     .map(|c| {
                         s.spawn(move || {
                             let mut local = Vec::new();
-                            for (path, is_book, idx) in c {
+                            for (path, is_book, idx, file_rank) in c {
                                 if *is_book {
-                                    load_book_parquet(path, *idx, tick, &mut local)?;
+                                    load_book_parquet(path, *idx, *file_rank, tick, &mut local)?;
                                 } else {
-                                    load_trades_parquet(path, *idx, &mut local)?;
+                                    load_trades_parquet(path, *idx, *file_rank, &mut local)?;
                                 }
                             }
                             Ok(local)
@@ -212,14 +230,19 @@ impl LoadedReplayData {
             }
         }
 
-        // Stable sort by (ts_ns, alphabetical rank of symbol, payload discriminator).
-        // Payload discriminator: book deltas sort before trades at the same
-        // (ts, symbol) for deterministic interleaving.
+        // Total-order sort by (ts_ns, alphabetical rank of symbol, payload
+        // discriminator, source position). Payload discriminator: book deltas
+        // sort before trades at the same (ts, symbol). `src` ((file_rank,
+        // row_idx)) is the final tie-breaker that makes the key TOTAL — events
+        // sharing the first three keys (e.g. many book rows at one ts_ns) would
+        // otherwise keep the parallel loader's nondeterministic append order,
+        // making the replay (and thus fills/PnL) vary run-to-run.
         events.sort_by(|a, b| {
             a.ts_ns
                 .cmp(&b.ts_ns)
                 .then_with(|| alpha_rank[a.symbol_idx].cmp(&alpha_rank[b.symbol_idx]))
                 .then_with(|| payload_rank(&a.payload).cmp(&payload_rank(&b.payload)))
+                .then_with(|| a.src.cmp(&b.src))
         });
 
         // Validate per-symbol seq monotonicity on book deltas.
@@ -442,6 +465,7 @@ fn payload_rank(p: &EventPayload) -> u8 {
 fn load_book_parquet(
     path: &Path,
     symbol_idx: usize,
+    file_rank: u32,
     tick_size: Decimal,
     out: &mut Vec<LoadedEvent>,
 ) -> Result<(), ReplayError> {
@@ -485,6 +509,7 @@ fn load_book_parquet(
                 size,
                 seq,
             },
+            src: (u64::from(file_rank) << 32) | i as u64,
         });
     }
     Ok(())
@@ -507,6 +532,7 @@ fn price_to_ticks(price: Decimal, tick_size: Decimal) -> Option<i64> {
 fn load_trades_parquet(
     path: &Path,
     symbol_idx: usize,
+    file_rank: u32,
     out: &mut Vec<LoadedEvent>,
 ) -> Result<(), ReplayError> {
     let df = read_parquet_df(path)?;
@@ -542,6 +568,7 @@ fn load_trades_parquet(
                 size,
                 taker_side,
             },
+            src: (u64::from(file_rank) << 32) | i as u64,
         });
     }
     Ok(())

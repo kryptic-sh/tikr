@@ -1038,8 +1038,17 @@ struct Args {
     /// Measure real round-trip latency to Binance USD-M (10 pings) at startup
     /// and use the mean as submit/cancel latency and the stddev as jitter,
     /// OVERRIDING the --sim-*-latency flags. On by default so sweeps reflect
-    /// this machine's actual link. `--no-measure-latency` keeps the static
-    /// flags (offline / fully-deterministic sweeps).
+    /// this machine's actual link.
+    ///
+    /// DETERMINISM: the probe runs ONCE per invocation and applies to every
+    /// preset, so presets WITHIN a single run share one latency model and stay
+    /// comparable. But the measured mean/jitter wander with real network RTT
+    /// run-to-run, so the SAME preset in two separate invocations will NOT
+    /// reproduce (different fills/PnL). For bit-reproducible results — e.g.
+    /// comparing a config change across runs, or A/B-ing one knob in two
+    /// invocations — pass `--measure-latency false` (uses the fixed
+    /// `--sim-submit-latency-ms` / jitter `0`), and pin filters too
+    /// (`--autodetect-filters false` + explicit `--tick-size`/`--step-size`).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     measure_latency: bool,
 
