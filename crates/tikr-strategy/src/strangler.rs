@@ -1,18 +1,18 @@
 //! Strangler: a plain tick-spaced lattice window that stays full.
 //!
-//! Dead simple. Each side rests `levels` post-only orders on the tick grid: the
-//! first `inner_ticks` from mid, then every `step_ticks` deeper. There is NO
-//! skew, inventory logic, or refill threshold — and fills are IGNORED. The
-//! strategy reconciles its window on a fixed **once-per-second** cadence:
-//!
-//! - **Recenter / fall-off:** the target prices follow the latest mid; any
-//!   resting order no longer on a target level is cancelled.
-//! - **Refill:** any target level with no resting order (never placed, or
-//!   filled since the last tick) is (re)placed.
+//! Dead simple, blind, place-only. Each side targets `levels` post-only orders
+//! on the tick grid: the first `inner_ticks` from mid, then every `step_ticks`
+//! deeper. There is NO skew, inventory logic, or refill threshold; it does NOT
+//! inspect resting orders; fills are IGNORED; and it NEVER cancels. Once a
+//! second it simply fires the FULL target grid off the current mid — the venue
+//! (post-only / max-open-orders) handles any duplicate or over-cap orders.
 //!
 //! Reconcile fires at most once per second (gated on the event timestamp), on a
-//! book update or heartbeat. `Fill` and `Trade` events are no-ops — a filled
-//! slot is simply refilled by the next 1 s reconcile, not reactively.
+//! book update or heartbeat. `Fill` and `Trade` events are no-ops.
+//!
+//! NOTE: because it never cancels and re-fires blindly, resting orders
+//! accumulate as the mid moves — size `levels` / cadence with the venue's
+//! open-order cap in mind.
 //!
 //! ## Knobs
 //! - `levels` — orders per side.
@@ -47,8 +47,8 @@ pub struct StranglerConfig {
     pub inner_ticks: u32,
 }
 
-/// Strangler strategy state. The resting book in `ctx.open_quotes` is the only
-/// state the reconcile reads; `last_reconcile_ns` gates the 1 s cadence.
+/// Strangler strategy state. Reconcile reads only the latest book (mid);
+/// `last_reconcile_ns` gates the 1 s cadence.
 pub struct Strangler {
     config: StranglerConfig,
     /// Event-time (ns) of the last reconcile, for the once-per-second gate.
@@ -120,7 +120,10 @@ impl Strangler {
         out
     }
 
-    /// Cancel resting orders off the current window, place any empty target slot.
+    /// Blindly emit the full target grid. Does NOT inspect resting orders and
+    /// NEVER cancels — every cycle just fires `make_quote` for every target
+    /// level off the current mid. Duplicate-price / over-cap orders are left for
+    /// the venue (post-only / max-orders) to reject.
     fn reconcile(&self, ctx: &StrategyContext<'_>) -> Vec<Action> {
         let Some(best_bid) = ctx.latest_book.bids.first().map(|l| l.price.0) else {
             return Vec::new();
@@ -128,31 +131,10 @@ impl Strangler {
         let Some(best_ask) = ctx.latest_book.asks.first().map(|l| l.price.0) else {
             return Vec::new();
         };
-        let targets = self.targets(best_bid, best_ask);
-        if targets.is_empty() {
-            return Vec::new();
-        }
-        let mut actions = Vec::new();
-        // Cancel anything that fell off the window (no matching target level).
-        for (id, q) in ctx.open_quotes {
-            let on_target = targets
-                .iter()
-                .any(|(side, price)| *side == q.side && *price == q.price.0);
-            if !on_target {
-                actions.push(Action::Cancel(*id));
-            }
-        }
-        // Fill empty slots (never placed, or just filled).
-        for (side, price) in &targets {
-            let present = ctx
-                .open_quotes
-                .iter()
-                .any(|(_, q)| q.side == *side && q.price.0 == *price);
-            if !present {
-                actions.push(self.make_quote(ctx.symbol, *side, Price(*price)));
-            }
-        }
-        actions
+        self.targets(best_bid, best_ask)
+            .into_iter()
+            .map(|(side, price)| self.make_quote(ctx.symbol, side, Price(price)))
+            .collect()
     }
 }
 
@@ -342,7 +324,9 @@ mod tests {
     }
 
     #[test]
-    fn intact_window_emits_nothing() {
+    fn refires_full_grid_blindly_ignoring_resting() {
+        // Even with the entire window already resting, the next cycle re-fires
+        // the FULL grid (no dedup against open_quotes) and never cancels.
         let mut w = Strangler::new(cfg());
         let s = snap(Decimal::from(100), Decimal::new(1001, 1));
         let p = pos();
@@ -354,6 +338,7 @@ mod tests {
             },
         );
         let open = quotes(&seeded);
+        assert_eq!(open.len(), 6);
         let again = w.on_event(
             &ctx_at(&sm, &s, &p, &open, NEXT),
             &MarketEvent::BookUpdate {
@@ -361,53 +346,21 @@ mod tests {
             },
         );
         assert!(
-            again.is_empty(),
-            "no churn when the window is intact: {again:?}"
+            !again.iter().any(|a| matches!(a, Action::Cancel(_))),
+            "strangler must never cancel: {again:?}"
         );
-    }
-
-    #[test]
-    fn filled_slot_is_refilled_only() {
-        let mut w = Strangler::new(cfg());
-        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
-        let p = pos();
-        let sm = sym();
-        let seeded = w.on_event(
-            &ctx(&sm, &s, &p, &[]),
-            &MarketEvent::BookUpdate {
-                snapshot: s.clone(),
-            },
-        );
-        // Drop one bid (simulate a fill) → exactly that slot is re-placed, no
-        // cancels.
-        let mut open = quotes(&seeded);
-        let dropped = open.remove(0); // a bid at 100.0
-        let actions = w.on_event(
-            &ctx_at(&sm, &s, &p, &open, NEXT),
-            &MarketEvent::BookUpdate {
-                snapshot: s.clone(),
-            },
-        );
-        assert!(
-            !actions.iter().any(|a| matches!(a, Action::Cancel(_))),
-            "no cancels when only a slot emptied: {actions:?}"
-        );
-        let placed: Vec<Decimal> = actions
-            .iter()
-            .filter_map(|a| match a {
-                Action::Quote(q) => Some(q.price.0),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            placed,
-            vec![dropped.1.price.0],
-            "only the emptied slot refilled"
+            again
+                .iter()
+                .filter(|a| matches!(a, Action::Quote(_)))
+                .count(),
+            6,
+            "re-fires the full grid regardless of what's resting: {again:?}"
         );
     }
 
     #[test]
-    fn recenter_cancels_fallen_off_and_places_new() {
+    fn recenter_places_new_and_never_cancels() {
         let mut w = Strangler::new(cfg());
         let s0 = snap(Decimal::from(100), Decimal::new(1001, 1));
         let p = pos();
@@ -419,7 +372,8 @@ mod tests {
             },
         );
         let open = quotes(&seeded);
-        // Market jumps up ~1 unit → whole window shifts → old orders fall off.
+        // Market jumps up ~1 unit → window shifts → new slots placed, but the
+        // drifted-out orders are LEFT resting (no cancels).
         let s1 = snap(Decimal::from(101), Decimal::new(1011, 1));
         let actions = w.on_event(
             &ctx_at(&sm, &s1, &p, &open, NEXT),
@@ -428,8 +382,8 @@ mod tests {
             },
         );
         assert!(
-            actions.iter().any(|a| matches!(a, Action::Cancel(_))),
-            "fallen-off orders must be cancelled: {actions:?}"
+            !actions.iter().any(|a| matches!(a, Action::Cancel(_))),
+            "strangler must never cancel: {actions:?}"
         );
         assert!(
             actions.iter().any(|a| matches!(a, Action::Quote(_))),
