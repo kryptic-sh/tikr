@@ -1,0 +1,15 @@
+[account]
+env = "futures-mainnet"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "0"
+leverage = 10
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "strangler"
+
+[bot.strangler]
+levels = 50
+step_ticks = 2
+inner_ticks = 10
