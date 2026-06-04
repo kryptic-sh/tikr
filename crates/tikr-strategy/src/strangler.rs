@@ -1,15 +1,18 @@
 //! Strangler: a plain tick-spaced lattice window that stays full.
 //!
 //! Dead simple. Each side rests `levels` post-only orders on the tick grid: the
-//! first `inner_ticks` from mid, then every `step_ticks` deeper. The window
-//! recenters on the current mid every event. There is NO skew, inventory logic,
-//! or refill threshold — the strategy just keeps its window full:
+//! first `inner_ticks` from mid, then every `step_ticks` deeper. There is NO
+//! skew, inventory logic, or refill threshold — and fills are IGNORED. The
+//! strategy reconciles its window on a fixed **once-per-second** cadence:
 //!
-//! - **Recenter / fall-off:** on a book move the target prices shift; any
+//! - **Recenter / fall-off:** the target prices follow the latest mid; any
 //!   resting order no longer on a target level is cancelled.
-//! - **Refill:** any target level with no resting order (never placed, or just
-//!   filled) is (re)placed — so a filled slot is replenished on the next event
-//!   (including the `Fill` itself).
+//! - **Refill:** any target level with no resting order (never placed, or
+//!   filled since the last tick) is (re)placed.
+//!
+//! Reconcile fires at most once per second (gated on the event timestamp), on a
+//! book update or heartbeat. `Fill` and `Trade` events are no-ops — a filled
+//! slot is simply refilled by the next 1 s reconcile, not reactively.
 //!
 //! ## Knobs
 //! - `levels` — orders per side.
@@ -21,6 +24,9 @@ use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, Time
 use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
+
+/// Reconcile cadence: rebuild the order batch at most once per second.
+const RECONCILE_INTERVAL_NS: u64 = 1_000_000_000;
 
 /// Configuration for [`Strangler`].
 #[derive(Debug, Clone)]
@@ -41,10 +47,12 @@ pub struct StranglerConfig {
     pub inner_ticks: u32,
 }
 
-/// Strangler strategy state. Stateless beyond its config — the resting book in
-/// `ctx.open_quotes` is the only state the reconcile needs.
+/// Strangler strategy state. The resting book in `ctx.open_quotes` is the only
+/// state the reconcile reads; `last_reconcile_ns` gates the 1 s cadence.
 pub struct Strangler {
     config: StranglerConfig,
+    /// Event-time (ns) of the last reconcile, for the once-per-second gate.
+    last_reconcile_ns: Option<u64>,
 }
 
 impl Strangler {
@@ -152,7 +160,10 @@ impl Strategy for Strangler {
     type Config = StranglerConfig;
 
     fn new(config: Self::Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            last_reconcile_ns: None,
+        }
     }
 
     fn name(&self) -> &str {
@@ -160,11 +171,22 @@ impl Strategy for Strangler {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        // Fills and trades are ignored — a filled slot is replenished by the
+        // next 1 s reconcile, not reactively. Only book updates / heartbeats can
+        // trigger a reconcile, and only once the 1 s cadence has elapsed.
         match event {
-            // Recenter on book moves; refill the just-emptied slot on a fill.
-            MarketEvent::BookUpdate { .. } | MarketEvent::Fill(_) => self.reconcile(ctx),
-            MarketEvent::Heartbeat { .. } | MarketEvent::Trade { .. } => Vec::new(),
+            MarketEvent::BookUpdate { .. } | MarketEvent::Heartbeat { .. } => {}
+            MarketEvent::Fill(_) | MarketEvent::Trade { .. } => return Vec::new(),
         }
+        let now = ctx.now.0;
+        let due = self
+            .last_reconcile_ns
+            .is_none_or(|last| now.saturating_sub(last) >= RECONCILE_INTERVAL_NS);
+        if !due {
+            return Vec::new();
+        }
+        self.last_reconcile_ns = Some(now);
+        self.reconcile(ctx)
     }
 
     fn on_notional_updated(
@@ -238,9 +260,19 @@ mod tests {
         p: &'a Position,
         open: &'a [(QuoteId, QuoteIntent)],
     ) -> StrategyContext<'a> {
+        ctx_at(symbol, s, p, open, 1)
+    }
+
+    fn ctx_at<'a>(
+        symbol: &'a Symbol,
+        s: &'a Snapshot,
+        p: &'a Position,
+        open: &'a [(QuoteId, QuoteIntent)],
+        now_ns: u64,
+    ) -> StrategyContext<'a> {
         StrategyContext {
             symbol,
-            now: Timestamp(1),
+            now: Timestamp(now_ns),
             position: p,
             recent_fills: &[],
             latest_book: s,
@@ -248,6 +280,9 @@ mod tests {
             recent_liqs: &[],
         }
     }
+
+    /// One second + 1 ns later — past the reconcile gate.
+    const NEXT: u64 = super::RECONCILE_INTERVAL_NS + 1;
 
     fn quotes(actions: &[Action]) -> Vec<(QuoteId, QuoteIntent)> {
         actions
@@ -320,7 +355,7 @@ mod tests {
         );
         let open = quotes(&seeded);
         let again = w.on_event(
-            &ctx(&sm, &s, &p, &open),
+            &ctx_at(&sm, &s, &p, &open, NEXT),
             &MarketEvent::BookUpdate {
                 snapshot: s.clone(),
             },
@@ -348,7 +383,7 @@ mod tests {
         let mut open = quotes(&seeded);
         let dropped = open.remove(0); // a bid at 100.0
         let actions = w.on_event(
-            &ctx(&sm, &s, &p, &open),
+            &ctx_at(&sm, &s, &p, &open, NEXT),
             &MarketEvent::BookUpdate {
                 snapshot: s.clone(),
             },
@@ -387,7 +422,7 @@ mod tests {
         // Market jumps up ~1 unit → whole window shifts → old orders fall off.
         let s1 = snap(Decimal::from(101), Decimal::new(1011, 1));
         let actions = w.on_event(
-            &ctx(&sm, &s1, &p, &open),
+            &ctx_at(&sm, &s1, &p, &open, NEXT),
             &MarketEvent::BookUpdate {
                 snapshot: s1.clone(),
             },
@@ -400,5 +435,66 @@ mod tests {
             actions.iter().any(|a| matches!(a, Action::Quote(_))),
             "new window slots must be placed: {actions:?}"
         );
+    }
+
+    #[test]
+    fn throttled_within_one_second() {
+        // A book change <1 s after the seed must NOT reconcile (1 Hz gate),
+        // even though the window would otherwise move.
+        let mut w = Strangler::new(cfg());
+        let s0 = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos();
+        let sm = sym();
+        let seeded = w.on_event(
+            &ctx_at(&sm, &s0, &p, &[], 1),
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
+        let open = quotes(&seeded);
+        let s1 = snap(Decimal::from(101), Decimal::new(1011, 1));
+        let half_sec = 1 + RECONCILE_INTERVAL_NS / 2;
+        let actions = w.on_event(
+            &ctx_at(&sm, &s1, &p, &open, half_sec),
+            &MarketEvent::BookUpdate {
+                snapshot: s1.clone(),
+            },
+        );
+        assert!(
+            actions.is_empty(),
+            "must not reconcile within 1 s of the last batch: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_fills() {
+        // A Fill event never triggers a reconcile (even past the 1 s gate).
+        let mut w = Strangler::new(cfg());
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos();
+        let sm = sym();
+        let seeded = w.on_event(
+            &ctx_at(&sm, &s, &p, &[], 1),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        // Drop a slot, then deliver a Fill well past the gate → still no-op.
+        let mut open = quotes(&seeded);
+        open.remove(0);
+        let fill = tikr_core::Fill {
+            quote_id: QuoteId::new(),
+            price: Price(Decimal::new(999, 1)),
+            size: Size(Decimal::new(1, 3)),
+            fee_asset: tikr_core::Asset::new("USDC"),
+            fee_amount: Decimal::ZERO,
+            fee_quote: Notional(Decimal::ZERO),
+            side: Side::Bid,
+            ts: Timestamp(NEXT),
+            is_full: true,
+            trade_id: None,
+        };
+        let actions = w.on_event(&ctx_at(&sm, &s, &p, &open, NEXT), &MarketEvent::Fill(fill));
+        assert!(actions.is_empty(), "fills are ignored: {actions:?}");
     }
 }
