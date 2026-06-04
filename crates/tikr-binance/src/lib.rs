@@ -480,6 +480,81 @@ impl BinanceClient {
     fn format_decimal(d: tikr_core::Decimal) -> String {
         format!("{}", d.normalize())
     }
+
+    /// Place one side's prepped orders, touch-first, as sequential 5-order
+    /// `batchOrders` requests (the venue's per-request cap). `pis` are indices
+    /// into `prepped`, pre-sorted best→worst. Returns `(orig_idx, result)` per
+    /// order. Caller runs the bid side and ask side concurrently so the two
+    /// sides' REST round-trips overlap instead of summing.
+    async fn place_side_batches(
+        &self,
+        base_url: &str,
+        prepped: &[(usize, PreppedOrder)],
+        pis: &[usize],
+    ) -> Vec<(usize, Result<QuoteId, VenueError>)> {
+        let mut out: Vec<(usize, Result<QuoteId, VenueError>)> = Vec::with_capacity(pis.len());
+        // Group by symbol, preserving the best-first order (single-symbol in
+        // practice, but stay correct for a mixed caller).
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        for &pi in pis {
+            let sym = &prepped[pi].1.sym;
+            if let Some(g) = groups.iter_mut().find(|g| &g.0 == sym) {
+                g.1.push(pi);
+            } else {
+                groups.push((sym.clone(), vec![pi]));
+            }
+        }
+        for (sym, sym_pis) in groups {
+            for chunk in sym_pis.chunks(5) {
+                let reqs: Vec<crate::futs::BatchOrderReq<'_>> = chunk
+                    .iter()
+                    .map(|&pi| {
+                        let p = &prepped[pi].1;
+                        crate::futs::BatchOrderReq {
+                            side: p.side,
+                            price: &p.price,
+                            quantity: &p.size,
+                            client_order_id: &p.coid,
+                            tif: p.tif,
+                        }
+                    })
+                    .collect();
+                let placed = crate::futs::place_batch_orders(
+                    &self.http,
+                    base_url,
+                    &self.api_key,
+                    &self.key_material,
+                    &sym,
+                    &reqs,
+                )
+                .await;
+                match placed {
+                    Ok(per) => {
+                        for (&pi, res) in chunk.iter().zip(per) {
+                            let (orig_idx, prep) = (prepped[pi].0, &prepped[pi].1);
+                            if let Ok(venue_qid) = &res
+                                && let Ok(mut map) = self.quote_symbols.lock()
+                            {
+                                map.insert(*venue_qid, (prep.sym.clone(), prep.coid.clone()));
+                            }
+                            out.push((orig_idx, res));
+                        }
+                    }
+                    Err(e) => {
+                        // Request-level failure (auth / rate-limit / malformed):
+                        // VenueError isn't Clone, so fan a faithful copy out to
+                        // every leg — preserving RateLimited so the runner's
+                        // cooldown arms no matter which result it inspects.
+                        let reason = format!("batch place request failed: {e:?}");
+                        for &pi in chunk {
+                            out.push((prepped[pi].0, Err(clone_batch_err(&e, &reason))));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +575,20 @@ fn clone_batch_err(e: &VenueError, reason: &str) -> VenueError {
             reason: reason.to_string(),
         },
     }
+}
+
+/// One validated, wire-formatted order awaiting batch placement. Owns its
+/// strings so [`BinanceClient::place_side_batches`] can borrow them across the
+/// `batchOrders` request.
+struct PreppedOrder {
+    sym: String,
+    price: String,
+    size: String,
+    coid: String,
+    side: Side,
+    tif: tikr_core::TimeInForce,
+    /// Rounded price, kept for the best→worst sort within a side.
+    sort_price: tikr_core::Decimal,
 }
 
 #[async_trait]
@@ -843,15 +932,7 @@ impl Venue for BinanceClient {
         let mut results: Vec<Option<Result<QuoteId, VenueError>>> =
             (0..intents.len()).map(|_| None).collect();
         // Prep each intent; keep the owned wire strings alive for the borrow.
-        struct Prep {
-            sym: String,
-            price: String,
-            size: String,
-            coid: String,
-            side: Side,
-            tif: tikr_core::TimeInForce,
-        }
-        let mut prepped: Vec<(usize, Prep)> = Vec::new();
+        let mut prepped: Vec<(usize, PreppedOrder)> = Vec::new();
         for (idx, intent) in intents.iter().enumerate() {
             let sym_str = binance_symbol(&intent.symbol);
             let price = match round_price_for_side(
@@ -879,71 +960,37 @@ impl Venue for BinanceClient {
             }
             prepped.push((
                 idx,
-                Prep {
+                PreppedOrder {
                     sym: sym_str,
                     price: Self::format_decimal(price.0),
                     size: Self::format_decimal(size.0),
                     coid: Self::client_order_id(QuoteId::new()),
                     side: intent.side,
                     tif: intent.tif,
+                    sort_price: price.0,
                 },
             ));
         }
-        // Group by symbol (the runner is single-symbol, but stay correct for a
-        // mixed caller), then chunk by the venue's 5-order batch cap.
-        let mut by_symbol: HashMap<String, Vec<usize>> = HashMap::new();
-        for (pi, (_, p)) in prepped.iter().enumerate() {
-            by_symbol.entry(p.sym.clone()).or_default().push(pi);
-        }
-        for (sym, pis) in by_symbol {
-            for chunk in pis.chunks(5) {
-                let reqs: Vec<crate::futs::BatchOrderReq<'_>> = chunk
-                    .iter()
-                    .map(|&pi| {
-                        let p = &prepped[pi].1;
-                        crate::futs::BatchOrderReq {
-                            side: p.side,
-                            price: &p.price,
-                            quantity: &p.size,
-                            client_order_id: &p.coid,
-                            tif: p.tif,
-                        }
-                    })
-                    .collect();
-                let placed = crate::futs::place_batch_orders(
-                    &self.http,
-                    base_url,
-                    &self.api_key,
-                    &self.key_material,
-                    &sym,
-                    &reqs,
-                )
-                .await;
-                match placed {
-                    Ok(per) => {
-                        for (&pi, res) in chunk.iter().zip(per) {
-                            let (orig_idx, prep) = (&prepped[pi].0, &prepped[pi].1);
-                            if let Ok(venue_qid) = &res
-                                && let Ok(mut map) = self.quote_symbols.lock()
-                            {
-                                map.insert(*venue_qid, (prep.sym.clone(), prep.coid.clone()));
-                            }
-                            results[*orig_idx] = Some(res);
-                        }
-                    }
-                    Err(e) => {
-                        // Request-level failure (auth / rate-limit / malformed):
-                        // VenueError isn't Clone, so fan a faithful copy out to
-                        // every leg — preserving RateLimited so the runner's
-                        // cooldown arms no matter which result it inspects.
-                        let reason = format!("batch place request failed: {e:?}");
-                        for &pi in chunk {
-                            let orig_idx = prepped[pi].0;
-                            results[orig_idx] = Some(Err(clone_batch_err(&e, &reason)));
-                        }
-                    }
-                }
-            }
+        // Split into bid + ask, each sorted touch-first (best→worst): bids
+        // high→low, asks low→high. The two sides are placed CONCURRENTLY (one
+        // logical "thread" each) so their sequential 5-order batch round-trips
+        // overlap — full-side placement is bounded by the slower side, not the
+        // sum of both. Within a side, the touch orders go out first.
+        let mut bid_pis: Vec<usize> = (0..prepped.len())
+            .filter(|&pi| prepped[pi].1.side == Side::Bid)
+            .collect();
+        let mut ask_pis: Vec<usize> = (0..prepped.len())
+            .filter(|&pi| prepped[pi].1.side == Side::Ask)
+            .collect();
+        bid_pis.sort_by(|&a, &b| prepped[b].1.sort_price.cmp(&prepped[a].1.sort_price));
+        ask_pis.sort_by(|&a, &b| prepped[a].1.sort_price.cmp(&prepped[b].1.sort_price));
+
+        let (bid_res, ask_res) = tokio::join!(
+            self.place_side_batches(base_url, &prepped, &bid_pis),
+            self.place_side_batches(base_url, &prepped, &ask_pis),
+        );
+        for (orig_idx, res) in bid_res.into_iter().chain(ask_res) {
+            results[orig_idx] = Some(res);
         }
         results
             .into_iter()
