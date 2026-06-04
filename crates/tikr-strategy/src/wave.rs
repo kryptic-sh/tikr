@@ -431,14 +431,51 @@ impl Wave {
             .ok()
     }
 
-    /// Cancel resting orders on `side` whose price is outside the band's
-    /// price range — the tail left behind as price travels. Holds the
-    /// resting-order count to ~`levels` per side.
+    /// Cancel only the TRAILING tail on `side` — resting orders past the deep
+    /// edge of the window, i.e. the ones price has moved AWAY from. Orders
+    /// between the window and the touch (the LEADING side, where price is
+    /// heading) are deliberately left resting so price fills them as it passes
+    /// each rung, instead of the window sliding the order out from under an
+    /// incoming fill. Used by the price-tracking refill.
     ///
-    /// BID band `[low_k, high_k]` → price band
-    /// `[origin - high_k·step, origin - low_k·step]` (high_k = deeper =
-    /// lower price). ASK → `[origin + low_k·step, origin + high_k·step]`.
-    fn prune_outside_band(
+    /// BID: the deep edge is the lowest active price (`origin - high_k·step`);
+    /// bids BELOW it are the tail left behind when price rose away — prune
+    /// those. Shallower bids (price falling toward them) are kept.
+    /// ASK: mirror — prune only asks ABOVE the highest active price
+    /// (`origin + high_k·step`); keep the lower asks price is rising toward.
+    fn prune_trailing_tail(
+        &self,
+        ctx: &StrategyContext<'_>,
+        side: Side,
+        band: WindowRange,
+        actions: &mut Vec<Action>,
+    ) {
+        let edge = match side {
+            Side::Bid => self.bid_price(band.high_k), // deepest (lowest) active bid
+            Side::Ask => self.ask_price(band.high_k), // deepest (highest) active ask
+        };
+        let Some(edge) = edge else {
+            return;
+        };
+        for (id, q) in ctx.open_quotes {
+            if q.side != side {
+                continue;
+            }
+            let is_trailing_tail = match side {
+                Side::Bid => q.price.0 < edge, // below the deepest active bid
+                Side::Ask => q.price.0 > edge, // above the deepest active ask
+            };
+            if is_trailing_tail {
+                actions.push(Action::Cancel(*id));
+            }
+        }
+    }
+
+    /// Cancel EVERY resting order on `side` outside the band on either edge.
+    /// Used only for a deliberate reposition (auto-inner dead-zone resize),
+    /// where near-touch orders genuinely need to move — unlike the price-
+    /// tracking refill, which keeps leading orders via [`Self::prune_trailing_tail`].
+    fn prune_full_window(
         &self,
         ctx: &StrategyContext<'_>,
         side: Side,
@@ -720,13 +757,22 @@ impl Strategy for Wave {
             if relatticed {
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
-            } else if inner_dirty || round_trip || side_empty {
-                // `inner_dirty`: auto-inner changed → the window shifted, so
-                // re-emit at the new offset and prune the tail that fell outside.
+            } else if inner_dirty {
+                // Auto-inner changed → deliberate reposition to the new offset:
+                // re-emit and FULL-prune (near-touch orders inside the new dead
+                // zone must move).
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
-                self.prune_outside_band(ctx, Side::Bid, bb, &mut actions);
-                self.prune_outside_band(ctx, Side::Ask, ab, &mut actions);
+                self.prune_full_window(ctx, Side::Bid, bb, &mut actions);
+                self.prune_full_window(ctx, Side::Ask, ab, &mut actions);
+            } else if round_trip || side_empty {
+                // Price-tracking refill: re-emit empty slots and prune only the
+                // TRAILING tail. Orders price is moving INTO are left to fill —
+                // never slid out from under an incoming price.
+                self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
+                self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
+                self.prune_trailing_tail(ctx, Side::Bid, bb, &mut actions);
+                self.prune_trailing_tail(ctx, Side::Ask, ab, &mut actions);
             }
         }
 
@@ -1071,11 +1117,12 @@ mod tests {
     }
 
     #[test]
-    fn refill_prunes_orders_outside_window() {
-        // After the window slides and refills, every resting order now outside
-        // the new window must be cancelled (no orphaned stragglers). Seed at
-        // ~100, jump the book to ~110 → all 12 old orders fall outside the new
-        // window → all 12 must get a Cancel.
+    fn refill_prunes_only_trailing_tail_not_leading_orders() {
+        // Seed at ~100, jump the book UP to ~110. Price rose AWAY from the bids
+        // (trailing tail) and rose THROUGH the asks (leading — price passed
+        // them). Only the trailing bids may be cancelled; the asks price moved
+        // into must be LEFT resting so they fill instead of being slid out from
+        // under the incoming price.
         let mut w = Wave::new(cfg());
         let s0 = snap(Decimal::from(100), Decimal::new(1001, 1));
         let p = pos_flat();
@@ -1094,8 +1141,16 @@ mod tests {
             })
             .collect();
         assert_eq!(open.len(), 12, "seed should rest 12 orders");
-        let seeded_ids: std::collections::HashSet<QuoteId> =
-            open.iter().map(|(id, _)| *id).collect();
+        let bid_ids: std::collections::HashSet<QuoteId> = open
+            .iter()
+            .filter(|(_, q)| q.side == Side::Bid)
+            .map(|(id, _)| *id)
+            .collect();
+        let ask_ids: std::collections::HashSet<QuoteId> = open
+            .iter()
+            .filter(|(_, q)| q.side == Side::Ask)
+            .map(|(id, _)| *id)
+            .collect();
 
         let s_up = snap(Decimal::from(110), Decimal::new(1101, 1));
         let a_up = w.on_event(
@@ -1112,8 +1167,12 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            cancelled, seeded_ids,
-            "every order outside the slid window must be cancelled: {a_up:?}"
+            cancelled, bid_ids,
+            "only the trailing bids (price moved away) may be cancelled: {a_up:?}"
+        );
+        assert!(
+            cancelled.is_disjoint(&ask_ids),
+            "asks price rose through must NOT be cancelled — let them fill: {a_up:?}"
         );
     }
 
