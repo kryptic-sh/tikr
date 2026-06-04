@@ -255,6 +255,36 @@ pub struct BotConfig {
     /// Volley params (only honored when `strategy = "volley"`).
     #[serde(default)]
     pub volley: Option<VolleyParams>,
+    /// Strangler params (only honored when `strategy = "strangler"`).
+    #[serde(default)]
+    pub strangler: Option<StranglerParams>,
+}
+
+/// Strangler — plain tick-spaced lattice window; keep it full.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StranglerParams {
+    /// Per-order notional. Account-derived if unset.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Orders per side. Default 10.
+    #[serde(default = "strangler_default_levels")]
+    pub levels: u32,
+    /// Ticks between consecutive levels (min 1). Default 1.
+    #[serde(default = "strangler_default_step_ticks")]
+    pub step_ticks: u32,
+    /// Ticks from mid to the first order on each side. `0` (default) = at the
+    /// mid tick.
+    #[serde(default)]
+    pub inner_ticks: u32,
+}
+
+fn strangler_default_levels() -> u32 {
+    10
+}
+
+fn strangler_default_step_ticks() -> u32 {
+    1
 }
 
 /// Wave — frozen fixed-step lattice with round-trip refill (pure form).

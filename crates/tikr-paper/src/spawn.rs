@@ -16,8 +16,8 @@ use tikr_strategy::{
     JokerConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade,
     LiqFadeConfig, Mantis, MantisConfig, MicroMeanReversion, MicroMeanReversionConfig, RsiMr,
     RsiMrConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
-    StaticGridConfig, Strategy, Tide, TideConfig, TopOfBook, TopOfBookConfig, Volley, VolleyConfig,
-    Wave, WaveConfig,
+    StaticGridConfig, Strangler, StranglerConfig, Strategy, Tide, TideConfig, TopOfBook,
+    TopOfBookConfig, Volley, VolleyConfig, Wave, WaveConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -69,6 +69,8 @@ pub enum StrategyChoice {
     Mantis(MantisConfig),
     /// [`Volley`] — timed batched book-flooding; refresh a fence each interval.
     Volley(VolleyConfig),
+    /// [`Strangler`] — plain tick-spaced lattice window; keep it full.
+    Strangler(StranglerConfig),
 }
 
 impl StrategyChoice {
@@ -92,6 +94,7 @@ impl StrategyChoice {
             Self::Wave(_) => "wave",
             Self::Mantis(_) => "mantis",
             Self::Volley(_) => "volley",
+            Self::Strangler(_) => "strangler",
         }
     }
 }
@@ -465,6 +468,23 @@ where
                 }
                 StrategyChoice::Volley(cfg) => {
                     let strategy = Volley::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
+                    )
+                    .await
+                }
+                StrategyChoice::Strangler(cfg) => {
+                    let strategy = Strangler::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,

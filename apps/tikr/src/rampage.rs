@@ -632,6 +632,7 @@ fn spawn_one_bot(
                 rsi_mr: None,
                 mantis: None,
                 volley: None,
+                strangler: None,
             };
             (bc, "wave".to_string())
         }
@@ -671,6 +672,7 @@ fn spawn_one_bot(
                 rsi_mr: None,
                 mantis: None,
                 volley: None,
+                strangler: None,
             };
             (bc, "tide".to_string())
         }

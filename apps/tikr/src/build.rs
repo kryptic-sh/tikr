@@ -12,7 +12,7 @@ use tikr_paper::{BotSpec, InventoryBoostConfig, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
     HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MantisConfig,
     MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
-    TideConfig, VolleyConfig, WaveConfig,
+    StranglerConfig, TideConfig, VolleyConfig, WaveConfig,
 };
 use tokio::sync::watch;
 
@@ -84,9 +84,10 @@ pub fn to_spec(
         "wave" | "wv" => build_wave(cfg, &symbol, venue, default_notional)?,
         "mantis" | "mn" => build_mantis(cfg, &symbol, venue, default_notional)?,
         "volley" | "vl" => build_volley(cfg, &symbol, venue, default_notional)?,
+        "strangler" | "st" => build_strangler(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, mantis, volley)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, mantis, volley, strangler)"
             ));
         }
     };
@@ -204,6 +205,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "wave" | "wv" => Ok(cfg.wave.as_ref().and_then(|p| p.notional)),
         "mantis" | "mn" => Ok(cfg.mantis.as_ref().and_then(|p| p.notional)),
         "volley" | "vl" => Ok(cfg.volley.as_ref().and_then(|p| p.notional)),
+        "strangler" | "st" => Ok(cfg.strangler.as_ref().and_then(|p| p.notional)),
         other => Err(anyhow::anyhow!("unknown strategy '{other}'")),
     }
 }
@@ -237,7 +239,9 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "mantis"
         | "mn"
         | "volley"
-        | "vl" => None,
+        | "vl"
+        | "strangler"
+        | "st" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
@@ -258,6 +262,8 @@ fn max_open_orders_for(cfg: &BotConfig) -> usize {
         "wave" | "wv" => 0,
         // Volley keeps a wall of `2 × levels` orders and refreshes it itself.
         "volley" | "vl" => 0,
+        // Strangler keeps a full `2 × levels` window and reconciles it itself.
+        "strangler" | "st" => 0,
         // Grid-style strategies — let the strategy manage its own
         // book without runner-level wipes.
         "static-grid" | "sg" | "layered-grid" | "lg" => 0,
@@ -551,6 +557,33 @@ fn build_wave(
         steps_inner: wave.steps_inner,
         auto_inner: wave.auto_inner,
         round_trips: wave.round_trips,
+    }))
+}
+
+fn build_strangler(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let s = cfg.strangler.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=strangler but [bot.strangler] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(s.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::Strangler(StranglerConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        levels: s.levels,
+        step_ticks: s.step_ticks,
+        inner_ticks: s.inner_ticks,
     }))
 }
 
