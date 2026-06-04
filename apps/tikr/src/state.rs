@@ -89,6 +89,13 @@ pub struct BotView {
     pub shutdown_tx: Option<watch::Sender<bool>>,
     /// Last Binance REST positionRisk snapshot for this symbol.
     pub api_position: Arc<RwLock<Option<ApiPositionSnapshot>>>,
+    /// `true` once this (rotated-out) bot's P&L has been PERMANENTLY folded into
+    /// the session retired totals. The view lingers in the TUI showing its final
+    /// numbers, but its snapshot is no longer added to the live grand total
+    /// (it's in `RetiredTotals`), the persist path won't re-fold it, and prune
+    /// won't double-count it. Reset to `false` when a fresh bot is spawned for
+    /// the symbol (rotate back in).
+    pub banked: bool,
 }
 
 /// Account-wide BNB-fee mode snapshot. When `enabled = true`, every
@@ -369,7 +376,11 @@ impl SharedBotState {
         let mut roster = Vec::new();
         for v in self.views() {
             if matches!(v.status, BotStatus::Rotated) {
-                if let Some(r) = v.snapshot.as_ref() {
+                // Banked views are ALREADY in `retired` (folded at rotate-out);
+                // only fold a not-yet-banked lingering rotated bot here.
+                if !v.banked
+                    && let Some(r) = v.snapshot.as_ref()
+                {
                     retired.realized += r.realized.0;
                     retired.unrealized += r.unrealized.0;
                     retired.fees += r.fees.0;
@@ -494,6 +505,7 @@ impl SharedBotState {
     pub fn remove(&self, symbol: &str) {
         if let Ok(mut g) = self.inner.lock()
             && let Some(view) = g.remove(symbol)
+            && !view.banked // already banked at rotate-out → don't double-fold
             && let Ok(snap) = view.snapshot.read()
             && let Some(r) = snap.as_ref()
             && let Ok(mut t) = self.retired.lock()
@@ -510,6 +522,49 @@ impl SharedBotState {
         if let Ok(mut o) = self.order.lock() {
             o.retain(|s| s != symbol);
         }
+        self.delete_bot_snapshot(symbol);
+    }
+
+    /// Permanently bank a just-rotated-out bot's P&L into the session retired
+    /// totals, mark its view `banked` (display-only from now on), and delete its
+    /// per-bot snapshot so a rotate-back-in starts FRESH instead of resuming the
+    /// already-banked P&L. The view stays visible (caller sets `Rotated`) until
+    /// it's pruned. Idempotent — a no-op if already banked.
+    pub fn bank_rotated(&self, symbol: &str) {
+        if let Ok(mut g) = self.inner.lock()
+            && let Some(v) = g.get_mut(symbol)
+            && !v.banked
+        {
+            // Read the snapshot totals into locals first so the read guard is
+            // dropped before we mutate `v.banked`.
+            let folded = v.snapshot.read().ok().and_then(|s| {
+                s.as_ref().map(|r| {
+                    (
+                        r.realized.0,
+                        r.unrealized.0,
+                        r.fees.0,
+                        r.funding.0,
+                        r.net.0,
+                        r.events_processed,
+                        r.fills_emitted,
+                    )
+                })
+            });
+            if let Some((re, un, fe, fu, ne, ev, fi)) = folded
+                && let Ok(mut t) = self.retired.lock()
+            {
+                t.realized += re;
+                t.unrealized += un;
+                t.fees += fe;
+                t.funding += fu;
+                t.net += ne;
+                t.events = t.events.saturating_add(ev);
+                t.fills = t.fills.saturating_add(fi);
+                t.count += 1;
+            }
+            v.banked = true;
+        }
+        // Delete the per-bot snapshot so a rotate-back-in resumes from nothing.
         self.delete_bot_snapshot(symbol);
     }
 
@@ -591,6 +646,7 @@ impl SharedBotState {
                     api_position: v.api_position.read().ok().and_then(|g| g.clone()),
                     history,
                     price_decimals,
+                    banked: v.banked,
                 })
             })
             .collect();
@@ -696,6 +752,9 @@ pub struct BotViewSnapshot {
     /// Price decimal places for this symbol (venue tick size), for coin-precision
     /// price rendering. `None` until the bot has spawned at least once.
     pub price_decimals: Option<u32>,
+    /// P&L already permanently banked into the session retired totals — its
+    /// snapshot is display-only and must not be re-added to the grand total.
+    pub banked: bool,
 }
 
 /// Account-wide aggregate computed from all bot views.
@@ -855,7 +914,12 @@ impl AccountAggregate {
                 BotStatus::Starting => a.starting_count += 1,
                 BotStatus::Rotated => a.rotated_count += 1,
             }
-            if let Some(ref r) = v.snapshot {
+            // Banked views are already in `retired` (seeded above) — their
+            // snapshot is display-only, so skip re-adding it to the grand total
+            // and the retired line (that would double-count).
+            if let Some(ref r) = v.snapshot
+                && !v.banked
+            {
                 a.realized += r.realized.0;
                 a.unrealized += r.unrealized.0;
                 a.fees += r.fees.0;
@@ -863,11 +927,9 @@ impl AccountAggregate {
                 a.net += r.net.0;
                 a.events = a.events.saturating_add(r.events_processed);
                 a.fills = a.fills.saturating_add(r.fills_emitted);
-                // A rotated bot still lingering in the list is already "done" —
-                // surface it in the retired line immediately (not only after GC
-                // folds it into RetiredTotals). Display-only: its P&L is already
-                // in the grand total above, so this never double-counts, and the
-                // count/total are continuous when GC later folds it in.
+                // A rotated bot still lingering before it's banked is already
+                // "done" — surface it in the retired line. Display-only: its P&L
+                // is in the grand total above, so this never double-counts.
                 if matches!(v.status, BotStatus::Rotated) {
                     a.retired_net += r.net.0;
                     a.retired_count += 1;

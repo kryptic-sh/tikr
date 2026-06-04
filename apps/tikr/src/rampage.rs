@@ -410,6 +410,11 @@ pub fn spawn_rampage_manager(
                     stop_bot(bot).await;
                     flatten_symbols(std::slice::from_ref(&symbol), &account).await;
                     shared_state.set_status(&symbol, BotStatus::Rotated);
+                    // PERMANENTLY bank this bot's P&L into the session retired
+                    // totals now (not at prune) and delete its snapshot so a
+                    // rotate-back-in starts FRESH instead of resuming the
+                    // already-banked P&L. The view lingers (Rotated) for display.
+                    shared_state.bank_rotated(&symbol);
                     // Start the retirement clock — its [off] tab lingers up to
                     // RETIRE_AFTER_CYCLES rechecks before we drop it.
                     retired.insert(symbol.clone(), 0);
@@ -696,6 +701,7 @@ fn spawn_one_bot(
             live: Arc::new(RwLock::new(None)),
             shutdown_tx: None,
             api_position: Arc::new(RwLock::new(None)),
+            banked: false,
         },
     );
     let handle = spawn_supervisor(

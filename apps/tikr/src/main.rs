@@ -771,6 +771,7 @@ async fn main() -> anyhow::Result<()> {
                 live: Arc::new(std::sync::RwLock::new(None)),
                 shutdown_tx: None,
                 api_position: Arc::new(std::sync::RwLock::new(None)),
+                banked: false,
             };
             shared_state.insert(&b.symbol, view);
         }

@@ -86,6 +86,7 @@ pub fn spawn_bagboy(
                 live: live.clone(),
                 shutdown_tx: None,
                 api_position: Arc::new(StdRwLock::new(None)),
+                banked: false,
             },
         );
         shared_state.set_status(&symbol, BotStatus::Running);
