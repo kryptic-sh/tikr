@@ -765,6 +765,12 @@ where
     // Price the resting take-profit order is currently pegged at, so we can
     // re-peg it to the touch when the market drifts away.
     let mut tp_price: Option<Decimal> = None;
+    // Latch: once the half-bag take-profit FILLS we must NOT re-arm and sell the
+    // next half (and the next…) — the point is to lock in HALF, once. Reset only
+    // when the position resets (flattens or flips sign) so a fresh winning bag
+    // can take profit again. Tracked alongside the position sign for the reset.
+    let mut tp_taken = false;
+    let mut tp_last_sign: i32 = 0;
 
     let mut last_funding_ts: Option<Timestamp> = None;
     // Live: a STABLE run_id so each bot keeps a single snapshot file in its
@@ -2051,12 +2057,31 @@ where
                         )
                     };
 
-                    // Clear a resolved order (filled / cancelled → gone from mirror).
+                    // Reset the once-per-bag latch when the position resets
+                    // (flat or flipped sign) — a new winning bag may take profit.
+                    let sign = if size > Decimal::ZERO {
+                        1
+                    } else if size < Decimal::ZERO {
+                        -1
+                    } else {
+                        0
+                    };
+                    if sign != tp_last_sign {
+                        tp_taken = false;
+                        tp_last_sign = sign;
+                    }
+
+                    // Clear a resolved order (gone from the mirror). If we still
+                    // held its id (we didn't cancel it ourselves — the re-peg /
+                    // reversal paths below null it explicitly), it FILLED → latch
+                    // `tp_taken` so we don't re-arm and ladder out the rest of the
+                    // bag.
                     if let Some(id) = tp_quote_id
                         && !quotes.iter().any(|(qid, _)| *qid == id)
                     {
                         tp_quote_id = None;
                         tp_price = None;
+                        tp_taken = true;
                     }
 
                     // Manage a resting profit-lock. Cancel it if the move reversed
@@ -2090,6 +2115,7 @@ where
                     // re-peg) when we hold a winning bag past the threshold and
                     // nothing is currently resting. Reduce-only maker at the touch.
                     if tp_quote_id.is_none()
+                        && !tp_taken
                         && threshold > Decimal::ZERO
                         && unrealized >= threshold
                         && size != Decimal::ZERO
