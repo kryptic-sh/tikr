@@ -954,8 +954,11 @@ pub async fn get_1m_closes(
     symbol: &str,
     limit: u32,
 ) -> Result<Vec<tikr_core::Decimal>, VenueError> {
-    let limit = limit.clamp(2, 100);
-    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}");
+    // `limit` is the number of COMPLETE candles wanted. Fetch one extra and drop
+    // the newest (in-progress) candle so its partial close doesn't pollute the
+    // returns series.
+    let fetch = limit.clamp(2, 99) + 1;
+    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={fetch}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
     let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
@@ -964,8 +967,10 @@ pub async fn get_1m_closes(
     let Some(rows) = body.as_array() else {
         return Ok(Vec::new());
     };
-    let mut closes = Vec::with_capacity(rows.len());
-    for row in rows {
+    // Drop the in-progress (newest) candle → complete closes only.
+    let complete = rows.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
+    let mut closes = Vec::with_capacity(complete.len());
+    for row in complete {
         let Some(close) = row
             .as_array()
             .and_then(|cols| cols.get(4))
@@ -1134,8 +1139,13 @@ pub async fn get_1m_avg_candle_pct(
     limit: u32,
 ) -> Result<tikr_core::Decimal, VenueError> {
     use std::str::FromStr;
-    let limit = limit.clamp(1, 100);
-    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={limit}");
+    // `limit` is the number of COMPLETE candles to average. Fetch one extra
+    // because the newest kline is the current, still-forming candle (partial
+    // high/low) — including it skews the average toward whatever fraction of the
+    // minute has elapsed. We drop that last row below.
+    let want = limit.clamp(1, 99);
+    let fetch = want + 1;
+    let url = format!("{base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit={fetch}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
     let body: Value = read_json(resp).await?;
     if let Some(err) = try_parse_error(&body) {
@@ -1144,10 +1154,12 @@ pub async fn get_1m_avg_candle_pct(
     let Some(rows) = body.as_array() else {
         return Ok(tikr_core::Decimal::ZERO);
     };
+    // Drop the in-progress (newest) candle → average over complete candles only.
+    let complete = rows.split_last().map(|(_, rest)| rest).unwrap_or(&[]);
     let hundred = tikr_core::Decimal::from(100);
     let mut sum = tikr_core::Decimal::ZERO;
     let mut n: u32 = 0;
-    for row in rows {
+    for row in complete {
         // kline cols: [openTime, open, high, low, close, volume, ...]
         let cols = match row.as_array() {
             Some(c) => c,
