@@ -298,7 +298,6 @@ pub fn run(
                 let api_account = state.api_account();
                 let start_balance = state.start_balance();
                 let bnb = state.bnb_snapshot();
-                let bnb_start_value = state.bnb_start_value_usdt();
                 let uptime_secs = state.uptime_secs();
                 terminal.draw(|f| {
                     draw(
@@ -308,7 +307,6 @@ pub fn run(
                         api_account.as_ref(),
                         start_balance,
                         Some(&bnb),
-                        bnb_start_value,
                         &log_lines,
                         &mut ui,
                         &config_path,
@@ -673,7 +671,6 @@ fn draw(
     api_account: Option<&ApiAccountSnapshot>,
     start_balance: Option<Decimal>,
     bnb: Option<&crate::state::BnbState>,
-    bnb_start_value_usdt: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
     config_path: &std::path::Path,
@@ -698,7 +695,6 @@ fn draw(
         api_account,
         start_balance,
         bnb,
-        bnb_start_value_usdt,
         log_lines,
         ui,
         uptime_secs,
@@ -934,7 +930,6 @@ fn draw_body(
     api_account: Option<&ApiAccountSnapshot>,
     start_balance: Option<Decimal>,
     bnb: Option<&crate::state::BnbState>,
-    bnb_start_value_usdt: Option<Decimal>,
     log_lines: &[LogLine],
     ui: &mut UiState,
     uptime_secs: u64,
@@ -974,7 +969,6 @@ fn draw_body(
         api_account,
         start_balance,
         bnb,
-        bnb_start_value_usdt,
         ui,
         uptime_secs,
     );
@@ -989,7 +983,6 @@ fn draw_account(
     api_account: Option<&ApiAccountSnapshot>,
     start_balance: Option<Decimal>,
     bnb: Option<&crate::state::BnbState>,
-    bnb_start_value_usdt: Option<Decimal>,
     ui: &mut UiState,
     uptime_secs: u64,
 ) {
@@ -1173,17 +1166,11 @@ fn draw_account(
             Style::default(),
         ));
         if let Some(start) = start_balance {
-            // Base api_net = USDT wallet delta (already realized — the
-            // exchange settled fees + realized PnL into wallet_balance).
-            // When BNB-fee mode is on, also add the BNB-value delta —
-            // fees come out of BNB balance (separate from USDT wallet)
-            // so true realized account-wide PnL is the sum of both.
-            let usdt_delta = api.wallet_balance - start;
-            let bnb_delta = match (bnb, bnb_start_value_usdt) {
-                (Some(b), Some(start_val)) if b.enabled => b.balance * b.price_usdt - start_val,
-                _ => Decimal::ZERO,
-            };
-            let api_real_net = usdt_delta + bnb_delta;
+            // `wallet_balance` is the all-asset USD total (BNB included), and
+            // `start` was captured the same way — so this delta already
+            // accounts for BNB-fee burn and BNB-value change. Adding a
+            // separate BNB delta on top would double-count.
+            let api_real_net = api.wallet_balance - start;
             let api_mtm_net = api_real_net + api.cross_unrealized_pnl;
             lines.push(kv_line(
                 "api real",
