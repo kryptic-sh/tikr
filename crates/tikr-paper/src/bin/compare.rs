@@ -923,6 +923,10 @@ struct Args {
     /// reaches this % of wallet (e.g. `100` = bag ≥ wallet). `0` = leave/off.
     #[arg(long, default_value = "0")]
     bagger_inv_flat_wallet_pct: String,
+    /// Gate the inventory cap on profit: only flatten if the bag is in profit
+    /// (unrealized > 0). `false` (default) = unconditional liquidation breaker.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    bagger_inv_flat_require_profit: bool,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -1420,6 +1424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if invflat > Decimal::ZERO {
         bagger_cfg.inv_flat_wallet_pct = invflat;
     }
+    bagger_cfg.inv_flat_require_profit = args.bagger_inv_flat_require_profit;
     let _ = BAGGER.set(bagger_cfg);
 
     // Isolated-margin liquidation model. Leverage drives the liq distance

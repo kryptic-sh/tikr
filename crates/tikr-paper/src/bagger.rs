@@ -76,6 +76,12 @@ pub struct BaggerConfig {
     /// `cap_pct` (which trims the excess), this dumps the entire position. Not
     /// size-gated (it IS the size gate). `0` off.
     pub inv_flat_wallet_pct: Decimal,
+    /// Gate `inv_flat_wallet_pct` on profit: when `true`, the inventory cap only
+    /// fires if the bag is in profit (`unrealized > 0`) — a big-winner
+    /// take-profit that locks the gain and leaves underwater bags for the grid
+    /// to recover. When `false` (default), the cap is unconditional (liquidation
+    /// circuit-breaker, any P&L).
+    pub inv_flat_require_profit: bool,
     /// **P&L flat**: flatten the whole bag when `|unrealized| ≥ this %` of the
     /// **per-order** notional (NOT equity, NOT bag size). A dead-simple
     /// high-churn rule — fires symmetrically on a tiny win or loss. Always
@@ -99,6 +105,7 @@ impl Default for BaggerConfig {
             fixed_tp_pct: Decimal::ZERO,
             pnl_flat_pct: Decimal::ZERO,
             inv_flat_wallet_pct: Decimal::ZERO,
+            inv_flat_require_profit: false,
         }
     }
 }
@@ -260,18 +267,26 @@ impl BaggerState {
             self.last_new_trough_ns = now_ns;
         }
 
-        // --- Inventory cap flatten: hard circuit-breaker. When the bag notional
-        // reaches `inv_flat_wallet_pct%` of the wallet, dump the WHOLE position.
-        // Not size-gated (it is the size gate) — checked first to pre-empt a
-        // runaway-inventory liquidation.
+        // --- Inventory cap flatten: when the bag notional reaches
+        // `inv_flat_wallet_pct%` of the wallet, dump the WHOLE position. Not
+        // size-gated (it is the size gate). When `inv_flat_require_profit` is
+        // set, only fires on a bag that is in profit (unrealized > 0) — a
+        // big-winner take-profit that locks the gain while leaving underwater
+        // bags to the grid (no crystallizing recoverable losses). When unset it
+        // is the unconditional liquidation circuit-breaker (any P&L).
         if cfg.inv_flat_wallet_pct > Decimal::ZERO && balance > Decimal::ZERO {
             let limit = balance * cfg.inv_flat_wallet_pct / Decimal::from(100);
-            if pos_notional >= limit {
+            let profit_ok = !cfg.inv_flat_require_profit || unrealized > Decimal::ZERO;
+            if pos_notional >= limit && profit_ok {
                 return Some(FlattenDecision {
                     qty: full,
                     side,
                     taker: cfg.exit_taker,
-                    reason: "inventory ≥ wallet cap",
+                    reason: if cfg.inv_flat_require_profit {
+                        "inventory cap (in profit)"
+                    } else {
+                        "inventory ≥ wallet cap"
+                    },
                 });
             }
         }
@@ -580,6 +595,32 @@ mod tests {
         let d = st.evaluate(&cfg, big).unwrap();
         assert_eq!(d.reason, "inventory ≥ wallet cap");
         assert_eq!(d.qty, dec("2"), "dumps the whole position");
+    }
+
+    #[test]
+    fn inv_flat_require_profit_holds_underwater_dumps_green() {
+        let mut cfg = gated("0");
+        cfg.inv_flat_wallet_pct = dec("100");
+        cfg.inv_flat_require_profit = true;
+        let big_red = GuardInput {
+            pos_notional: dec("1100"),
+            unrealized: dec("-5"),
+            ..long_input("-5", 0)
+        };
+        let mut st = BaggerState::default();
+        assert!(
+            st.evaluate(&cfg, big_red).is_none(),
+            "big underwater bag holds (no crystallizing the loss)"
+        );
+        let big_green = GuardInput {
+            pos_notional: dec("1100"),
+            unrealized: dec("5"),
+            ..long_input("5", 0)
+        };
+        let mut st2 = BaggerState::default();
+        let d = st2.evaluate(&cfg, big_green).unwrap();
+        assert_eq!(d.reason, "inventory cap (in profit)");
+        assert_eq!(d.qty, dec("2"));
     }
 
     #[test]
