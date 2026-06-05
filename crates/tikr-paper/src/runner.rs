@@ -227,6 +227,11 @@ pub struct RunnerConfig {
     /// up on a curve as inventory approaches the per-bot cap. `None` (default)
     /// = no boost; sizes pass through untouched. See [`InventoryBoostConfig`].
     pub inventory_boost: Option<InventoryBoostConfig>,
+    /// Bag guard ("bagger") — runner-level inventory-risk layer that flattens a
+    /// large one-sided bag before a swing erases its unrealized P&L (or to cap
+    /// an underwater tail). Runs in BOTH live and backtest. Default mode `Off`.
+    /// See [`crate::bagger::BaggerConfig`].
+    pub bagger: crate::bagger::BaggerConfig,
 }
 
 /// Inventory-aware order-size boost. Scales the *inventory-reducing* side's
@@ -307,6 +312,7 @@ impl Default for RunnerConfig {
             liquidation: None,
             mark_series: None,
             inventory_boost: None,
+            bagger: crate::bagger::BaggerConfig::default(),
         }
     }
 }
@@ -772,6 +778,11 @@ where
     let mut tp_taken = false;
     let mut tp_last_sign: i32 = 0;
 
+    // Bagger: runner-level inventory-risk flatten. Runs in both live + backtest.
+    let bagger_cfg = config.bagger;
+    let bagger_enabled = bagger_cfg.enabled();
+    let mut bagger_state = crate::bagger::BaggerState::default();
+
     let mut last_funding_ts: Option<Timestamp> = None;
     // Live: a STABLE run_id so each bot keeps a single snapshot file in its
     // per-symbol state dir (overwritten each write) — bounded, and trivially
@@ -1126,6 +1137,140 @@ where
                             &symbol,
                         )
                         .await;
+                    }
+                }
+
+                // Bagger: flatten/trim a big one-sided bag before a swing erases
+                // its unrealized P&L (or to cap an underwater tail). Runs each
+                // event BEFORE the strategy reacts — a full flatten cancels the
+                // resting grid so the strategy re-seeds clean at the current
+                // touch this same tick (mirrors the liquidation path). Active in
+                // both live and backtest.
+                if bagger_enabled && last_mark.0 > Decimal::ZERO {
+                    let pos_now = tracker.snapshot();
+                    let size = pos_now.size.0;
+                    if size != Decimal::ZERO {
+                        let avg = pos_now.avg_entry.0;
+                        let mark = last_mark.0;
+                        let unrealized = if avg > Decimal::ZERO {
+                            (mark - avg) * size
+                        } else {
+                            Decimal::ZERO
+                        };
+                        let pos_notional = size.abs() * mark;
+                        // Equity basis for the percent thresholds: live wallet,
+                        // else backtest running balance (initial + realized − fees).
+                        let balance = if live_mode {
+                            wallet_rx
+                                .as_ref()
+                                .map(|rx| *rx.borrow())
+                                .unwrap_or(Decimal::ZERO)
+                        } else {
+                            initial_balance + tracker.realized().0 - tracker.fees().0
+                        };
+                        if let Some(d) = bagger_state.evaluate(
+                            &bagger_cfg,
+                            crate::bagger::GuardInput {
+                                pos_size: size,
+                                pos_notional,
+                                unrealized,
+                                balance,
+                                now_ns: ts.0,
+                            },
+                        ) {
+                            // Reducing-side touch: taker crosses the spread (sell
+                            // into the bid / buy from the ask), maker rests at its
+                            // own touch.
+                            let touch = match (d.side, d.taker) {
+                                (Side::Ask, true) => current_book.bids.first().map(|l| l.price.0),
+                                (Side::Ask, false) => current_book.asks.first().map(|l| l.price.0),
+                                (Side::Bid, true) => current_book.asks.first().map(|l| l.price.0),
+                                (Side::Bid, false) => current_book.bids.first().map(|l| l.price.0),
+                            };
+                            let qty = d.qty.min(size.abs());
+                            let full_flatten = qty >= size.abs();
+                            if qty > Decimal::ZERO
+                                && let Some(px) = touch.filter(|p| *p > Decimal::ZERO)
+                            {
+                                if !live_mode {
+                                    // Backtest: synthesize the close fill (taker
+                                    // or maker fee), then apply it. On a full
+                                    // flatten, drop the resting grid so it reseeds.
+                                    let fee_bps = if d.taker {
+                                        Decimal::from(fill_sim.taker_bps())
+                                    } else {
+                                        Decimal::from(fill_sim.maker_bps())
+                                    };
+                                    let notional = (px * qty).round_dp(8);
+                                    let fee =
+                                        (notional * fee_bps / Decimal::from(10_000)).round_dp(8);
+                                    let fill = Fill {
+                                        quote_id: QuoteId::new(),
+                                        price: Price(px),
+                                        size: tikr_core::Size(qty),
+                                        fee_asset: symbol.quote.clone(),
+                                        fee_amount: fee,
+                                        fee_quote: Notional(fee),
+                                        side: d.side,
+                                        ts,
+                                        is_full: true,
+                                        trade_id: None,
+                                    };
+                                    if full_flatten {
+                                        fill_sim.drop_quotes_for(&symbol);
+                                    }
+                                    info!(
+                                        reason = d.reason,
+                                        side = ?d.side,
+                                        qty = %qty,
+                                        px = %px,
+                                        unrealized = %unrealized.round_dp(4),
+                                        "bagger flatten"
+                                    );
+                                    apply_fill(
+                                        fill,
+                                        &mut tracker,
+                                        &mut risk_gate,
+                                        &mut fills_emitted,
+                                        &mut full_fills,
+                                        &mut partial_fills,
+                                        &mut buy_fills,
+                                        &mut sell_fills,
+                                        &mut buy_volume,
+                                        &mut sell_volume,
+                                        &mut fill_rate,
+                                        alert_sink.as_deref(),
+                                        &symbol,
+                                    )
+                                    .await;
+                                } else {
+                                    // Live: real reduce. Taker = market_close;
+                                    // maker = reduce-only limit at the touch. The
+                                    // resulting stream fill updates the tracker;
+                                    // the resting grid is reconciled by the sweep.
+                                    if d.taker {
+                                        let _ = venue
+                                            .market_close(&symbol, d.side, tikr_core::Size(qty))
+                                            .await;
+                                    } else {
+                                        let _ = venue
+                                            .reduce_only_limit(
+                                                &symbol,
+                                                d.side,
+                                                Price(px),
+                                                tikr_core::Size(qty),
+                                            )
+                                            .await;
+                                    }
+                                    info!(
+                                        reason = d.reason,
+                                        side = ?d.side,
+                                        qty = %qty,
+                                        "bagger flatten (live)"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -3539,6 +3684,7 @@ mod tests {
             liquidation: None,
             mark_series: None,
             inventory_boost: None,
+            bagger: crate::bagger::BaggerConfig::default(),
         }
     }
 
@@ -4142,6 +4288,7 @@ mod tests {
             liquidation: None,
             mark_series: None,
             inventory_boost: None,
+            bagger: crate::bagger::BaggerConfig::default(),
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -4244,6 +4391,7 @@ mod tests {
             liquidation: None,
             mark_series: None,
             inventory_boost: None,
+            bagger: crate::bagger::BaggerConfig::default(),
         };
         let (_tx, rx) = watch::channel(false);
 

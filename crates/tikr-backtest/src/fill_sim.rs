@@ -334,6 +334,16 @@ impl FillSim {
         }
     }
 
+    /// Maker fee in bps (for runner-side synthetic fills, e.g. the bagger).
+    pub fn maker_bps(&self) -> i32 {
+        self.cfg.fees.maker_bps
+    }
+
+    /// Taker fee in bps (for runner-side synthetic flatten fills).
+    pub fn taker_bps(&self) -> u32 {
+        self.cfg.fees.taker_bps
+    }
+
     /// Total scheduling delay in nanoseconds for an op submitted now: the
     /// fixed `base_ms` plus an exponential jitter draw with mean
     /// `cfg.latency_jitter_ms` (capped at 20× the mean to bound outliers).

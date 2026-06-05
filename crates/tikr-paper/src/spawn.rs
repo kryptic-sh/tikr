@@ -541,5 +541,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         liquidation: None,
         mark_series: None,
         inventory_boost: None,
+        bagger: crate::bagger::BaggerConfig::default(),
     }
 }

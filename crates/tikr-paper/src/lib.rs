@@ -35,6 +35,7 @@
 #![deny(missing_docs)]
 
 pub mod alerts;
+pub mod bagger;
 pub mod live;
 pub mod metrics;
 pub mod multi;

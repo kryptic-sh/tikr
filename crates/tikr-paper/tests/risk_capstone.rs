@@ -384,6 +384,7 @@ async fn risk_resume_alerting_capstone() {
         liquidation: None,
         mark_series: None,
         inventory_boost: None,
+        bagger: tikr_paper::bagger::BaggerConfig::default(),
     };
     let (_tx1, rx1) = watch::channel(false);
 

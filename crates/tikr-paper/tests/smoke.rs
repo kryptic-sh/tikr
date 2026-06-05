@@ -71,6 +71,7 @@ async fn paper_runner_against_testnet_5min() {
         liquidation: None,
         mark_series: None,
         inventory_boost: None,
+        bagger: tikr_paper::bagger::BaggerConfig::default(),
     };
 
     let (tx, rx) = watch::channel(false);

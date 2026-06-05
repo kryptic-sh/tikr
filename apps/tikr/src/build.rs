@@ -36,6 +36,10 @@ pub fn to_spec(
     wallet_rx: Option<watch::Receiver<Decimal>>,
     take_profit_pct: Decimal,
 ) -> Result<BotSpec> {
+    // Bagger (inventory-risk flatten) — default OFF for live until a preset is
+    // validated in backtest. Account-TOML plumbing is the follow-up; the runner
+    // + backtest (compare `--bagger-*` flags) already exercise every mechanism.
+    let bagger_config = tikr_paper::bagger::BaggerConfig::default();
     let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
         "static-grid" | "sg" => build_sg(
@@ -147,6 +151,10 @@ pub fn to_spec(
         // limit to lock in half the bag.
         wallet_rx,
         take_profit_pct,
+        // Bagger (inventory-risk flatten) — account-level. Wired from config in
+        // `to_spec`'s caller once a winning preset is chosen in backtest; default
+        // off until then.
+        bagger: bagger_config,
     };
 
     // Live mode → FillSim is discarded but the runner takes it unconditionally.

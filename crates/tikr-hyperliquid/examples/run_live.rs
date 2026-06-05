@@ -246,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         liquidation: None,
         mark_series: None,
         inventory_boost: None,
+        bagger: tikr_paper::bagger::BaggerConfig::default(),
     };
 
     let report = run_with_resume(

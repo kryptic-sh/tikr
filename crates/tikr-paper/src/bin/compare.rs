@@ -117,6 +117,9 @@ static INVENTORY_BOOST: OnceLock<Option<InventoryBoostConfig>> = OnceLock::new()
 /// backtest rides drawdowns a real leveraged account would be liquidated out
 /// of. Read by the `run_one` / `spawn_preset_with_liqs` RunnerConfig builders.
 static LIQUIDATION: OnceLock<Option<LiquidationConfig>> = OnceLock::new();
+/// Bagger (inventory-risk flatten) config, set once in `main` from the
+/// `--bagger-*` flags. Default-off. Read by the RunnerConfig builders.
+static BAGGER: OnceLock<tikr_paper::bagger::BaggerConfig> = OnceLock::new();
 /// Per-symbol venue `min_notional` (from exchangeInfo autodetect), read by the
 /// `run_one` / `spawn_preset_with_liqs` RunnerConfig builders. Settable (not a
 /// `OnceLock`) because basket mode resolves a different value per symbol; safe
@@ -141,6 +144,10 @@ fn inventory_boost() -> Option<InventoryBoostConfig> {
 
 fn liquidation() -> Option<LiquidationConfig> {
     LIQUIDATION.get().copied().flatten()
+}
+
+fn bagger() -> tikr_paper::bagger::BaggerConfig {
+    BAGGER.get().copied().unwrap_or_default()
 }
 
 /// `true` when `--liquidation` armed the forced-close model — used to decide
@@ -870,6 +877,40 @@ struct Args {
     #[arg(long, default_value = "0.02")]
     wave_relattice_drift_pct: String,
 
+    // ─── Bagger (inventory-risk flatten) ──────────────────────────────────
+    /// Bagger preset(s), composable with `+`: `fixed` | `ratchet` | `dual` |
+    /// `cap` | `equity` (e.g. `dual+cap`). Empty (default) = off. Individual
+    /// `--bagger-*-pct` flags below override the preset's params.
+    #[arg(long, default_value = "")]
+    bagger: String,
+    /// Bagger size gate: arm only when |position notional| ≥ this % of equity.
+    #[arg(long, default_value = "20")]
+    bagger_size_gate_pct: String,
+    /// Bagger exit style: taker (cross spread) vs reduce-only maker.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    bagger_exit_taker: bool,
+    /// Bagger: flatten FULL bag (true) vs HALF (false) on a take-profit trigger.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    bagger_flatten_full: bool,
+    /// Override: size-cap ceiling (% of equity). `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_cap_pct: String,
+    /// Override: stop-loss level (% of equity). `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_sl_pct: String,
+    /// Override: deteriorating-SL window (secs); `0` = bare level stop.
+    #[arg(long, default_value_t = 0u64)]
+    bagger_deteriorate_secs: u64,
+    /// Override: trailing-TP retrace fraction. `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_trail_pct: String,
+    /// Override: fixed-TP level (% of equity). `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_fixed_tp_pct: String,
+    /// Override: equity-giveback fraction from session peak. `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_equity_giveback_pct: String,
+
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
     #[arg(long, default_value = "10")]
@@ -1323,6 +1364,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let _ = INVENTORY_BOOST.set(inv_boost);
+
+    // Bagger: start from preset(s), then apply any non-zero individual
+    // overrides. Default-off when `--bagger` empty and no override set.
+    let mut bagger_cfg = tikr_paper::bagger::BaggerConfig {
+        size_gate_pct: Decimal::from_str(&args.bagger_size_gate_pct)?,
+        exit_taker: args.bagger_exit_taker,
+        flatten_full: args.bagger_flatten_full,
+        ..Default::default()
+    };
+    if !args.bagger.trim().is_empty() {
+        bagger_cfg.apply_preset(&args.bagger);
+    }
+    let cap = Decimal::from_str(&args.bagger_cap_pct)?;
+    if cap > Decimal::ZERO {
+        bagger_cfg.cap_pct = cap;
+    }
+    let sl = Decimal::from_str(&args.bagger_sl_pct)?;
+    if sl > Decimal::ZERO {
+        bagger_cfg.sl_pct = sl;
+    }
+    if args.bagger_deteriorate_secs > 0 {
+        bagger_cfg.deteriorate_secs = args.bagger_deteriorate_secs;
+    }
+    let trail = Decimal::from_str(&args.bagger_trail_pct)?;
+    if trail > Decimal::ZERO {
+        bagger_cfg.trail_pct = trail;
+    }
+    let ftp = Decimal::from_str(&args.bagger_fixed_tp_pct)?;
+    if ftp > Decimal::ZERO {
+        bagger_cfg.fixed_tp_pct = ftp;
+    }
+    let egb = Decimal::from_str(&args.bagger_equity_giveback_pct)?;
+    if egb > Decimal::ZERO {
+        bagger_cfg.equity_giveback_pct = egb;
+    }
+    let _ = BAGGER.set(bagger_cfg);
 
     // Isolated-margin liquidation model. Leverage drives the liq distance
     // (1/lev below entry for longs); off unless explicitly armed so the
@@ -3045,6 +3122,7 @@ async fn run_one<S: Strategy>(
         liquidation: liquidation(),
         mark_series: None,
         inventory_boost: inventory_boost(),
+        bagger: bagger(),
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -3137,6 +3215,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             liquidation: liquidation(),
             mark_series: None,
             inventory_boost: inventory_boost(),
+            bagger: bagger(),
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");
