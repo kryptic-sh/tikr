@@ -113,6 +113,26 @@ pub struct WaveConfig {
     /// triggers always fire first, so this never bites; on a slow one it stops
     /// half-drained bands sitting idle. `0` = disabled. Default `300` (5 min).
     pub force_refill_secs: u64,
+
+    /// Auto-size the lattice step from recent volatility, mirroring `auto_inner`.
+    /// When `true` (and `steps_bps > 0`), the live step tracks
+    /// `auto_step_k × mean(1s candle high→low gap, bps)`, clamped to
+    /// `[floor, steps_bps]` where the floor is the round-trip break-even
+    /// (`2 × maker_fee_bps`) and `steps_bps` is the ceiling/anchor. The change is
+    /// delivered by the existing relattice (>10% drift) path. `false` (default)
+    /// uses the fixed `steps_bps`.
+    pub auto_step: bool,
+
+    /// Fraction of the mean candle range one step targets when `auto_step` is on
+    /// (e.g. `0.5` → each step banks ~half a typical 1-second swing). The main
+    /// tuning lever; default `0.5`.
+    pub auto_step_k: Decimal,
+
+    /// Maker fee in bps for this symbol, used only to floor the auto-step at the
+    /// round-trip break-even (`2 × maker_fee_bps`). A 0-fee pair → no fee floor
+    /// (the 1-tick min in `compute_step` still applies). Live: from
+    /// `/fapi/v1/commissionRate`; backtest: the sim's `maker_bps`.
+    pub maker_fee_bps: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +171,10 @@ pub struct Wave {
     /// `on_event` to force a refill so the resting lattice re-places at the new
     /// inner offset immediately (not on the next round-trip/side-empty).
     inner_dirty: bool,
+    /// Auto-sized lattice step in bps. Seeded to `config.steps_bps` (the
+    /// ceiling), recomputed on each candle close when `auto_step`. Ignored when
+    /// `config.auto_step == false`. Delivered to the live grid by relattice.
+    dyn_step_bps: u32,
     /// Event-time (ns) of the last refill, for the `force_refill_secs` valve.
     last_refill_ns: Option<u64>,
 }
@@ -205,12 +229,55 @@ impl Wave {
         }
     }
 
+    /// The lattice step in bps actually used this event: the auto-sized value
+    /// when `auto_step` (and `steps_bps > 0`), else the fixed config knob.
+    fn effective_step_bps(&self) -> u32 {
+        if self.config.auto_step && self.config.steps_bps > 0 {
+            self.dyn_step_bps
+        } else {
+            self.config.steps_bps
+        }
+    }
+
+    /// Round-trip break-even floor for the auto-step, in bps: `2 × maker_fee`
+    /// (one maker buy + one maker sell). A 0-fee pair → 0 (no fee floor; the
+    /// 1-tick min in `compute_step` still bounds the step).
+    fn floor_step_bps(&self) -> u32 {
+        let floor = self.config.maker_fee_bps * Decimal::from(2);
+        floor.ceil().to_string().parse::<i64>().unwrap_or(0).max(0) as u32
+    }
+
+    /// Recompute the auto-sized step: `auto_step_k × mean candle gap (bps)`,
+    /// clamped to `[floor, steps_bps]` (floor = round-trip break-even, ceil =
+    /// the configured `steps_bps` anchor). No-op when `auto_step` is off,
+    /// `steps_bps == 0`, or no candles yet — `dyn_step_bps` stays at its seed.
+    /// The change reaches the live grid via the relattice (>10% drift) path; no
+    /// dirty flag needed.
+    fn recompute_dyn_step(&mut self) {
+        if !self.config.auto_step || self.config.steps_bps == 0 || self.candle_bps.is_empty() {
+            return;
+        }
+        let sum: Decimal = self.candle_bps.iter().copied().sum();
+        let avg = sum / Decimal::from(self.candle_bps.len() as u64);
+        let raw = avg * self.config.auto_step_k;
+        let floor = self.floor_step_bps();
+        // Ceil is the configured anchor; if the fee floor exceeds it (a misconfig
+        // where the configured step can't clear break-even), the floor wins.
+        let ceil = self.config.steps_bps.max(floor);
+        self.dyn_step_bps = raw
+            .round()
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(self.config.steps_bps as i64)
+            .clamp(floor as i64, ceil as i64) as u32;
+    }
+
     /// Fold the current mid into the 1-second candle tracker. On a second
     /// rollover the just-closed candle's high→low gap (bps) is pushed into the
     /// rolling window and the auto-inner is recomputed. No-op unless
     /// `auto_inner` (avoids the work when the feature is off).
     fn update_candles(&mut self, mid: Decimal, now_ns: u64) {
-        if !self.config.auto_inner || mid <= Decimal::ZERO {
+        if !(self.config.auto_inner || self.config.auto_step) || mid <= Decimal::ZERO {
             return;
         }
         let sec = now_ns / CANDLE_NANOS;
@@ -233,6 +300,8 @@ impl Wave {
                         self.candle_bps.pop_front();
                     }
                     self.candle_bps.push_back(gap_bps);
+                    // Step first: the inner divides by the effective step.
+                    self.recompute_dyn_step();
                     self.recompute_dyn_inner();
                 }
                 self.cur_candle_sec = Some(sec);
@@ -252,7 +321,10 @@ impl Wave {
     /// `[0, MAX_AUTO_INNER]`. No-op when `steps_bps == 0` (no bps-per-step to
     /// divide by — inner stays 0).
     fn recompute_dyn_inner(&mut self) {
-        let sbps = self.config.steps_bps;
+        // Divide by the EFFECTIVE step (the auto-sized one when `auto_step`), so
+        // the inner dead-zone is measured in current steps. Must run AFTER
+        // `recompute_dyn_step` on a candle close.
+        let sbps = self.effective_step_bps();
         let steps = if sbps == 0 || self.candle_bps.is_empty() {
             0
         } else {
@@ -314,7 +386,7 @@ impl Wave {
     /// first level.
     fn compute_step(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
-        let sbps = self.config.steps_bps;
+        let sbps = self.effective_step_bps();
         if sbps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
             let target = mid * Decimal::from(sbps) / Decimal::from(10_000);
             return if target > tick {
@@ -347,7 +419,7 @@ impl Wave {
         top_a: Option<Price>,
         actions: &mut Vec<Action>,
     ) -> bool {
-        let sbps = self.config.steps_bps;
+        let sbps = self.effective_step_bps();
         let tick = self.config.tick_size;
         if sbps == 0 || tick <= Decimal::ZERO {
             return false;
@@ -620,6 +692,10 @@ impl Strategy for Wave {
     type Config = WaveConfig;
 
     fn new(config: Self::Config) -> Self {
+        // Seed the auto-step at the configured `steps_bps` (the ceiling/anchor),
+        // so the bot starts at the configured spacing and adapts down as candles
+        // arrive.
+        let dyn_step_bps = config.steps_bps;
         Self {
             config,
             bid_lattice_origin: None,
@@ -633,6 +709,7 @@ impl Strategy for Wave {
             candle_bps: std::collections::VecDeque::with_capacity(CANDLE_WINDOW),
             dyn_inner_steps: 0,
             inner_dirty: false,
+            dyn_step_bps,
             last_refill_ns: None,
         }
     }
@@ -846,6 +923,10 @@ mod tests {
             round_trips: 1,
             // Off by default in tests; the force-refill valve has its own test.
             force_refill_secs: 0,
+            // Auto-step off by default; it has its own dedicated tests.
+            auto_step: false,
+            auto_step_k: Decimal::new(5, 1),
+            maker_fee_bps: Decimal::from(2),
         }
     }
 
@@ -1562,6 +1643,90 @@ mod tests {
         assert!(
             acted.iter().any(|a| matches!(a, Action::Quote(_))),
             "must re-emit at the new inner=3 offset: {acted:?}"
+        );
+    }
+
+    #[test]
+    fn auto_step_tracks_k_times_candle_gap() {
+        // steps_bps=30 ceiling, k=0.5, maker=2bps → floor=4bps. A 40bps avg
+        // candle gap → 0.5×40 = 20bps (within [4,30]).
+        let mut c = cfg();
+        c.auto_step = true;
+        c.steps_bps = 30;
+        c.auto_step_k = Decimal::new(5, 1); // 0.5
+        c.maker_fee_bps = Decimal::from(2);
+        let mut w = Wave::new(c);
+        assert_eq!(w.dyn_step_bps, 30, "auto-step seeds at the ceiling");
+        assert_eq!(w.effective_step_bps(), 30);
+
+        // 40bps gap at mid 100 → 100.2 / 99.8.
+        feed_candles(&mut w, Decimal::new(1002, 1), Decimal::new(998, 1), 5);
+        assert_eq!(w.dyn_step_bps, 20, "0.5 × 40bps = 20bps");
+        assert_eq!(w.effective_step_bps(), 20);
+    }
+
+    #[test]
+    fn auto_step_floors_at_round_trip_breakeven() {
+        // Quiet market (4bps gap) with k=0.5 → raw 2bps, below the 2×maker=4bps
+        // floor → clamps up to 4bps. The floor protects against sub-break-even.
+        let mut c = cfg();
+        c.auto_step = true;
+        c.steps_bps = 30;
+        c.auto_step_k = Decimal::new(5, 1);
+        c.maker_fee_bps = Decimal::from(2); // floor = 4bps
+        let mut w = Wave::new(c);
+        // 4bps gap at mid 100 → 100.02 / 99.98.
+        feed_candles(&mut w, Decimal::new(10002, 2), Decimal::new(9998, 2), 5);
+        assert_eq!(w.dyn_step_bps, 4, "raw 2bps floored to 2×maker = 4bps");
+    }
+
+    #[test]
+    fn auto_step_zero_fee_has_no_floor() {
+        // USDC 0-fee promo (maker=0) → floor=0. A near-flat market computes a
+        // tiny step (clamped only by the ceiling), no break-even floor.
+        let mut c = cfg();
+        c.auto_step = true;
+        c.steps_bps = 30;
+        c.auto_step_k = Decimal::new(5, 1);
+        c.maker_fee_bps = Decimal::ZERO; // 0-fee → floor 0
+        let mut w = Wave::new(c);
+        assert_eq!(w.floor_step_bps(), 0);
+        // 6bps gap → 0.5×6 = 3bps; no fee floor lifts it.
+        feed_candles(&mut w, Decimal::new(10003, 2), Decimal::new(9997, 2), 5);
+        assert_eq!(w.dyn_step_bps, 3, "0-fee: step follows k×gap with no floor");
+    }
+
+    #[test]
+    fn auto_step_caps_at_configured_ceiling() {
+        // A violent market must not blow the step past the configured steps_bps.
+        let mut c = cfg();
+        c.auto_step = true;
+        c.steps_bps = 15; // ceiling
+        c.auto_step_k = Decimal::new(5, 1);
+        c.maker_fee_bps = Decimal::from(2);
+        let mut w = Wave::new(c);
+        // ~2000bps gap → 0.5× = 1000bps, capped at the 15bps ceiling.
+        feed_candles(&mut w, Decimal::from(110), Decimal::from(90), 5);
+        assert_eq!(
+            w.dyn_step_bps, 15,
+            "auto-step clamps to the steps_bps ceiling"
+        );
+    }
+
+    #[test]
+    fn fixed_step_ignores_candles_when_auto_off() {
+        // auto_step=false → effective step is the fixed steps_bps regardless of
+        // candle volatility.
+        let mut c = cfg();
+        c.auto_step = false;
+        c.steps_bps = 10;
+        c.maker_fee_bps = Decimal::from(2);
+        let mut w = Wave::new(c);
+        feed_candles(&mut w, Decimal::new(1003, 1), Decimal::new(997, 1), 10);
+        assert_eq!(
+            w.effective_step_bps(),
+            10,
+            "fixed steps_bps used when auto_step off"
         );
     }
 }

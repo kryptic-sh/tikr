@@ -847,6 +847,19 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     wave_auto_inner: bool,
 
+    /// Wave: auto-size the lattice STEP from candle volatility
+    /// (`k × mean candle gap`, floored at 2× maker, capped at `steps_bps`).
+    /// `false` (default) uses the fixed `--wave-step-bps-list`. When `true`, the
+    /// step_bps sweep becomes the per-preset CEILING and `k` is swept instead.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    wave_auto_step: bool,
+
+    /// Wave auto-step sweep: comma-separated `k` fractions (each step targets
+    /// `k × mean candle gap`). Only used when `--wave-auto-step true`. The main
+    /// tuning lever — default sweeps the four candidate fractions.
+    #[arg(long, default_value = "0.25,0.5,0.75,1.0")]
+    wave_auto_step_k_list: String,
+
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
     #[arg(long, default_value = "10")]
@@ -2332,41 +2345,61 @@ async fn run_sweep_collect(
         } else {
             parse_u32_list(&args.wave_inner_steps_list)?
         };
+        // When auto-step is off, k is irrelevant — collapse to a single sentinel
+        // so the loop runs the fixed-step sweep exactly once per (levels, step).
+        let wave_k_sweep = if args.wave_auto_step {
+            parse_decimal_list(&args.wave_auto_step_k_list)?
+        } else {
+            vec![Decimal::new(5, 1)]
+        };
+        // Backtest fee floor for auto-step = the sim's own maker rate (bps).
+        let maker_fee_bps = Decimal::from(fees.maker_bps);
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &inner in &wave_inner_sweep {
-                    let inner_label = if args.wave_auto_inner {
-                        "auto".to_string()
-                    } else {
-                        inner.to_string()
-                    };
-                    let label = format!(
-                        "Wave lv={levels} steps_bps={step} inner={inner_label} rt={}",
-                        args.wave_refill_threshold,
-                    );
-                    spawn_preset(
-                        &mut handles,
-                        &shared_data,
-                        &symbol,
-                        &label,
-                        Wave::new(WaveConfig {
-                            notional_per_order: wave_notional,
-                            tick_size: tick,
-                            step_size: lot_step,
-                            min_notional,
-                            levels,
-                            steps_bps: step,
-                            steps_inner: inner,
-                            auto_inner: args.wave_auto_inner,
-                            round_trips: args.wave_refill_threshold,
-                            force_refill_secs: args.wave_force_refill_secs,
-                        }),
-                        fees,
-                        skim_cfg,
-                        funding_cfg,
-                        sim_cfg_template.clone(),
-                        equity_csv_dir.clone(),
-                    );
+                    for &k in &wave_k_sweep {
+                        let inner_label = if args.wave_auto_inner {
+                            "auto".to_string()
+                        } else {
+                            inner.to_string()
+                        };
+                        // With auto-step, `step` is the ceiling and `k` the lever.
+                        let step_label = if args.wave_auto_step {
+                            format!("auto(k={k},ceil={step})")
+                        } else {
+                            step.to_string()
+                        };
+                        let label = format!(
+                            "Wave lv={levels} steps_bps={step_label} inner={inner_label} rt={}",
+                            args.wave_refill_threshold,
+                        );
+                        spawn_preset(
+                            &mut handles,
+                            &shared_data,
+                            &symbol,
+                            &label,
+                            Wave::new(WaveConfig {
+                                notional_per_order: wave_notional,
+                                tick_size: tick,
+                                step_size: lot_step,
+                                min_notional,
+                                levels,
+                                steps_bps: step,
+                                steps_inner: inner,
+                                auto_inner: args.wave_auto_inner,
+                                round_trips: args.wave_refill_threshold,
+                                force_refill_secs: args.wave_force_refill_secs,
+                                auto_step: args.wave_auto_step,
+                                auto_step_k: k,
+                                maker_fee_bps,
+                            }),
+                            fees,
+                            skim_cfg,
+                            funding_cfg,
+                            sim_cfg_template.clone(),
+                            equity_csv_dir.clone(),
+                        );
+                    }
                 }
             }
         }

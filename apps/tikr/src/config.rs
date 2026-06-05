@@ -318,10 +318,28 @@ pub struct WaveParams {
     /// regardless of `round_trips`. `0` = off. Default `300` (5 min).
     #[serde(default = "wave_default_force_refill_secs")]
     pub force_refill_secs: u64,
+    /// Auto-size the lattice step from recent volatility (mirrors `auto_inner`):
+    /// step tracks `auto_step_k × mean 1s candle gap (bps)`, floored at the
+    /// round-trip break-even (`2 × maker fee`) and capped at `steps_bps`. `false`
+    /// (default) uses the fixed `steps_bps`.
+    #[serde(default = "wave_default_auto_step")]
+    pub auto_step: bool,
+    /// Fraction of the mean candle range one step targets when `auto_step` is on.
+    /// Default `0.5`.
+    #[serde(default = "wave_default_auto_step_k")]
+    pub auto_step_k: Decimal,
 }
 
 fn wave_default_auto_inner() -> bool {
     true
+}
+
+fn wave_default_auto_step() -> bool {
+    false
+}
+
+fn wave_default_auto_step_k() -> Decimal {
+    Decimal::new(5, 1) // 0.5
 }
 
 fn wave_default_force_refill_secs() -> u64 {
@@ -671,6 +689,10 @@ pub enum RampageStrategy {
         round_trips: u32,
         #[serde(default = "wave_default_force_refill_secs")]
         force_refill_secs: u64,
+        #[serde(default = "wave_default_auto_step")]
+        auto_step: bool,
+        #[serde(default = "wave_default_auto_step_k")]
+        auto_step_k: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {
@@ -1461,6 +1483,8 @@ mod tests {
                 auto_inner,
                 round_trips,
                 force_refill_secs,
+                auto_step,
+                auto_step_k,
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
@@ -1468,6 +1492,8 @@ mod tests {
                 assert!(*auto_inner, "auto_inner defaults true");
                 assert_eq!(*round_trips, 5);
                 assert_eq!(*force_refill_secs, 300, "default 5min");
+                assert!(!*auto_step, "auto_step defaults false");
+                assert_eq!(*auto_step_k, Decimal::new(5, 1), "auto_step_k defaults 0.5");
             }
             other => panic!("expected Wave, got {other:?}"),
         }

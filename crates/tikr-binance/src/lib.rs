@@ -244,6 +244,10 @@ pub struct BinanceClient {
     key_material: BinanceKeyMaterial,
     mainnet_writes_enabled: bool,
     exchange_info_cache: ExchangeInfoCache,
+    /// Maker fee (bps) per symbol, fetched from `/fapi/v1/commissionRate` at
+    /// build time. Keyed by uppercase Binance symbol. Empty on non-futures /
+    /// read-only / fetch-failure — callers fall back to a conservative default.
+    commission_maker_bps: HashMap<String, tikr_core::Decimal>,
     /// Tracks every open order placed via `quote()` keyed by the
     /// **venue-assigned** `QuoteId` (derived from Binance's `orderId`),
     /// value = `(binance_symbol, clientOrderId_we_sent_at_place)`.
@@ -348,6 +352,38 @@ impl BinanceClient {
             "exchangeInfo cached"
         );
 
+        // Fetch the per-symbol maker fee (futures + a real symbol + writes
+        // allowed). Used by Wave auto-step to floor the step at the round-trip
+        // break-even (2 × maker). A 0-fee USDC promo pair returns 0 → no floor.
+        // On any failure we leave the cache empty; the strategy builder falls
+        // back to a conservative tier-0 maker.
+        let mut commission_maker_bps: HashMap<String, tikr_core::Decimal> = HashMap::new();
+        if env.is_futures()
+            && let Some(sym) = symbol
+            && (!env.is_mainnet() || mainnet_writes_enabled)
+        {
+            let sym_str = binance_symbol(sym);
+            match crate::futs::get_commission_rate(
+                &http,
+                base_url,
+                &api_key,
+                &key_material,
+                &sym_str,
+            )
+            .await
+            {
+                Ok(rate) => {
+                    // API returns a fraction (0.0002 = 2 bps) → convert to bps.
+                    let maker_bps = rate.maker * tikr_core::Decimal::from(10_000);
+                    info!(symbol = sym_str, %maker_bps, "commission rate cached");
+                    commission_maker_bps.insert(sym_str, maker_bps);
+                }
+                Err(e) => {
+                    warn!(symbol = sym_str, error = ?e, "commissionRate fetch failed; auto-step will use fallback maker fee");
+                }
+            }
+        }
+
         let client = Self {
             env,
             http,
@@ -355,6 +391,7 @@ impl BinanceClient {
             key_material,
             mainnet_writes_enabled,
             exchange_info_cache,
+            commission_maker_bps,
             quote_symbols: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -420,6 +457,14 @@ impl BinanceClient {
     pub fn step_size(&self, symbol: &Symbol) -> Option<tikr_core::Decimal> {
         let sym_str = binance_symbol(symbol);
         self.exchange_info_cache.get(&sym_str).map(|f| f.step_size)
+    }
+
+    /// Look up the maker fee (bps) cached from `/fapi/v1/commissionRate` at
+    /// build time. `None` if not fetched (non-futures / read-only / fetch
+    /// failed) — callers should fall back to a conservative default.
+    pub fn maker_fee_bps(&self, symbol: &Symbol) -> Option<tikr_core::Decimal> {
+        let sym_str = binance_symbol(symbol);
+        self.commission_maker_bps.get(&sym_str).copied()
     }
 
     /// Fetch USD-M futures balance for a margin asset (usually `USDT`).

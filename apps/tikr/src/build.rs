@@ -547,6 +547,11 @@ fn build_wave(
     let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
     let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
     let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    // Maker fee for the auto-step floor (round-trip break-even = 2× this). Live:
+    // from the venue's cached commissionRate. On a fetch failure the cache is
+    // empty → fall back to a conservative futures tier-0 maker (2 bps) so the
+    // floor never lets the step run sub-break-even.
+    let maker_fee_bps = venue.maker_fee_bps(symbol).unwrap_or(Decimal::from(2));
     Ok(StrategyChoice::Wave(WaveConfig {
         notional_per_order: notional,
         tick_size,
@@ -558,6 +563,9 @@ fn build_wave(
         auto_inner: wave.auto_inner,
         round_trips: wave.round_trips,
         force_refill_secs: wave.force_refill_secs,
+        auto_step: wave.auto_step,
+        auto_step_k: wave.auto_step_k,
+        maker_fee_bps,
     }))
 }
 
