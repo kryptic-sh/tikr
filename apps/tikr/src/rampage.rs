@@ -712,6 +712,8 @@ fn spawn_one_bot(
             force_refill_secs,
             auto_step,
             auto_step_k,
+            auto_candle_window,
+            relattice_drift_pct,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -726,6 +728,8 @@ fn spawn_one_bot(
                     force_refill_secs: *force_refill_secs,
                     auto_step: *auto_step,
                     auto_step_k: *auto_step_k,
+                    auto_candle_window: *auto_candle_window,
+                    relattice_drift_pct: *relattice_drift_pct,
                 }),
                 tide: None,
                 sg: None,

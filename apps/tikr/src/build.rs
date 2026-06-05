@@ -566,6 +566,8 @@ fn build_wave(
         auto_step: wave.auto_step,
         auto_step_k: wave.auto_step_k,
         maker_fee_bps,
+        auto_candle_window: wave.auto_candle_window,
+        relattice_drift_pct: wave.relattice_drift_pct,
     }))
 }
 

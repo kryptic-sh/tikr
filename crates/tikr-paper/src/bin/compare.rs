@@ -860,6 +860,16 @@ struct Args {
     #[arg(long, default_value = "0.25,0.5,0.75,1.0")]
     wave_auto_step_k_list: String,
 
+    /// Wave: trailing 1s candles averaged for the auto-step / auto-inner vol
+    /// signal. Fewer = faster reaction (less lag). Default 15.
+    #[arg(long, default_value_t = 15u32)]
+    wave_auto_candle_window: u32,
+
+    /// Wave: relattice/reposition deadband (fraction) — re-place only when the
+    /// computed step differs from the placed one by ≥ this. Default 0.02 (2%).
+    #[arg(long, default_value = "0.02")]
+    wave_relattice_drift_pct: String,
+
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
     #[arg(long, default_value = "10")]
@@ -2354,6 +2364,8 @@ async fn run_sweep_collect(
         };
         // Backtest fee floor for auto-step = the sim's own maker rate (bps).
         let maker_fee_bps = Decimal::from(fees.maker_bps);
+        let wave_relattice_drift = Decimal::from_str(&args.wave_relattice_drift_pct)
+            .map_err(|e| format!("--wave-relattice-drift-pct: {e}"))?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &inner in &wave_inner_sweep {
@@ -2392,6 +2404,8 @@ async fn run_sweep_collect(
                                 auto_step: args.wave_auto_step,
                                 auto_step_k: k,
                                 maker_fee_bps,
+                                auto_candle_window: args.wave_auto_candle_window,
+                                relattice_drift_pct: wave_relattice_drift,
                             }),
                             fees,
                             skim_cfg,

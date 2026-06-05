@@ -10,7 +10,7 @@
 //! The grid is frozen in ABSOLUTE price, so as mid drifts the step measured in
 //! bps of the current mid drifts off `steps_bps`. A **relattice** event rebuilds
 //! the grid (new step + origins) at the current touch when that drift exceeds
-//! [`relattice_drift`] — bounded, infrequent, and self-arresting (after a
+//! `relattice_drift_pct` — bounded, infrequent, and self-arresting (after a
 //! relattice the effective bps is back at `steps_bps`, so it won't re-fire until
 //! mid drifts another 10%).
 //!
@@ -46,15 +46,9 @@ use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
 
-/// Relattice when the frozen lattice step, expressed in bps of the CURRENT mid,
-/// drifts more than this fraction (10%) from the configured `steps_bps`.
-fn relattice_drift() -> Decimal {
-    Decimal::new(1, 1) // 0.10
-}
-
-/// Auto-inner: number of trailing 1-second candles averaged to size the inner
-/// dead-zone.
-const CANDLE_WINDOW: usize = 60;
+/// Hard ceiling on the rolling candle window (capacity guard); the live window
+/// length is `WaveConfig.auto_candle_window`, clamped to this.
+const MAX_CANDLE_WINDOW: usize = 600;
 /// Auto-inner: candle bucket width in nanoseconds (1 second).
 const CANDLE_NANOS: u64 = 1_000_000_000;
 /// Auto-inner: hard cap on the auto-sized inner (steps), so a volatility spike
@@ -95,7 +89,7 @@ pub struct WaveConfig {
 
     /// Auto-size the inner dead-zone from recent volatility. When `true`
     /// (default behavior), `steps_inner` is ignored: the inner starts at 0 and
-    /// tracks ~half the average high→low gap of the last [`CANDLE_WINDOW`]
+    /// tracks ~half the average high→low gap of the last `auto_candle_window`
     /// one-second candles (in bps), divided by `steps_bps` to convert to steps.
     /// When `false`, the fixed `steps_inner` is used.
     pub auto_inner: bool,
@@ -133,6 +127,18 @@ pub struct WaveConfig {
     /// (the 1-tick min in `compute_step` still applies). Live: from
     /// `/fapi/v1/commissionRate`; backtest: the sim's `maker_bps`.
     pub maker_fee_bps: Decimal,
+
+    /// Number of trailing 1-second candles averaged for the auto-step /
+    /// auto-inner volatility signal. Fewer = faster reaction (less lag), more =
+    /// smoother. Default `15`. Clamped to `[1, MAX_CANDLE_WINDOW]`.
+    pub auto_candle_window: u32,
+
+    /// Relattice/reposition deadband as a FRACTION: the lattice only re-places
+    /// when the freshly computed step (or inner offset) differs from the one
+    /// currently placed by at least this fraction. e.g. `0.02` = placed 100bps,
+    /// re-place at ≥102 or ≤98. Skips no-op rebuilds; lower = tracks tighter.
+    /// Default `0.02`.
+    pub relattice_drift_pct: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +168,7 @@ pub struct Wave {
     cur_candle_high: Decimal,
     cur_candle_low: Decimal,
     /// Closed-candle high→low gaps in bps, newest at the back, capped at
-    /// [`CANDLE_WINDOW`].
+    /// `auto_candle_window`.
     candle_bps: std::collections::VecDeque<Decimal>,
     /// Auto-sized inner dead-zone in steps. Starts at 0, recomputed on each
     /// candle close. Ignored when `config.auto_inner == false`.
@@ -227,6 +233,11 @@ impl Wave {
         } else {
             self.config.steps_inner
         }
+    }
+
+    /// Rolling candle-window length (config, clamped to `[1, MAX_CANDLE_WINDOW]`).
+    fn candle_window(&self) -> usize {
+        (self.config.auto_candle_window as usize).clamp(1, MAX_CANDLE_WINDOW)
     }
 
     /// The lattice step in bps actually used this event: the auto-sized value
@@ -296,7 +307,7 @@ impl Wave {
                 if cmid > Decimal::ZERO {
                     let gap_bps =
                         (self.cur_candle_high - self.cur_candle_low) / cmid * Decimal::from(10_000);
-                    if self.candle_bps.len() == CANDLE_WINDOW {
+                    while self.candle_bps.len() >= self.candle_window() {
                         self.candle_bps.pop_front();
                     }
                     self.candle_bps.push_back(gap_bps);
@@ -398,7 +409,7 @@ impl Wave {
         tick
     }
 
-    /// If the frozen lattice step has drifted more than [`relattice_drift`] from
+    /// If the frozen lattice step has drifted more than `relattice_drift_pct` from
     /// the step we'd freshly install at the current mid, rebuild the grid (fresh
     /// step + origins) at the current touch and cancel every resting order so the
     /// grid is a clean slate. Returns `true` if it relatticed.
@@ -439,7 +450,7 @@ impl Wave {
             return false;
         }
         let drift = (step - fresh).abs() / fresh;
-        if drift <= relattice_drift() {
+        if drift <= self.config.relattice_drift_pct {
             return false;
         }
         // Relattice: cancel everything on the stale grid, then re-freeze at the
@@ -696,6 +707,7 @@ impl Strategy for Wave {
         // so the bot starts at the configured spacing and adapts down as candles
         // arrive.
         let dyn_step_bps = config.steps_bps;
+        let cap = (config.auto_candle_window as usize).clamp(1, MAX_CANDLE_WINDOW);
         Self {
             config,
             bid_lattice_origin: None,
@@ -706,7 +718,7 @@ impl Strategy for Wave {
             cur_candle_sec: None,
             cur_candle_high: Decimal::ZERO,
             cur_candle_low: Decimal::ZERO,
-            candle_bps: std::collections::VecDeque::with_capacity(CANDLE_WINDOW),
+            candle_bps: std::collections::VecDeque::with_capacity(cap),
             dyn_inner_steps: 0,
             inner_dirty: false,
             dyn_step_bps,
@@ -927,6 +939,9 @@ mod tests {
             auto_step: false,
             auto_step_k: Decimal::new(5, 1),
             maker_fee_bps: Decimal::from(2),
+            // Prior fixed values so the existing window/relattice tests hold.
+            auto_candle_window: 60,
+            relattice_drift_pct: Decimal::new(1, 1), // 0.10
         }
     }
 

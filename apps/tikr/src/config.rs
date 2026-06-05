@@ -328,6 +328,14 @@ pub struct WaveParams {
     /// Default `0.5`.
     #[serde(default = "wave_default_auto_step_k")]
     pub auto_step_k: Decimal,
+    /// Trailing 1s candles averaged for the auto-step / auto-inner vol signal.
+    /// Fewer = faster reaction (less lag). Default `15`.
+    #[serde(default = "wave_default_auto_candle_window")]
+    pub auto_candle_window: u32,
+    /// Relattice/reposition deadband (fraction): re-place only when the computed
+    /// step differs from the placed one by ≥ this. Default `0.02` (2%).
+    #[serde(default = "wave_default_relattice_drift_pct")]
+    pub relattice_drift_pct: Decimal,
 }
 
 fn wave_default_auto_inner() -> bool {
@@ -340,6 +348,14 @@ fn wave_default_auto_step() -> bool {
 
 fn wave_default_auto_step_k() -> Decimal {
     Decimal::new(5, 1) // 0.5
+}
+
+fn wave_default_auto_candle_window() -> u32 {
+    15
+}
+
+fn wave_default_relattice_drift_pct() -> Decimal {
+    Decimal::new(2, 2) // 0.02
 }
 
 fn wave_default_force_refill_secs() -> u64 {
@@ -693,6 +709,10 @@ pub enum RampageStrategy {
         auto_step: bool,
         #[serde(default = "wave_default_auto_step_k")]
         auto_step_k: Decimal,
+        #[serde(default = "wave_default_auto_candle_window")]
+        auto_candle_window: u32,
+        #[serde(default = "wave_default_relattice_drift_pct")]
+        relattice_drift_pct: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {
@@ -1485,6 +1505,8 @@ mod tests {
                 force_refill_secs,
                 auto_step,
                 auto_step_k,
+                auto_candle_window,
+                relattice_drift_pct,
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
@@ -1494,6 +1516,12 @@ mod tests {
                 assert_eq!(*force_refill_secs, 300, "default 5min");
                 assert!(!*auto_step, "auto_step defaults false");
                 assert_eq!(*auto_step_k, Decimal::new(5, 1), "auto_step_k defaults 0.5");
+                assert_eq!(*auto_candle_window, 15, "auto_candle_window defaults 15");
+                assert_eq!(
+                    *relattice_drift_pct,
+                    Decimal::new(2, 2),
+                    "relattice_drift_pct defaults 0.02"
+                );
             }
             other => panic!("expected Wave, got {other:?}"),
         }
