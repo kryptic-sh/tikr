@@ -415,6 +415,48 @@ pub fn spawn_rampage_manager(
                     // rotate-back-in starts FRESH instead of resuming the
                     // already-banked P&L. The view lingers (Rotated) for display.
                     shared_state.bank_rotated(&symbol);
+                    // Bank a slice of this retirement's PROFIT into BNB (for
+                    // VIP-tier fee accrual): convert `retire_bnb_pct`% of the
+                    // final NET into BNB on the futures wallet. No-op on a loss
+                    // (NET ≤ 0), when disabled (pct 0), or while rate-limited.
+                    let final_net = shared_state.net_for(&symbol).unwrap_or_default();
+                    if cfg.retire_bnb_pct > Decimal::ZERO
+                        && final_net > Decimal::ZERO
+                        && shared_state.rate_limit_remaining_ms() == 0
+                    {
+                        let convert_usd = final_net * cfg.retire_bnb_pct / Decimal::from(100);
+                        if convert_usd >= Decimal::ONE {
+                            let from_amount = format!("{convert_usd:.2}");
+                            match tikr_binance::futs::convert_futures(
+                                &http,
+                                account.env.rest_base_url(),
+                                &account.api_key,
+                                &account.key_material,
+                                "USDT",
+                                "BNB",
+                                &from_amount,
+                            )
+                            .await
+                            {
+                                Ok(bnb_received) => info!(
+                                    symbol = %symbol,
+                                    profit = %final_net.round_dp(4),
+                                    pct = %cfg.retire_bnb_pct,
+                                    convert_usd = %from_amount,
+                                    bnb_received = %bnb_received,
+                                    "rampage: retired profit → BNB"
+                                ),
+                                Err(e) => {
+                                    if let tikr_venue::VenueError::RateLimited { retry_after_ms } =
+                                        &e
+                                    {
+                                        shared_state.note_rate_limit(*retry_after_ms);
+                                    }
+                                    warn!(symbol = %symbol, error = ?e, "rampage: retire profit→BNB convert failed");
+                                }
+                            }
+                        }
+                    }
                     // Start the retirement clock — its [off] tab lingers up to
                     // RETIRE_AFTER_CYCLES rechecks before we drop it.
                     retired.insert(symbol.clone(), 0);

@@ -50,6 +50,7 @@ top_n = 10
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.01" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 big_bag_pct = "25"       # hold (don't rotate) a bot in POSITIVE unrealized whose bag ≥ this % of wallet — work it down instead of dumping; 0 = off
+retire_bnb_pct = "50"    # on retire, convert this % of the bot's final NET PROFIT to BNB (VIP-tier fee accrual); loss = no-op; 0 = off
 
 [rampage.score]
 mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)

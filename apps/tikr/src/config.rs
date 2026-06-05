@@ -743,10 +743,20 @@ pub struct RampageConfig {
     pub score: ScoreMode,
     /// Strategy to spawn on each qualifying symbol.
     pub strategy: RampageStrategy,
+    /// On retire (rotate-out), convert this PERCENT of the retired bot's final
+    /// NET PROFIT into BNB on the futures wallet (USDT→BNB Convert API), to
+    /// accumulate BNB for VIP-tier fee discounts. A losing bot is a no-op.
+    /// `50` (default) banks half the profit into BNB; `0` disables.
+    #[serde(default = "rampage_default_retire_bnb_pct")]
+    pub retire_bnb_pct: Decimal,
 }
 
 fn rampage_default_rotate_loss_pct() -> Decimal {
     Decimal::from(1)
+}
+
+fn rampage_default_retire_bnb_pct() -> Decimal {
+    Decimal::from(50)
 }
 
 fn rampage_default_big_bag_pct() -> Decimal {
