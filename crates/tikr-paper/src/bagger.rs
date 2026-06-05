@@ -70,6 +70,13 @@ pub struct BaggerConfig {
     pub trail_pct: Decimal,
     /// **Fixed TP**: flatten when unrealized ≥ this % of equity. `0` off.
     pub fixed_tp_pct: Decimal,
+    /// **P&L flat**: flatten the whole bag when `|unrealized| ≥ this %` of the
+    /// **per-order** notional (NOT equity, NOT bag size). A dead-simple
+    /// high-churn rule — fires symmetrically on a tiny win or loss. Always
+    /// **maker** exit (ignores `exit_taker`) and **not size-gated**, since the
+    /// whole point is to flip fast and rack up volume without paying taker fees.
+    /// `0` off.
+    pub pnl_flat_pct: Decimal,
 }
 
 impl Default for BaggerConfig {
@@ -84,6 +91,7 @@ impl Default for BaggerConfig {
             equity_giveback_pct: Decimal::ZERO,
             trail_pct: Decimal::ZERO,
             fixed_tp_pct: Decimal::ZERO,
+            pnl_flat_pct: Decimal::ZERO,
         }
     }
 }
@@ -96,6 +104,7 @@ impl BaggerConfig {
             || self.equity_giveback_pct > Decimal::ZERO
             || self.trail_pct > Decimal::ZERO
             || self.fixed_tp_pct > Decimal::ZERO
+            || self.pnl_flat_pct > Decimal::ZERO
     }
 
     /// Apply a named preset (sets the underlying mechanism params). Keeps the
@@ -126,6 +135,9 @@ impl BaggerConfig {
                 "equity" | "highwater" => {
                     self.equity_giveback_pct = Decimal::new(10, 2); // 0.10
                 }
+                "flat" | "churn" => {
+                    self.pnl_flat_pct = Decimal::new(5, 0); // 5% of per-order notional
+                }
                 _ => {}
             }
         }
@@ -143,6 +155,9 @@ pub struct GuardInput {
     pub unrealized: Decimal,
     /// Realized-settled equity basis (live wallet, or backtest running balance).
     pub balance: Decimal,
+    /// Per-order notional (quote currency) — the denominator for `pnl_flat_pct`.
+    /// `0` if unknown (that mechanism then no-ops).
+    pub order_notional: Decimal,
     /// Event time in nanoseconds (for the deterioration window).
     pub now_ns: u64,
 }
@@ -196,6 +211,7 @@ impl BaggerState {
             pos_notional,
             unrealized,
             balance,
+            order_notional,
             now_ns,
         } = input;
 
@@ -231,6 +247,21 @@ impl BaggerState {
         if unrealized < self.trough_unrealized {
             self.trough_unrealized = unrealized;
             self.last_new_trough_ns = now_ns;
+        }
+
+        // --- P&L flat: ungated, maker-only, high-churn. |unrealized| ≥ pct of
+        // the PER-ORDER notional → flatten the whole bag. Checked first; when on
+        // it's the dominant rule. Forces maker exit regardless of `exit_taker`.
+        if cfg.pnl_flat_pct > Decimal::ZERO && order_notional > Decimal::ZERO {
+            let thresh = order_notional * cfg.pnl_flat_pct / Decimal::from(100);
+            if unrealized.abs() >= thresh {
+                return Some(FlattenDecision {
+                    qty: full,
+                    side,
+                    taker: false,
+                    reason: "pnl flat",
+                });
+            }
         }
 
         // --- Equity giveback: global, no size gate. Risk-reducing → checked first.
@@ -347,6 +378,7 @@ mod tests {
             pos_notional: dec("200"),
             unrealized: dec(unrealized),
             balance: dec("1000"),
+            order_notional: dec("60"),
             now_ns,
         }
     }
@@ -476,6 +508,46 @@ mod tests {
         assert!(cfg.sl_pct > Decimal::ZERO, "dual sets SL");
         assert_eq!(cfg.deteriorate_secs, 10, "dual = deteriorating gate");
         assert!(cfg.cap_pct > Decimal::ZERO, "cap stacked on");
+    }
+
+    #[test]
+    fn pnl_flat_fires_symmetric_maker_ungated() {
+        // 5% of per-order notional 60 = 3.0. Fires on +3 OR -3, ungated, maker.
+        let mut cfg = gated("0"); // no size gate — pnl_flat is ungated
+        cfg.pnl_flat_pct = dec("5");
+        cfg.exit_taker = true; // must be overridden to maker
+
+        let mut st = BaggerState::default();
+        assert!(
+            st.evaluate(&cfg, long_input("2.9", 1)).is_none(),
+            "below 3 holds"
+        );
+
+        let mut st2 = BaggerState::default();
+        let win = st2.evaluate(&cfg, long_input("3.0", 1)).unwrap();
+        assert_eq!(win.reason, "pnl flat");
+        assert_eq!(win.qty, dec("2"), "flattens full");
+        assert!(!win.taker, "pnl flat is always maker");
+
+        let mut st3 = BaggerState::default();
+        let loss = st3.evaluate(&cfg, long_input("-3.0", 1)).unwrap();
+        assert_eq!(loss.reason, "pnl flat");
+        assert!(!loss.taker);
+    }
+
+    #[test]
+    fn pnl_flat_noop_without_order_notional() {
+        let mut cfg = gated("0");
+        cfg.pnl_flat_pct = dec("5");
+        let mut st = BaggerState::default();
+        let no_notional = GuardInput {
+            order_notional: dec("0"),
+            ..long_input("100", 1)
+        };
+        assert!(
+            st.evaluate(&cfg, no_notional).is_none(),
+            "no denominator → no-op"
+        );
     }
 
     #[test]

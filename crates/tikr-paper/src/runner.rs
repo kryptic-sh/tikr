@@ -1168,6 +1168,12 @@ where
                         } else {
                             initial_balance + tracker.realized().0 - tracker.fees().0
                         };
+                        // Per-order notional for the `pnl_flat_pct` denominator
+                        // — the live sizing channel (compounding/account-driven).
+                        let order_notional = notional_rx
+                            .as_ref()
+                            .map(|rx| *rx.borrow())
+                            .unwrap_or(Decimal::ZERO);
                         if let Some(d) = bagger_state.evaluate(
                             &bagger_cfg,
                             crate::bagger::GuardInput {
@@ -1175,6 +1181,7 @@ where
                                 pos_notional,
                                 unrealized,
                                 balance,
+                                order_notional,
                                 now_ns: ts.0,
                             },
                         ) {

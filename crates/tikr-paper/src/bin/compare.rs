@@ -910,6 +910,10 @@ struct Args {
     /// Override: equity-giveback fraction from session peak. `0` = leave preset/off.
     #[arg(long, default_value = "0")]
     bagger_equity_giveback_pct: String,
+    /// Override: P&L-flat threshold as % of PER-ORDER notional (maker-only,
+    /// ungated, high-churn). `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_pnl_flat_pct: String,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -1398,6 +1402,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let egb = Decimal::from_str(&args.bagger_equity_giveback_pct)?;
     if egb > Decimal::ZERO {
         bagger_cfg.equity_giveback_pct = egb;
+    }
+    let pflat = Decimal::from_str(&args.bagger_pnl_flat_pct)?;
+    if pflat > Decimal::ZERO {
+        bagger_cfg.pnl_flat_pct = pflat;
     }
     let _ = BAGGER.set(bagger_cfg);
 
