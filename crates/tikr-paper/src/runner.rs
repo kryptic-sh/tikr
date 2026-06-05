@@ -1681,6 +1681,7 @@ where
                             buy_volume,
                             sell_volume,
                             &last_fill,
+                            live_metrics(&strategy),
                         );
                         // Partial: the LiveQuote is still on the book (FillSim
                         // keeps it around with reduced size_remaining). Don't
@@ -1831,6 +1832,7 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    live_metrics(&strategy),
                 );
 
                 // PaperReport snapshot: fire on the very FIRST event so
@@ -2047,6 +2049,7 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    live_metrics(&strategy),
                 );
                     continue;
                 }
@@ -2105,6 +2108,7 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    live_metrics(&strategy),
                 );
             }
             _ = status_tick.tick() => {
@@ -2133,6 +2137,7 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    live_metrics(&strategy),
                 );
                 if let Some(ref tap) = config.snapshot_tap {
                     let mut heartbeat = finalize(
@@ -2503,6 +2508,7 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    live_metrics(&strategy),
                 );
                         }
                     }
@@ -3226,6 +3232,16 @@ fn empty_snapshot(symbol: &Symbol) -> Snapshot {
 /// Called on every fill and at every regular snapshot tick so dashboards
 /// see position + open-order + last-fill state with sub-second latency.
 #[allow(clippy::too_many_arguments)]
+/// Collect the strategy's live introspection metrics as owned strings for the
+/// `LiveSnapshot` (TUI bot-detail panel).
+fn live_metrics<S: Strategy>(s: &S) -> Vec<(String, String)> {
+    s.status_metrics()
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn publish_live(
     tap: &Option<std::sync::Arc<std::sync::RwLock<Option<LiveSnapshot>>>>,
     tracker: &PositionTracker,
@@ -3238,6 +3254,7 @@ fn publish_live(
     buy_volume: Decimal,
     sell_volume: Decimal,
     last_fill: &Option<Fill>,
+    metrics: Vec<(String, String)>,
 ) {
     let Some(tap) = tap.as_ref() else {
         return;
@@ -3307,6 +3324,7 @@ fn publish_live(
         last_fill_price: last_fill.as_ref().map(|f| f.price.0).unwrap_or_default(),
         last_fill_size: last_fill.as_ref().map(|f| f.size.0).unwrap_or_default(),
         inventory_usdt: pos.size.0 * last_mid.0,
+        metrics,
     };
     // Non-blocking: dashboard reader can be holding the read lock
     // during a draw; the next fill / snapshot tick will refresh.

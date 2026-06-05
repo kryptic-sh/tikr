@@ -2119,6 +2119,24 @@ fn draw_bot_detail(
             Style::default().fg(th().muted),
             pnl_style(lv.inventory_usdt),
         ));
+        // Strategy introspection (e.g. Wave's effective step_bps / inner,
+        // tagged `cfg` for static config vs `auto` for the live auto-sized
+        // value). Empty for strategies that don't expose metrics.
+        if !lv.metrics.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                "── strategy ──",
+                Style::default().fg(th().muted).add_modifier(Modifier::DIM),
+            ));
+            for (label, value) in &lv.metrics {
+                lines.push(kv_line(
+                    label,
+                    value.clone(),
+                    Style::default().fg(th().muted),
+                    Style::default(),
+                ));
+            }
+        }
         lines.push(Line::from(""));
         lines.push(Line::styled(
             "── book ──",

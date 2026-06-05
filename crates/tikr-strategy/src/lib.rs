@@ -230,6 +230,15 @@ pub trait Strategy: Send {
     ) -> Vec<Action> {
         Vec::new()
     }
+
+    /// Live introspection for the TUI/dashboard: short `(label, value)` pairs
+    /// describing the strategy's current internal state (e.g. Wave's effective
+    /// step/inner, showing the static config value or the live auto-sized one).
+    /// Default empty — strategies opt in. Read by the runner on each
+    /// `LiveSnapshot` publish; kept tiny (rendered in the bot-detail panel).
+    fn status_metrics(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 // ---------------------------------------------------------------------------

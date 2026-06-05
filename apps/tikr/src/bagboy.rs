@@ -377,6 +377,7 @@ fn publish(
         last_fill_price: Decimal::ZERO,
         last_fill_size: Decimal::ZERO,
         inventory_usdt: total_base * bid,
+        metrics: Vec::new(),
     };
     if let Ok(mut g) = live.write() {
         *g = Some(snap);

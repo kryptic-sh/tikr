@@ -63,4 +63,8 @@ pub struct LiveSnapshot {
     /// Inventory marked at `last_mid`: `position_size × last_mid`.
     /// Signed (positive = long, negative = short).
     pub inventory_usdt: Decimal,
+    /// Strategy-supplied `(label, value)` introspection pairs (e.g. Wave's
+    /// effective step/inner, static-vs-auto). Empty for strategies that don't
+    /// implement `status_metrics`. Rendered in the TUI bot-detail panel.
+    pub metrics: Vec<(String, String)>,
 }

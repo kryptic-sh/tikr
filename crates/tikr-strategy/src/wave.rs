@@ -730,6 +730,21 @@ impl Strategy for Wave {
         "wave"
     }
 
+    fn status_metrics(&self) -> Vec<(&'static str, String)> {
+        // Show the value actually in force, tagged static (cfg) vs auto.
+        let step = if self.config.auto_step && self.config.steps_bps > 0 {
+            format!("{} auto", self.effective_step_bps())
+        } else {
+            format!("{} cfg", self.config.steps_bps)
+        };
+        let inner = if self.config.auto_inner {
+            format!("{} auto", self.effective_inner())
+        } else {
+            format!("{} cfg", self.config.steps_inner)
+        };
+        vec![("step_bps", step), ("inner", inner)]
+    }
+
     fn on_event(&mut self, ctx: &StrategyContext<'_>, _event: &MarketEvent) -> Vec<Action> {
         self.emitted_this_event_bid.clear();
         self.emitted_this_event_ask.clear();
