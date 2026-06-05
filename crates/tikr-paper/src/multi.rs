@@ -83,6 +83,8 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
     let mut total_buy_fills = 0u64;
     let mut total_sell_fills = 0u64;
     let mut max_peak_position = Decimal::ZERO;
+    let mut max_peak_long = Decimal::ZERO;
+    let mut max_peak_short = Decimal::ZERO;
     // Mean inventory + full/partial fills sum across symbols (mean = total
     // typical notional deployed across the portfolio; peak stays a MAX).
     let mut total_mean_position = Decimal::ZERO;
@@ -121,6 +123,8 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         if r.peak_position_usdt.0 > max_peak_position {
             max_peak_position = r.peak_position_usdt.0;
         }
+        max_peak_long = max_peak_long.max(r.peak_long_usdt.0);
+        max_peak_short = max_peak_short.max(r.peak_short_usdt.0);
         total_mean_position += r.mean_position_usdt.0;
         total_full_fills += r.full_fills;
         total_partial_fills += r.partial_fills;
@@ -162,6 +166,8 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         buy_fills: total_buy_fills,
         sell_fills: total_sell_fills,
         peak_position_usdt: Notional(max_peak_position),
+        peak_long_usdt: Notional(max_peak_long),
+        peak_short_usdt: Notional(max_peak_short),
         mean_position_usdt: Notional(total_mean_position),
         full_fills: total_full_fills,
         partial_fills: total_partial_fills,

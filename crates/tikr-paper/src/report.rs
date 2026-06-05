@@ -81,6 +81,12 @@ pub struct PaperReport {
     /// (`|size| × last_mid` sampled on every event). Shows how close
     /// the strategy came to its `max_position_usdt` cap.
     pub peak_position_usdt: Notional,
+    /// Peak LONG inventory notional reached (≥ 0). High-water `|size| × mid`
+    /// while the position was long. Persisted + restored across restart.
+    pub peak_long_usdt: Notional,
+    /// Peak SHORT inventory notional reached (≥ 0). High-water `|size| × mid`
+    /// while the position was short. Persisted + restored across restart.
+    pub peak_short_usdt: Notional,
     /// Mean absolute position value over the run, in USDT (`|size| × mark`
     /// averaged over every sample point, same cadence as `peak_position_usdt`).
     /// Unlike the peak, this shows the strategy's *typical* inventory load —
@@ -155,6 +161,10 @@ struct PaperReportWire {
     #[serde(default)]
     peak_position_usdt: String,
     #[serde(default)]
+    peak_long_usdt: String,
+    #[serde(default)]
+    peak_short_usdt: String,
+    #[serde(default)]
     mean_position_usdt: String,
     #[serde(default)]
     full_fills: u64,
@@ -193,6 +203,8 @@ impl Serialize for PaperReport {
             buy_fills: self.buy_fills,
             sell_fills: self.sell_fills,
             peak_position_usdt: self.peak_position_usdt.0.to_string(),
+            peak_long_usdt: self.peak_long_usdt.0.to_string(),
+            peak_short_usdt: self.peak_short_usdt.0.to_string(),
             mean_position_usdt: self.mean_position_usdt.0.to_string(),
             full_fills: self.full_fills,
             partial_fills: self.partial_fills,
@@ -268,6 +280,16 @@ impl<'de> Deserialize<'de> for PaperReport {
                 Notional(Decimal::ZERO)
             } else {
                 parse(&wire.peak_position_usdt)?
+            },
+            peak_long_usdt: if wire.peak_long_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.peak_long_usdt)?
+            },
+            peak_short_usdt: if wire.peak_short_usdt.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.peak_short_usdt)?
             },
             mean_position_usdt: if wire.mean_position_usdt.is_empty() {
                 Notional(Decimal::ZERO)

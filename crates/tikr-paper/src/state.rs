@@ -68,6 +68,8 @@ mod tests {
             buy_fills: 7,
             sell_fills: 9,
             peak_position_usdt: Notional(Decimal::ZERO),
+            peak_long_usdt: Notional(Decimal::ZERO),
+            peak_short_usdt: Notional(Decimal::ZERO),
             mean_position_usdt: Notional(Decimal::ZERO),
             full_fills: 0,
             partial_fills: 0,

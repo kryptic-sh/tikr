@@ -629,11 +629,20 @@ where
     // run. Sampled on BookUpdate events so a strategy that grew to its
     // cap then traded out still shows the high-water mark in the
     // final report.
-    let mut peak_position_usdt: Decimal = Decimal::ZERO;
+    let mut peak_position_usdt: Decimal = resume
+        .as_ref()
+        .map(|r| r.peak_position_usdt.0)
+        .unwrap_or(Decimal::ZERO);
     // Directional peaks for the live TUI: high-water inventory notional while
-    // long vs while short (both ≥ 0). Session-cumulative.
-    let mut peak_long_usdt: Decimal = Decimal::ZERO;
-    let mut peak_short_usdt: Decimal = Decimal::ZERO;
+    // long vs while short (both ≥ 0). Session-cumulative + restored on restart.
+    let mut peak_long_usdt: Decimal = resume
+        .as_ref()
+        .map(|r| r.peak_long_usdt.0)
+        .unwrap_or(Decimal::ZERO);
+    let mut peak_short_usdt: Decimal = resume
+        .as_ref()
+        .map(|r| r.peak_short_usdt.0)
+        .unwrap_or(Decimal::ZERO);
     // Running accumulators for MEAN absolute position notional (same sample
     // cadence as the peak). Mean shows typical inventory load, not just the
     // high-water mark — a lower mean at equal net = the algo carried less risk.
@@ -837,6 +846,8 @@ where
                 buy_fills,
                 sell_fills,
                 peak_position_usdt,
+                peak_long_usdt,
+                peak_short_usdt,
                 position_usdt_sum,
                 position_samples,
                 full_fills,
@@ -1881,6 +1892,8 @@ where
                         buy_fills,
                         sell_fills,
                         peak_position_usdt,
+                        peak_long_usdt,
+                        peak_short_usdt,
                         position_usdt_sum,
                         position_samples,
                         full_fills,
@@ -2034,6 +2047,8 @@ where
                         buy_fills,
                         sell_fills,
                         peak_position_usdt,
+                        peak_long_usdt,
+                        peak_short_usdt,
                         position_usdt_sum,
                         position_samples,
                         full_fills,
@@ -2181,6 +2196,8 @@ where
                         buy_fills,
                         sell_fills,
                         peak_position_usdt,
+                        peak_long_usdt,
+                        peak_short_usdt,
                         position_usdt_sum,
                         position_samples,
                         full_fills,
@@ -2583,6 +2600,8 @@ where
         buy_fills,
         sell_fills,
         peak_position_usdt,
+        peak_long_usdt,
+        peak_short_usdt,
         position_usdt_sum,
         position_samples,
         full_fills,
@@ -3180,6 +3199,8 @@ fn finalize(
     buy_fills: u64,
     sell_fills: u64,
     peak_position_usdt: Decimal,
+    peak_long_usdt: Decimal,
+    peak_short_usdt: Decimal,
     position_usdt_sum: Decimal,
     position_samples: u64,
     full_fills: u64,
@@ -3233,6 +3254,8 @@ fn finalize(
         buy_fills,
         sell_fills,
         peak_position_usdt: Notional(peak_position_usdt),
+        peak_long_usdt: Notional(peak_long_usdt),
+        peak_short_usdt: Notional(peak_short_usdt),
         mean_position_usdt: Notional(mean_position_usdt),
         full_fills,
         partial_fills,
@@ -4097,6 +4120,8 @@ mod tests {
             buy_fills: 0,
             sell_fills: 0,
             peak_position_usdt: Notional(Decimal::ZERO),
+            peak_long_usdt: Notional(Decimal::ZERO),
+            peak_short_usdt: Notional(Decimal::ZERO),
             mean_position_usdt: Notional(Decimal::ZERO),
             full_fills: 0,
             partial_fills: 0,
@@ -4155,6 +4180,8 @@ mod tests {
             buy_fills: 0,
             sell_fills: 0,
             peak_position_usdt: Notional(Decimal::ZERO),
+            peak_long_usdt: Notional(Decimal::ZERO),
+            peak_short_usdt: Notional(Decimal::ZERO),
             mean_position_usdt: Notional(Decimal::ZERO),
             full_fills: 0,
             partial_fills: 0,
