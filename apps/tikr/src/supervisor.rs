@@ -306,11 +306,22 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
     )
     .await?;
 
-    let default_notional = default_order_notional(&venue_for_run, ctx).await?;
-    // Derive max_pos from the same wallet source as default_notional:
-    //   max_pos = wallet × max_position_pct / 100
-    //          = default_notional × (max_position_pct / order_balance_pct)
-    let max_pos_default = if ctx.order_balance_pct > Decimal::ZERO {
+    // Seed the bot's order size from the live poller value (which is sized off
+    // the all-asset USD wallet) when it has already reported. Only fall back to
+    // a direct USDT-only fetch on cold start, before the first poll lands — a
+    // USDT-only seed under-sizes first orders in a multi-asset wallet.
+    let live_notional = *ctx.notional_rx.borrow();
+    let default_notional = if live_notional > Decimal::ZERO {
+        live_notional
+    } else {
+        default_order_notional(&venue_for_run, ctx).await?
+    };
+    // Derive max_pos from the same wallet source: prefer the live poller value,
+    // else mirror default_notional via the pct ratio.
+    let live_max_pos = *ctx.max_position_rx.borrow();
+    let max_pos_default = if live_max_pos > Decimal::ZERO {
+        live_max_pos
+    } else if ctx.order_balance_pct > Decimal::ZERO {
         default_notional * ctx.max_position_pct / ctx.order_balance_pct
     } else {
         Decimal::ZERO

@@ -596,22 +596,16 @@ fn should_defer_rotation(
     }
 }
 
-/// Total wallet balance for the `rotate_loss_pct` tolerance: futures wallet
-/// balance + BNB value (when BNB-fee mode is on), mirroring the account poller's
-/// sizing base. `0` if no account snapshot has landed yet (→ zero tolerance →
-/// any underwater bot defers, the safe default).
+/// Total wallet balance for the `rotate_loss_pct` tolerance. `wallet_balance` is
+/// already the all-asset USD total (BNB included) from the account poller, so it
+/// is used directly — adding BNB again would double-count. `0` if no account
+/// snapshot has landed yet (→ zero tolerance → any underwater bot defers, the
+/// safe default).
 fn total_wallet_balance(shared_state: &SharedBotState) -> Decimal {
-    let wallet = shared_state
+    shared_state
         .api_account()
         .map(|a| a.wallet_balance)
-        .unwrap_or_default();
-    let bnb = shared_state.bnb_snapshot();
-    let bnb_value = if bnb.enabled {
-        bnb.balance * bnb.price_usdt
-    } else {
-        Decimal::ZERO
-    };
-    wallet + bnb_value
+        .unwrap_or_default()
 }
 
 /// Signal a bot to shut down and GUARANTEE it has stopped before the caller
