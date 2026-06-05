@@ -420,12 +420,20 @@ pub fn spawn_rampage_manager(
                     // final NET into BNB on the futures wallet. No-op on a loss
                     // (NET ≤ 0), when disabled (pct 0), or while rate-limited.
                     let final_net = shared_state.net_for(&symbol).unwrap_or_default();
-                    if cfg.retire_bnb_pct > Decimal::ZERO
-                        && final_net > Decimal::ZERO
-                        && shared_state.rate_limit_remaining_ms() == 0
-                    {
+                    if cfg.retire_bnb_pct > Decimal::ZERO && final_net > Decimal::ZERO {
                         let convert_usd = final_net * cfg.retire_bnb_pct / Decimal::from(100);
-                        if convert_usd >= Decimal::ONE {
+                        if shared_state.rate_limit_remaining_ms() > 0 {
+                            info!(symbol = %symbol, "rampage: retire profit→BNB skipped — rate-limited");
+                        } else if convert_usd < Decimal::ONE {
+                            // Below Binance's ~$1 min convert — common on tiny /
+                            // break-even rotations. Logged so the no-op is visible.
+                            info!(
+                                symbol = %symbol,
+                                profit = %final_net.round_dp(4),
+                                convert_usd = %convert_usd.round_dp(4),
+                                "rampage: retire profit→BNB skipped — below $1 min convert"
+                            );
+                        } else {
                             let from_amount = format!("{convert_usd:.2}");
                             match tikr_binance::futs::convert_futures(
                                 &http,
