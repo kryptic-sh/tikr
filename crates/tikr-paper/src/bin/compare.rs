@@ -919,6 +919,10 @@ struct Args {
     /// ungated, high-churn). `0` = leave preset/off.
     #[arg(long, default_value = "0")]
     bagger_pnl_flat_pct: String,
+    /// Override: inventory-cap flatten — dump the whole bag when its notional
+    /// reaches this % of wallet (e.g. `100` = bag ≥ wallet). `0` = leave/off.
+    #[arg(long, default_value = "0")]
+    bagger_inv_flat_wallet_pct: String,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -1411,6 +1415,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pflat = Decimal::from_str(&args.bagger_pnl_flat_pct)?;
     if pflat > Decimal::ZERO {
         bagger_cfg.pnl_flat_pct = pflat;
+    }
+    let invflat = Decimal::from_str(&args.bagger_inv_flat_wallet_pct)?;
+    if invflat > Decimal::ZERO {
+        bagger_cfg.inv_flat_wallet_pct = invflat;
     }
     let _ = BAGGER.set(bagger_cfg);
 

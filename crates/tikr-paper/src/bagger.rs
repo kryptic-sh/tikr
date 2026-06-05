@@ -70,6 +70,12 @@ pub struct BaggerConfig {
     pub trail_pct: Decimal,
     /// **Fixed TP**: flatten when unrealized ≥ this % of equity. `0` off.
     pub fixed_tp_pct: Decimal,
+    /// **Inventory cap flatten**: flatten the WHOLE bag when its notional
+    /// reaches this % of the wallet/equity basis (e.g. `100` = bag ≥ wallet).
+    /// A hard circuit-breaker against runaway inventory / liquidation — unlike
+    /// `cap_pct` (which trims the excess), this dumps the entire position. Not
+    /// size-gated (it IS the size gate). `0` off.
+    pub inv_flat_wallet_pct: Decimal,
     /// **P&L flat**: flatten the whole bag when `|unrealized| ≥ this %` of the
     /// **per-order** notional (NOT equity, NOT bag size). A dead-simple
     /// high-churn rule — fires symmetrically on a tiny win or loss. Always
@@ -92,6 +98,7 @@ impl Default for BaggerConfig {
             trail_pct: Decimal::ZERO,
             fixed_tp_pct: Decimal::ZERO,
             pnl_flat_pct: Decimal::ZERO,
+            inv_flat_wallet_pct: Decimal::ZERO,
         }
     }
 }
@@ -105,6 +112,7 @@ impl BaggerConfig {
             || self.trail_pct > Decimal::ZERO
             || self.fixed_tp_pct > Decimal::ZERO
             || self.pnl_flat_pct > Decimal::ZERO
+            || self.inv_flat_wallet_pct > Decimal::ZERO
     }
 
     /// Apply a named preset (sets the underlying mechanism params). Keeps the
@@ -137,6 +145,9 @@ impl BaggerConfig {
                 }
                 "flat" | "churn" => {
                     self.pnl_flat_pct = Decimal::new(5, 0); // 5% of per-order notional
+                }
+                "wallet" | "invcap" => {
+                    self.inv_flat_wallet_pct = Decimal::new(100, 0); // bag ≥ wallet
                 }
                 _ => {}
             }
@@ -247,6 +258,22 @@ impl BaggerState {
         if unrealized < self.trough_unrealized {
             self.trough_unrealized = unrealized;
             self.last_new_trough_ns = now_ns;
+        }
+
+        // --- Inventory cap flatten: hard circuit-breaker. When the bag notional
+        // reaches `inv_flat_wallet_pct%` of the wallet, dump the WHOLE position.
+        // Not size-gated (it is the size gate) — checked first to pre-empt a
+        // runaway-inventory liquidation.
+        if cfg.inv_flat_wallet_pct > Decimal::ZERO && balance > Decimal::ZERO {
+            let limit = balance * cfg.inv_flat_wallet_pct / Decimal::from(100);
+            if pos_notional >= limit {
+                return Some(FlattenDecision {
+                    qty: full,
+                    side,
+                    taker: cfg.exit_taker,
+                    reason: "inventory ≥ wallet cap",
+                });
+            }
         }
 
         // --- P&L flat: ungated, maker-only, high-churn. |unrealized| ≥ pct of
@@ -533,6 +560,26 @@ mod tests {
         let loss = st3.evaluate(&cfg, long_input("-3.0", 1)).unwrap();
         assert_eq!(loss.reason, "pnl flat");
         assert!(!loss.taker);
+    }
+
+    #[test]
+    fn inv_flat_wallet_cap_dumps_whole_bag() {
+        // bag notional 200, balance 1000. At 100% → limit 1000; 200 < 1000 holds.
+        let mut cfg = gated("0"); // ungated
+        cfg.inv_flat_wallet_pct = dec("100");
+        let mut st = BaggerState::default();
+        assert!(
+            st.evaluate(&cfg, long_input("0", 0)).is_none(),
+            "200 < 1000 holds"
+        );
+        // Bag grows to ≥ wallet → flatten full.
+        let big = GuardInput {
+            pos_notional: dec("1000.1"),
+            ..long_input("0", 0)
+        };
+        let d = st.evaluate(&cfg, big).unwrap();
+        assert_eq!(d.reason, "inventory ≥ wallet cap");
+        assert_eq!(d.qty, dec("2"), "dumps the whole position");
     }
 
     #[test]

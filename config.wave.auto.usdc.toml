@@ -1,36 +1,6 @@
-# ─── Rampage AUTO-rotation — MAINNET (default config) ──────────────────────
-#
-# No fixed bot list. The [rampage] manager scores every liquid USD-M perp and
-# runs the configured strategy on the top N. Re-ranks every recheck.
-#
-# Score mode: candle_height — average height of the last `candle_count`
-# 1-minute candles, as a percent: mean( (high − low) / low × 100 ), wicks
-# included. Big 1-minute candles = lots of intra-minute oscillation for the
-# frozen lattice to bank — the GUN signature. This is a RECENT signal, so it
-# catches a market that just woke up, unlike a 24h aggregate that dilutes it.
-#
-# Each recheck: list perps + price + 24h volume (cheap), pre-filter by
-# `min_volume_usdt`, then fetch the last `candle_count` 1m klines for each
-# survivor (concurrent), score, and run the strategy on the top `top_n`.
-#
-# Rotation is graceful: a symbol that drops out only rotates when its bot is
-# flat or GREEN. Holding an underwater bag? It keeps running until recovered
-# (defer_underwater, default on) — rotation never crystallizes a loss.
-#
-# WHY USDT: the volatile small-cap oscillators (GUN-likes) live on USDT perps;
-# USDT perps are mostly the tight majors. Discovery scans USDT, so the futures
-# wallet needs USDT margin.
-#
-# ⚠ Live, real money. Wave adds into a trend; big 1m candles can be a trend as
-# easily as chop. The defer-underwater guard + (optional) SL are the backstops.
-# Watch the first sessions; size so summed peaks stay under buying power.
-#
-# Pre-flight (mainnet): TIKR_BINANCE_ENABLE_MAINNET=1; .env keys; funded USDT
-# in the Futures wallet; confirm maker fee at binance.com/en/fee/futureFee.
-
 [account]
 env = "futures-mainnet"
-asset = "USDT"
+asset = "USDC"
 order_balance_pct = "0.1"
 max_position_pct = "0"
 take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
@@ -38,15 +8,15 @@ leverage = 10
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
-# bnb_min_balance_usdt = "1"     # refill trigger (default $1)
-# bnb_target_balance_usdt = "10" # top-up target (default $10)
+# bnb_min_balance_usdc = "1"     # refill trigger (default $1)
+# bnb_target_balance_usdc = "10" # top-up target (default $10)
 
 [rampage]
 enabled = true
-min_volume_usdt = "2000000" # $2M 24h quote volume floor
+min_volume_usdc = "2000000" # $2M 24h quote volume floor
 recheck_interval_secs = 60
-quote_asset = "USDT"
-top_n = 10
+quote_asset = "USDC"
+top_n = 4
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.01" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 big_bag_pct = "25"       # hold (don't rotate) a bot in POSITIVE unrealized whose bag ≥ this % of wallet — work it down instead of dumping; 0 = off
@@ -63,7 +33,7 @@ kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 levels = 10
 round_trips = 5
-steps_bps = 10
+steps_bps = 5
 auto_inner = true            # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 0              # only used when auto_inner = false
 force_refill_secs = 120      # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
@@ -71,4 +41,4 @@ auto_step = false            # auto-size the lattice step (k×mean candle gap, f
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
 relattice_drift_pct = "0.02" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
-size_mult = "1.55"           # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
+size_mult = "1.5"            # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform

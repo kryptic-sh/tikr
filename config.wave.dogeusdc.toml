@@ -1,0 +1,20 @@
+[account]
+env = "futures-mainnet"
+asset = "USDC"
+order_balance_pct = "1"
+max_position_pct = "0"
+leverage = 10
+
+[[bot]]
+symbol = "BTCUSDC"
+strategy = "wave"
+
+[bot.wave]
+notional = 120
+levels = 10
+round_trips = 5
+steps_inner = 1
+steps_bps = 2
+force_refill_secs = 120
+relattice_drift_pct = "0.02"
+size_mult = "2"
