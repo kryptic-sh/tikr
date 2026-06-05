@@ -378,6 +378,32 @@ fn rate_limit_backoff(e: &tikr_venue::VenueError) -> Option<std::time::Duration>
     }
 }
 
+/// USD-pegged margin assets valued at ~$1 (no `{ASSET}USDT` lookup needed).
+fn is_usd_stable(asset: &str) -> bool {
+    matches!(
+        asset,
+        "USDT" | "USDC" | "BUSD" | "FDUSD" | "TUSD" | "USDP" | "DAI"
+    )
+}
+
+/// USD value of `amount` of `asset`: stables ≈ $1, everything else via the
+/// futures `{ASSET}USDT` bookTicker mid. `None` if the asset can't be priced
+/// (no USDT pair in the map) — the caller excludes it from the total and logs.
+fn asset_usd_value(
+    asset: &str,
+    amount: Decimal,
+    tickers: &std::collections::HashMap<String, (Decimal, Decimal)>,
+) -> Option<Decimal> {
+    if amount.is_zero() {
+        return Some(Decimal::ZERO);
+    }
+    if is_usd_stable(asset) {
+        return Some(amount);
+    }
+    let (bid, ask) = tickers.get(&format!("{asset}USDT"))?;
+    Some(amount * (*bid + *ask) / Decimal::from(2))
+}
+
 fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
     tokio::spawn(async move {
         let http = reqwest::Client::new();
@@ -454,32 +480,52 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
             // back off for this long at the top of the next iteration.
             let mut limited: Option<std::time::Duration> = None;
 
-            // BNB-aware accounting block — only fires when feeBurn is on.
-            // Fetches BNB futures-wallet balance + BNBUSDT mark, publishes
-            // to SharedState + price watch channel. The user-stream parser
-            // reads `bnb_price_tx` to convert commissions; the refill task
-            // reads SharedState to decide when to top up.
+            // Wallet base = USD value of EVERY margin asset (multi-asset
+            // margin: USDT, USDC, BNB, …). Fetch all balances + the all-symbol
+            // price map once; value each asset (stables ≈ $1, others via
+            // {ASSET}USDT mid) and sum. This total drives every %-based config
+            // (order size, position cap, take-profit), so holding a large BNB
+            // balance for VIP-tier fees still counts toward sizing.
+            let balances = match tikr_binance::futs::get_all_balances(
+                &http,
+                cfg.env.rest_base_url(),
+                &cfg.api_key,
+                &key_material,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    limited = limited.or_else(|| rate_limit_backoff(&e));
+                    tracing::warn!(error = ?e, "account balance poll failed");
+                    Vec::new()
+                }
+            };
+            let tickers = match tikr_binance::futs::get_all_book_tickers(
+                &http,
+                cfg.env.rest_base_url(),
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    limited = limited.or_else(|| rate_limit_backoff(&e));
+                    std::collections::HashMap::new()
+                }
+            };
+
+            // BNB accounting (fee conversion + refill) sourced from the bulk
+            // fetches — only when feeBurn is on.
             if bnb_fee_enabled {
-                let mut bnb_balance = Decimal::ZERO;
-                let mut bnb_price = Decimal::ZERO;
-                match tikr_binance::futs::get_balance(
-                    &http,
-                    cfg.env.rest_base_url(),
-                    &cfg.api_key,
-                    &key_material,
-                    "BNB",
-                )
-                .await
-                {
-                    Ok(b) => bnb_balance = b.wallet_balance,
-                    Err(e) => limited = limited.or_else(|| rate_limit_backoff(&e)),
-                }
-                if let Ok(t) =
-                    tikr_binance::futs::get_book_ticker(&http, cfg.env.rest_base_url(), "BNBUSDT")
-                        .await
-                {
-                    bnb_price = (t.bid_price + t.ask_price) / Decimal::from(2);
-                }
+                let bnb_balance = balances
+                    .iter()
+                    .find(|b| b.asset == "BNB")
+                    .map(|b| b.wallet_balance)
+                    .unwrap_or(Decimal::ZERO);
+                let bnb_price = tickers
+                    .get("BNBUSDT")
+                    .map(|(b, a)| (*b + *a) / Decimal::from(2))
+                    .unwrap_or(Decimal::ZERO);
                 cfg.shared_state.set_bnb(crate::state::BnbState {
                     enabled: true,
                     balance: bnb_balance,
@@ -488,83 +534,67 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                 if bnb_price > Decimal::ZERO && bnb_price != *cfg.bnb_price_tx.borrow() {
                     let _ = cfg.bnb_price_tx.send(bnb_price);
                 }
-                tracing::info!(
-                    bnb_balance = %bnb_balance,
-                    bnb_price = %bnb_price,
-                    bnb_usdt_value = %(bnb_balance * bnb_price),
-                    "bnb poll"
-                );
             }
-            match tikr_binance::futs::get_balance(
-                &http,
-                cfg.env.rest_base_url(),
-                &cfg.api_key,
-                &key_material,
-                &cfg.wallet_asset,
-            )
-            .await
-            {
-                Ok(balance) => {
-                    cfg.shared_state.set_api_account(ApiAccountSnapshot {
-                        asset: cfg.wallet_asset.clone(),
-                        wallet_balance: balance.wallet_balance,
-                        available_balance: balance.available_balance,
-                        cross_unrealized_pnl: balance.cross_unrealized_pnl,
-                        fetched_at_ms: current_time_ms(),
-                    });
-                    let symbols = cfg.shared_state.symbols();
-                    let symbols = if symbols.is_empty() {
-                        cfg.symbols.clone()
-                    } else {
-                        symbols
-                    };
-                    // Total balance for sizing = USDT wallet + BNB value
-                    // (when BNB-fee mode is on). BNB held in the futures
-                    // wallet for fee payment IS spendable capital — count
-                    // it toward the available pool for order sizing +
-                    // position cap. When BNB-fee mode is off, BnbState's
-                    // balance + price are 0 so the addition is a no-op.
-                    let bnb_snap = cfg.shared_state.bnb_snapshot();
-                    let bnb_value_usdt = if bnb_snap.enabled {
-                        bnb_snap.balance * bnb_snap.price_usdt
-                    } else {
-                        Decimal::ZERO
-                    };
-                    let total_balance = balance.wallet_balance + bnb_value_usdt;
-                    // Sizing is purely wallet-relative and per-bot (NOT split
-                    // across bots) — mirrors max_position_pct below: 1% means
-                    // each bot orders 1% of wallet. Leverage only affects the
-                    // Binance POST /fapi/v1/leverage call.
-                    let notional = total_balance * cfg.order_balance_pct / Decimal::from(100);
-                    if notional != *cfg.notional_tx.borrow() {
-                        let _ = cfg.notional_tx.send(notional);
-                    }
-                    // max_position_pct is per-bot, NOT split across bots.
-                    // 100 = each bot can hold up to 100% of wallet notional.
-                    // Total risk capped by Binance margin engine + leverage.
-                    let max_position = total_balance * cfg.max_position_pct / Decimal::from(100);
-                    if max_position != *cfg.max_position_tx.borrow() {
-                        let _ = cfg.max_position_tx.send(max_position);
-                    }
-                    // Publish wallet balance for the take-profit threshold
-                    // (`take_profit_pct` of this). Same wallet+BNB base as sizing.
-                    if total_balance != *cfg.wallet_tx.borrow() {
-                        let _ = cfg.wallet_tx.send(total_balance);
-                    }
-                    for symbol in &symbols {
-                        tracing::info!(
-                            symbol,
-                            wallet = %balance.wallet_balance,
-                            available = %balance.available_balance,
-                            api_unrealized = %balance.cross_unrealized_pnl,
-                            "account balance poll"
-                        );
+
+            if !balances.is_empty() {
+                // Sum the USD value of every asset for the wallet base.
+                let mut wallet_usd = Decimal::ZERO;
+                let mut avail_usd = Decimal::ZERO;
+                let mut cross_usd = Decimal::ZERO;
+                let mut unpriced: Vec<String> = Vec::new();
+                for b in &balances {
+                    match asset_usd_value(&b.asset, b.wallet_balance, &tickers) {
+                        Some(v) => {
+                            wallet_usd += v;
+                            avail_usd += asset_usd_value(&b.asset, b.available_balance, &tickers)
+                                .unwrap_or(Decimal::ZERO);
+                            cross_usd +=
+                                asset_usd_value(&b.asset, b.cross_unrealized_pnl, &tickers)
+                                    .unwrap_or(Decimal::ZERO);
+                        }
+                        None => unpriced.push(b.asset.clone()),
                     }
                 }
-                Err(e) => {
-                    limited = limited.or_else(|| rate_limit_backoff(&e));
-                    tracing::warn!(error = ?e, "account balance poll failed");
+                if !unpriced.is_empty() {
+                    tracing::warn!(
+                        ?unpriced,
+                        "wallet: assets excluded from USD total (no {{ASSET}}USDT price)"
+                    );
                 }
+
+                cfg.shared_state.set_api_account(ApiAccountSnapshot {
+                    asset: cfg.wallet_asset.clone(),
+                    wallet_balance: wallet_usd,
+                    available_balance: avail_usd,
+                    cross_unrealized_pnl: cross_usd,
+                    fetched_at_ms: current_time_ms(),
+                });
+
+                // Sizing is wallet-relative + per-bot (NOT split across bots):
+                // `order_balance_pct`/`max_position_pct` are each a % of the full
+                // multi-asset wallet. Leverage only affects the venue margin call.
+                let notional = wallet_usd * cfg.order_balance_pct / Decimal::from(100);
+                if notional != *cfg.notional_tx.borrow() {
+                    let _ = cfg.notional_tx.send(notional);
+                }
+                let max_position = wallet_usd * cfg.max_position_pct / Decimal::from(100);
+                if max_position != *cfg.max_position_tx.borrow() {
+                    let _ = cfg.max_position_tx.send(max_position);
+                }
+                // Wallet base for the take-profit threshold (`take_profit_pct`).
+                if wallet_usd != *cfg.wallet_tx.borrow() {
+                    let _ = cfg.wallet_tx.send(wallet_usd);
+                }
+                let breakdown: Vec<String> = balances
+                    .iter()
+                    .map(|b| format!("{}={}", b.asset, b.wallet_balance.normalize()))
+                    .collect();
+                tracing::info!(
+                    wallet_usd = %wallet_usd.round_dp(2),
+                    assets = balances.len(),
+                    breakdown = ?breakdown,
+                    "account balance poll (multi-asset USD total)"
+                );
             }
 
             let symbols = cfg.shared_state.symbols();

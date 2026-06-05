@@ -1601,6 +1601,72 @@ pub async fn get_balance(
     })
 }
 
+/// One margin asset's balance row from `/fapi/v3/balance`.
+#[derive(Debug, Clone)]
+pub struct AssetBalance {
+    /// Asset symbol (e.g. `USDT`, `BNB`, `USDC`).
+    pub asset: String,
+    /// `balance` — total wallet balance in the asset's own units.
+    pub wallet_balance: tikr_core::Decimal,
+    /// `availableBalance` — free margin in the asset's own units.
+    pub available_balance: tikr_core::Decimal,
+    /// `crossUnPnl` — cross-position unrealized PnL in the asset's own units.
+    pub cross_unrealized_pnl: tikr_core::Decimal,
+}
+
+/// Fetch ALL margin-asset balances on the USD-M futures account in one call.
+///
+/// Endpoint: `GET /fapi/v3/balance`. Multi-asset-margin accounts can hold
+/// several assets (USDT, USDC, BNB, …); callers value each in USD (stables ≈ 1,
+/// others via `{ASSET}USDT`) and sum for wallet-relative sizing. Zero-balance
+/// rows are dropped.
+pub async fn get_all_balances(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+) -> Result<Vec<AssetBalance>, VenueError> {
+    use std::str::FromStr;
+    let signed = append_auth_dispatch("", key_material);
+    let url = format!("{base_url}/fapi/v3/balance?{signed}");
+    let resp = http
+        .get(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+    let body: Value = read_json(resp).await?;
+    if let Some(err) = try_parse_error(&body) {
+        return Err(err);
+    }
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other("balance: expected array")))
+    })?;
+    let dec = |row: &Value, field: &str| -> tikr_core::Decimal {
+        row.get(field)
+            .and_then(Value::as_str)
+            .and_then(|s| tikr_core::Decimal::from_str(s).ok())
+            .unwrap_or(tikr_core::Decimal::ZERO)
+    };
+    let mut out = Vec::new();
+    for row in arr {
+        let Some(asset) = row.get("asset").and_then(Value::as_str) else {
+            continue;
+        };
+        let wallet_balance = dec(row, "balance");
+        if wallet_balance.is_zero() {
+            continue;
+        }
+        out.push(AssetBalance {
+            asset: asset.to_string(),
+            wallet_balance,
+            available_balance: dec(row, "availableBalance"),
+            cross_unrealized_pnl: dec(row, "crossUnPnl"),
+        });
+    }
+    Ok(out)
+}
+
 /// Get the BNB-pays-fees flag for the user's Futures account.
 ///
 /// `GET /fapi/v1/feeBurn` — returns `{"feeBurn": true}` when the user
