@@ -829,6 +829,11 @@ struct Args {
     #[arg(long, default_value_t = 5u32)]
     wave_refill_threshold: u32,
 
+    /// Wave slow-market valve: refill vacant slots after this many seconds
+    /// regardless of round_trips. `0` = off. Default `300` (5 min).
+    #[arg(long, default_value_t = 300u64)]
+    wave_force_refill_secs: u64,
+
     /// Wave sweep: comma-separated inner dead-zone values in STEPS (mid → first
     /// order = `steps_inner × step`). `0` = origins at the touch. Ignored when
     /// `--wave-auto-inner` is true (the default).
@@ -2354,6 +2359,7 @@ async fn run_sweep_collect(
                             steps_inner: inner,
                             auto_inner: args.wave_auto_inner,
                             round_trips: args.wave_refill_threshold,
+                            force_refill_secs: args.wave_force_refill_secs,
                         }),
                         fees,
                         skim_cfg,

@@ -715,6 +715,7 @@ fn spawn_one_bot(
             steps_inner,
             auto_inner,
             round_trips,
+            force_refill_secs,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -726,6 +727,7 @@ fn spawn_one_bot(
                     steps_inner: *steps_inner,
                     auto_inner: *auto_inner,
                     round_trips: *round_trips,
+                    force_refill_secs: *force_refill_secs,
                 }),
                 tide: None,
                 sg: None,

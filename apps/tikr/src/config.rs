@@ -314,10 +314,18 @@ pub struct WaveParams {
     /// drained). A whole side emptying refills regardless. Default 1.
     #[serde(default = "wave_default_round_trips")]
     pub round_trips: u32,
+    /// Slow-market valve: after this many seconds with vacant slots, refill them
+    /// regardless of `round_trips`. `0` = off. Default `300` (5 min).
+    #[serde(default = "wave_default_force_refill_secs")]
+    pub force_refill_secs: u64,
 }
 
 fn wave_default_auto_inner() -> bool {
     true
+}
+
+fn wave_default_force_refill_secs() -> u64 {
+    300
 }
 
 fn wave_default_round_trips() -> u32 {
@@ -661,6 +669,8 @@ pub enum RampageStrategy {
         auto_inner: bool,
         #[serde(default = "wave_default_round_trips")]
         round_trips: u32,
+        #[serde(default = "wave_default_force_refill_secs")]
+        force_refill_secs: u64,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {
@@ -1450,12 +1460,14 @@ mod tests {
                 steps_inner,
                 auto_inner,
                 round_trips,
+                force_refill_secs,
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
                 assert_eq!(*steps_inner, 2);
                 assert!(*auto_inner, "auto_inner defaults true");
                 assert_eq!(*round_trips, 5);
+                assert_eq!(*force_refill_secs, 300, "default 5min");
             }
             other => panic!("expected Wave, got {other:?}"),
         }

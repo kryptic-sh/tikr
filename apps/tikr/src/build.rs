@@ -557,6 +557,7 @@ fn build_wave(
         steps_inner: wave.steps_inner,
         auto_inner: wave.auto_inner,
         round_trips: wave.round_trips,
+        force_refill_secs: wave.force_refill_secs,
     }))
 }
 

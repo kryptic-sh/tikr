@@ -106,6 +106,13 @@ pub struct WaveConfig {
     /// round-trip. A whole side emptying refills regardless of this. Default
     /// `1`.
     pub round_trips: u32,
+
+    /// Slow-market safety valve: if this many seconds pass since the last refill
+    /// AND any band slot is vacant, refill the empty slots — short-circuiting
+    /// the `round_trips` gate. On a fast market the round-trip / side-empty
+    /// triggers always fire first, so this never bites; on a slow one it stops
+    /// half-drained bands sitting idle. `0` = disabled. Default `300` (5 min).
+    pub force_refill_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +151,8 @@ pub struct Wave {
     /// `on_event` to force a refill so the resting lattice re-places at the new
     /// inner offset immediately (not on the next round-trip/side-empty).
     inner_dirty: bool,
+    /// Event-time (ns) of the last refill, for the `force_refill_secs` valve.
+    last_refill_ns: Option<u64>,
 }
 
 impl Wave {
@@ -624,6 +633,7 @@ impl Strategy for Wave {
             candle_bps: std::collections::VecDeque::with_capacity(CANDLE_WINDOW),
             dyn_inner_steps: 0,
             inner_dirty: false,
+            last_refill_ns: None,
         }
     }
 
@@ -751,12 +761,22 @@ impl Strategy for Wave {
             let full = self.config.levels.max(1);
             let round_trip = bid_drained >= thr && ask_drained >= thr;
             let side_empty = bid_drained >= full || ask_drained >= full;
+            // Slow-market valve: any vacant slot + `force_refill_secs` elapsed
+            // since the last refill → refill anyway (short-circuit round_trips).
+            // Never bites on a fast market — round_trip/side_empty fire first.
+            let force_refill = self.config.force_refill_secs > 0
+                && (bid_drained > 0 || ask_drained > 0)
+                && self.last_refill_ns.is_none_or(|last| {
+                    ctx.now.0.saturating_sub(last)
+                        >= self.config.force_refill_secs.saturating_mul(1_000_000_000)
+                });
             // After a relattice the stale orders are already queued for cancel,
             // so seed the fresh grid directly and skip prune (avoids a redundant
             // double-cancel of those same ids).
             if relatticed {
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
+                self.last_refill_ns = Some(ctx.now.0);
             } else if inner_dirty {
                 // Auto-inner changed → deliberate reposition to the new offset:
                 // re-emit and FULL-prune (near-touch orders inside the new dead
@@ -765,14 +785,17 @@ impl Strategy for Wave {
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
                 self.prune_full_window(ctx, Side::Bid, bb, &mut actions);
                 self.prune_full_window(ctx, Side::Ask, ab, &mut actions);
-            } else if round_trip || side_empty {
+                self.last_refill_ns = Some(ctx.now.0);
+            } else if round_trip || side_empty || force_refill {
                 // Price-tracking refill: re-emit empty slots and prune only the
                 // TRAILING tail. Orders price is moving INTO are left to fill —
-                // never slid out from under an incoming price.
+                // never slid out from under an incoming price. `force_refill`
+                // adds the slow-market valve on top of the round-trip triggers.
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
                 self.prune_trailing_tail(ctx, Side::Bid, bb, &mut actions);
                 self.prune_trailing_tail(ctx, Side::Ask, ab, &mut actions);
+                self.last_refill_ns = Some(ctx.now.0);
             }
         }
 
@@ -821,6 +844,8 @@ mod tests {
             // has its own dedicated tests.
             auto_inner: false,
             round_trips: 1,
+            // Off by default in tests; the force-refill valve has its own test.
+            force_refill_secs: 0,
         }
     }
 
@@ -1250,6 +1275,57 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn force_refill_fills_vacant_slots_after_timeout_only() {
+        // round_trips high so the round-trip trigger can't fire; one vacant slot
+        // must NOT refill before force_refill_secs, but MUST after.
+        let mut c = cfg();
+        c.round_trips = 100;
+        c.force_refill_secs = 60;
+        let mut w = Wave::new(c);
+        let s = snap(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos_flat();
+        let sm = sym();
+        let seeded = w.on_event(
+            &ctx(&sm, &s, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        // Drop exactly ONE bid (partial drain, below round_trips=100).
+        let mut open = quotes_as_open(&seeded);
+        let drop_idx = open
+            .iter()
+            .position(|(_, q)| q.side == Side::Bid)
+            .expect("a bid to drop");
+        open.remove(drop_idx);
+
+        // 30s later (< 60s): no refill — round_trips not met, valve not open.
+        let a30 = w.on_event(
+            &ctx_at(&sm, &s, &p, &open, 30 * 1_000_000_000),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        assert!(
+            a30.is_empty(),
+            "no refill before force_refill_secs elapses: {a30:?}"
+        );
+
+        // 61s later (> 60s): the valve opens → the vacant bid is refilled.
+        let a61 = w.on_event(
+            &ctx_at(&sm, &s, &p, &open, 61 * 1_000_000_000),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        assert!(
+            a61.iter()
+                .any(|a| matches!(a, Action::Quote(q) if q.side == Side::Bid)),
+            "force-refill fills the vacant slot after the timeout: {a61:?}"
+        );
     }
 
     #[test]
