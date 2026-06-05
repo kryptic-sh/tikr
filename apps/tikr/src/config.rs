@@ -336,6 +336,10 @@ pub struct WaveParams {
     /// step differs from the placed one by ≥ this. Default `0.02` (2%).
     #[serde(default = "wave_default_relattice_drift_pct")]
     pub relattice_drift_pct: Decimal,
+    /// Geometric order-size multiplier per lattice step (deeper orders bigger).
+    /// `1.0` (default) = uniform. e.g. `1.2` → each step out is 1.2× the prior.
+    #[serde(default = "wave_default_size_mult")]
+    pub size_mult: Decimal,
 }
 
 fn wave_default_auto_inner() -> bool {
@@ -356,6 +360,10 @@ fn wave_default_auto_candle_window() -> u32 {
 
 fn wave_default_relattice_drift_pct() -> Decimal {
     Decimal::new(2, 2) // 0.02
+}
+
+fn wave_default_size_mult() -> Decimal {
+    Decimal::ONE
 }
 
 fn wave_default_force_refill_secs() -> u64 {
@@ -713,6 +721,8 @@ pub enum RampageStrategy {
         auto_candle_window: u32,
         #[serde(default = "wave_default_relattice_drift_pct")]
         relattice_drift_pct: Decimal,
+        #[serde(default = "wave_default_size_mult")]
+        size_mult: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {
@@ -1507,6 +1517,7 @@ mod tests {
                 auto_step_k,
                 auto_candle_window,
                 relattice_drift_pct,
+                size_mult,
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
@@ -1522,6 +1533,7 @@ mod tests {
                     Decimal::new(2, 2),
                     "relattice_drift_pct defaults 0.02"
                 );
+                assert_eq!(*size_mult, Decimal::ONE, "size_mult defaults 1.0");
             }
             other => panic!("expected Wave, got {other:?}"),
         }

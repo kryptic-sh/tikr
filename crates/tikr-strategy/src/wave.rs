@@ -139,6 +139,14 @@ pub struct WaveConfig {
     /// re-place at ≥102 or ≤98. Skips no-op rebuilds; lower = tracks tighter.
     /// Default `0.02`.
     pub relattice_drift_pct: Decimal,
+
+    /// Geometric order-size multiplier per lattice step: order at `depth` (steps
+    /// from the shallowest active slot) is sized `size_mult^depth × base`.
+    /// Deeper orders bigger → average entry tracks price as the bag fills →
+    /// faster breakeven on a rebound. `1.0` (default) = uniform sizing. Note: a
+    /// side fully filled holds `Σ size_mult^k` × base — front-loads inventory,
+    /// so it amplifies trend risk; keep the position cap / bagger in play.
+    pub size_mult: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,13 +194,29 @@ pub struct Wave {
 }
 
 impl Wave {
-    /// Order size for `price`: notional / price, rounded to the lot step and
-    /// floored at `min_notional`.
-    fn quote_size(&self, price: Price) -> Size {
+    /// Geometric size curve: the notional multiplier for an order at `depth`
+    /// steps from the shallowest active slot (`depth = 0` → 1×). `size_mult`
+    /// compounds per step, so deeper orders are bigger — pulling the average
+    /// entry toward price as the bag fills, for a faster breakeven on rebound.
+    /// `size_mult ≤ 1` (default 1.0) → uniform sizing (no scaling).
+    fn depth_mult(&self, depth: i64) -> Decimal {
+        if self.config.size_mult <= Decimal::ONE || depth <= 0 {
+            return Decimal::ONE;
+        }
+        let mut m = Decimal::ONE;
+        for _ in 0..depth {
+            m *= self.config.size_mult;
+        }
+        m
+    }
+
+    /// Size for an explicit `notional`, rounded to the lot step and floored at
+    /// `min_notional`. Shared by the base + depth-scaled sizing.
+    fn size_for_notional(&self, price: Price, notional: Decimal) -> Size {
         if price.0 <= Decimal::ZERO {
             return Size(Decimal::ZERO);
         }
-        let raw = self.config.notional_per_order / price.0;
+        let raw = notional / price.0;
         let stepped = if self.config.step_size > Decimal::ZERO {
             (raw / self.config.step_size).floor() * self.config.step_size
         } else {
@@ -214,12 +238,15 @@ impl Wave {
         }
     }
 
-    fn make_quote(&self, symbol: &Symbol, side: Side, price: Price) -> Action {
+    /// Emit one order at lattice `depth` (0 = shallowest active slot). Size =
+    /// base notional × `size_mult^depth`, lot-rounded + min-notional floored.
+    fn make_quote(&self, symbol: &Symbol, side: Side, price: Price, depth: i64) -> Action {
+        let notional = self.config.notional_per_order * self.depth_mult(depth);
         Action::Quote(QuoteIntent {
             symbol: symbol.clone(),
             side,
             price,
-            size: self.quote_size(price),
+            size: self.size_for_notional(price, notional),
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
@@ -686,7 +713,10 @@ impl Wave {
             if present {
                 continue;
             }
-            actions.push(self.make_quote(ctx.symbol, side, Price(safe_price)));
+            // Depth from the shallowest active slot (window top) → geometric
+            // size scaling: deeper orders bigger when `size_mult > 1`.
+            let depth = k - window.low_k;
+            actions.push(self.make_quote(ctx.symbol, side, Price(safe_price), depth));
             match side {
                 Side::Bid => {
                     self.emitted_this_event_bid.insert(k);
@@ -957,6 +987,8 @@ mod tests {
             // Prior fixed values so the existing window/relattice tests hold.
             auto_candle_window: 60,
             relattice_drift_pct: Decimal::new(1, 1), // 0.10
+            // Uniform sizing by default; the size-curve has its own test.
+            size_mult: Decimal::ONE,
         }
     }
 
@@ -1082,7 +1114,9 @@ mod tests {
         let w = Wave::new(c);
         for i in 1..=500u32 {
             let price = Decimal::from(i) / Decimal::from(133); // 133 = 7×19 → repeating
-            let sz = w.quote_size(Price(price)).0;
+            let sz = w
+                .size_for_notional(Price(price), w.config.notional_per_order)
+                .0;
             assert!(
                 sz * price >= Decimal::from(5),
                 "notional {} < min 5 at price {price} (size {sz})",
@@ -1741,6 +1775,33 @@ mod tests {
             w.dyn_step_bps, 15,
             "auto-step clamps to the steps_bps ceiling"
         );
+    }
+
+    #[test]
+    fn size_mult_scales_geometrically_by_depth() {
+        let mut c = cfg();
+        c.size_mult = Decimal::new(12, 1); // 1.2
+        let w = Wave::new(c);
+        assert_eq!(w.depth_mult(0), Decimal::ONE, "shallowest = 1×");
+        assert_eq!(w.depth_mult(1), Decimal::new(12, 1), "1.2^1");
+        assert_eq!(w.depth_mult(2), Decimal::new(144, 2), "1.2^2 = 1.44");
+        // Deeper order is bigger in notional terms (same price).
+        let p = Price(Decimal::from(100));
+        let base = w.size_for_notional(p, w.config.notional_per_order).0;
+        let deep = w
+            .size_for_notional(p, w.config.notional_per_order * w.depth_mult(3))
+            .0;
+        assert!(
+            deep > base,
+            "depth-3 order larger than base: {deep} vs {base}"
+        );
+    }
+
+    #[test]
+    fn size_mult_one_is_uniform() {
+        let w = Wave::new(cfg()); // size_mult defaults to 1.0
+        assert_eq!(w.depth_mult(0), Decimal::ONE);
+        assert_eq!(w.depth_mult(5), Decimal::ONE, "no scaling at mult=1");
     }
 
     #[test]

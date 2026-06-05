@@ -576,6 +576,7 @@ fn build_wave(
         maker_fee_bps,
         auto_candle_window: wave.auto_candle_window,
         relattice_drift_pct: wave.relattice_drift_pct,
+        size_mult: wave.size_mult,
     }))
 }
 

@@ -877,6 +877,11 @@ struct Args {
     #[arg(long, default_value = "0.02")]
     wave_relattice_drift_pct: String,
 
+    /// Wave: geometric order-size multiplier per lattice step (deeper orders
+    /// bigger; pulls avg entry toward price). `1.0` (default) = uniform.
+    #[arg(long, default_value = "1.0")]
+    wave_size_mult: String,
+
     // ─── Bagger (inventory-risk flatten) ──────────────────────────────────
     /// Bagger preset(s), composable with `+`: `fixed` | `ratchet` | `dual` |
     /// `cap` | `equity` (e.g. `dual+cap`). Empty (default) = off. Individual
@@ -2451,6 +2456,8 @@ async fn run_sweep_collect(
         let maker_fee_bps = Decimal::from(fees.maker_bps);
         let wave_relattice_drift = Decimal::from_str(&args.wave_relattice_drift_pct)
             .map_err(|e| format!("--wave-relattice-drift-pct: {e}"))?;
+        let wave_size_mult = Decimal::from_str(&args.wave_size_mult)
+            .map_err(|e| format!("--wave-size-mult: {e}"))?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &inner in &wave_inner_sweep {
@@ -2491,6 +2498,7 @@ async fn run_sweep_collect(
                                 maker_fee_bps,
                                 auto_candle_window: args.wave_auto_candle_window,
                                 relattice_drift_pct: wave_relattice_drift,
+                                size_mult: wave_size_mult,
                             }),
                             fees,
                             skim_cfg,
