@@ -537,24 +537,27 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
             }
 
             if !balances.is_empty() {
-                // Sum the USD value of every asset for the wallet base.
+                // WALLET = USD value of EVERY asset (the multi-asset total).
                 let mut wallet_usd = Decimal::ZERO;
-                let mut avail_usd = Decimal::ZERO;
-                let mut cross_usd = Decimal::ZERO;
                 let mut unpriced: Vec<String> = Vec::new();
                 for b in &balances {
                     match asset_usd_value(&b.asset, b.wallet_balance, &tickers) {
-                        Some(v) => {
-                            wallet_usd += v;
-                            avail_usd += asset_usd_value(&b.asset, b.available_balance, &tickers)
-                                .unwrap_or(Decimal::ZERO);
-                            cross_usd +=
-                                asset_usd_value(&b.asset, b.cross_unrealized_pnl, &tickers)
-                                    .unwrap_or(Decimal::ZERO);
-                        }
+                        Some(v) => wallet_usd += v,
                         None => unpriced.push(b.asset.clone()),
                     }
                 }
+                // AVAILABLE + cross-unrealized are ACCOUNT-LEVEL: in multi-asset
+                // margin Binance reports the cross available (already crediting
+                // other assets' collateral) on the margin-asset row, so taking
+                // that row directly is correct — summing per-asset would
+                // double-count the shared collateral.
+                let primary = balances.iter().find(|b| b.asset == cfg.wallet_asset);
+                let avail_usd = primary
+                    .and_then(|b| asset_usd_value(&b.asset, b.available_balance, &tickers))
+                    .unwrap_or(Decimal::ZERO);
+                let cross_usd = primary
+                    .and_then(|b| asset_usd_value(&b.asset, b.cross_unrealized_pnl, &tickers))
+                    .unwrap_or(Decimal::ZERO);
                 if !unpriced.is_empty() {
                     tracing::warn!(
                         ?unpriced,

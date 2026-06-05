@@ -1138,29 +1138,9 @@ fn draw_account(
             Style::default().fg(th().muted),
             Style::default(),
         ));
-        // BNB-aware combined totals — wallet+bnb_usdt and avail+bnb_usdt.
-        // BNB held in futures wallet IS spendable; show the inclusive
-        // figure alongside the asset-only one. Only shown when BNB-fee
-        // mode is on and we have a price.
-        if let Some(b) = bnb
-            && b.enabled
-            && b.balance > Decimal::ZERO
-            && b.price_usdt > Decimal::ZERO
-        {
-            let bnb_usdt = b.balance * b.price_usdt;
-            lines.push(kv_line(
-                "wallet+bnb",
-                format!("{:>.2}", dec_to_f64(api.wallet_balance + bnb_usdt)),
-                Style::default().fg(th().dim),
-                Style::default().fg(th().dim),
-            ));
-            lines.push(kv_line(
-                "avail+bnb",
-                format!("{:>.2}", dec_to_f64(api.available_balance + bnb_usdt)),
-                Style::default().fg(th().dim),
-                Style::default().fg(th().dim),
-            ));
-        }
+        // `wallet` is already the all-asset USD total (BNB included), so a
+        // separate "+bnb" line would double-count — removed. The raw BNB
+        // balance/value is shown in the BNB panel.
         lines.push(kv_line(
             "api unrl",
             format!("{:>+.2}", dec_to_f64(api.cross_unrealized_pnl)),
