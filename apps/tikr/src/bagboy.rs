@@ -377,6 +377,8 @@ fn publish(
         last_fill_price: Decimal::ZERO,
         last_fill_size: Decimal::ZERO,
         inventory_usdt: total_base * bid,
+        peak_long_usdt: Decimal::ZERO,
+        peak_short_usdt: Decimal::ZERO,
         metrics: Vec::new(),
     };
     if let Ok(mut g) = live.write() {

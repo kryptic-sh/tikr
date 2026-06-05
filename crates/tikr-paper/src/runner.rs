@@ -630,6 +630,10 @@ where
     // cap then traded out still shows the high-water mark in the
     // final report.
     let mut peak_position_usdt: Decimal = Decimal::ZERO;
+    // Directional peaks for the live TUI: high-water inventory notional while
+    // long vs while short (both ≥ 0). Session-cumulative.
+    let mut peak_long_usdt: Decimal = Decimal::ZERO;
+    let mut peak_short_usdt: Decimal = Decimal::ZERO;
     // Running accumulators for MEAN absolute position notional (same sample
     // cadence as the peak). Mean shows typical inventory load, not just the
     // high-water mark — a lower mean at equal net = the algo carried less risk.
@@ -1057,9 +1061,17 @@ where
                         // Sample peak position notional at this fresh
                         // mid. tracker.snapshot() is cheap (struct copy)
                         // so once-per-book is fine even on chatty syms.
-                        let pos_notional = tracker.snapshot().size.0.abs() * last_mid.0;
+                        let signed_size = tracker.snapshot().size.0;
+                        let pos_notional = signed_size.abs() * last_mid.0;
                         if pos_notional > peak_position_usdt {
                             peak_position_usdt = pos_notional;
+                        }
+                        if signed_size > Decimal::ZERO {
+                            if pos_notional > peak_long_usdt {
+                                peak_long_usdt = pos_notional;
+                            }
+                        } else if signed_size < Decimal::ZERO && pos_notional > peak_short_usdt {
+                            peak_short_usdt = pos_notional;
                         }
                         position_usdt_sum += pos_notional;
                         position_samples += 1;
@@ -1681,6 +1693,8 @@ where
                             buy_volume,
                             sell_volume,
                             &last_fill,
+                            peak_long_usdt,
+                            peak_short_usdt,
                             live_metrics(&strategy),
                         );
                         // Partial: the LiveQuote is still on the book (FillSim
@@ -1832,6 +1846,8 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    peak_long_usdt,
+                    peak_short_usdt,
                     live_metrics(&strategy),
                 );
 
@@ -2049,6 +2065,8 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    peak_long_usdt,
+                    peak_short_usdt,
                     live_metrics(&strategy),
                 );
                     continue;
@@ -2108,6 +2126,8 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    peak_long_usdt,
+                    peak_short_usdt,
                     live_metrics(&strategy),
                 );
             }
@@ -2137,6 +2157,8 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    peak_long_usdt,
+                    peak_short_usdt,
                     live_metrics(&strategy),
                 );
                 if let Some(ref tap) = config.snapshot_tap {
@@ -2508,6 +2530,8 @@ where
                     buy_volume,
                     sell_volume,
                     &last_fill,
+                    peak_long_usdt,
+                    peak_short_usdt,
                     live_metrics(&strategy),
                 );
                         }
@@ -3254,6 +3278,8 @@ fn publish_live(
     buy_volume: Decimal,
     sell_volume: Decimal,
     last_fill: &Option<Fill>,
+    peak_long_usdt: Decimal,
+    peak_short_usdt: Decimal,
     metrics: Vec<(String, String)>,
 ) {
     let Some(tap) = tap.as_ref() else {
@@ -3324,6 +3350,8 @@ fn publish_live(
         last_fill_price: last_fill.as_ref().map(|f| f.price.0).unwrap_or_default(),
         last_fill_size: last_fill.as_ref().map(|f| f.size.0).unwrap_or_default(),
         inventory_usdt: pos.size.0 * last_mid.0,
+        peak_long_usdt,
+        peak_short_usdt,
         metrics,
     };
     // Non-blocking: dashboard reader can be holding the read lock

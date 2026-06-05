@@ -63,6 +63,12 @@ pub struct LiveSnapshot {
     /// Inventory marked at `last_mid`: `position_size × last_mid`.
     /// Signed (positive = long, negative = short).
     pub inventory_usdt: Decimal,
+    /// Peak LONG inventory notional reached this session (≥ 0). Max of
+    /// `position_notional` while the position was long.
+    pub peak_long_usdt: Decimal,
+    /// Peak SHORT inventory notional reached this session (≥ 0). Max of
+    /// `position_notional` while the position was short.
+    pub peak_short_usdt: Decimal,
     /// Strategy-supplied `(label, value)` introspection pairs (e.g. Wave's
     /// effective step/inner, static-vs-auto). Empty for strategies that don't
     /// implement `status_metrics`. Rendered in the TUI bot-detail panel.

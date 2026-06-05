@@ -2119,6 +2119,19 @@ fn draw_bot_detail(
             Style::default().fg(th().muted),
             pnl_style(lv.inventory_usdt),
         ));
+        // Session high-water inventory notional, per direction (both ≥ 0).
+        lines.push(kv_line(
+            "peak long",
+            format!("{:>.2}", dec_to_f64(lv.peak_long_usdt)),
+            Style::default().fg(th().muted),
+            Style::default().fg(th().green),
+        ));
+        lines.push(kv_line(
+            "peak short",
+            format!("{:>.2}", dec_to_f64(lv.peak_short_usdt)),
+            Style::default().fg(th().muted),
+            Style::default().fg(th().red),
+        ));
         // Strategy introspection (e.g. Wave's effective step_bps / inner,
         // tagged `cfg` for static config vs `auto` for the live auto-sized
         // value). Empty for strategies that don't expose metrics.
