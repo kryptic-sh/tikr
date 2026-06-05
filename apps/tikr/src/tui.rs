@@ -2119,16 +2119,18 @@ fn draw_bot_detail(
             Style::default().fg(th().muted),
             pnl_style(lv.inventory_usdt),
         ));
-        // Session high-water inventory notional, per direction (both ≥ 0).
+        // Session high-water inventory notional, per direction. Stored as
+        // magnitudes (≥ 0); render with an explicit direction sign + color:
+        // long = +green, short = −red.
         lines.push(kv_line(
             "peak long",
-            format!("{:>.2}", dec_to_f64(lv.peak_long_usdt)),
+            format!("+{:>.2}", dec_to_f64(lv.peak_long_usdt)),
             Style::default().fg(th().muted),
             Style::default().fg(th().green),
         ));
         lines.push(kv_line(
             "peak short",
-            format!("{:>.2}", dec_to_f64(lv.peak_short_usdt)),
+            format!("-{:>.2}", dec_to_f64(lv.peak_short_usdt)),
             Style::default().fg(th().muted),
             Style::default().fg(th().red),
         ));
