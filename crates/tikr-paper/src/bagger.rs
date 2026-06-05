@@ -76,6 +76,14 @@ pub struct BaggerConfig {
     /// `cap_pct` (which trims the excess), this dumps the entire position. Not
     /// size-gated (it IS the size gate). `0` off.
     pub inv_flat_wallet_pct: Decimal,
+    /// **Periodic flatten**: every this-many seconds, reduce the open position
+    /// by `periodic_flatten_frac` (e.g. dump HALF every 5 min). A simple
+    /// time-based de-risk — bleeds inventory back toward flat on a schedule,
+    /// independent of P&L or size. `0` off. Not size-gated.
+    pub periodic_flatten_secs: u64,
+    /// Fraction of the position to reduce on each periodic flatten. Default
+    /// `0.5` (half). Only used when `periodic_flatten_secs > 0`.
+    pub periodic_flatten_frac: Decimal,
     /// Gate `inv_flat_wallet_pct` on profit: when `true`, the inventory cap only
     /// fires if the bag is in profit (`unrealized > 0`) — a big-winner
     /// take-profit that locks the gain and leaves underwater bags for the grid
@@ -106,6 +114,8 @@ impl Default for BaggerConfig {
             pnl_flat_pct: Decimal::ZERO,
             inv_flat_wallet_pct: Decimal::ZERO,
             inv_flat_require_profit: false,
+            periodic_flatten_secs: 0,
+            periodic_flatten_frac: Decimal::new(5, 1), // 0.5
         }
     }
 }
@@ -120,6 +130,7 @@ impl BaggerConfig {
             || self.fixed_tp_pct > Decimal::ZERO
             || self.pnl_flat_pct > Decimal::ZERO
             || self.inv_flat_wallet_pct > Decimal::ZERO
+            || self.periodic_flatten_secs > 0
     }
 
     /// Apply a named preset (sets the underlying mechanism params). Keeps the
@@ -206,6 +217,8 @@ pub struct BaggerState {
     last_sign: i32,
     /// Session high-water mark of MTM equity (for equity giveback).
     equity_high_water: Decimal,
+    /// Event-time (ns) of the last periodic flatten (`0` = uninitialized).
+    last_periodic_flatten_ns: u64,
 }
 
 impl BaggerState {
@@ -257,6 +270,29 @@ impl BaggerState {
         }
         let side = Self::reducing_side(pos_size);
         let full = pos_size.abs();
+
+        // --- Periodic flatten: every `periodic_flatten_secs`, reduce the
+        // position by `periodic_flatten_frac` (e.g. half every 5 min). Simple
+        // scheduled de-risk. The timer initializes on the first tick with a
+        // position so the first flatten is one interval after entry, not
+        // immediately.
+        if cfg.periodic_flatten_secs > 0 && cfg.periodic_flatten_frac > Decimal::ZERO {
+            let interval_ns = cfg.periodic_flatten_secs.saturating_mul(1_000_000_000);
+            if self.last_periodic_flatten_ns == 0 {
+                self.last_periodic_flatten_ns = now_ns;
+            } else if now_ns.saturating_sub(self.last_periodic_flatten_ns) >= interval_ns {
+                self.last_periodic_flatten_ns = now_ns;
+                let qty = (full * cfg.periodic_flatten_frac).min(full);
+                if qty > Decimal::ZERO {
+                    return Some(FlattenDecision {
+                        qty,
+                        side,
+                        taker: cfg.exit_taker,
+                        reason: "periodic flatten",
+                    });
+                }
+            }
+        }
 
         // Update peak/trough for the live bag.
         if unrealized > self.peak_unrealized {
@@ -636,6 +672,25 @@ mod tests {
             st.evaluate(&cfg, no_notional).is_none(),
             "no denominator → no-op"
         );
+    }
+
+    #[test]
+    fn periodic_flatten_dumps_half_on_schedule() {
+        let mut cfg = gated("0"); // ungated
+        cfg.periodic_flatten_secs = 300; // 5 min
+        cfg.periodic_flatten_frac = dec("0.5");
+        let ns = 1_000_000_000u64;
+        let mut st = BaggerState::default();
+        // First tick: timer inits, no flatten.
+        assert!(st.evaluate(&cfg, long_input("0", 100 * ns)).is_none());
+        // 4 min later: not yet.
+        assert!(st.evaluate(&cfg, long_input("0", 340 * ns)).is_none());
+        // 5 min after init (100s+300s=400s): fire, dump half of 2 = 1.
+        let d = st.evaluate(&cfg, long_input("0", 400 * ns)).unwrap();
+        assert_eq!(d.reason, "periodic flatten");
+        assert_eq!(d.qty, dec("1"), "half of 2 units");
+        // Immediately after: timer reset, no re-fire.
+        assert!(st.evaluate(&cfg, long_input("0", 401 * ns)).is_none());
     }
 
     #[test]

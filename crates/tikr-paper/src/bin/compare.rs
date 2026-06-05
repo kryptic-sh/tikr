@@ -927,6 +927,13 @@ struct Args {
     /// (unrealized > 0). `false` (default) = unconditional liquidation breaker.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     bagger_inv_flat_require_profit: bool,
+    /// Periodic flatten: reduce the position by `bagger-periodic-flatten-frac`
+    /// every this-many seconds (e.g. 300 = dump half every 5 min). `0` = off.
+    #[arg(long, default_value_t = 0u64)]
+    bagger_periodic_flatten_secs: u64,
+    /// Fraction reduced on each periodic flatten. Default 0.5 (half).
+    #[arg(long, default_value = "0.5")]
+    bagger_periodic_flatten_frac: String,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -1425,6 +1432,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bagger_cfg.inv_flat_wallet_pct = invflat;
     }
     bagger_cfg.inv_flat_require_profit = args.bagger_inv_flat_require_profit;
+    if args.bagger_periodic_flatten_secs > 0 {
+        bagger_cfg.periodic_flatten_secs = args.bagger_periodic_flatten_secs;
+        bagger_cfg.periodic_flatten_frac = Decimal::from_str(&args.bagger_periodic_flatten_frac)?;
+    }
     let _ = BAGGER.set(bagger_cfg);
 
     // Isolated-margin liquidation model. Leverage drives the liq distance
