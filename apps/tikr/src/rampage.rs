@@ -398,6 +398,18 @@ pub fn spawn_rampage_manager(
                     );
                     continue; // keep the bot; it holds its slot until recovered
                 }
+                // Gate-and-defer: only rotate when the account is healthy enough
+                // to FULLY flatten. While rate-limited the flatten would fail and
+                // strand the position (banked + Rotated but still open → orphan
+                // churn), so keep the bot — it manages its bag — and retry next
+                // cycle.
+                if shared_state.rate_limit_remaining_ms() > 0 {
+                    info!(
+                        symbol = %symbol,
+                        "rampage: deferring rotation — account rate-limited (would strand the position)"
+                    );
+                    continue;
+                }
                 if let Some(bot) = active.remove(&symbol) {
                     warn!(
                         symbol = %symbol,
@@ -408,7 +420,27 @@ pub fn spawn_rampage_manager(
                     // still-running bot would re-quote and re-open the position
                     // we're about to close, orphaning it.
                     stop_bot(bot).await;
-                    flatten_symbols(std::slice::from_ref(&symbol), &account).await;
+                    // If the flatten fails (e.g. a rate limit hit mid-rotation),
+                    // DON'T bank/retire a bot whose position is still open —
+                    // re-spawn a manager so the residual keeps being worked and
+                    // the rotation retries next cycle.
+                    if !flatten_symbols(std::slice::from_ref(&symbol), &account, &shared_state)
+                        .await
+                    {
+                        warn!(
+                            symbol = %symbol,
+                            "rampage: flatten failed — re-spawning manager, deferring retire"
+                        );
+                        let bot = spawn_one_bot(
+                            &symbol,
+                            &account,
+                            &shared_state,
+                            &cfg,
+                            template.as_ref(),
+                        );
+                        active.insert(symbol.clone(), bot);
+                        continue;
+                    }
                     shared_state.set_status(&symbol, BotStatus::Rotated);
                     // PERMANENTLY bank this bot's P&L into the session retired
                     // totals now (not at prune) and delete its snapshot so a
@@ -600,7 +632,17 @@ async fn stop_bot(bot: ActiveBot) {
     }
 }
 
-async fn flatten_symbols(symbols: &[String], account: &RampageAccountCtx) {
+/// Cancel + reduce-only-close every `symbol`. Returns `true` only if EVERY
+/// symbol flattened cleanly. A venue-build failure (e.g. a rate-limited
+/// `exchangeInfo`) is published to the account-wide gate so callers can defer,
+/// and makes this return `false` — the caller must NOT treat the position as
+/// closed.
+async fn flatten_symbols(
+    symbols: &[String],
+    account: &RampageAccountCtx,
+    shared_state: &SharedBotState,
+) -> bool {
+    let mut all_ok = true;
     for symbol_str in symbols {
         let symbol = venue::perp_symbol(symbol_str);
         match venue::build_venue(
@@ -616,13 +658,24 @@ async fn flatten_symbols(symbols: &[String], account: &RampageAccountCtx) {
                 info!(symbol = symbol_str, "rampage: cancel + flatten");
                 reset_symbol_state(&v, &symbol).await;
             }
-            Err(e) => warn!(
-                symbol = symbol_str,
-                error = ?e,
-                "rampage: venue build for flatten failed"
-            ),
+            Err(e) => {
+                // Preserve the gate so the rotation defers instead of stranding.
+                if let Some(tikr_venue::VenueError::RateLimited { retry_after_ms }) = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<tikr_venue::VenueError>())
+                {
+                    shared_state.note_rate_limit(*retry_after_ms);
+                }
+                warn!(
+                    symbol = symbol_str,
+                    error = ?e,
+                    "rampage: venue build for flatten failed"
+                );
+                all_ok = false;
+            }
         }
     }
+    all_ok
 }
 
 /// Mean absolute 1-minute close-to-close return, in bps — the realized-vol
