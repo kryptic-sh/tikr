@@ -84,6 +84,17 @@ pub struct BaggerConfig {
     /// Fraction of the position to reduce on each periodic flatten. Default
     /// `0.5` (half). Only used when `periodic_flatten_secs > 0`.
     pub periodic_flatten_frac: Decimal,
+    /// **Wallet bracket TP**: reduce the position by `wallet_flat_frac` when
+    /// unrealized P&L reaches `+this %` of the wallet (e.g. `1` = +1% → cut
+    /// half). Ungated. `0` off.
+    pub wallet_tp_pct: Decimal,
+    /// **Wallet bracket SL**: reduce the position by `wallet_flat_frac` when
+    /// unrealized P&L falls to `−this %` of the wallet (e.g. `2` = −2% → cut
+    /// half). Ungated. `0` off.
+    pub wallet_sl_pct: Decimal,
+    /// Fraction to reduce on either wallet-bracket trigger. Default `0.5`
+    /// (half). Only used when a wallet bracket is enabled.
+    pub wallet_flat_frac: Decimal,
     /// Gate `inv_flat_wallet_pct` on profit: when `true`, the inventory cap only
     /// fires if the bag is in profit (`unrealized > 0`) — a big-winner
     /// take-profit that locks the gain and leaves underwater bags for the grid
@@ -116,6 +127,9 @@ impl Default for BaggerConfig {
             inv_flat_require_profit: false,
             periodic_flatten_secs: 0,
             periodic_flatten_frac: Decimal::new(5, 1), // 0.5
+            wallet_tp_pct: Decimal::ZERO,
+            wallet_sl_pct: Decimal::ZERO,
+            wallet_flat_frac: Decimal::new(5, 1), // 0.5
         }
     }
 }
@@ -131,6 +145,8 @@ impl BaggerConfig {
             || self.pnl_flat_pct > Decimal::ZERO
             || self.inv_flat_wallet_pct > Decimal::ZERO
             || self.periodic_flatten_secs > 0
+            || self.wallet_tp_pct > Decimal::ZERO
+            || self.wallet_sl_pct > Decimal::ZERO
     }
 
     /// Apply a named preset (sets the underlying mechanism params). Keeps the
@@ -339,6 +355,35 @@ impl BaggerState {
                     taker: false,
                     reason: "pnl flat",
                 });
+            }
+        }
+
+        // --- Wallet bracket: ungated 2-sided cut. Reduce by `wallet_flat_frac`
+        // when unrealized hits +`wallet_tp_pct`% (take a slice of profit) or
+        // −`wallet_sl_pct`% (cut a slice of loss) of the wallet.
+        if balance > Decimal::ZERO && cfg.wallet_flat_frac > Decimal::ZERO {
+            let qty = (full * cfg.wallet_flat_frac).min(full);
+            if qty > Decimal::ZERO {
+                if cfg.wallet_tp_pct > Decimal::ZERO
+                    && unrealized >= balance * cfg.wallet_tp_pct / Decimal::from(100)
+                {
+                    return Some(FlattenDecision {
+                        qty,
+                        side,
+                        taker: cfg.exit_taker,
+                        reason: "wallet bracket TP",
+                    });
+                }
+                if cfg.wallet_sl_pct > Decimal::ZERO
+                    && unrealized <= -(balance * cfg.wallet_sl_pct / Decimal::from(100))
+                {
+                    return Some(FlattenDecision {
+                        qty,
+                        side,
+                        taker: cfg.exit_taker,
+                        reason: "wallet bracket SL",
+                    });
+                }
             }
         }
 
@@ -691,6 +736,31 @@ mod tests {
         assert_eq!(d.qty, dec("1"), "half of 2 units");
         // Immediately after: timer reset, no re-fire.
         assert!(st.evaluate(&cfg, long_input("0", 401 * ns)).is_none());
+    }
+
+    #[test]
+    fn wallet_bracket_2sided_half() {
+        // balance 1000: TP +1% = +10, SL -2% = -20. Reduce half (of 2 = 1).
+        let mut cfg = gated("0"); // ungated
+        cfg.wallet_tp_pct = dec("1");
+        cfg.wallet_sl_pct = dec("2");
+        cfg.wallet_flat_frac = dec("0.5");
+        // +10 unrealized → TP cut half.
+        let mut st = BaggerState::default();
+        let d = st.evaluate(&cfg, long_input("10", 0)).unwrap();
+        assert_eq!(d.reason, "wallet bracket TP");
+        assert_eq!(d.qty, dec("1"), "half of 2");
+        // +9 → not yet.
+        let mut st2 = BaggerState::default();
+        assert!(st2.evaluate(&cfg, long_input("9", 0)).is_none());
+        // -20 unrealized → SL cut half.
+        let mut st3 = BaggerState::default();
+        let d3 = st3.evaluate(&cfg, long_input("-20", 0)).unwrap();
+        assert_eq!(d3.reason, "wallet bracket SL");
+        assert_eq!(d3.qty, dec("1"));
+        // -19 → not yet (between TP and SL → hold).
+        let mut st4 = BaggerState::default();
+        assert!(st4.evaluate(&cfg, long_input("-19", 0)).is_none());
     }
 
     #[test]

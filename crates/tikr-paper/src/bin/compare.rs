@@ -934,6 +934,17 @@ struct Args {
     /// Fraction reduced on each periodic flatten. Default 0.5 (half).
     #[arg(long, default_value = "0.5")]
     bagger_periodic_flatten_frac: String,
+    /// Wallet-bracket TP: reduce by `bagger-wallet-flat-frac` when unrealized
+    /// reaches +this % of wallet (e.g. 1 = +1%). `0` off.
+    #[arg(long, default_value = "0")]
+    bagger_wallet_tp_pct: String,
+    /// Wallet-bracket SL: reduce by `bagger-wallet-flat-frac` when unrealized
+    /// falls to −this % of wallet (e.g. 2 = −2%). `0` off.
+    #[arg(long, default_value = "0")]
+    bagger_wallet_sl_pct: String,
+    /// Fraction reduced on either wallet-bracket trigger. Default 0.5 (half).
+    #[arg(long, default_value = "0.5")]
+    bagger_wallet_flat_frac: String,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -1435,6 +1446,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.bagger_periodic_flatten_secs > 0 {
         bagger_cfg.periodic_flatten_secs = args.bagger_periodic_flatten_secs;
         bagger_cfg.periodic_flatten_frac = Decimal::from_str(&args.bagger_periodic_flatten_frac)?;
+    }
+    let wtp = Decimal::from_str(&args.bagger_wallet_tp_pct)?;
+    let wsl = Decimal::from_str(&args.bagger_wallet_sl_pct)?;
+    if wtp > Decimal::ZERO || wsl > Decimal::ZERO {
+        bagger_cfg.wallet_tp_pct = wtp;
+        bagger_cfg.wallet_sl_pct = wsl;
+        bagger_cfg.wallet_flat_frac = Decimal::from_str(&args.bagger_wallet_flat_frac)?;
     }
     let _ = BAGGER.set(bagger_cfg);
 

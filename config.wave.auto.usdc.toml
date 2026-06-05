@@ -1,10 +1,10 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "0.05"
+order_balance_pct = "0.5"
 max_position_pct = "0"
 take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
-leverage = 10
+leverage = 30
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
@@ -41,4 +41,4 @@ auto_step = false            # auto-size the lattice step (k×mean candle gap, f
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
 relattice_drift_pct = "0.02" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
-size_mult = "1.5"            # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
+size_mult = "1.25"           # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
