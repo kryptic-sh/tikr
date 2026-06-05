@@ -1691,11 +1691,24 @@ fn draw_chart(
         ));
     }
     if let Some(avg) = avg_entry {
+        // Profit-window indicator: green when the position is in profit, red
+        // when in loss, neutral when AVG is within 1% of the mark (mid). Long
+        // profits when mark > avg, short when mark < avg.
+        let mark = api.map(|p| p.mark_price).unwrap_or(Decimal::ZERO);
+        let pos = api.map(|p| p.position_amount).unwrap_or(Decimal::ZERO);
+        let one_pct = Decimal::new(1, 2); // 0.01
+        let avg_color = if mark <= Decimal::ZERO || (avg - mark).abs() / mark <= one_pct {
+            th().fg // within 1% (or no mark) → neutral
+        } else if (pos > Decimal::ZERO && mark > avg) || (pos < Decimal::ZERO && mark < avg) {
+            th().green // in the profit window
+        } else {
+            th().red // underwater
+        };
         refs.push((
             avg,
             format!(" AVG {} ", fmt_price(avg, price_dp)),
             '─',
-            th().fg,
+            avg_color,
         ));
     }
     if let Some(liq) = liq_price {
