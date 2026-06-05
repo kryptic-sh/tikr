@@ -2272,9 +2272,16 @@ where
                     // reversal paths below null it explicitly), it FILLED → latch
                     // `tp_taken` so we don't re-arm and ladder out the rest of the
                     // bag.
+                    // Detect a TP fill against the UNFILTERED quote list — the
+                    // strategy-facing `quotes` excludes manager orders, so it
+                    // would always look "gone" and false-detect a fill.
                     if let Some(id) = tp_quote_id
-                        && !quotes.iter().any(|(qid, _)| *qid == id)
+                        && !fill_sim
+                            .all_live_quotes_for(&symbol)
+                            .iter()
+                            .any(|(qid, _)| *qid == id)
                     {
+                        fill_sim.unmark_manager(id);
                         tp_quote_id = None;
                         tp_price = None;
                         tp_taken = true;
@@ -2296,6 +2303,7 @@ where
                         if unrealized < threshold || drifted {
                             let _ = venue.cancel(id).await;
                             fill_sim.drop_quote(id);
+                            fill_sim.unmark_manager(id);
                             tp_quote_id = None;
                             tp_price = None;
                             if drifted && unrealized >= threshold {
@@ -2339,6 +2347,10 @@ where
                                         now_ts,
                                         id,
                                     );
+                                    // Hide this reduce-only order from the
+                                    // strategy so it can't re-quote against or
+                                    // cancel the manager's profit-lock.
+                                    fill_sim.mark_manager(id);
                                     tp_quote_id = Some(id);
                                     tp_price = Some(px);
                                     info!(

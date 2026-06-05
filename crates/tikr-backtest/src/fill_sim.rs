@@ -5,6 +5,7 @@
 //! [issue #11]: https://github.com/kryptic-sh/tikr/issues/11
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use tikr_core::{
     Decimal, Fill, MarketEvent, Notional, Price, Side, Size, Snapshot, Symbol, TimeInForce,
@@ -270,6 +271,12 @@ pub struct FillSim {
     diag: FillDiag,
     pending: Vec<PendingOp>,
     live_quotes: Vec<LiveQuote>,
+    /// IDs of orders placed by the MANAGER (runner-level take-profit / bagger),
+    /// not the strategy. These are hidden from the strategy-facing views
+    /// (`live_quotes_for`, `open_quotes`, `committed_notional_by_side`) so the
+    /// strategy never sees, re-quotes against, or cancels them. The runner still
+    /// sees them via `all_live_quotes_for` for its own fill tracking.
+    manager_ids: HashSet<QuoteId>,
     book_state: HashMap<Symbol, BookState>,
     /// Intents rejected during the last `apply_pending` pass (post-only
     /// crosses the touch). Paper-mode runner drains this after each
@@ -322,6 +329,7 @@ impl FillSim {
             diag: FillDiag::default(),
             pending: Vec::new(),
             live_quotes: Vec::new(),
+            manager_ids: HashSet::new(),
             book_state: HashMap::new(),
             pending_rejections: Vec::new(),
             position_notional: HashMap::new(),
@@ -384,12 +392,51 @@ impl FillSim {
         out
     }
 
+    /// Tag an order id as MANAGER-owned (take-profit / bagger) — hidden from the
+    /// strategy-facing views. Call right after placing a runner-level order.
+    pub fn mark_manager(&mut self, id: QuoteId) {
+        self.manager_ids.insert(id);
+    }
+
+    /// Untag a manager order (it resolved — filled/cancelled). Keeps the set
+    /// bounded; safe to call with an unknown id.
+    pub fn unmark_manager(&mut self, id: QuoteId) {
+        self.manager_ids.remove(&id);
+    }
+
+    /// ALL live quotes for `symbol`, INCLUDING manager orders — for the runner's
+    /// own order-lifecycle tracking (e.g. detecting a take-profit fill). The
+    /// strategy must NOT use this; it should see only [`Self::live_quotes_for`].
+    pub fn all_live_quotes_for(&self, symbol: &Symbol) -> Vec<(QuoteId, QuoteIntent)> {
+        self.live_quotes
+            .iter()
+            .filter(|q| &q.symbol == symbol)
+            .map(|q| {
+                (
+                    q.id,
+                    QuoteIntent {
+                        symbol: q.symbol.clone(),
+                        side: q.side,
+                        price: q.price,
+                        size: q.size_remaining,
+                        tif: TimeInForce::PostOnly,
+                        kind: tikr_core::QuoteKind::Point,
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// Same as [`Self::live_quotes_for`] but writes into a caller-owned buffer
     /// (cleared first), so the hot per-event path can reuse one allocation
     /// instead of allocating a fresh Vec every call.
     pub fn live_quotes_into(&self, symbol: &Symbol, out: &mut Vec<(QuoteId, QuoteIntent)>) {
         out.clear();
-        for q in self.live_quotes.iter().filter(|q| &q.symbol == symbol) {
+        for q in self
+            .live_quotes
+            .iter()
+            .filter(|q| &q.symbol == symbol && !self.manager_ids.contains(&q.id))
+        {
             out.push((
                 q.id,
                 QuoteIntent {
@@ -418,7 +465,9 @@ impl FillSim {
                 Op::Place {
                     intent,
                     override_id,
-                } if &intent.symbol == symbol => {
+                } if &intent.symbol == symbol
+                    && !override_id.is_some_and(|id| self.manager_ids.contains(&id)) =>
+                {
                     out.push((override_id.unwrap_or_else(QuoteId::nil), intent.clone()));
                 }
                 // A pending Replace's NEW intent occupies its slot the moment
@@ -442,7 +491,13 @@ impl FillSim {
     pub fn committed_notional_by_side(&self, symbol: &Symbol) -> (Decimal, Decimal) {
         let mut bid = Decimal::ZERO;
         let mut ask = Decimal::ZERO;
-        for q in self.live_quotes.iter().filter(|q| &q.symbol == symbol) {
+        // Manager (reduce-only) orders are excluded — they REDUCE inventory, so
+        // they must not count toward the bot's adding-side committed exposure.
+        for q in self
+            .live_quotes
+            .iter()
+            .filter(|q| &q.symbol == symbol && !self.manager_ids.contains(&q.id))
+        {
             let n = q.price.0 * q.size_remaining.0;
             match q.side {
                 Side::Bid => bid += n,
@@ -450,8 +505,12 @@ impl FillSim {
             }
         }
         for p in &self.pending {
-            if let Op::Place { intent, .. } = &p.op
+            if let Op::Place {
+                intent,
+                override_id,
+            } = &p.op
                 && &intent.symbol == symbol
+                && !override_id.is_some_and(|id| self.manager_ids.contains(&id))
             {
                 let n = intent.price.0 * intent.size.0;
                 match intent.side {
