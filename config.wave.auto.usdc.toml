@@ -1,10 +1,10 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "0.05"
+order_balance_pct = "0.1"
 max_position_pct = "0"
 take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
-leverage = 5
+leverage = 25
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
@@ -26,7 +26,7 @@ enabled = true
 min_volume_usdc = "20000000" # $20M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDC"
-top_n = 1
+top_n = 2
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.01" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 big_bag_pct = "0"        # hold (don't rotate) a bot in POSITIVE unrealized whose bag ≥ this % of wallet — work it down instead of dumping; 0 = off
@@ -51,4 +51,4 @@ auto_step = false            # auto-size the lattice step (k×mean candle gap, f
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
 relattice_drift_pct = "0.02" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
-size_mult = "1.25"           # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
+size_mult = "1.0"            # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
