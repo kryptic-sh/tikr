@@ -4,7 +4,7 @@ asset = "USDC"
 order_balance_pct = "0.5"
 max_position_pct = "0"
 take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
-leverage = 10
+leverage = 5
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
