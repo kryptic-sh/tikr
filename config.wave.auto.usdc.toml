@@ -1,7 +1,7 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "0.5"
+order_balance_pct = "0.05"
 max_position_pct = "0"
 take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 5
