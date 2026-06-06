@@ -4,12 +4,22 @@ asset = "USDC"
 order_balance_pct = "0.5"
 max_position_pct = "0"
 take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
-leverage = 30
+leverage = 10
 inventory_boost_pct = "0"
 inventory_boost_curve = "1"
 bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
 # bnb_min_balance_usdc = "1"     # refill trigger (default $1)
 # bnb_target_balance_usdc = "10" # top-up target (default $10)
+
+# Bagger (inventory-risk flatten) — profit lock (ratchet): snapshot MTM equity
+# (wallet + unrealized); once equity grows +2% past the snapshot, flatten the
+# WHOLE bag to bank the gain, then re-snapshot at the new (higher) equity. A
+# monotonic profit ratchet — each +2% of growth is realized and the bar steps up.
+# All other mechanisms off.
+[account.bagger]
+#profit_lock_pct = "2" # bank the bag + re-baseline every +2% equity growth
+#loss_lock_pct = "3"   # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
+#exit_taker = false    # reduce-only maker exit (don't pay the spread)
 
 [rampage]
 enabled = true
@@ -33,10 +43,10 @@ kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 levels = 20
 round_trips = 10
-steps_bps = 2
+steps_bps = 5
 auto_inner = true            # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 0              # only used when auto_inner = false
-force_refill_secs = 0        # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
+force_refill_secs = 120      # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
 auto_step = false            # auto-size the lattice step (k×mean candle gap, floored at 2× maker fee, capped at steps_bps); false = fixed steps_bps
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
