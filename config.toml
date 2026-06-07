@@ -47,6 +47,7 @@ min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
+notional = 5
 levels = 10
 round_trips = 5
 steps_bps = 1
