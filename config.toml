@@ -47,12 +47,11 @@ min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
-notional = 5
-levels = 10
-round_trips = 5
+levels = 20
+round_trips = 10
 steps_bps = 1
 auto_inner = false        # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
-steps_inner = 1           # only used when auto_inner = false
+steps_inner = 2           # only used when auto_inner = false
 force_refill_secs = 0     # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
 auto_step = false         # auto-size the lattice step (k×mean candle gap, floored at 2× maker fee, capped at steps_bps); false = fixed steps_bps
 auto_step_k = "0.25"      # when auto_step=true: each step targets this fraction of the mean 1s candle range
