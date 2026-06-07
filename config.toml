@@ -7,7 +7,7 @@ auto_scale = false                     # false = each bot orders FULL wallet×or
 min_bot_capital_usdc = "200"           # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
 take_profit_pct = "0"                  # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 25
-inventory_boost_pct = "50"             # profit-gated reducing-side size boost: enlarge reducing (in-profit) orders as they sit further past avg
+inventory_boost_pct = "0"              # profit-gated reducing-side size boost: enlarge reducing (in-profit) orders as they sit further past avg
 inventory_boost_curve = "1"
 inventory_boost_profit_gated = true    # gate the boost on per-order profit vs avg (never enlarge a loss-locking quote); works cap-off
 inventory_boost_profit_full_bps = "50" # reducing boost saturates at this many bps past avg-entry
