@@ -23,8 +23,8 @@ bnb_refill_enabled = true               # this is the manager process; enable on
 # monotonic profit ratchet — each +2% of growth is realized and the bar steps up.
 # All other mechanisms off.
 [account.bagger]
-profit_lock_pct = "2" # bank the bag + re-baseline every +2% equity growth
-loss_lock_pct = "3"   # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
+profit_lock_pct = "5" # bank the bag + re-baseline every +2% equity growth
+loss_lock_pct = "10"  # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
 exit_taker = false    # reduce-only maker exit (don't pay the spread)
 
 [rampage]
@@ -49,13 +49,13 @@ kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 levels = 20
 round_trips = 10
-steps_bps = 1
+steps_bps = 10
 auto_inner = true            # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 0              # only used when auto_inner = false
-force_refill_secs = 30       # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
+force_refill_secs = 120      # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
 auto_step = false            # auto-size the lattice step (k×mean candle gap, floored at 2× maker fee, capped at steps_bps); false = fixed steps_bps
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
 relattice_drift_pct = "0.02" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
-size_mult = "1.0"            # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
-size_ramp = "10"             # LINEAR inner→outer size ramp: innermost order 1×, outermost size_ramp×, straight-line between; 1.0 = uniform
+size_mult = "1"              # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
+size_ramp = "3"              # LINEAR inner→outer size ramp: innermost order 1×, outermost size_ramp×, straight-line between; 1.0 = uniform
