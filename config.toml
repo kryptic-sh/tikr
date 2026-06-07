@@ -23,7 +23,7 @@ bnb_refill_enabled = true               # this is the manager process; enable on
 # monotonic profit ratchet — each +2% of growth is realized and the bar steps up.
 # All other mechanisms off.
 [account.bagger]
-#profit_lock_pct = "5" # bank the bag + re-baseline every +2% equity growth
+profit_lock_pct = "0.1" # bank the bag + re-baseline every +2% equity growth
 #loss_lock_pct = "10" # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
 #exit_taker = false   # reduce-only maker exit (don't pay the spread)
 
