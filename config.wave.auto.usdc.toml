@@ -1,10 +1,10 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "1"
+order_balance_pct = "0.2"
 max_position_pct = "0"
 auto_scale = true                      # wallet-aware: N = min(rampage.top_n, floor(wallet/min_bot_capital_usdc)); each bot orders (wallet/N)×order_balance_pct
-min_bot_capital_usdc = "500"           # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
+min_bot_capital_usdc = "250"           # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
 take_profit_pct = "0"                  # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 25
 inventory_boost_pct = "200"            # profit-gated reducing-side size boost: enlarge reducing orders up to +25% as they sit further past avg
@@ -45,13 +45,12 @@ min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
-notional = 5
 levels = 20
 round_trips = 10
 steps_bps = 1
 auto_inner = true            # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 0              # only used when auto_inner = false
-force_refill_secs = 5        # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
+force_refill_secs = 30       # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
 auto_step = false            # auto-size the lattice step (k×mean candle gap, floored at 2× maker fee, capped at steps_bps); false = fixed steps_bps
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
