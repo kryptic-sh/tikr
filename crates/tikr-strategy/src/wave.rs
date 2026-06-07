@@ -257,10 +257,48 @@ impl Wave {
         }
     }
 
+    /// Inventory-aware reducing-side size multiplier — a proportional controller
+    /// that keeps net inventory flat through directional moves. In a trend the
+    /// reducing side fills rarely (price runs away from it) while the adding side
+    /// sweeps, so the bag grows. This enlarges each reducing order in proportion
+    /// to the bag (the error signal) so the few reducing fills shed as much as
+    /// the many adding fills accumulate:
+    ///   `boost = 1 + (size_ramp − 1) · (bag_notional / ladder)`,
+    /// where `ladder = notional_per_order × levels` (one flat ladder — a
+    /// self-referential unit that scales with the wallet via notional_per_order).
+    /// Reducing side only (long → Ask, short → Bid); adding/flat side or
+    /// `size_ramp ≤ 1` → `1.0`. Uncapped on purpose: a reduce-only order
+    /// self-limits at the remaining bag, so the boost can never oversell.
+    fn reduce_size_boost(&self, signed_pos: Decimal, mark: Decimal, side: Side) -> Decimal {
+        let gain = self.config.size_ramp - Decimal::ONE;
+        if gain <= Decimal::ZERO || signed_pos == Decimal::ZERO || mark <= Decimal::ZERO {
+            return Decimal::ONE;
+        }
+        let reducing = (signed_pos > Decimal::ZERO && side == Side::Ask)
+            || (signed_pos < Decimal::ZERO && side == Side::Bid);
+        if !reducing {
+            return Decimal::ONE;
+        }
+        let ladder = self.config.notional_per_order * Decimal::from(self.config.levels.max(1));
+        if ladder <= Decimal::ZERO {
+            return Decimal::ONE;
+        }
+        let u = (signed_pos.abs() * mark) / ladder;
+        Decimal::ONE + gain * u
+    }
+
     /// Emit one order at lattice `depth` (0 = shallowest active slot). Size =
-    /// base notional × `size_mult^depth`, lot-rounded + min-notional floored.
-    fn make_quote(&self, symbol: &Symbol, side: Side, price: Price, depth: i64) -> Action {
-        let notional = self.config.notional_per_order * self.depth_mult(depth);
+    /// base notional × `size_mult^depth` × `reduce_boost` (inventory-aware
+    /// reducing-side enlargement), lot-rounded + min-notional floored.
+    fn make_quote(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        price: Price,
+        depth: i64,
+        reduce_boost: Decimal,
+    ) -> Action {
+        let notional = self.config.notional_per_order * self.depth_mult(depth) * reduce_boost;
         Action::Quote(QuoteIntent {
             symbol: symbol.clone(),
             side,
@@ -680,6 +718,15 @@ impl Wave {
         let cross_guard_ask = ctx.latest_book.asks.first().map(|l| l.price);
         let cross_guard_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let tick = self.config.tick_size;
+        // Inventory-aware reducing-side boost — same for every order on this side
+        // (depends only on the bag), so compute it once. Mark = book mid.
+        let mark = match (cross_guard_bid, cross_guard_ask) {
+            (Some(b), Some(a)) => (b.0 + a.0) / Decimal::from(2),
+            (Some(b), None) => b.0,
+            (None, Some(a)) => a.0,
+            (None, None) => Decimal::ZERO,
+        };
+        let reduce_boost = self.reduce_size_boost(ctx.position.size.0, mark, side);
         for k in window.low_k..=window.high_k {
             let Some(price_raw) = (match side {
                 Side::Bid => self.bid_price(k),
@@ -735,7 +782,7 @@ impl Wave {
             // Depth from the shallowest active slot (window top) → geometric
             // size scaling: deeper orders bigger when `size_mult > 1`.
             let depth = k - window.low_k;
-            actions.push(self.make_quote(ctx.symbol, side, Price(safe_price), depth));
+            actions.push(self.make_quote(ctx.symbol, side, Price(safe_price), depth, reduce_boost));
             match side {
                 Side::Bid => {
                     self.emitted_this_event_bid.insert(k);
@@ -1832,6 +1879,48 @@ mod tests {
             w.depth_mult(9),
             Decimal::from(2),
             "clamped to 2× beyond outer"
+        );
+    }
+
+    #[test]
+    fn reduce_boost_scales_with_inventory_on_reducing_side_only() {
+        let mut c = cfg();
+        c.levels = 10;
+        c.notional_per_order = Decimal::from(5); // ladder = 5 × 10 = $50
+        c.size_ramp = Decimal::from(5); // gain = 4
+        let w = Wave::new(c);
+        let mark = Decimal::from(100);
+        // Flat → no boost on either side.
+        assert_eq!(
+            w.reduce_size_boost(Decimal::ZERO, mark, Side::Ask),
+            Decimal::ONE
+        );
+        // Long bag of 0.5 → notional $50 = one full ladder → u = 1.
+        // Reducing side (Ask): boost = 1 + 4·1 = 5.
+        let long = Decimal::new(5, 1); // 0.5 × 100 = $50
+        assert_eq!(w.reduce_size_boost(long, mark, Side::Ask), Decimal::from(5));
+        // Adding side (Bid) for a long → untouched.
+        assert_eq!(w.reduce_size_boost(long, mark, Side::Bid), Decimal::ONE);
+        // Half a ladder ($25) → u = 0.5 → boost = 1 + 4·0.5 = 3.
+        let half = Decimal::new(25, 2); // 0.25 × 100 = $25
+        assert_eq!(w.reduce_size_boost(half, mark, Side::Ask), Decimal::from(3));
+        // Short bag → reducing side is Bid; Ask (adding) untouched.
+        assert_eq!(
+            w.reduce_size_boost(-long, mark, Side::Bid),
+            Decimal::from(5)
+        );
+        assert_eq!(w.reduce_size_boost(-long, mark, Side::Ask), Decimal::ONE);
+    }
+
+    #[test]
+    fn reduce_boost_off_when_size_ramp_one() {
+        let mut c = cfg();
+        c.size_ramp = Decimal::ONE; // gain 0 → controller disabled
+        let w = Wave::new(c);
+        let long = Decimal::from(1000);
+        assert_eq!(
+            w.reduce_size_boost(long, Decimal::from(100), Side::Ask),
+            Decimal::ONE
         );
     }
 
