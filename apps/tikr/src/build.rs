@@ -10,9 +10,9 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, InventoryBoostConfig, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
-    HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MantisConfig,
-    MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig,
-    StranglerConfig, TideConfig, VolleyConfig, WaveConfig,
+    FlatMmConfig, HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig,
+    MantisConfig, MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig,
+    StaticGridConfig, StranglerConfig, TideConfig, VolleyConfig, WaveConfig,
 };
 use tokio::sync::watch;
 
@@ -86,12 +86,13 @@ pub fn to_spec(
         "joker" | "jk" => build_joker(cfg, &symbol, venue, default_notional)?,
         "rsi-mr" | "rsimr" => build_rsi_mr(cfg, &symbol, venue, default_notional)?,
         "wave" | "wv" => build_wave(cfg, &symbol, venue, default_notional)?,
+        "flat-mm" | "fm" => build_flat_mm(cfg, &symbol, venue, default_notional)?,
         "mantis" | "mn" => build_mantis(cfg, &symbol, venue, default_notional)?,
         "volley" | "vl" => build_volley(cfg, &symbol, venue, default_notional)?,
         "strangler" | "st" => build_strangler(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, mantis, volley, strangler)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, flat-mm, mantis, volley, strangler)"
             ));
         }
     };
@@ -211,6 +212,7 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "joker" | "jk" => Ok(cfg.joker.as_ref().and_then(|p| p.notional)),
         "rsi-mr" | "rsimr" => Ok(cfg.rsi_mr.as_ref().and_then(|p| p.notional)),
         "wave" | "wv" => Ok(cfg.wave.as_ref().and_then(|p| p.notional)),
+        "flat-mm" | "fm" => Ok(cfg.flat_mm.as_ref().and_then(|p| p.notional)),
         "mantis" | "mn" => Ok(cfg.mantis.as_ref().and_then(|p| p.notional)),
         "volley" | "vl" => Ok(cfg.volley.as_ref().and_then(|p| p.notional)),
         "strangler" | "st" => Ok(cfg.strangler.as_ref().and_then(|p| p.notional)),
@@ -244,6 +246,8 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "rsimr"
         | "wave"
         | "wv"
+        | "flat-mm"
+        | "fm"
         | "mantis"
         | "mn"
         | "volley"
@@ -268,6 +272,7 @@ fn max_open_orders_for(cfg: &BotConfig) -> usize {
         "joker" | "jk" => 0,
         "rsi-mr" | "rsimr" => 0,
         "wave" | "wv" => 0,
+        "flat-mm" | "fm" => 0,
         // Volley keeps a wall of `2 × levels` orders and refreshes it itself.
         "volley" | "vl" => 0,
         // Strangler keeps a full `2 × levels` window and reconciles it itself.
@@ -578,6 +583,40 @@ fn build_wave(
         relattice_drift_pct: wave.relattice_drift_pct,
         size_mult: wave.size_mult,
         size_ramp: wave.size_ramp,
+    }))
+}
+
+fn build_flat_mm(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let flat = cfg.flat_mm.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "bot {} strategy=flat-mm but [bot.flat_mm] missing",
+            cfg.symbol
+        )
+    })?;
+    let notional = autobump_notional(flat.notional.unwrap_or(default_notional), symbol, venue)?;
+    let tick_size = venue.tick_size(symbol).unwrap_or(Decimal::new(1, 8));
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    let min_notional = venue.min_notional(symbol).unwrap_or(Decimal::ZERO);
+    Ok(StrategyChoice::FlatMm(FlatMmConfig {
+        notional_per_order: notional,
+        tick_size,
+        step_size,
+        min_notional,
+        inner_bps: flat.inner_bps,
+        step_bps: flat.step_bps,
+        levels: flat.levels,
+        reservation_skew_bps: flat.reservation_skew_bps,
+        imbalance_skew_bps: flat.imbalance_skew_bps,
+        skew_unit_notional: flat.skew_unit.unwrap_or(notional * Decimal::from(20)),
+        flush_bps: flat.flush_bps,
+        chase_boost_pct: flat.chase_boost_pct,
+        flush_frac: flat.flush_frac,
+        underwater_reduce_frac: flat.underwater_reduce_frac,
     }))
 }
 

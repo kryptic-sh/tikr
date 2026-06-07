@@ -486,6 +486,9 @@ pub struct BotConfig {
     /// Wave params (only honored when `strategy = "wave"`).
     #[serde(default)]
     pub wave: Option<WaveParams>,
+    /// FlatMm params (only honored when `strategy = "flat-mm"`).
+    #[serde(default)]
+    pub flat_mm: Option<FlatMmParams>,
     /// Mantis params (only honored when `strategy = "mantis"`).
     #[serde(default)]
     pub mantis: Option<MantisParams>,
@@ -619,6 +622,74 @@ fn wave_default_round_trips() -> u32 {
 
 fn wave_default_levels() -> u32 {
     12
+}
+
+/// FlatMm — flat-inventory 0-fee market maker.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlatMmParams {
+    /// Per-order notional. Account-derived if unset.
+    #[serde(default)]
+    pub notional: Option<Decimal>,
+    /// Half-spread to innermost level, in bps. Default 1.
+    #[serde(default = "flat_mm_default_inner_bps")]
+    pub inner_bps: Decimal,
+    /// Level spacing beyond the innermost, in bps. Default 1.
+    #[serde(default = "flat_mm_default_step_bps")]
+    pub step_bps: Decimal,
+    /// Number of levels quoted per side. Default 5.
+    #[serde(default = "flat_mm_default_levels")]
+    pub levels: u32,
+    /// Reservation-price skew in bps (max shift at full inventory). Default 2.
+    #[serde(default = "flat_mm_default_reservation_skew_bps")]
+    pub reservation_skew_bps: Decimal,
+    /// Book-imbalance skew in bps. Default 0 (off).
+    #[serde(default)]
+    pub imbalance_skew_bps: Decimal,
+    /// Inventory notional for full skew / full size bias denominator.
+    /// `None` = derive as `20 × notional_per_order`.
+    #[serde(default)]
+    pub skew_unit: Option<Decimal>,
+    /// Break-even flush distance from avg entry, in bps. Default 1.
+    #[serde(default = "flat_mm_default_flush_bps")]
+    pub flush_bps: Decimal,
+    /// Average-chase boost pct when underwater. Default 0 (anti-martingale).
+    #[serde(default)]
+    pub chase_boost_pct: Decimal,
+    /// Fraction of bag the break-even flush dumps each fill. Default 1.
+    #[serde(default = "flat_mm_default_flush_frac")]
+    pub flush_frac: Decimal,
+    /// Size multiplier for underwater reducing levels. Default 1.
+    #[serde(default = "flat_mm_default_underwater_reduce_frac")]
+    pub underwater_reduce_frac: Decimal,
+}
+
+fn flat_mm_default_inner_bps() -> Decimal {
+    Decimal::ONE
+}
+
+fn flat_mm_default_step_bps() -> Decimal {
+    Decimal::ONE
+}
+
+fn flat_mm_default_levels() -> u32 {
+    5
+}
+
+fn flat_mm_default_reservation_skew_bps() -> Decimal {
+    Decimal::from(2)
+}
+
+fn flat_mm_default_flush_bps() -> Decimal {
+    Decimal::ONE
+}
+
+fn flat_mm_default_flush_frac() -> Decimal {
+    Decimal::ONE
+}
+
+fn flat_mm_default_underwater_reduce_frac() -> Decimal {
+    Decimal::ONE
 }
 
 /// Mantis — symmetric touch scalper; rests a bid+ask at the touch.
@@ -968,6 +1039,29 @@ pub enum RampageStrategy {
         size_mult: Decimal,
         #[serde(default = "wave_default_size_mult")]
         size_ramp: Decimal,
+    },
+    /// Spawn a FlatMm (flat-inventory 0-fee market maker) bot.
+    FlatMm {
+        #[serde(default = "flat_mm_default_levels")]
+        levels: u32,
+        #[serde(default = "flat_mm_default_inner_bps")]
+        inner_bps: Decimal,
+        #[serde(default = "flat_mm_default_step_bps")]
+        step_bps: Decimal,
+        #[serde(default = "flat_mm_default_reservation_skew_bps")]
+        reservation_skew_bps: Decimal,
+        #[serde(default)]
+        imbalance_skew_bps: Decimal,
+        #[serde(default)]
+        skew_unit: Option<Decimal>,
+        #[serde(default = "flat_mm_default_flush_bps")]
+        flush_bps: Decimal,
+        #[serde(default)]
+        chase_boost_pct: Decimal,
+        #[serde(default = "flat_mm_default_flush_frac")]
+        flush_frac: Decimal,
+        #[serde(default = "flat_mm_default_underwater_reduce_frac")]
+        underwater_reduce_frac: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {

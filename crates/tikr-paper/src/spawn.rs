@@ -12,12 +12,12 @@ use std::sync::{Arc, RwLock};
 use tikr_backtest::fill_sim::FillSim;
 use tikr_core::{Fill, Symbol};
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, Glft, GlftConfig, Hydra, HydraConfig, Joker,
-    JokerConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade,
-    LiqFadeConfig, Mantis, MantisConfig, MicroMeanReversion, MicroMeanReversionConfig, RsiMr,
-    RsiMrConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
-    StaticGridConfig, Strangler, StranglerConfig, Strategy, Tide, TideConfig, TopOfBook,
-    TopOfBookConfig, Volley, VolleyConfig, Wave, WaveConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, FlatMm, FlatMmConfig, Glft, GlftConfig, Hydra,
+    HydraConfig, Joker, JokerConfig, LadderReentry, LadderReentryConfig, LayeredGrid,
+    LayeredGridConfig, LiqFade, LiqFadeConfig, Mantis, MantisConfig, MicroMeanReversion,
+    MicroMeanReversionConfig, RsiMr, RsiMrConfig, SimpleGap, SimpleGapConfig, SpreadScalp,
+    SpreadScalpConfig, StaticGrid, StaticGridConfig, Strangler, StranglerConfig, Strategy, Tide,
+    TideConfig, TopOfBook, TopOfBookConfig, Volley, VolleyConfig, Wave, WaveConfig,
 };
 use tikr_venue::Venue;
 use tokio::sync::{mpsc, watch};
@@ -65,6 +65,8 @@ pub enum StrategyChoice {
     RsiMr(RsiMrConfig),
     /// [`Wave`] — frozen fixed-step lattice with round-trip refill.
     Wave(WaveConfig),
+    /// [`FlatMm`] — flat-inventory 0-fee market maker.
+    FlatMm(FlatMmConfig),
     /// [`Mantis`] — symmetric touch scalper; rests bid+ask at the touch.
     Mantis(MantisConfig),
     /// [`Volley`] — timed batched book-flooding; refresh a fence each interval.
@@ -92,6 +94,7 @@ impl StrategyChoice {
             Self::Joker(_) => "joker",
             Self::RsiMr(_) => "rsi-mr",
             Self::Wave(_) => "wave",
+            Self::FlatMm(_) => "flat-mm",
             Self::Mantis(_) => "mantis",
             Self::Volley(_) => "volley",
             Self::Strangler(_) => "strangler",
@@ -434,6 +437,23 @@ where
                 }
                 StrategyChoice::Wave(cfg) => {
                     let strategy = Wave::new(cfg);
+                    run_with_resume(
+                        venue,
+                        strategy,
+                        fill_sim,
+                        symbol,
+                        shutdown_rx,
+                        config,
+                        None,
+                        None,
+                        None,
+                        external_fills,
+                        None,
+                    )
+                    .await
+                }
+                StrategyChoice::FlatMm(cfg) => {
+                    let strategy = FlatMm::new(cfg);
                     run_with_resume(
                         venue,
                         strategy,

@@ -40,6 +40,15 @@ pub struct FlatMmConfig {
     /// Fiat notional per ladder level (base size before skew). Quantity is
     /// `notional_per_order / price`.
     pub notional_per_order: Decimal,
+    /// Venue tick size (price increment). Prices are rounded to the nearest
+    /// multiple of this value before submission. `0` = no rounding.
+    pub tick_size: Decimal,
+    /// Venue lot step (size increment). Sizes are floored to the nearest
+    /// multiple of this value before submission. `0` = no rounding.
+    pub step_size: Decimal,
+    /// Venue minimum order notional. When `> 0`, sizes are bumped up by whole
+    /// `step_size` lots until `size × price ≥ min_notional`. `0` = no minimum.
+    pub min_notional: Decimal,
     /// Half-spread: distance from the reservation price to the **innermost**
     /// level on each side, in basis points. The effective quoted spread is
     /// `2 × inner_bps`. Sitting back from mid trades a little volume for more
@@ -98,6 +107,9 @@ impl FlatMmConfig {
     pub fn defaults(notional_per_order: Decimal) -> Self {
         Self {
             notional_per_order,
+            tick_size: Decimal::ZERO,
+            step_size: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
             inner_bps: Decimal::ONE,
             step_bps: Decimal::ONE,
             levels: 5,
@@ -124,6 +136,11 @@ struct Slot {
 /// reconciled against the resting orders each cycle.
 pub struct FlatMm {
     config: FlatMmConfig,
+    /// Mid price at which the resting ladder was last placed. A book move
+    /// smaller than the quoted spread (`2 × inner_bps`) from this can't have
+    /// touched our innermost order, so nothing filled and the ladder is still
+    /// valid → skip the requote (rate-limit defence). `None` until first placed.
+    last_quote_mid: Option<Decimal>,
 }
 
 impl FlatMm {
@@ -168,7 +185,36 @@ impl FlatMm {
         (b - a) / total
     }
 
-    fn intent(symbol: &Symbol, side: Side, price: Decimal, size: Decimal) -> QuoteIntent {
+    fn intent(&self, symbol: &Symbol, side: Side, price: Decimal, size: Decimal) -> QuoteIntent {
+        // Round price to nearest tick_size.
+        let price = if self.config.tick_size > Decimal::ZERO {
+            (price / self.config.tick_size).round() * self.config.tick_size
+        } else {
+            price
+        };
+        // Floor size to step_size.
+        let size = if self.config.step_size > Decimal::ZERO {
+            (size / self.config.step_size).floor() * self.config.step_size
+        } else {
+            size
+        };
+        // Bump size up by whole step_size lots until size * price >= min_notional.
+        let size = if self.config.min_notional > Decimal::ZERO
+            && self.config.step_size > Decimal::ZERO
+            && price > Decimal::ZERO
+            && size * price < self.config.min_notional
+        {
+            let mut needed = (self.config.min_notional / price / self.config.step_size).ceil()
+                * self.config.step_size;
+            // Guard: Decimal ceil can land one lot short due to truncation; bump
+            // by whole lots until the notional actually clears min_notional.
+            while needed * price < self.config.min_notional {
+                needed += self.config.step_size;
+            }
+            needed
+        } else {
+            size
+        };
         QuoteIntent {
             symbol: symbol.clone(),
             side,
@@ -332,14 +378,14 @@ impl FlatMm {
                     if rel > Self::size_tol() {
                         actions.push(Action::Requote {
                             id: *id,
-                            intent: Self::intent(ctx.symbol, slot.side, slot.price, slot.size),
+                            intent: self.intent(ctx.symbol, slot.side, slot.price, slot.size),
                         });
                     }
                     // else: within tolerance → leave it (preserve queue).
                 }
-                None => actions.push(Action::Quote(Self::intent(
-                    ctx.symbol, slot.side, slot.price, slot.size,
-                ))),
+                None => actions.push(Action::Quote(
+                    self.intent(ctx.symbol, slot.side, slot.price, slot.size),
+                )),
             }
         }
 
@@ -365,7 +411,10 @@ impl Strategy for FlatMm {
     type Config = FlatMmConfig;
 
     fn new(config: Self::Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            last_quote_mid: None,
+        }
     }
 
     fn name(&self) -> &str {
@@ -374,9 +423,34 @@ impl Strategy for FlatMm {
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
         match event {
-            // Both a fill and a book move can change the desired ladder; the
-            // reconciler is cheap and no-ops when nothing changed.
-            MarketEvent::Fill(_) | MarketEvent::BookUpdate { .. } => self.requote(ctx),
+            // A fill is the only thing that changes inventory (and thus the skew
+            // and break-even flush), so it always re-quotes.
+            MarketEvent::Fill(_) => {
+                if let Some(mid) = compute_mid_strict(ctx.latest_book) {
+                    self.last_quote_mid = Some(mid.0);
+                }
+                self.requote(ctx)
+            }
+            // A book move only matters if the mid travelled at least the quoted
+            // spread (`2 × inner_bps`) since we last placed: a smaller move can't
+            // have reached our innermost order, so nothing filled and the resting
+            // ladder is still correct. Skipping these is the rate-limit defence —
+            // without it we re-quote on every tick and blow the order API limit.
+            MarketEvent::BookUpdate { .. } => {
+                let Some(mid) = compute_mid_strict(ctx.latest_book) else {
+                    return Vec::new();
+                };
+                let spread = Self::bps(self.config.inner_bps) * Decimal::from(2);
+                let moved_enough = match self.last_quote_mid {
+                    Some(last) if last > Decimal::ZERO => (mid.0 - last).abs() / last >= spread,
+                    _ => true, // never placed (or degenerate last) → place now
+                };
+                if !moved_enough {
+                    return Vec::new();
+                }
+                self.last_quote_mid = Some(mid.0);
+                self.requote(ctx)
+            }
             MarketEvent::Heartbeat { .. } | MarketEvent::Trade { .. } => Vec::new(),
         }
     }
@@ -476,6 +550,9 @@ mod tests {
     fn cfg() -> FlatMmConfig {
         FlatMmConfig {
             notional_per_order: Decimal::from(5),
+            tick_size: Decimal::ZERO,
+            step_size: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
             inner_bps: Decimal::ONE,
             step_bps: Decimal::ONE,
             levels: 3,
@@ -509,6 +586,62 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Book with a chosen `mid` and a tiny 1-unit half-spread around it.
+    fn book_mid(symbol: &Symbol, mid: Decimal) -> Snapshot {
+        let h = Decimal::new(5, 5); // 0.00005
+        Snapshot {
+            symbol: symbol.clone(),
+            bids: vec![Level {
+                price: Price(mid - h),
+                size: Size(Decimal::from(100)),
+            }],
+            asks: vec![Level {
+                price: Price(mid + h),
+                size: Size(Decimal::from(100)),
+            }],
+            ts: Timestamp(1),
+        }
+    }
+
+    #[test]
+    fn sub_spread_book_move_skips_requote() {
+        // cfg() inner_bps = 1 → quoted spread (deadband) = 2 bps.
+        let s = sym();
+        let p = pos(&s, Decimal::ZERO, Decimal::ZERO);
+        let mut st = FlatMm::new(cfg());
+        // First placement at mid 1.0000 → ladder placed, last_quote_mid = 1.0.
+        let b0 = book_mid(&s, Decimal::ONE);
+        let a0 = st.on_event(
+            &ctx(&s, &b0, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: b0.clone(),
+            },
+        );
+        let resting = as_resting(&a0);
+        assert!(!resting.is_empty(), "first event must place the ladder");
+        // +1 bps move (< 2 bps spread) with the ladder resting → NO requote.
+        let b1 = book_mid(&s, Decimal::new(10001, 4)); // 1.0001
+        let a1 = st.on_event(
+            &ctx(&s, &b1, &p, &resting),
+            &MarketEvent::BookUpdate {
+                snapshot: b1.clone(),
+            },
+        );
+        assert!(
+            a1.is_empty(),
+            "sub-spread move must not requote, got {a1:?}"
+        );
+        // +3 bps move (≥ 2 bps spread) → requote fires.
+        let b2 = book_mid(&s, Decimal::new(10003, 4)); // 1.0003
+        let a2 = st.on_event(
+            &ctx(&s, &b2, &p, &resting),
+            &MarketEvent::BookUpdate {
+                snapshot: b2.clone(),
+            },
+        );
+        assert!(!a2.is_empty(), "supra-spread move must requote");
     }
 
     #[test]

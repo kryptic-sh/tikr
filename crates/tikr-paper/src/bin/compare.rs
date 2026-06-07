@@ -2553,6 +2553,9 @@ async fn run_sweep_collect(
                                             &label,
                                             FlatMm::new(FlatMmConfig {
                                                 notional_per_order: flat_mm_notional,
+                                                tick_size: tick,
+                                                step_size: lot_step,
+                                                min_notional,
                                                 inner_bps: inner,
                                                 step_bps: step,
                                                 levels: args.flat_mm_levels,

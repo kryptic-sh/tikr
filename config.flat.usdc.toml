@@ -1,0 +1,50 @@
+# FlatMM via rampage — flat-inventory market maker on the top-5 USDC markets.
+# Goal: high volume + near-flat inventory + ~break-even (0-fee VIP-volume play),
+# NOT reversion profit. Each bot sizes orders at 1% of the FULL wallet balance.
+
+[account]
+env = "futures-mainnet"
+asset = "USDC"
+order_balance_pct = "1"       # order notional = 1% of wallet
+max_position_pct = "0"        # no hard cap; FlatMM stays flat via skew + flush
+auto_scale = false            # each bot orders FULL wallet×order_balance_pct (no /bot split); N = rampage.top_n
+min_bot_capital_usdc = "200"  # margin gate (unused when auto_scale = false)
+take_profit_pct = "0"
+leverage = 25
+inventory_boost_pct = "0"     # wave-only knob; off for FlatMM
+inventory_boost_add_pct = "0"
+bnb_refill_enabled = true     # this is the manager process; enable on exactly ONE process per account
+
+[account.bagger]
+# All bagger mechanisms off — FlatMM manages its own inventory via reservation
+# skew + break-even flush, not a flatten-on-equity trigger.
+
+[rampage]
+enabled = true
+min_volume_usdc = "20000000" # $20M 24h quote volume floor
+recheck_interval_secs = 60
+quote_asset = "USDC"
+top_n = 1                    # run the top 5 markets
+rotate_loss_pct = "0.01"     # accept NET loss up to 1% of wallet on rotate
+big_bag_pct = "0"
+retire_bnb_pct = "50"        # convert 50% of a retired bot's NET profit to BNB (VIP-tier fee accrual)
+
+[rampage.score]
+mode = "candle_height" # rank candidates by recent candle range (volatility = spread to capture)
+[rampage.score.params]
+candle_count = 30
+min_candle_pct = "0"
+
+[rampage.strategy]
+kind = "flat_mm"
+[rampage.strategy.params]
+inner_bps = "1"              # half-spread: innermost level 1bps off the reservation price
+step_bps = "1"               # spacing between ladder levels
+levels = 5                   # levels per side
+reservation_skew_bps = "2"   # γ: max ladder shift away from inventory (keeps it flat)
+imbalance_skew_bps = "0"     # book-imbalance edge vs adverse selection; 0 = off (sweep to tune)
+flush_bps = "1"              # break-even reduce-only rests at avg ± this; dumps the bag on a tick back
+chase_boost_pct = "0"        # 0 = anti-martingale (shrink the adding side); >0 averages down (needs a cap)
+flush_frac = "1"             # flush the whole bag at once
+underwater_reduce_frac = "1" # full size on below-break-even reducers (1 = the bleed; lower = suppress)
+# skew_unit omitted → defaults to notional × 20 (inventory at which skew/size-bias saturates)

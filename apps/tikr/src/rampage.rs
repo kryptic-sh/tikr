@@ -30,7 +30,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::config::{BotConfig, RampageConfig, RampageStrategy, ScoreMode, TideParams, WaveParams};
+use crate::config::{
+    BotConfig, FlatMmParams, RampageConfig, RampageStrategy, ScoreMode, TideParams, WaveParams,
+};
 use crate::state::{BotStatus, BotView, SharedBotState};
 use crate::supervisor::{SupervisorCtx, reset_symbol_state, spawn_supervisor};
 use crate::venue;
@@ -134,6 +136,7 @@ pub fn spawn_rampage_manager(
         };
         let strategy_label = match &cfg.strategy {
             RampageStrategy::Wave { .. } => "wave",
+            RampageStrategy::FlatMm { .. } => "flat-mm",
             RampageStrategy::Tide { .. } => "tide",
             RampageStrategy::Template { name } => name.as_str(),
         };
@@ -756,6 +759,7 @@ fn spawn_one_bot(
                     size_mult: *size_mult,
                     size_ramp: *size_ramp,
                 }),
+                flat_mm: None,
                 tide: None,
                 sg: None,
                 lg: None,
@@ -772,6 +776,52 @@ fn spawn_one_bot(
                 strangler: None,
             };
             (bc, "wave".to_string())
+        }
+        RampageStrategy::FlatMm {
+            levels,
+            inner_bps,
+            step_bps,
+            reservation_skew_bps,
+            imbalance_skew_bps,
+            skew_unit,
+            flush_bps,
+            chase_boost_pct,
+            flush_frac,
+            underwater_reduce_frac,
+        } => {
+            let bc = BotConfig {
+                symbol: symbol.to_string(),
+                strategy: "flat-mm".to_string(),
+                flat_mm: Some(FlatMmParams {
+                    notional: None,
+                    inner_bps: *inner_bps,
+                    step_bps: *step_bps,
+                    levels: *levels,
+                    reservation_skew_bps: *reservation_skew_bps,
+                    imbalance_skew_bps: *imbalance_skew_bps,
+                    skew_unit: *skew_unit,
+                    flush_bps: *flush_bps,
+                    chase_boost_pct: *chase_boost_pct,
+                    flush_frac: *flush_frac,
+                    underwater_reduce_frac: *underwater_reduce_frac,
+                }),
+                wave: None,
+                tide: None,
+                sg: None,
+                lg: None,
+                ladder_reentry: None,
+                simple_gap: None,
+                micro_mean_reversion: None,
+                spread_scalp: None,
+                liq_fade: None,
+                hydra: None,
+                joker: None,
+                rsi_mr: None,
+                mantis: None,
+                volley: None,
+                strangler: None,
+            };
+            (bc, "flat-mm".to_string())
         }
         RampageStrategy::Tide {
             grid_levels,
@@ -796,6 +846,7 @@ fn spawn_one_bot(
                     chase_to_avg: *chase_to_avg,
                     relattice_timeout_secs: 300,
                 }),
+                flat_mm: None,
                 wave: None,
                 sg: None,
                 lg: None,
