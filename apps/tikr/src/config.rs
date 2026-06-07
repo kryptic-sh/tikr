@@ -1763,6 +1763,7 @@ mod tests {
                 auto_candle_window,
                 relattice_drift_pct,
                 size_mult,
+                size_ramp,
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
@@ -1779,6 +1780,7 @@ mod tests {
                     "relattice_drift_pct defaults 0.02"
                 );
                 assert_eq!(*size_mult, Decimal::ONE, "size_mult defaults 1.0");
+                assert_eq!(*size_ramp, Decimal::ONE, "size_ramp defaults 1.0");
             }
             other => panic!("expected Wave, got {other:?}"),
         }
