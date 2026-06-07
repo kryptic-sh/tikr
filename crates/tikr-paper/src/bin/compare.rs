@@ -918,6 +918,11 @@ struct Args {
     /// bigger; pulls avg entry toward price). `1.0` (default) = uniform.
     #[arg(long, default_value = "1.0")]
     wave_size_mult: String,
+    /// Wave: LINEAR inner→outer size ramp — shallowest order `1×`, deepest
+    /// `size_ramp×`, straight-line between. Gentle bounded alternative to
+    /// `--wave-size-mult`; composes with it. `1.0` (default) = uniform.
+    #[arg(long, default_value = "1.0")]
+    wave_size_ramp: String,
 
     // ─── Bagger (inventory-risk flatten) ──────────────────────────────────
     /// Bagger preset(s), composable with `+`: `fixed` | `ratchet` | `dual` |
@@ -2691,6 +2696,8 @@ async fn run_sweep_collect(
             .map_err(|e| format!("--wave-relattice-drift-pct: {e}"))?;
         let wave_size_mult = Decimal::from_str(&args.wave_size_mult)
             .map_err(|e| format!("--wave-size-mult: {e}"))?;
+        let wave_size_ramp = Decimal::from_str(&args.wave_size_ramp)
+            .map_err(|e| format!("--wave-size-ramp: {e}"))?;
         for &levels in &wave_levels {
             for &step in &wave_steps {
                 for &inner in &wave_inner_sweep {
@@ -2732,6 +2739,7 @@ async fn run_sweep_collect(
                                 auto_candle_window: args.wave_auto_candle_window,
                                 relattice_drift_pct: wave_relattice_drift,
                                 size_mult: wave_size_mult,
+                                size_ramp: wave_size_ramp,
                             }),
                             fees,
                             skim_cfg,

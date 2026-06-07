@@ -147,6 +147,15 @@ pub struct WaveConfig {
     /// side fully filled holds `Σ size_mult^k` × base — front-loads inventory,
     /// so it amplifies trend risk; keep the position cap / bagger in play.
     pub size_mult: Decimal,
+
+    /// LINEAR inner→outer size ramp: the shallowest order (`depth = 0`) is `1×`
+    /// base and the deepest (`depth = levels − 1`) is `size_ramp × base`, with a
+    /// straight-line interpolation in between — `1 + (size_ramp − 1)·depth/(levels−1)`.
+    /// Unlike `size_mult` (geometric, compounds per step) this is a gentle,
+    /// bounded ramp with an explicit outer endpoint. Applies on EVERY order,
+    /// always (not gated on profit/avg), and composes multiplicatively with
+    /// `size_mult` (use either or both). `1.0` (default) = uniform (no ramp).
+    pub size_ramp: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,12 +209,22 @@ impl Wave {
     /// entry toward price as the bag fills, for a faster breakeven on rebound.
     /// `size_mult ≤ 1` (default 1.0) → uniform sizing (no scaling).
     fn depth_mult(&self, depth: i64) -> Decimal {
-        if self.config.size_mult <= Decimal::ONE || depth <= 0 {
+        if depth <= 0 {
             return Decimal::ONE;
         }
         let mut m = Decimal::ONE;
-        for _ in 0..depth {
-            m *= self.config.size_mult;
+        // Geometric curve: size_mult^depth.
+        if self.config.size_mult > Decimal::ONE {
+            for _ in 0..depth {
+                m *= self.config.size_mult;
+            }
+        }
+        // Linear inner→outer ramp: depth 0 → 1×, deepest level → size_ramp×,
+        // straight-line in between. Composes multiplicatively with size_mult.
+        if self.config.size_ramp > Decimal::ONE && self.config.levels > 1 {
+            let span = Decimal::from(self.config.levels - 1);
+            let frac = (Decimal::from(depth) / span).min(Decimal::ONE);
+            m *= Decimal::ONE + (self.config.size_ramp - Decimal::ONE) * frac;
         }
         m
     }
@@ -989,6 +1008,7 @@ mod tests {
             relattice_drift_pct: Decimal::new(1, 1), // 0.10
             // Uniform sizing by default; the size-curve has its own test.
             size_mult: Decimal::ONE,
+            size_ramp: Decimal::ONE,
         }
     }
 
@@ -1795,6 +1815,34 @@ mod tests {
             deep > base,
             "depth-3 order larger than base: {deep} vs {base}"
         );
+    }
+
+    #[test]
+    fn size_ramp_scales_linearly_inner_to_outer() {
+        let mut c = cfg(); // levels = 6 → outer depth = 5
+        c.size_mult = Decimal::ONE; // ramp only
+        c.size_ramp = Decimal::from(2); // outermost = 2× innermost
+        let w = Wave::new(c);
+        assert_eq!(w.depth_mult(0), Decimal::ONE, "shallowest = 1×");
+        assert_eq!(w.depth_mult(1), Decimal::new(12, 1), "1 + 1/5 = 1.2");
+        assert_eq!(w.depth_mult(3), Decimal::new(16, 1), "1 + 3/5 = 1.6");
+        assert_eq!(w.depth_mult(5), Decimal::from(2), "deepest (levels-1) = 2×");
+        // Past the outer level the ramp clamps at its endpoint.
+        assert_eq!(
+            w.depth_mult(9),
+            Decimal::from(2),
+            "clamped to 2× beyond outer"
+        );
+    }
+
+    #[test]
+    fn size_ramp_composes_with_size_mult() {
+        let mut c = cfg(); // levels = 6
+        c.size_mult = Decimal::from(2); // geometric 2^depth
+        c.size_ramp = Decimal::from(2); // linear ramp to 2× at depth 5
+        let w = Wave::new(c);
+        // depth 1: 2^1 (geometric) × (1 + 1/5) (ramp) = 2 × 1.2 = 2.4
+        assert_eq!(w.depth_mult(1), Decimal::new(24, 1), "2 × 1.2 = 2.4");
     }
 
     #[test]

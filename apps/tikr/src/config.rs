@@ -577,6 +577,12 @@ pub struct WaveParams {
     /// `1.0` (default) = uniform. e.g. `1.2` → each step out is 1.2× the prior.
     #[serde(default = "wave_default_size_mult")]
     pub size_mult: Decimal,
+    /// Linear inner→outer size ramp: shallowest order `1×`, deepest `size_ramp×`,
+    /// straight-line between. A gentle bounded alternative to `size_mult`'s
+    /// geometric curve; composes with it. `1.0` (default) = uniform (no ramp).
+    /// e.g. `2.0` → outermost order is 2× the innermost.
+    #[serde(default = "wave_default_size_mult")]
+    pub size_ramp: Decimal,
 }
 
 fn wave_default_auto_inner() -> bool {
@@ -960,6 +966,8 @@ pub enum RampageStrategy {
         relattice_drift_pct: Decimal,
         #[serde(default = "wave_default_size_mult")]
         size_mult: Decimal,
+        #[serde(default = "wave_default_size_mult")]
+        size_ramp: Decimal,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {

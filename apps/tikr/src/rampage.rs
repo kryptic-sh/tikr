@@ -736,6 +736,7 @@ fn spawn_one_bot(
             auto_candle_window,
             relattice_drift_pct,
             size_mult,
+            size_ramp,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -753,6 +754,7 @@ fn spawn_one_bot(
                     auto_candle_window: *auto_candle_window,
                     relattice_drift_pct: *relattice_drift_pct,
                     size_mult: *size_mult,
+                    size_ramp: *size_ramp,
                 }),
                 tide: None,
                 sg: None,

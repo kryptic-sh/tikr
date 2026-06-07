@@ -577,6 +577,7 @@ fn build_wave(
         auto_candle_window: wave.auto_candle_window,
         relattice_drift_pct: wave.relattice_drift_pct,
         size_mult: wave.size_mult,
+        size_ramp: wave.size_ramp,
     }))
 }
 
