@@ -73,4 +73,12 @@ pub struct LiveSnapshot {
     /// effective step/inner, static-vs-auto). Empty for strategies that don't
     /// implement `status_metrics`. Rendered in the TUI bot-detail panel.
     pub metrics: Vec<(String, String)>,
+    /// Number of bagger flatten actions this bot has issued this session
+    /// (every enabled mechanism — equity giveback, cap, SL, etc.). `0` when the
+    /// bagger is disabled or has not fired. Session-scoped (not persisted).
+    pub bagger_flattens: u64,
+    /// Active bagger target, preformatted for display (e.g. `"eqv 10%"`,
+    /// `"lock ±2%"`). `None` when the bagger is disabled. Same for every bot on
+    /// the account; the TUI aggregate shows one.
+    pub bagger_target: Option<String>,
 }

@@ -35,11 +35,11 @@ pub fn to_spec(
     inventory_boost: Option<InventoryBoostConfig>,
     wallet_rx: Option<watch::Receiver<Decimal>>,
     take_profit_pct: Decimal,
+    bagger_config: tikr_paper::bagger::BaggerConfig,
 ) -> Result<BotSpec> {
-    // Bagger (inventory-risk flatten) — default OFF for live until a preset is
-    // validated in backtest. Account-TOML plumbing is the follow-up; the runner
-    // + backtest (compare `--bagger-*` flags) already exercise every mechanism.
-    let bagger_config = tikr_paper::bagger::BaggerConfig::default();
+    // Bagger (inventory-risk flatten) — account-level, wired from the
+    // `[account.bagger]` TOML table by `to_spec`'s caller. Off when no
+    // mechanism is enabled (`BaggerConfig::enabled()` is false).
     let uses_default_notional = strategy_notional(cfg)?.is_none();
     let strategy = match cfg.strategy.as_str() {
         "static-grid" | "sg" => build_sg(

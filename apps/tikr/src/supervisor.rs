@@ -59,6 +59,9 @@ pub struct SupervisorCtx {
     /// bot's unrealized P&L exceeds this, the runner rests a reduce-only maker
     /// limit to lock in half the bag.
     pub take_profit_pct: Decimal,
+    /// Account-level bagger (inventory-risk flatten), built from the
+    /// `[account.bagger]` TOML table. Off when no mechanism is enabled.
+    pub bagger: tikr_paper::bagger::BaggerConfig,
     /// Live BNBUSDT mid; user-stream parser uses this to convert BNB
     /// commissions → USDT-equivalent fee_quote. When BNB-fee mode is
     /// off (or autodetect fails), this stays at ZERO and the parser
@@ -338,6 +341,7 @@ async fn run_once(ctx: &SupervisorCtx) -> Result<SpawnedBot> {
         ctx.inventory_boost,
         Some(ctx.wallet_rx.clone()),
         ctx.take_profit_pct,
+        ctx.bagger,
     )?;
 
     // Resume path (--clear OFF): seed the strategy's local position

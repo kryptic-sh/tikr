@@ -152,24 +152,217 @@ pub struct AccountConfig {
     #[serde(default = "default_inventory_boost_pct")]
     pub inventory_boost_pct: Decimal,
     /// Curve exponent on the inventory ratio (|pos|/cap, clamped `0..=1`) used
-    /// by `inventory_boost_pct`. `1` (default) = linear; `>1` = slow start
-    /// then steep (boost concentrated near the cap); `<1` = fast early ramp.
+    /// by `inventory_boost_pct` AND `avg_chase_boost_pct`. `1` (default) =
+    /// linear; `>1` = slow start then steep (boost concentrated near the cap);
+    /// `<1` = fast early ramp.
     #[serde(default = "default_inventory_boost_curve")]
     pub inventory_boost_curve: Decimal,
+    /// Average-chase order-size boost: the INVERSE of `inventory_boost_pct`.
+    /// Scales the inventory-*adding* side up (short → sells, long → buys) as the
+    /// bag fills, averaging the entry toward mid — paired with an avg-price
+    /// take-profit, this keeps the bag near-empty in chop. `0` (default) off.
+    /// Takes precedence over `inventory_boost_pct` (they're opposite directions,
+    /// one runner slot). WARNING: this is averaging-down/martingale — it grows
+    /// the bag faster into a sustained trend; pair with low leverage + a bag cap.
+    #[serde(default = "default_inventory_boost_pct")]
+    pub avg_chase_boost_pct: Decimal,
+    /// Profit-gated reducing-side boost. When `true`, `inventory_boost_pct`
+    /// scales each reducing-side quote by how far its price sits PAST the
+    /// position's average entry in the favorable direction (long: sell above
+    /// avg; short: buy below avg) instead of by `|pos|/cap` — so the bag is
+    /// only shed harder when the fill banks a gain, and a quote that would lock
+    /// a loss is left untouched. Needs no position cap (works with
+    /// `max_position_pct = 0`). Only affects the reducing side (ignored when
+    /// `avg_chase_boost_pct > 0`). `false` (default) = legacy `|pos|/cap` curve.
+    #[serde(default)]
+    pub inventory_boost_profit_gated: bool,
+    /// Profit distance past avg-entry, in bps, at which the profit-gated boost
+    /// saturates to `inventory_boost_pct`. Ignored unless
+    /// `inventory_boost_profit_gated`. Default 50 bps.
+    #[serde(default = "default_inventory_boost_profit_full_bps")]
+    pub inventory_boost_profit_full_bps: Decimal,
+    /// Account-level bagger (inventory-risk flatten). All mechanisms default
+    /// off; populate the `[account.bagger]` table to enable one. Applied to
+    /// every bot by the runner.
+    #[serde(default)]
+    pub bagger: BaggerSettings,
+}
+
+/// `[account.bagger]` — inventory-risk flatten mechanisms. Mirrors
+/// `tikr_paper::bagger::BaggerConfig`; every mechanism is off by default and
+/// composes (the runner evaluates them in priority order). The `compare`
+/// `--bagger-*` flags exercise the same knobs in backtest.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BaggerSettings {
+    /// Exit style: `true` = taker (cross spread), `false` = reduce-only maker.
+    pub exit_taker: bool,
+    /// Take-profit flatten size: `true` = full bag, `false` = half. (SL / equity
+    /// / size-cap always flatten what they must.)
+    pub flatten_full: bool,
+    /// Size gate: gated mechanisms (all except equity giveback / inv-cap /
+    /// wallet bracket / pnl-flat / periodic) arm only when `|pos notional| ≥
+    /// this %` of the wallet. `0` = those never arm.
+    pub size_gate_pct: Decimal,
+    /// Size cap: trim the bag back to this % of wallet when exceeded. `0` off.
+    pub cap_pct: Decimal,
+    /// Stop-loss: flatten when unrealized ≤ `−this %` of wallet. `0` off.
+    pub sl_pct: Decimal,
+    /// Stop-loss gate: only cut an underwater bag that made a new adverse
+    /// extreme within this many seconds (still trending). `0` = bare level stop.
+    pub deteriorate_secs: u64,
+    /// Equity giveback: flatten when MTM equity drops this **percent** from its
+    /// session peak (e.g. `10` = 10% off the high). Global, no size gate.
+    /// `0` off.
+    pub equity_giveback_pct: Decimal,
+    /// Trailing TP: flatten when unrealized retraces this **percent** from its
+    /// peak (e.g. `30` = 30%). `0` off.
+    pub trail_pct: Decimal,
+    /// Fixed TP: flatten when unrealized ≥ this % of wallet. `0` off.
+    pub fixed_tp_pct: Decimal,
+    /// Inventory cap: dump the WHOLE bag when its notional reaches this % of
+    /// the wallet (e.g. `100` = bag ≥ wallet). Hard circuit-breaker. `0` off.
+    pub inv_flat_wallet_pct: Decimal,
+    /// Gate the inventory cap on profit: `true` = only fire when the bag is in
+    /// profit (big-winner TP); `false` = unconditional (liquidation breaker).
+    pub inv_flat_require_profit: bool,
+    /// Periodic flatten: every this-many seconds, reduce the bag by
+    /// `periodic_flatten_frac`. `0` off.
+    pub periodic_flatten_secs: u64,
+    /// Fraction reduced on each periodic flatten. Default `0.5`.
+    pub periodic_flatten_frac: Decimal,
+    /// Wallet bracket TP: reduce by `wallet_flat_frac` when unrealized reaches
+    /// `+this %` of wallet. `0` off.
+    pub wallet_tp_pct: Decimal,
+    /// Wallet bracket SL: reduce by `wallet_flat_frac` when unrealized falls to
+    /// `−this %` of wallet. `0` off.
+    pub wallet_sl_pct: Decimal,
+    /// Fraction reduced on either wallet-bracket trigger. Default `0.5`.
+    pub wallet_flat_frac: Decimal,
+    /// P&L flat: flatten the whole bag (maker, ungated) when `|unrealized| ≥
+    /// this %` of the per-order notional. High-churn. `0` off.
+    pub pnl_flat_pct: Decimal,
+    /// Profit-lock ratchet: bank the whole bag once MTM equity grows `+this %`
+    /// past the snapshot, then re-snapshot at the new equity. `0` off.
+    pub profit_lock_pct: Decimal,
+    /// Loss-lock ratchet (downside counterpart): cut the whole bag once MTM
+    /// equity falls `−this %` below the shared snapshot, then re-snapshot at the
+    /// new equity. Enable both for a two-sided bracket. `0` off.
+    pub loss_lock_pct: Decimal,
+    /// Buying-power cut: reduce the bag by `bp_flat_frac` when its notional
+    /// reaches `this %` of buying power (wallet × leverage), e.g. `30`. `0` off.
+    pub bp_flat_pct: Decimal,
+    /// Fraction reduced on each buying-power-cut trigger. Default `0.5`.
+    pub bp_flat_frac: Decimal,
+    /// Avg take-profit: rest a reduce-only post-only order `this many bps` beyond
+    /// the average entry and sell `avg_tp_frac` of the bag when the mark reaches
+    /// it. Companion to `avg_chase_boost_pct`. `0` off.
+    pub avg_tp_bps: Decimal,
+    /// Fraction of the bag sold on each avg-take-profit trigger. Default `0.5`.
+    pub avg_tp_frac: Decimal,
+}
+
+impl Default for BaggerSettings {
+    fn default() -> Self {
+        // Mirror `BaggerConfig::default()` except `exit_taker` — live exits
+        // prefer maker (reduce-only) to avoid paying the spread.
+        Self {
+            exit_taker: false,
+            flatten_full: true,
+            size_gate_pct: Decimal::ZERO,
+            cap_pct: Decimal::ZERO,
+            sl_pct: Decimal::ZERO,
+            deteriorate_secs: 0,
+            equity_giveback_pct: Decimal::ZERO,
+            trail_pct: Decimal::ZERO,
+            fixed_tp_pct: Decimal::ZERO,
+            inv_flat_wallet_pct: Decimal::ZERO,
+            inv_flat_require_profit: false,
+            periodic_flatten_secs: 0,
+            periodic_flatten_frac: Decimal::new(5, 1),
+            wallet_tp_pct: Decimal::ZERO,
+            wallet_sl_pct: Decimal::ZERO,
+            wallet_flat_frac: Decimal::new(5, 1),
+            pnl_flat_pct: Decimal::ZERO,
+            profit_lock_pct: Decimal::ZERO,
+            loss_lock_pct: Decimal::ZERO,
+            bp_flat_pct: Decimal::ZERO,
+            bp_flat_frac: Decimal::new(5, 1),
+            avg_tp_bps: Decimal::ZERO,
+            avg_tp_frac: Decimal::new(5, 1),
+        }
+    }
+}
+
+impl BaggerSettings {
+    /// Convert to the runner's `BaggerConfig`. A 1:1 field map.
+    pub fn to_config(&self) -> tikr_paper::bagger::BaggerConfig {
+        tikr_paper::bagger::BaggerConfig {
+            size_gate_pct: self.size_gate_pct,
+            exit_taker: self.exit_taker,
+            flatten_full: self.flatten_full,
+            cap_pct: self.cap_pct,
+            sl_pct: self.sl_pct,
+            deteriorate_secs: self.deteriorate_secs,
+            equity_giveback_pct: self.equity_giveback_pct,
+            trail_pct: self.trail_pct,
+            fixed_tp_pct: self.fixed_tp_pct,
+            inv_flat_wallet_pct: self.inv_flat_wallet_pct,
+            inv_flat_require_profit: self.inv_flat_require_profit,
+            periodic_flatten_secs: self.periodic_flatten_secs,
+            periodic_flatten_frac: self.periodic_flatten_frac,
+            wallet_tp_pct: self.wallet_tp_pct,
+            wallet_sl_pct: self.wallet_sl_pct,
+            wallet_flat_frac: self.wallet_flat_frac,
+            pnl_flat_pct: self.pnl_flat_pct,
+            profit_lock_pct: self.profit_lock_pct,
+            loss_lock_pct: self.loss_lock_pct,
+            bp_flat_pct: self.bp_flat_pct,
+            bp_flat_frac: self.bp_flat_frac,
+            avg_tp_bps: self.avg_tp_bps,
+            avg_tp_frac: self.avg_tp_frac,
+        }
+    }
 }
 
 impl AccountConfig {
-    /// Build the runner-side inventory boost config, or `None` when the boost
-    /// percent is non-positive (feature off).
+    /// Build the runner-side inventory boost config, or `None` when off.
+    ///
+    /// Two mutually-exclusive directions share one runner slot:
+    /// - `avg_chase_boost_pct > 0` → boost the inventory-**adding** side
+    ///   (average the entry toward mid as the bag fills); takes precedence.
+    /// - else `inventory_boost_pct > 0` → boost the inventory-**reducing** side
+    ///   (flatten faster).
+    ///
+    /// Both use `inventory_boost_curve` for the ramp shape.
     pub fn inventory_boost(&self) -> Option<tikr_paper::InventoryBoostConfig> {
-        if self.inventory_boost_pct > Decimal::ZERO {
+        if self.avg_chase_boost_pct > Decimal::ZERO {
+            Some(tikr_paper::InventoryBoostConfig {
+                max_boost_pct: self.avg_chase_boost_pct,
+                curve_exponent: self.inventory_boost_curve,
+                chase: true,
+                // Profit-gating only applies to the reducing side.
+                profit_gated: false,
+                profit_full_bps: Decimal::ZERO,
+            })
+        } else if self.inventory_boost_pct > Decimal::ZERO {
             Some(tikr_paper::InventoryBoostConfig {
                 max_boost_pct: self.inventory_boost_pct,
                 curve_exponent: self.inventory_boost_curve,
+                chase: false,
+                profit_gated: self.inventory_boost_profit_gated,
+                profit_full_bps: self.inventory_boost_profit_full_bps,
             })
         } else {
             None
         }
+    }
+
+    /// Build the runner-side bagger config from the `[account.bagger]` table.
+    /// Always returns a config; `BaggerConfig::enabled()` is `false` when no
+    /// mechanism is set, so the runner skips it.
+    pub fn bagger(&self) -> tikr_paper::bagger::BaggerConfig {
+        self.bagger.to_config()
     }
 }
 
@@ -194,6 +387,9 @@ fn default_inventory_boost_pct() -> Decimal {
 }
 fn default_inventory_boost_curve() -> Decimal {
     Decimal::ONE
+}
+fn default_inventory_boost_profit_full_bps() -> Decimal {
+    Decimal::from(50)
 }
 
 fn default_leverage() -> u32 {

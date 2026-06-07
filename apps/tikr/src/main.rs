@@ -920,6 +920,7 @@ async fn main() -> anyhow::Result<()> {
                 max_position_rx: max_position_rx.clone(),
                 wallet_rx: wallet_rx.clone(),
                 take_profit_pct: cfg.account.take_profit_pct,
+                bagger: cfg.account.bagger(),
                 bnb_price_rx: bnb_price_rx.clone(),
             },
             shared_state.clone(),
@@ -945,6 +946,7 @@ async fn main() -> anyhow::Result<()> {
                 max_position_rx: max_position_rx.clone(),
                 wallet_rx: wallet_rx.clone(),
                 take_profit_pct: cfg.account.take_profit_pct,
+                bagger: cfg.account.bagger(),
                 bnb_price_rx: bnb_price_rx.clone(),
                 clear_on_start: args.clear,
             };

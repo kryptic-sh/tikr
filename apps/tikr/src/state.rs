@@ -888,6 +888,12 @@ pub struct AccountAggregate {
     pub retired_net: Decimal,
     /// Number of departed bots folded in.
     pub retired_count: usize,
+    /// Σ bagger flatten actions across all live bots this session.
+    pub bagger_flattens: u64,
+    /// Active bagger target, preformatted (e.g. `"lock ±2%"`) — taken from the
+    /// first live bot that reports one (account-level, same for all). `None`
+    /// when off.
+    pub bagger_target: Option<String>,
 }
 
 impl AccountAggregate {
@@ -944,6 +950,10 @@ impl AccountAggregate {
                 a.open_sells = a.open_sells.saturating_add(lv.open_sells as u64);
                 a.net_inventory += lv.inventory_usdt;
                 a.gross_inventory += lv.inventory_usdt.abs();
+                a.bagger_flattens = a.bagger_flattens.saturating_add(lv.bagger_flattens);
+                if a.bagger_target.is_none() {
+                    a.bagger_target = lv.bagger_target.clone();
+                }
             }
             if let Some(ref api) = v.api_position {
                 a.has_api_positions = true;

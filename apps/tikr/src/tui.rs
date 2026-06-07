@@ -1113,6 +1113,27 @@ fn draw_account(
         Style::default().fg(th().muted),
         Style::default().fg(th().fg),
     ));
+    // Bagger (inventory-risk flatten): active target + session flatten count.
+    // `bagger_target` is preformatted by the runner (e.g. "lock ±2%", "eqv 15%")
+    // so the two-sided lock bracket shows both sides. `None` → bagger off.
+    match &agg.bagger_target {
+        Some(target) => lines.push(kv_line(
+            "bagger",
+            format!("{target}  ×{}", agg.bagger_flattens),
+            Style::default().fg(th().muted),
+            if agg.bagger_flattens > 0 {
+                Style::default().fg(th().yellow)
+            } else {
+                Style::default().fg(th().fg)
+            },
+        )),
+        None => lines.push(kv_line(
+            "bagger",
+            "off".to_string(),
+            Style::default().fg(th().muted),
+            Style::default().fg(th().dim),
+        )),
+    }
     lines.push(Line::from(""));
     lines.push(Line::styled(
         "api account",

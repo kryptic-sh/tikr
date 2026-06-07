@@ -54,6 +54,7 @@ pub struct RampageAccountCtx {
     pub max_position_rx: watch::Receiver<Decimal>,
     pub wallet_rx: watch::Receiver<Decimal>,
     pub take_profit_pct: Decimal,
+    pub bagger: tikr_paper::bagger::BaggerConfig,
     pub bnb_price_rx: watch::Receiver<Decimal>,
 }
 
@@ -828,6 +829,7 @@ fn spawn_one_bot(
             max_position_rx: account.max_position_rx.clone(),
             wallet_rx: account.wallet_rx.clone(),
             take_profit_pct: account.take_profit_pct,
+            bagger: account.bagger,
             bnb_price_rx: account.bnb_price_rx.clone(),
             // Restart cancels orphan orders but PRESERVES the open position
             // (clear_on_start=true would flatten). A symbol that re-enters the

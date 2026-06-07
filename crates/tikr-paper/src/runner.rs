@@ -255,6 +255,25 @@ pub struct InventoryBoostConfig {
     /// `1` = linear; `>1` = slow start then steep (boost concentrated near the
     /// cap); `<1` = fast early ramp. Non-positive is treated as `1`.
     pub curve_exponent: Decimal,
+    /// Direction. `false` (default) = boost the inventory-**reducing** side
+    /// (long → bigger sells) to flatten faster. `true` = boost the inventory-
+    /// **adding** side (long → bigger buys) to average the entry toward mid as
+    /// the bag fills — "avg-chase" / martingale. The two are mutually exclusive.
+    pub chase: bool,
+    /// Profit-gated reducing-side boost. When `true` the boost is driven by how
+    /// far each reducing-side quote's price sits *past the position's average
+    /// entry in the favorable direction* (long: sell above avg; short: buy
+    /// below avg), NOT by `|pos|/cap`. A quote that would lock a loss (priced on
+    /// the wrong side of avg) is left untouched, so the bag is only shed when
+    /// the fill banks a gain. Works with the per-bot cap OFF — it needs no cap
+    /// reference. Only meaningful with `chase == false` (reducing side). When
+    /// `false` (default) the legacy `|pos|/cap` curve is used instead.
+    pub profit_gated: bool,
+    /// Profit distance past avg-entry, in bps, at which the profit-gated boost
+    /// saturates to `max_boost_pct`. The per-quote ratio is
+    /// `(profit_bps / profit_full_bps).clamp(0,1)^curve_exponent`. Ignored
+    /// unless `profit_gated`. Non-positive disables the profit-gated boost.
+    pub profit_full_bps: Decimal,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -795,6 +814,30 @@ where
     let bagger_cfg = config.bagger;
     let bagger_enabled = bagger_cfg.enabled();
     let mut bagger_state = crate::bagger::BaggerState::default();
+    // Debounce between bagger flatten *actions*, applied in BOTH live and
+    // backtest so the two behave identically. Live needs it because a reduce
+    // order fills asynchronously (order → user-stream → tracker lags 200ms–2s),
+    // so without it the bagger re-fires every intervening event (log spam +
+    // stacked orders). Backtest applies the fill synchronously, but a PARTIAL
+    // reducer (avg-TP, buying-power cut, wallet bracket) still leaves a non-zero
+    // bag that would re-fire every tick — so the same window keeps backtest a
+    // faithful model of the live rate-limit.
+    const BAGGER_FLATTEN_COOLDOWN_NS: u64 = 10_000_000_000; // 10s
+    let mut last_bagger_flatten_ns: u64 = 0;
+    // Session count of bagger flatten actions + the active target (label, value)
+    // for the TUI account sidebar. Target is constant for the run.
+    let mut bagger_flattens: u64 = 0;
+    let bagger_target: Option<String> = bagger_cfg.display_string();
+    // Leverage for the bagger's buying-power-relative threshold (`bp_flat_pct`).
+    // Backtest: the isolated-margin liquidation model carries it. Live: that
+    // model is `None`, so this falls back to `1` (the mechanism then treats
+    // buying power as wallet) until account leverage is plumbed to the runner.
+    let bagger_leverage = config
+        .liquidation
+        .as_ref()
+        .map(|l| l.leverage)
+        .filter(|l| *l > Decimal::ZERO)
+        .unwrap_or(Decimal::ONE);
 
     let mut last_funding_ts: Option<Timestamp> = None;
     // Live: a STABLE run_id so each bot keeps a single snapshot file in its
@@ -1135,7 +1178,11 @@ where
                     && let Some(model) = liq_model.as_mut()
                 {
                     let pos_now = tracker.snapshot();
-                    if let Some(fill) = model.check(&pos_now, last_mark, ts) {
+                    // Cross-margin liquidation: the whole wallet backs the bag,
+                    // so the trigger needs the realized wallet (initial + realized
+                    // − fees), not just the position. Backtest-only path.
+                    let liq_wallet = initial_balance + tracker.realized().0 - tracker.fees().0;
+                    if let Some(fill) = model.check(&pos_now, last_mark, liq_wallet, ts) {
                         warn!(
                             liq_price = %fill.price.0,
                             mark = %last_mark.0,
@@ -1204,24 +1251,45 @@ where
                                 pos_notional,
                                 unrealized,
                                 balance,
+                                leverage: bagger_leverage,
+                                avg_price: avg,
+                                mark_price: mark,
                                 order_notional,
                                 now_ns: ts.0,
                             },
                         ) {
-                            // Reducing-side touch: taker crosses the spread (sell
-                            // into the bid / buy from the ask), maker rests at its
-                            // own touch.
-                            let touch = match (d.side, d.taker) {
+                            // Price for the reduce. The avg-take-profit rests at
+                            // `avg ± avg_tp_bps` (post-only, relative to entry);
+                            // every other mechanism uses the reducing-side touch
+                            // (taker crosses the spread, maker rests at its touch).
+                            let avg_tp_px = if d.reason == "avg TP" && avg > Decimal::ZERO {
+                                let bps = bagger_cfg.avg_tp_bps / Decimal::from(10_000);
+                                Some(if size > Decimal::ZERO {
+                                    avg * (Decimal::ONE + bps) // long sells above entry
+                                } else {
+                                    avg * (Decimal::ONE - bps) // short buys below entry
+                                })
+                            } else {
+                                None
+                            };
+                            let touch = avg_tp_px.or_else(|| match (d.side, d.taker) {
                                 (Side::Ask, true) => current_book.bids.first().map(|l| l.price.0),
                                 (Side::Ask, false) => current_book.asks.first().map(|l| l.price.0),
                                 (Side::Bid, true) => current_book.asks.first().map(|l| l.price.0),
                                 (Side::Bid, false) => current_book.bids.first().map(|l| l.price.0),
-                            };
+                            });
                             let qty = d.qty.min(size.abs());
                             let full_flatten = qty >= size.abs();
+                            // Cooldown applies in BOTH modes so backtest models
+                            // the live rate-limit: a partial reducer (avg-TP,
+                            // buying-power cut, wallet bracket) can't re-fire every
+                            // tick. Live also needs it for async fill latency.
                             if qty > Decimal::ZERO
+                                && ts.0.saturating_sub(last_bagger_flatten_ns)
+                                    >= BAGGER_FLATTEN_COOLDOWN_NS
                                 && let Some(px) = touch.filter(|p| *p > Decimal::ZERO)
                             {
+                                last_bagger_flatten_ns = ts.0;
                                 if !live_mode {
                                     // Backtest: synthesize the close fill (taker
                                     // or maker fee), then apply it. On a full
@@ -1249,6 +1317,7 @@ where
                                     if full_flatten {
                                         fill_sim.drop_quotes_for(&symbol);
                                     }
+                                    bagger_flattens = bagger_flattens.saturating_add(1);
                                     info!(
                                         reason = d.reason,
                                         side = ?d.side,
@@ -1275,29 +1344,48 @@ where
                                     .await;
                                 } else {
                                     // Live: real reduce. Taker = market_close;
-                                    // maker = reduce-only limit at the touch. The
-                                    // resulting stream fill updates the tracker;
-                                    // the resting grid is reconciled by the sweep.
-                                    if d.taker {
-                                        let _ = venue
+                                    // maker = reduce-only limit (GTX post-only) at
+                                    // the touch / avg±bps. The resulting stream
+                                    // fill updates the tracker; the resting grid is
+                                    // reconciled by the sweep. The send result is
+                                    // logged — a swallowed reject is what made
+                                    // earlier flattens "log but never flatten".
+                                    let send = if d.taker {
+                                        venue
                                             .market_close(&symbol, d.side, tikr_core::Size(qty))
-                                            .await;
+                                            .await
+                                            .map(|_| ())
                                     } else {
-                                        let _ = venue
+                                        venue
                                             .reduce_only_limit(
                                                 &symbol,
                                                 d.side,
                                                 Price(px),
                                                 tikr_core::Size(qty),
                                             )
-                                            .await;
+                                            .await
+                                            .map(|_| ())
+                                    };
+                                    match send {
+                                        Ok(()) => {
+                                            bagger_flattens = bagger_flattens.saturating_add(1);
+                                            info!(
+                                                reason = d.reason,
+                                                side = ?d.side,
+                                                qty = %qty,
+                                                taker = d.taker,
+                                                "bagger flatten (live)"
+                                            );
+                                        }
+                                        Err(e) => warn!(
+                                            reason = d.reason,
+                                            side = ?d.side,
+                                            qty = %qty,
+                                            taker = d.taker,
+                                            error = ?e,
+                                            "bagger flatten (live) FAILED"
+                                        ),
                                     }
-                                    info!(
-                                        reason = d.reason,
-                                        side = ?d.side,
-                                        qty = %qty,
-                                        "bagger flatten (live)"
-                                    );
                                 }
                             }
                         }
@@ -1352,6 +1440,7 @@ where
                         actions,
                         signed_pos_notional,
                         current_max_position,
+                        pos.avg_entry.0,
                         boost,
                     ),
                     None => actions,
@@ -1707,6 +1796,8 @@ where
                             peak_long_usdt,
                             peak_short_usdt,
                             live_metrics(&strategy),
+                            bagger_flattens,
+                            bagger_target.clone(),
                         );
                         // Partial: the LiveQuote is still on the book (FillSim
                         // keeps it around with reduced size_remaining). Don't
@@ -1860,6 +1951,8 @@ where
                     peak_long_usdt,
                     peak_short_usdt,
                     live_metrics(&strategy),
+                    bagger_flattens,
+                    bagger_target.clone(),
                 );
 
                 // PaperReport snapshot: fire on the very FIRST event so
@@ -2083,6 +2176,8 @@ where
                     peak_long_usdt,
                     peak_short_usdt,
                     live_metrics(&strategy),
+                    bagger_flattens,
+                    bagger_target.clone(),
                 );
                     continue;
                 }
@@ -2144,6 +2239,8 @@ where
                     peak_long_usdt,
                     peak_short_usdt,
                     live_metrics(&strategy),
+                    bagger_flattens,
+                    bagger_target.clone(),
                 );
             }
             _ = status_tick.tick() => {
@@ -2175,6 +2272,8 @@ where
                     peak_long_usdt,
                     peak_short_usdt,
                     live_metrics(&strategy),
+                    bagger_flattens,
+                    bagger_target.clone(),
                 );
                 if let Some(ref tap) = config.snapshot_tap {
                     let mut heartbeat = finalize(
@@ -2562,6 +2661,8 @@ where
                     peak_long_usdt,
                     peak_short_usdt,
                     live_metrics(&strategy),
+                    bagger_flattens,
+                    bagger_target.clone(),
                 );
                         }
                     }
@@ -2710,18 +2811,78 @@ fn apply_inventory_size_boost(
     actions: Vec<tikr_strategy::Action>,
     signed_pos_notional: Decimal,
     cap: Decimal,
+    avg_price: Decimal,
     cfg: InventoryBoostConfig,
 ) -> Vec<tikr_strategy::Action> {
-    if cfg.max_boost_pct <= Decimal::ZERO || cap <= Decimal::ZERO {
+    if cfg.max_boost_pct <= Decimal::ZERO {
         return actions;
     }
-    // Reducing side: a long (+) is reduced by Ask sells; a short (-) by Bid
-    // buys. Flat → nothing to reduce, pass through.
-    let reducing_side = match signed_pos_notional.cmp(&Decimal::ZERO) {
-        std::cmp::Ordering::Greater => Side::Ask,
-        std::cmp::Ordering::Less => Side::Bid,
-        std::cmp::Ordering::Equal => return actions,
+    // Target side. Default (chase=false): the inventory-REDUCING side — a long
+    // (+) is reduced by Ask sells, a short (-) by Bid buys. With chase=true:
+    // the inventory-ADDING side instead (long → Bid buys, short → Ask sells),
+    // averaging the entry toward mid as the bag fills. Flat → pass through.
+    let boost_side = match (signed_pos_notional.cmp(&Decimal::ZERO), cfg.chase) {
+        (std::cmp::Ordering::Greater, false) => Side::Ask, // long, reduce
+        (std::cmp::Ordering::Less, false) => Side::Bid,    // short, reduce
+        (std::cmp::Ordering::Greater, true) => Side::Bid,  // long, add (chase)
+        (std::cmp::Ordering::Less, true) => Side::Ask,     // short, add (chase)
+        (std::cmp::Ordering::Equal, _) => return actions,
     };
+    let exponent_of = |r: Decimal| -> Decimal {
+        let e = if cfg.curve_exponent > Decimal::ZERO {
+            cfg.curve_exponent
+        } else {
+            Decimal::ONE
+        };
+        if e == Decimal::ONE { r } else { r.powd(e) }
+    };
+
+    // Profit-gated mode: each reducing-side quote is boosted by how far its
+    // price sits past avg-entry in the favorable direction, so the bag is only
+    // shed harder when the fill banks a gain. Needs no cap reference (works
+    // cap-off). Only sensible on the reducing side — chase is left alone.
+    if cfg.profit_gated && !cfg.chase {
+        if avg_price <= Decimal::ZERO || cfg.profit_full_bps <= Decimal::ZERO {
+            return actions;
+        }
+        let bps = Decimal::from(10_000);
+        return actions
+            .into_iter()
+            .map(|action| {
+                let tikr_strategy::Action::Quote(mut intent) = action else {
+                    return action;
+                };
+                if intent.side != boost_side {
+                    return tikr_strategy::Action::Quote(intent);
+                }
+                // Favorable distance past avg: long reduces via Asks priced
+                // ABOVE avg; short reduces via Bids priced BELOW avg.
+                let profit_bps = match boost_side {
+                    Side::Ask => (intent.price.0 - avg_price) / avg_price * bps,
+                    Side::Bid => (avg_price - intent.price.0) / avg_price * bps,
+                };
+                if profit_bps <= Decimal::ZERO {
+                    // Quote would lock a loss (wrong side of avg) — never enlarge.
+                    return tikr_strategy::Action::Quote(intent);
+                }
+                let ratio = (profit_bps / cfg.profit_full_bps).min(Decimal::ONE);
+                let mult =
+                    Decimal::ONE + (cfg.max_boost_pct / Decimal::from(100)) * exponent_of(ratio);
+                if mult > Decimal::ONE {
+                    let scale = intent.size.0.scale();
+                    let boosted = (intent.size.0 * mult).round_dp(scale);
+                    if boosted > intent.size.0 {
+                        intent.size = tikr_core::Size(boosted);
+                    }
+                }
+                tikr_strategy::Action::Quote(intent)
+            })
+            .collect();
+    }
+
+    if cap <= Decimal::ZERO {
+        return actions;
+    }
     let ratio = (signed_pos_notional.abs() / cap).min(Decimal::ONE);
     let exponent = if cfg.curve_exponent > Decimal::ZERO {
         cfg.curve_exponent
@@ -2741,7 +2902,7 @@ fn apply_inventory_size_boost(
         .into_iter()
         .map(|action| {
             if let tikr_strategy::Action::Quote(mut intent) = action {
-                if intent.side == reducing_side {
+                if intent.side == boost_side {
                     let scale = intent.size.0.scale();
                     let boosted = (intent.size.0 * mult).round_dp(scale);
                     if boosted > intent.size.0 {
@@ -2794,23 +2955,39 @@ async fn dispatch_post_fill_actions<V, S>(
     // Resting same-side exposure comes from FillSim's live quotes; sum it
     // before dispatching (drops the borrow before the `&mut fill_sim` use
     // below).
+    // Profit-gated boost needs no cap reference, so it must run even with the
+    // per-bot cap OFF (`max_position == 0`); the legacy |pos|/cap boost and the
+    // worst-case cap only apply when the cap is set.
+    let profit_gated_boost = matches!(
+        inventory_boost,
+        Some(b) if b.profit_gated && !b.chase && b.profit_full_bps > Decimal::ZERO
+    );
     let actions: Vec<tikr_strategy::Action> = match snapshot_mid(current_book) {
-        Some(mid) if max_position > Decimal::ZERO => {
+        Some(mid) if max_position > Decimal::ZERO || profit_gated_boost => {
             let signed_pos_notional = post_fill_pos.size.0 * mid;
+            let avg = post_fill_pos.avg_entry.0;
             let actions = match inventory_boost {
-                Some(boost) => {
-                    apply_inventory_size_boost(actions, signed_pos_notional, max_position, boost)
-                }
+                Some(boost) => apply_inventory_size_boost(
+                    actions,
+                    signed_pos_notional,
+                    max_position,
+                    avg,
+                    boost,
+                ),
                 None => actions,
             };
-            let (resting_bid, resting_ask) = fill_sim.committed_notional_by_side(symbol);
-            apply_bot_inventory_cap(
-                actions,
-                signed_pos_notional,
-                resting_bid,
-                resting_ask,
-                max_position,
-            )
+            if max_position > Decimal::ZERO {
+                let (resting_bid, resting_ask) = fill_sim.committed_notional_by_side(symbol);
+                apply_bot_inventory_cap(
+                    actions,
+                    signed_pos_notional,
+                    resting_bid,
+                    resting_ask,
+                    max_position,
+                )
+            } else {
+                actions
+            }
         }
         _ => actions,
     };
@@ -3316,6 +3493,8 @@ fn publish_live(
     peak_long_usdt: Decimal,
     peak_short_usdt: Decimal,
     metrics: Vec<(String, String)>,
+    bagger_flattens: u64,
+    bagger_target: Option<String>,
 ) {
     let Some(tap) = tap.as_ref() else {
         return;
@@ -3388,6 +3567,8 @@ fn publish_live(
         peak_long_usdt,
         peak_short_usdt,
         metrics,
+        bagger_flattens,
+        bagger_target,
     };
     // Non-blocking: dashboard reader can be holding the read lock
     // during a draw; the next fill / snapshot tick will refresh.
@@ -3566,12 +3747,54 @@ mod tests {
         let boost = InventoryBoostConfig {
             max_boost_pct: Decimal::from(100),
             curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: false,
+            profit_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
-        let out =
-            apply_inventory_size_boost(actions, Decimal::from(-300), Decimal::from(600), boost);
+        let out = apply_inventory_size_boost(
+            actions,
+            Decimal::from(-300),
+            Decimal::from(600),
+            Decimal::ZERO,
+            boost,
+        );
         assert_eq!(quote_size(&out[0]), Decimal::new(1500, 3)); // 1.000 × 1.5
         assert_eq!(quote_size(&out[1]), Decimal::new(1000, 3)); // ask unchanged
+    }
+
+    #[test]
+    fn avg_chase_boost_scales_adding_side() {
+        // chase=true inverts the side. Long at full cap → boost the ADDING side
+        // (Bid buys) ×1.5, reducing side (Ask) untouched — averages entry down.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(50),
+            curve_exponent: Decimal::ONE,
+            chase: true,
+            profit_gated: false,
+            profit_full_bps: Decimal::ZERO,
+        };
+        let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
+        let out = apply_inventory_size_boost(
+            actions,
+            Decimal::from(600),
+            Decimal::from(600),
+            Decimal::ZERO,
+            boost,
+        );
+        assert_eq!(quote_size(&out[0]), Decimal::new(1500, 3)); // bid (add) ×1.5
+        assert_eq!(quote_size(&out[1]), Decimal::new(1000, 3)); // ask unchanged
+        // Short → chase boosts the Ask (adding side for a short).
+        let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
+        let out = apply_inventory_size_boost(
+            actions,
+            Decimal::from(-600),
+            Decimal::from(600),
+            Decimal::ZERO,
+            boost,
+        );
+        assert_eq!(quote_size(&out[0]), Decimal::new(1000, 3)); // bid unchanged
+        assert_eq!(quote_size(&out[1]), Decimal::new(1500, 3)); // ask (add) ×1.5
     }
 
     #[test]
@@ -3580,10 +3803,18 @@ mod tests {
         let boost = InventoryBoostConfig {
             max_boost_pct: Decimal::from(50),
             curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: false,
+            profit_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
-        let out =
-            apply_inventory_size_boost(actions, Decimal::from(600), Decimal::from(600), boost);
+        let out = apply_inventory_size_boost(
+            actions,
+            Decimal::from(600),
+            Decimal::from(600),
+            Decimal::ZERO,
+            boost,
+        );
         assert_eq!(quote_size(&out[0]), Decimal::new(1000, 3)); // bid unchanged
         assert_eq!(quote_size(&out[1]), Decimal::new(1500, 3)); // 1.000 × 1.5
     }
@@ -3595,10 +3826,18 @@ mod tests {
         let boost = InventoryBoostConfig {
             max_boost_pct: Decimal::from(100),
             curve_exponent: Decimal::from(2),
+            chase: false,
+            profit_gated: false,
+            profit_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid)];
-        let out =
-            apply_inventory_size_boost(actions, Decimal::from(-300), Decimal::from(600), boost);
+        let out = apply_inventory_size_boost(
+            actions,
+            Decimal::from(-300),
+            Decimal::from(600),
+            Decimal::ZERO,
+            boost,
+        );
         assert_eq!(quote_size(&out[0]), Decimal::new(1250, 3)); // 1.000 × 1.25
     }
 
@@ -3607,12 +3846,16 @@ mod tests {
         let boost = InventoryBoostConfig {
             max_boost_pct: Decimal::from(100),
             curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: false,
+            profit_full_bps: Decimal::ZERO,
         };
         // Flat position: nothing to reduce.
         let flat = apply_inventory_size_boost(
             vec![boost_quote(Side::Bid)],
             Decimal::ZERO,
             Decimal::from(600),
+            Decimal::ZERO,
             boost,
         );
         assert_eq!(quote_size(&flat[0]), Decimal::new(1000, 3));
@@ -3621,12 +3864,82 @@ mod tests {
             vec![boost_quote(Side::Bid)],
             Decimal::from(-600),
             Decimal::from(600),
+            Decimal::ZERO,
             InventoryBoostConfig {
                 max_boost_pct: Decimal::ZERO,
                 curve_exponent: Decimal::ONE,
+                chase: false,
+                profit_gated: false,
+                profit_full_bps: Decimal::ZERO,
             },
         );
         assert_eq!(quote_size(&off[0]), Decimal::new(1000, 3));
+    }
+
+    // Quote on `side` at an explicit price (scale-3 lot), for profit-gated tests.
+    fn boost_quote_at(side: Side, price: Decimal) -> tikr_strategy::Action {
+        tikr_strategy::Action::Quote(QuoteIntent {
+            symbol: cap_test_symbol(),
+            side,
+            price: Price(price),
+            size: Size(Decimal::new(1000, 3)), // 1.000
+            tif: tikr_core::TimeInForce::PostOnly,
+            kind: tikr_core::QuoteKind::Point,
+        })
+    }
+
+    #[test]
+    fn profit_gated_boosts_only_sells_above_avg() {
+        // Long bag, avg 100. Profit-gated, 100% max boost, saturates at 50 bps
+        // past avg. cap = 0 (off) → legacy curve would no-op; profit gate drives it.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: true,
+            profit_full_bps: Decimal::from(50),
+        };
+        let avg = Decimal::from(100);
+        // Ask at 100.50 = +50 bps past avg → ratio 1.0 → ×2.0.
+        // Ask at 100.25 = +25 bps → ratio 0.5 → ×1.5.
+        // Ask at 99.90  = −10 bps (below avg, locks a loss) → untouched.
+        // Bid (growing side) → untouched.
+        let actions = vec![
+            boost_quote_at(Side::Ask, Decimal::new(10050, 2)),
+            boost_quote_at(Side::Ask, Decimal::new(10025, 2)),
+            boost_quote_at(Side::Ask, Decimal::new(9990, 2)),
+            boost_quote_at(Side::Bid, Decimal::new(9990, 2)),
+        ];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(600), Decimal::ZERO, avg, boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(2000, 3)); // +50bps → ×2.0
+        assert_eq!(quote_size(&out[1]), Decimal::new(1500, 3)); // +25bps → ×1.5
+        assert_eq!(quote_size(&out[2]), Decimal::new(1000, 3)); // below avg → untouched
+        assert_eq!(quote_size(&out[3]), Decimal::new(1000, 3)); // growing side → untouched
+    }
+
+    #[test]
+    fn profit_gated_short_boosts_only_buys_below_avg() {
+        // Short bag, avg 100. Reducing side = Bid (buys). Buys below avg bank a
+        // gain; a buy above avg would lock a loss and must be left alone.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: true,
+            profit_full_bps: Decimal::from(50),
+        };
+        let avg = Decimal::from(100);
+        let actions = vec![
+            boost_quote_at(Side::Bid, Decimal::new(9950, 2)), // −50bps → ×2.0
+            boost_quote_at(Side::Bid, Decimal::new(10010, 2)), // above avg → untouched
+            boost_quote_at(Side::Ask, Decimal::new(10050, 2)), // growing side → untouched
+        ];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(-600), Decimal::ZERO, avg, boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(2000, 3));
+        assert_eq!(quote_size(&out[1]), Decimal::new(1000, 3));
+        assert_eq!(quote_size(&out[2]), Decimal::new(1000, 3));
     }
 
     struct MockVenue {
@@ -3780,8 +4093,10 @@ mod tests {
     async fn liquidation_force_closes_seeded_long() {
         let temp = TempDir::new().unwrap();
         let symbol = make_symbol();
-        // Seed a 10× long, size 1 @ entry 100. With mmr=0 the liquidation
-        // price is 100 × (1 − 0.1) = 90.
+        // Seed a long, size 1 @ entry 100. Cross-margin liq price (mmr=0) is
+        // `entry − wallet/size = 100 − 10/1 = 90`, where wallet = the account's
+        // initial balance (10) set below. Leverage no longer enters the trigger
+        // (it only caps buying power); the wallet backs the bag.
         let seed = Position {
             symbol: symbol.clone(),
             size: tikr_core::SignedSize(Decimal::from(1)),
@@ -3790,6 +4105,9 @@ mod tests {
         };
         let mut config = test_config(temp.path().into());
         config.seed_position = Some(seed);
+        // Cross-margin liquidation is wallet-backed: wallet 10 → long liq price
+        // = entry − wallet/size = 100 − 10 = 90.
+        config.initial_balance = Decimal::from(10);
         config.liquidation = Some(LiquidationConfig {
             leverage: Decimal::from(10),
             maint_margin_rate: Decimal::ZERO,
@@ -3843,6 +4161,9 @@ mod tests {
         };
         let mut config = test_config(temp.path().into());
         config.seed_position = Some(seed);
+        // Cross-margin liquidation is wallet-backed: wallet 10 → long liq price
+        // = entry − wallet/size = 100 − 10 = 90.
+        config.initial_balance = Decimal::from(10);
         config.liquidation = Some(LiquidationConfig {
             leverage: Decimal::from(10),
             maint_margin_rate: Decimal::ZERO,
@@ -3894,6 +4215,9 @@ mod tests {
         };
         let mut config = test_config(temp.path().into());
         config.seed_position = Some(seed);
+        // Cross-margin liquidation is wallet-backed: wallet 10 → long liq price
+        // = entry − wallet/size = 100 − 10 = 90.
+        config.initial_balance = Decimal::from(10);
         config.liquidation = Some(LiquidationConfig {
             leverage: Decimal::from(10),
             maint_margin_rate: Decimal::ZERO,

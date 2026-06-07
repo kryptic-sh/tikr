@@ -20,9 +20,9 @@
 //!   is set, only cut when it's still making new adverse extremes (trend), not on
 //!   a recovering dip (noise); otherwise a bare level stop.
 //! - **Equity giveback** (`equity_giveback_pct`) — flatten when MTM equity drops
-//!   that fraction from its session peak. Global (not size-gated).
+//!   that percent from its session peak. Global (not size-gated).
 //! - **Trailing TP** (`trail_pct`) — flatten when unrealized retraces that
-//!   fraction from its peak. Lets winners run, locks gains when a swing turns.
+//!   percent from its peak. Lets winners run, locks gains when a swing turns.
 //! - **Fixed TP** (`fixed_tp_pct`) — flatten at a fixed unrealized level.
 //!
 //! **Size gate is load-bearing.** Every mechanism except equity-giveback only
@@ -39,7 +39,7 @@ use tikr_core::{Decimal, Side};
 
 /// Tunable parameters. Each mechanism is enabled by its own positive parameter;
 /// all default to `0` (the whole bagger off). Percent fields are percent of the
-/// equity basis; `trail_pct`/`equity_giveback_pct` are fractions of a peak.
+/// equity basis; `trail_pct`/`equity_giveback_pct` are percents of a peak.
 #[derive(Debug, Clone, Copy)]
 pub struct BaggerConfig {
     /// Shared size gate: mechanisms (except equity giveback) arm only when
@@ -62,11 +62,11 @@ pub struct BaggerConfig {
     /// adverse extreme within this many seconds (still trending). `0` = bare
     /// level stop (cut as soon as `sl_pct` is breached).
     pub deteriorate_secs: u64,
-    /// **Equity giveback**: flatten when MTM equity drops this FRACTION from its
-    /// session peak. Global (no size gate). `0` off.
+    /// **Equity giveback**: flatten when MTM equity drops this **percent** from
+    /// its session peak (e.g. `10` = 10%). Global (no size gate). `0` off.
     pub equity_giveback_pct: Decimal,
-    /// **Trailing TP**: flatten when unrealized retraces this FRACTION from its
-    /// peak (e.g. `0.30`). `0` off.
+    /// **Trailing TP**: flatten when unrealized retraces this **percent** from
+    /// its peak (e.g. `30` = 30%). `0` off.
     pub trail_pct: Decimal,
     /// **Fixed TP**: flatten when unrealized ≥ this % of equity. `0` off.
     pub fixed_tp_pct: Decimal,
@@ -108,6 +108,36 @@ pub struct BaggerConfig {
     /// whole point is to flip fast and rack up volume without paying taker fees.
     /// `0` off.
     pub pnl_flat_pct: Decimal,
+    /// **Profit lock (ratchet)**: snapshot MTM equity, then flatten the WHOLE
+    /// bag once equity rises `≥ this %` above the snapshot — banking the gain —
+    /// and re-snapshot at the new (higher) equity. A monotonic profit ratchet:
+    /// each `this %` of growth is realized and the bar moves up. Global, no size
+    /// gate. `0` off.
+    pub profit_lock_pct: Decimal,
+    /// **Loss lock (ratchet)**: the downside counterpart to `profit_lock_pct`.
+    /// Flatten the WHOLE bag once equity falls `≥ this %` BELOW the shared
+    /// snapshot — cutting the loss — and re-snapshot at the new (lower) equity.
+    /// Shares the snapshot with profit lock, so enabling both makes a two-sided
+    /// bracket: flatten on a ±move from the last baseline, then re-baseline.
+    /// Global, no size gate. `0` off.
+    pub loss_lock_pct: Decimal,
+    /// **Buying-power cut**: reduce the position by `bp_flat_frac` when its
+    /// notional reaches `this %` of BUYING POWER (`wallet × leverage`), e.g.
+    /// `30` = cut at 30% of max position. Leverage-relative (vs `cap_pct` which
+    /// is wallet-relative). Ungated, P&L-blind. `0` off.
+    pub bp_flat_pct: Decimal,
+    /// Fraction reduced on each buying-power-cut trigger. Default `0.5` (half).
+    /// Only used when `bp_flat_pct > 0`.
+    pub bp_flat_frac: Decimal,
+    /// **Avg take-profit**: rest a reduce-only **post-only** order `this many
+    /// bps` beyond the average entry (long → `avg×(1+bps)`, short → `avg×(1−bps)`)
+    /// and sell `avg_tp_frac` of the bag when the mark reaches it. The companion
+    /// to `avg_chase` — flushes the averaged-down bag on a small reversal toward
+    /// the entry. Ungated, profit-only. `0` off.
+    pub avg_tp_bps: Decimal,
+    /// Fraction of the bag sold on each avg-take-profit trigger. Default `0.5`.
+    /// Only used when `avg_tp_bps > 0`.
+    pub avg_tp_frac: Decimal,
 }
 
 impl Default for BaggerConfig {
@@ -130,6 +160,12 @@ impl Default for BaggerConfig {
             wallet_tp_pct: Decimal::ZERO,
             wallet_sl_pct: Decimal::ZERO,
             wallet_flat_frac: Decimal::new(5, 1), // 0.5
+            profit_lock_pct: Decimal::ZERO,
+            loss_lock_pct: Decimal::ZERO,
+            bp_flat_pct: Decimal::ZERO,
+            bp_flat_frac: Decimal::new(5, 1), // 0.5
+            avg_tp_bps: Decimal::ZERO,
+            avg_tp_frac: Decimal::new(5, 1), // 0.5
         }
     }
 }
@@ -147,6 +183,69 @@ impl BaggerConfig {
             || self.periodic_flatten_secs > 0
             || self.wallet_tp_pct > Decimal::ZERO
             || self.wallet_sl_pct > Decimal::ZERO
+            || self.profit_lock_pct > Decimal::ZERO
+            || self.loss_lock_pct > Decimal::ZERO
+            || self.bp_flat_pct > Decimal::ZERO
+            || self.avg_tp_bps > Decimal::ZERO
+    }
+
+    /// Dominant enabled mechanism formatted for dashboards (e.g. `"eqv 15%"`,
+    /// `"lock ±2%"`, `"plk +2%"`). Returns the first enabled in display-priority
+    /// order, or `None` when the bagger is off. Profit/loss lock are rendered
+    /// together as a bracket when both are set, so neither side is hidden.
+    /// All `_pct` thresholds are real percents; `periodic` is seconds.
+    pub fn display_string(&self) -> Option<String> {
+        let pct = |v: Decimal| format!("{}%", v.normalize());
+        if self.equity_giveback_pct > Decimal::ZERO {
+            Some(format!("eqv {}", pct(self.equity_giveback_pct)))
+        } else if self.inv_flat_wallet_pct > Decimal::ZERO {
+            Some(format!("inv {}", pct(self.inv_flat_wallet_pct)))
+        } else if self.wallet_tp_pct > Decimal::ZERO || self.wallet_sl_pct > Decimal::ZERO {
+            Some(format!(
+                "wlt +{}/−{}",
+                self.wallet_tp_pct.normalize(),
+                self.wallet_sl_pct.normalize()
+            ))
+        } else if self.cap_pct > Decimal::ZERO {
+            Some(format!("cap {}", pct(self.cap_pct)))
+        } else if self.sl_pct > Decimal::ZERO {
+            Some(format!("sl {}", pct(self.sl_pct)))
+        } else if self.trail_pct > Decimal::ZERO {
+            Some(format!("trl {}", pct(self.trail_pct)))
+        } else if self.fixed_tp_pct > Decimal::ZERO {
+            Some(format!("ftp {}", pct(self.fixed_tp_pct)))
+        } else if self.pnl_flat_pct > Decimal::ZERO {
+            Some(format!("pnl {}", pct(self.pnl_flat_pct)))
+        } else if self.profit_lock_pct > Decimal::ZERO || self.loss_lock_pct > Decimal::ZERO {
+            let (p, l) = (self.profit_lock_pct, self.loss_lock_pct);
+            if p > Decimal::ZERO && l > Decimal::ZERO {
+                if p == l {
+                    Some(format!("lock ±{}", pct(p)))
+                } else {
+                    Some(format!("lock +{}/−{}", p.normalize(), l.normalize()))
+                }
+            } else if p > Decimal::ZERO {
+                Some(format!("plk +{}", pct(p)))
+            } else {
+                Some(format!("llk −{}", pct(l)))
+            }
+        } else if self.bp_flat_pct > Decimal::ZERO {
+            Some(format!(
+                "bpc {} ×{}",
+                pct(self.bp_flat_pct),
+                self.bp_flat_frac.normalize()
+            ))
+        } else if self.avg_tp_bps > Decimal::ZERO {
+            Some(format!(
+                "atp {}bps ×{}",
+                self.avg_tp_bps.normalize(),
+                self.avg_tp_frac.normalize()
+            ))
+        } else if self.periodic_flatten_secs > 0 {
+            Some(format!("per {}s", self.periodic_flatten_secs))
+        } else {
+            None
+        }
     }
 
     /// Apply a named preset (sets the underlying mechanism params). Keeps the
@@ -162,12 +261,12 @@ impl BaggerConfig {
                     self.deteriorate_secs = 0; // bare stop
                 }
                 "ratchet" | "trailing" => {
-                    self.trail_pct = Decimal::new(30, 2); // 0.30
+                    self.trail_pct = Decimal::from(30); // 30%
                     self.sl_pct = Decimal::new(3, 0);
                     self.deteriorate_secs = 0;
                 }
                 "dual" => {
-                    self.trail_pct = Decimal::new(30, 2);
+                    self.trail_pct = Decimal::from(30); // 30%
                     self.sl_pct = Decimal::new(3, 0);
                     self.deteriorate_secs = 10; // deteriorating gate
                 }
@@ -175,13 +274,25 @@ impl BaggerConfig {
                     self.cap_pct = Decimal::new(25, 0); // trim back to 25%
                 }
                 "equity" | "highwater" => {
-                    self.equity_giveback_pct = Decimal::new(10, 2); // 0.10
+                    self.equity_giveback_pct = Decimal::from(10); // 10%
                 }
                 "flat" | "churn" => {
                     self.pnl_flat_pct = Decimal::new(5, 0); // 5% of per-order notional
                 }
                 "wallet" | "invcap" => {
                     self.inv_flat_wallet_pct = Decimal::new(100, 0); // bag ≥ wallet
+                }
+                "lock" | "profitlock" | "ratchet-profit" => {
+                    self.profit_lock_pct = Decimal::new(2, 0); // bank every +2%
+                }
+                "losslock" | "ratchet-loss" => {
+                    self.loss_lock_pct = Decimal::new(2, 0); // cut every −2%
+                }
+                "bpcut" | "buyingpower" => {
+                    self.bp_flat_pct = Decimal::new(30, 0); // cut half at 30% of wallet×lev
+                }
+                "avgtp" | "chase-tp" => {
+                    self.avg_tp_bps = Decimal::new(10, 0); // sell half 10bps past avg
                 }
                 _ => {}
             }
@@ -200,6 +311,15 @@ pub struct GuardInput {
     pub unrealized: Decimal,
     /// Realized-settled equity basis (live wallet, or backtest running balance).
     pub balance: Decimal,
+    /// Account leverage (e.g. `30`). Buying power = `balance × leverage`; used by
+    /// `bp_flat_pct`. `1` when unknown (that mechanism then treats it as wallet).
+    pub leverage: Decimal,
+    /// Position average entry price (`0` if flat/unknown). Used by `avg_tp_bps`
+    /// to place the take-profit relative to the entry, not the touch.
+    pub avg_price: Decimal,
+    /// Current mark price (book-mid or recorded mark). Used by `avg_tp_bps` to
+    /// detect when the mark has reached `avg ± bps`.
+    pub mark_price: Decimal,
     /// Per-order notional (quote currency) — the denominator for `pnl_flat_pct`.
     /// `0` if unknown (that mechanism then no-ops).
     pub order_notional: Decimal,
@@ -235,6 +355,10 @@ pub struct BaggerState {
     equity_high_water: Decimal,
     /// Event-time (ns) of the last periodic flatten (`0` = uninitialized).
     last_periodic_flatten_ns: u64,
+    /// Lock-ratchet baseline: MTM equity snapshot the next ±`pct` move is
+    /// measured from. Shared by profit lock (up) and loss lock (down); whichever
+    /// fires re-snapshots it. `0` = uninitialized (seeded on the first tick).
+    lock_snapshot: Decimal,
 }
 
 impl BaggerState {
@@ -258,6 +382,9 @@ impl BaggerState {
             pos_notional,
             unrealized,
             balance,
+            leverage,
+            avg_price,
+            mark_price,
             order_notional,
             now_ns,
         } = input;
@@ -279,6 +406,15 @@ impl BaggerState {
         let mtm_equity = balance + unrealized;
         if mtm_equity > self.equity_high_water {
             self.equity_high_water = mtm_equity;
+        }
+        // Lock-ratchet baseline (shared by profit lock + loss lock): seed once
+        // from the first observed equity (tracked while flat so it starts at the
+        // opening balance, not after the first bag is already winning/losing).
+        if (cfg.profit_lock_pct > Decimal::ZERO || cfg.loss_lock_pct > Decimal::ZERO)
+            && self.lock_snapshot == Decimal::ZERO
+            && mtm_equity > Decimal::ZERO
+        {
+            self.lock_snapshot = mtm_equity;
         }
 
         if sign == 0 {
@@ -343,6 +479,53 @@ impl BaggerState {
             }
         }
 
+        // --- Buying-power cut: when the bag notional reaches `bp_flat_pct%` of
+        // BUYING POWER (`balance × leverage`), reduce it by `bp_flat_frac` (e.g.
+        // cut half at 30% of max position). Leverage-relative position cap;
+        // ungated, P&L-blind. Trims the bag back from the margin wall on a
+        // schedule of size, not price.
+        if cfg.bp_flat_pct > Decimal::ZERO && balance > Decimal::ZERO && leverage > Decimal::ZERO {
+            let limit = balance * leverage * cfg.bp_flat_pct / Decimal::from(100);
+            if pos_notional >= limit {
+                let qty = (full * cfg.bp_flat_frac).min(full);
+                if qty > Decimal::ZERO {
+                    return Some(FlattenDecision {
+                        qty,
+                        side,
+                        taker: cfg.exit_taker,
+                        reason: "buying-power cut",
+                    });
+                }
+            }
+        }
+
+        // --- Avg take-profit: once the mark reaches `avg ± avg_tp_bps`, sell
+        // `avg_tp_frac` of the bag as a reduce-only post-only maker AT that
+        // avg±bps price (the runner computes the exact price from `avg` + the
+        // configured bps). Profit-only (long needs mark > avg, short mark < avg).
+        // The companion to avg-chase: flushes the averaged-down bag on a small
+        // reversal toward entry. `taker:false` → the runner rests GTX/post-only.
+        if cfg.avg_tp_bps > Decimal::ZERO && avg_price > Decimal::ZERO && mark_price > Decimal::ZERO
+        {
+            let bps = cfg.avg_tp_bps / Decimal::from(10_000);
+            let hit = if pos_size > Decimal::ZERO {
+                mark_price >= avg_price * (Decimal::ONE + bps) // long: take above entry
+            } else {
+                mark_price <= avg_price * (Decimal::ONE - bps) // short: take below entry
+            };
+            if hit {
+                let qty = (full * cfg.avg_tp_frac).min(full);
+                if qty > Decimal::ZERO {
+                    return Some(FlattenDecision {
+                        qty,
+                        side,
+                        taker: false,
+                        reason: "avg TP",
+                    });
+                }
+            }
+        }
+
         // --- P&L flat: ungated, maker-only, high-churn. |unrealized| ≥ pct of
         // the PER-ORDER notional → flatten the whole bag. Checked first; when on
         // it's the dominant rule. Forces maker exit regardless of `exit_taker`.
@@ -390,13 +573,52 @@ impl BaggerState {
         // --- Equity giveback: global, no size gate. Risk-reducing → checked first.
         if cfg.equity_giveback_pct > Decimal::ZERO
             && self.equity_high_water > Decimal::ZERO
-            && mtm_equity <= self.equity_high_water * (Decimal::ONE - cfg.equity_giveback_pct)
+            && mtm_equity
+                <= self.equity_high_water
+                    * (Decimal::ONE - cfg.equity_giveback_pct / Decimal::from(100))
         {
             return Some(FlattenDecision {
                 qty: full,
                 side,
                 taker: cfg.exit_taker,
                 reason: "equity giveback",
+            });
+        }
+
+        // --- Loss lock (ratchet): the downside counterpart. Cut the whole bag
+        // once equity has fallen `−loss_lock_pct%` below the snapshot, then
+        // re-snapshot at the new (lower) equity. Risk-reducing → checked before
+        // profit lock. Shares `lock_snapshot` with profit lock.
+        if cfg.loss_lock_pct > Decimal::ZERO
+            && self.lock_snapshot > Decimal::ZERO
+            && mtm_equity
+                <= self.lock_snapshot * (Decimal::ONE - cfg.loss_lock_pct / Decimal::from(100))
+        {
+            self.lock_snapshot = mtm_equity;
+            return Some(FlattenDecision {
+                qty: full,
+                side,
+                taker: cfg.exit_taker,
+                reason: "loss lock",
+            });
+        }
+
+        // --- Profit lock (ratchet): bank the whole bag once equity has grown
+        // `+profit_lock_pct%` past the snapshot, then re-snapshot at the new
+        // (higher) equity so the next +pct is measured from here. Global, no size
+        // gate. The re-snapshot uses current `mtm_equity`, which is what equity
+        // becomes after the flatten realizes the open P&L.
+        if cfg.profit_lock_pct > Decimal::ZERO
+            && self.lock_snapshot > Decimal::ZERO
+            && mtm_equity
+                >= self.lock_snapshot * (Decimal::ONE + cfg.profit_lock_pct / Decimal::from(100))
+        {
+            self.lock_snapshot = mtm_equity;
+            return Some(FlattenDecision {
+                qty: full,
+                side,
+                taker: cfg.exit_taker,
+                reason: "profit lock",
             });
         }
 
@@ -457,7 +679,8 @@ impl BaggerState {
 
         // Trailing TP: retrace from peak, but only while still net-positive.
         if cfg.trail_pct > Decimal::ZERO && self.peak_unrealized > Decimal::ZERO {
-            let lock_at = self.peak_unrealized * (Decimal::ONE - cfg.trail_pct);
+            let lock_at =
+                self.peak_unrealized * (Decimal::ONE - cfg.trail_pct / Decimal::from(100));
             if lock_at > Decimal::ZERO && unrealized <= lock_at {
                 return Some(FlattenDecision {
                     qty: tp_qty,
@@ -501,6 +724,9 @@ mod tests {
             pos_notional: dec("200"),
             unrealized: dec(unrealized),
             balance: dec("1000"),
+            leverage: dec("1"),
+            avg_price: dec("100"),
+            mark_price: dec("100"),
             order_notional: dec("60"),
             now_ns,
         }
@@ -559,9 +785,131 @@ mod tests {
     }
 
     #[test]
+    fn profit_lock_ratchets() {
+        let cfg = BaggerConfig {
+            profit_lock_pct: dec("2"),
+            ..Default::default()
+        };
+        let mut st = BaggerState::default();
+        // First tick seeds the snapshot at equity 1000 (balance) — no fire.
+        assert!(st.evaluate(&cfg, long_input("0", 0)).is_none());
+        // +2% (equity 1020 = 1000 × 1.02) → bank the full bag.
+        let d = st.evaluate(&cfg, long_input("20", 1)).unwrap();
+        assert_eq!(d.reason, "profit lock");
+        assert_eq!(d.qty, dec("2"), "flattens full bag");
+        // Snapshot re-based to 1020: another +20 (equity 1020) is NOT enough.
+        assert!(st.evaluate(&cfg, long_input("20", 2)).is_none());
+        // Equity 1041 ≥ 1020 × 1.02 = 1040.4 → bank again.
+        assert_eq!(
+            st.evaluate(&cfg, long_input("41", 3)).unwrap().reason,
+            "profit lock"
+        );
+    }
+
+    #[test]
+    fn loss_lock_ratchets_down() {
+        let cfg = BaggerConfig {
+            loss_lock_pct: dec("2"),
+            ..Default::default()
+        };
+        let mut st = BaggerState::default();
+        // First tick seeds the snapshot at equity 1000 — no fire.
+        assert!(st.evaluate(&cfg, long_input("0", 0)).is_none());
+        // −2% (equity 980 = 1000 × 0.98) → cut the full bag.
+        let d = st.evaluate(&cfg, long_input("-20", 1)).unwrap();
+        assert_eq!(d.reason, "loss lock");
+        assert_eq!(d.qty, dec("2"), "flattens full bag");
+        // Snapshot re-based DOWN to 980: another −20 (equity 980) is not enough.
+        assert!(st.evaluate(&cfg, long_input("-20", 2)).is_none());
+        // Equity 959.6 ≤ 980 × 0.98 = 960.4 → cut again.
+        assert_eq!(
+            st.evaluate(&cfg, long_input("-40.4", 3)).unwrap().reason,
+            "loss lock"
+        );
+    }
+
+    #[test]
+    fn profit_and_loss_lock_two_sided() {
+        // Both on → bracket around a shared, re-baselining snapshot.
+        let cfg = BaggerConfig {
+            profit_lock_pct: dec("2"),
+            loss_lock_pct: dec("2"),
+            ..Default::default()
+        };
+        let mut st = BaggerState::default();
+        assert!(st.evaluate(&cfg, long_input("0", 0)).is_none()); // seed @1000
+        // +2% banks (snapshot → 1020).
+        assert_eq!(
+            st.evaluate(&cfg, long_input("20", 1)).unwrap().reason,
+            "profit lock"
+        );
+        // From snapshot 1020, equity 979.6 ≤ 1020 × 0.98 = 999.6 → loss lock.
+        assert_eq!(
+            st.evaluate(&cfg, long_input("-20.4", 2)).unwrap().reason,
+            "loss lock"
+        );
+    }
+
+    #[test]
+    fn avg_tp_sells_frac_beyond_entry() {
+        // Sell half once the mark reaches avg + 10bps (long).
+        let cfg = BaggerConfig {
+            avg_tp_bps: dec("10"),
+            ..Default::default()
+        }; // avg_tp_frac defaults 0.5
+        let mut st = BaggerState::default();
+        // avg 100, mark 100.05 = avg × 1.0005 (5bps) → not yet (needs 10bps).
+        let early = GuardInput {
+            avg_price: dec("100"),
+            mark_price: dec("100.05"),
+            ..long_input("0", 0)
+        };
+        assert!(st.evaluate(&cfg, early).is_none());
+        // mark 100.10 = avg × 1.001 (10bps) → fires, sells half the 2-unit bag.
+        let hit = GuardInput {
+            avg_price: dec("100"),
+            mark_price: dec("100.10"),
+            ..long_input("0", 0)
+        };
+        let d = st.evaluate(&cfg, hit).unwrap();
+        assert_eq!(d.reason, "avg TP");
+        assert!(!d.taker, "avg TP rests as a post-only maker");
+        assert_eq!(d.qty, dec("1"), "half of the 2-unit bag");
+    }
+
+    #[test]
+    fn buying_power_cut_half() {
+        // Cut half when bag ≥ 30% of buying power (balance × leverage).
+        let cfg = BaggerConfig {
+            bp_flat_pct: dec("30"),
+            ..Default::default()
+        }; // bp_flat_frac defaults 0.5
+        let mut st = BaggerState::default();
+        // balance 1000 × leverage 30 = 30000 buying power; 30% = 9000 threshold.
+        let at = GuardInput {
+            pos_size: dec("90"),
+            pos_notional: dec("9000"), // exactly at threshold
+            leverage: dec("30"),
+            ..long_input("0", 0)
+        };
+        let d = st.evaluate(&cfg, at).unwrap();
+        assert_eq!(d.reason, "buying-power cut");
+        assert_eq!(d.qty, dec("45"), "cuts half the 90-unit bag");
+
+        // Below threshold (8000 < 9000) → no fire.
+        let below = GuardInput {
+            pos_size: dec("80"),
+            pos_notional: dec("8000"),
+            leverage: dec("30"),
+            ..long_input("0", 0)
+        };
+        assert!(st.evaluate(&cfg, below).is_none());
+    }
+
+    #[test]
     fn trailing_tp_from_peak() {
         let mut cfg = gated("15");
-        cfg.trail_pct = dec("0.30");
+        cfg.trail_pct = dec("30");
         let mut st = BaggerState::default();
         assert!(st.evaluate(&cfg, long_input("50", 1)).is_none()); // peak 50
         assert!(st.evaluate(&cfg, long_input("40", 2)).is_none()); // 20% off → hold
@@ -603,7 +951,7 @@ mod tests {
     #[test]
     fn equity_giveback_no_size_gate() {
         let mut cfg = gated("0"); // no size gate at all
-        cfg.equity_giveback_pct = dec("0.10");
+        cfg.equity_giveback_pct = dec("10");
         let mut st = BaggerState::default();
         assert!(st.evaluate(&cfg, long_input("100", 1)).is_none()); // peak equity 1100
         let d = st.evaluate(&cfg, long_input("-10", 2)).unwrap(); // 990 ≤ 1100*0.9
@@ -615,7 +963,7 @@ mod tests {
         // Stack trailing TP + size cap. A big bag over the cap trims FIRST
         // (risk-reducing) even if it's also profitable enough to TP.
         let mut cfg = gated("15");
-        cfg.trail_pct = dec("0.30");
+        cfg.trail_pct = dec("30");
         cfg.cap_pct = dec("15"); // cap 150 < notional 200
         let mut st = BaggerState::default();
         let _ = st.evaluate(&cfg, long_input("50", 1)); // peak 50
@@ -766,7 +1114,7 @@ mod tests {
     #[test]
     fn resets_on_flip() {
         let mut cfg = gated("15");
-        cfg.trail_pct = dec("0.30");
+        cfg.trail_pct = dec("30");
         let mut st = BaggerState::default();
         let _ = st.evaluate(&cfg, long_input("50", 1)); // peak 50 long
         let short = GuardInput {

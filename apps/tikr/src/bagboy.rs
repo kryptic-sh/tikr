@@ -380,6 +380,8 @@ fn publish(
         peak_long_usdt: Decimal::ZERO,
         peak_short_usdt: Decimal::ZERO,
         metrics: Vec::new(),
+        bagger_flattens: 0,
+        bagger_target: None,
     };
     if let Ok(mut g) = live.write() {
         *g = Some(snap);

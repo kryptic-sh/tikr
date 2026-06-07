@@ -30,12 +30,12 @@ use tikr_paper::{
     FundingConfig, InventoryBoostConfig, PaperReport, RunnerConfig, SkimConfig, run_with_resume,
 };
 use tikr_strategy::{
-    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, Glft, GlftConfig, Hawk, HawkConfig,
-    Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid, LayeredGridConfig,
-    LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig, MicroPrice,
-    MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
-    StaticGridConfig, Strategy, Tidal, TidalConfig, Tide, TideConfig, TopOfBook, TopOfBookConfig,
-    Wave, WaveConfig,
+    AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, FlatMm, FlatMmConfig, Glft, GlftConfig,
+    Hawk, HawkConfig, Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid,
+    LayeredGridConfig, LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig,
+    MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig,
+    StaticGrid, StaticGridConfig, Strategy, Tidal, TidalConfig, Tide, TideConfig, TopOfBook,
+    TopOfBookConfig, Wave, WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -709,6 +709,43 @@ struct Args {
     #[arg(long, default_value = "4")]
     simple_gap_bps_list: String,
 
+    /// FlatMm sweep: comma-separated ladder step spacing, in bps.
+    #[arg(long, default_value = "1")]
+    flat_mm_step_bps_list: String,
+    /// FlatMm sweep: comma-separated inner half-spread (innermost level
+    /// distance from mid), in bps. Effective spread = 2×inner.
+    #[arg(long, default_value = "1")]
+    flat_mm_inner_bps_list: String,
+    /// FlatMm sweep: comma-separated reservation-skew γ values, in bps.
+    #[arg(long, default_value = "2")]
+    flat_mm_skew_bps_list: String,
+    /// FlatMm sweep: comma-separated book-imbalance skew values, in bps (shift
+    /// the ladder toward the heavier book side; the adverse-selection edge).
+    #[arg(long, default_value = "0")]
+    flat_mm_imbalance_bps_list: String,
+    /// FlatMm sweep: comma-separated break-even flush distances, in bps.
+    #[arg(long, default_value = "1")]
+    flat_mm_flush_bps_list: String,
+    /// FlatMm: ladder levels per side.
+    #[arg(long, default_value_t = 5u32)]
+    flat_mm_levels: u32,
+    /// FlatMm sweep: comma-separated size multiplier for below-break-even
+    /// reducing levels. `1` = full (bleed), `0` = suppress, between = smaller.
+    #[arg(long, default_value = "1")]
+    flat_mm_underwater_frac_list: String,
+    /// FlatMm sweep: comma-separated chase-boost % (grow the adding side when
+    /// underwater, to average toward mark). `0` = anti-martingale shrink.
+    #[arg(long, default_value = "0")]
+    flat_mm_chase_list: String,
+    /// FlatMm sweep: comma-separated flush fraction (share of the bag the
+    /// break-even flush dumps each fill). `1` = whole bag, `0.5` = cut half.
+    #[arg(long, default_value = "1")]
+    flat_mm_flush_frac_list: String,
+    /// FlatMm: inventory notional (USDC) that maps to full skew / size bias.
+    /// `0` (default) → `20 × notional`.
+    #[arg(long, default_value = "0")]
+    flat_mm_skew_unit: String,
+
     /// Per-order notional (USDT) shared by the flat-notional strategies
     /// (SimpleGap, LadderReentry, MicroMeanReversion, Tide, Wave). When
     /// balance-compounding is enabled (`--sim-initial-balance` +
@@ -906,13 +943,14 @@ struct Args {
     /// Override: deteriorating-SL window (secs); `0` = bare level stop.
     #[arg(long, default_value_t = 0u64)]
     bagger_deteriorate_secs: u64,
-    /// Override: trailing-TP retrace fraction. `0` = leave preset/off.
+    /// Override: trailing-TP retrace percent (e.g. `30` = 30%). `0` = leave/off.
     #[arg(long, default_value = "0")]
     bagger_trail_pct: String,
     /// Override: fixed-TP level (% of equity). `0` = leave preset/off.
     #[arg(long, default_value = "0")]
     bagger_fixed_tp_pct: String,
-    /// Override: equity-giveback fraction from session peak. `0` = leave preset/off.
+    /// Override: equity-giveback percent from session peak (e.g. `10` = 10%).
+    /// `0` = leave preset/off.
     #[arg(long, default_value = "0")]
     bagger_equity_giveback_pct: String,
     /// Override: P&L-flat threshold as % of PER-ORDER notional (maker-only,
@@ -945,6 +983,31 @@ struct Args {
     /// Fraction reduced on either wallet-bracket trigger. Default 0.5 (half).
     #[arg(long, default_value = "0.5")]
     bagger_wallet_flat_frac: String,
+    /// Profit-lock ratchet: bank the whole bag once MTM equity grows +this % past
+    /// the snapshot, then re-snapshot at the new equity. `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_profit_lock_pct: String,
+    /// Loss-lock ratchet (downside counterpart): cut the whole bag once MTM
+    /// equity falls −this % below the shared snapshot, then re-snapshot at the
+    /// new equity. `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_loss_lock_pct: String,
+    /// Buying-power cut: reduce the bag by `bagger-bp-flat-frac` when its
+    /// notional reaches this % of buying power (wallet × leverage), e.g. 30.
+    /// `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_bp_flat_pct: String,
+    /// Fraction reduced on each buying-power-cut trigger. Default 0.5 (half).
+    #[arg(long, default_value = "0.5")]
+    bagger_bp_flat_frac: String,
+    /// Avg take-profit: rest a reduce-only post-only order this many bps beyond
+    /// avg entry, selling `bagger-avg-tp-frac` of the bag when the mark hits it.
+    /// `0` = leave preset/off.
+    #[arg(long, default_value = "0")]
+    bagger_avg_tp_bps: String,
+    /// Fraction of the bag sold on each avg-take-profit trigger. Default 0.5.
+    #[arg(long, default_value = "0.5")]
+    bagger_avg_tp_frac: String,
 
     // ─── Tidal (asymmetric cadence) ───────────────────────────────────────
     /// Tidal sweep: comma-separated step_bps (level spacing). Default 10.
@@ -1040,12 +1103,13 @@ struct Args {
 
     /// FillSim: submit-ack latency in ms. Bumping this from 0 exposes
     /// post-only crosses on fast moves (book ticks through our intended
-    /// price between decision and ack). Realistic NA → AWS-Tokyo ~50ms.
-    #[arg(long, default_value_t = 50u64)]
+    /// price between decision and ack). Default `76` = the operator's measured
+    /// mean RTT to Binance USD-M.
+    #[arg(long, default_value_t = 76u64)]
     sim_submit_latency_ms: u64,
 
-    /// FillSim: cancel-ack latency in ms.
-    #[arg(long, default_value_t = 10u64)]
+    /// FillSim: cancel-ack latency in ms. Default `76` (same measured RTT).
+    #[arg(long, default_value_t = 76u64)]
     sim_cancel_latency_ms: u64,
 
     /// FillSim: synthetic `-2019` margin cap in USDT notional (signed
@@ -1082,10 +1146,28 @@ struct Args {
     /// disables. Applies to every preset (runner-side, like the cap).
     #[arg(long, default_value = "0")]
     sim_inventory_boost_pct: String,
+    /// Average-chase boost: INVERSE of inventory-boost — scales the inventory-
+    /// ADDING side up as the bag fills (long → bigger buys), averaging entry
+    /// toward mid. Takes precedence over `--sim-inventory-boost-pct`. `0` off.
+    #[arg(long, default_value = "0")]
+    sim_avg_chase_boost_pct: String,
     /// Curve exponent for the inventory boost (|pos|/cap ratio). `1` = linear,
     /// `>1` = slow start then steep, `<1` = fast early ramp.
     #[arg(long, default_value = "1")]
     sim_inventory_boost_curve: String,
+    /// Profit-gated reducing-side boost. When `true`, `--sim-inventory-boost-pct`
+    /// scales each reducing-side quote by how far its price sits PAST the
+    /// position's average entry in the favorable direction (long: sell above
+    /// avg; short: buy below avg) instead of by `|pos|/cap` — the bag is only
+    /// shed harder when the fill banks a gain, and a quote that would lock a
+    /// loss is never enlarged. Needs no cap (works with
+    /// `--sim-max-position-pct 0`). Reducing side only (ignored under chase).
+    #[arg(long, default_value = "false")]
+    sim_inventory_boost_profit_gated: bool,
+    /// Profit distance past avg-entry, in bps, at which the profit-gated boost
+    /// saturates to `--sim-inventory-boost-pct`. Default 50.
+    #[arg(long, default_value = "50")]
+    sim_inventory_boost_profit_full_bps: String,
 
     /// Account leverage. Like the live bot, leverage does NOT affect order
     /// sizing or the position cap (those are wallet-relative) — it only sets
@@ -1128,8 +1210,8 @@ struct Args {
     sim_rng_seed: u64,
 
     /// FillSim: mean exponential latency jitter (ms) added per op on top of
-    /// `--sim-submit-latency-ms`. `0` = fixed latency (deterministic sweeps).
-    /// Overridden when `--measure-latency` is on (default).
+    /// `--sim-submit-latency-ms`. `0` (default) = fixed latency, bit-reproducible
+    /// sweeps. Only overridden when `--measure-latency` is explicitly turned on.
     #[arg(long, default_value_t = 0u64)]
     sim_latency_jitter_ms: u64,
 
@@ -1141,19 +1223,15 @@ struct Args {
 
     /// Measure real round-trip latency to Binance USD-M (10 pings) at startup
     /// and use the mean as submit/cancel latency and the stddev as jitter,
-    /// OVERRIDING the --sim-*-latency flags. On by default so sweeps reflect
-    /// this machine's actual link.
+    /// OVERRIDING the --sim-*-latency flags.
     ///
-    /// DETERMINISM: the probe runs ONCE per invocation and applies to every
-    /// preset, so presets WITHIN a single run share one latency model and stay
-    /// comparable. But the measured mean/jitter wander with real network RTT
-    /// run-to-run, so the SAME preset in two separate invocations will NOT
-    /// reproduce (different fills/PnL). For bit-reproducible results — e.g.
-    /// comparing a config change across runs, or A/B-ing one knob in two
-    /// invocations — pass `--measure-latency false` (uses the fixed
-    /// `--sim-submit-latency-ms` / jitter `0`), and pin filters too
-    /// (`--autodetect-filters false` + explicit `--tick-size`/`--step-size`).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// OFF by default: the live probe's mean/jitter wander with real network
+    /// RTT run-to-run, which made the SAME preset NON-reproducible across
+    /// invocations (different fills/PnL) — a silent determinism bug. The static
+    /// default (`--sim-submit-latency-ms`/`--sim-cancel-latency-ms` = 76ms,
+    /// jitter 0, fixed RNG seed) is bit-reproducible. Turn this ON only for a
+    /// one-off "what's my link doing right now" check, never for sweeps.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     measure_latency: bool,
 
     /// FillSim: max simultaneously-resting orders per symbol (Binance
@@ -1390,10 +1468,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_pct = Decimal::from_str(&args.sim_max_position_pct)?;
     let _ = BALANCE_COMPOUNDING.set((initial, order_pct, max_pct));
     let inv_boost_pct = Decimal::from_str(&args.sim_inventory_boost_pct)?;
-    let inv_boost = if inv_boost_pct > Decimal::ZERO {
+    let chase_pct = Decimal::from_str(&args.sim_avg_chase_boost_pct)?;
+    // avg-chase (adding side) takes precedence over inventory-boost (reducing
+    // side) — they're opposite directions sharing one runner slot.
+    let inv_boost = if chase_pct > Decimal::ZERO {
+        Some(InventoryBoostConfig {
+            max_boost_pct: chase_pct,
+            curve_exponent: Decimal::from_str(&args.sim_inventory_boost_curve)?,
+            chase: true,
+            profit_gated: false,
+            profit_full_bps: Decimal::ZERO,
+        })
+    } else if inv_boost_pct > Decimal::ZERO {
         Some(InventoryBoostConfig {
             max_boost_pct: inv_boost_pct,
             curve_exponent: Decimal::from_str(&args.sim_inventory_boost_curve)?,
+            chase: false,
+            profit_gated: args.sim_inventory_boost_profit_gated,
+            profit_full_bps: Decimal::from_str(&args.sim_inventory_boost_profit_full_bps)?,
         })
     } else {
         None
@@ -1453,6 +1545,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bagger_cfg.wallet_tp_pct = wtp;
         bagger_cfg.wallet_sl_pct = wsl;
         bagger_cfg.wallet_flat_frac = Decimal::from_str(&args.bagger_wallet_flat_frac)?;
+    }
+    let plock = Decimal::from_str(&args.bagger_profit_lock_pct)?;
+    if plock > Decimal::ZERO {
+        bagger_cfg.profit_lock_pct = plock;
+    }
+    let llock = Decimal::from_str(&args.bagger_loss_lock_pct)?;
+    if llock > Decimal::ZERO {
+        bagger_cfg.loss_lock_pct = llock;
+    }
+    let bpcut = Decimal::from_str(&args.bagger_bp_flat_pct)?;
+    if bpcut > Decimal::ZERO {
+        bagger_cfg.bp_flat_pct = bpcut;
+        bagger_cfg.bp_flat_frac = Decimal::from_str(&args.bagger_bp_flat_frac)?;
+    }
+    let avgtp = Decimal::from_str(&args.bagger_avg_tp_bps)?;
+    if avgtp > Decimal::ZERO {
+        bagger_cfg.avg_tp_bps = avgtp;
+        bagger_cfg.avg_tp_frac = Decimal::from_str(&args.bagger_avg_tp_frac)?;
     }
     let _ = BAGGER.set(bagger_cfg);
 
@@ -1914,6 +2024,7 @@ async fn run_sweep_collect(
         Decimal::ZERO
     };
     let simple_gap_notional = notional;
+    let flat_mm_notional = notional;
     let ladder_reentry_notional = notional;
     let micro_mean_reversion_notional = notional;
     let tide_notional = notional;
@@ -2381,6 +2492,71 @@ async fn run_sweep_collect(
                 sim_cfg_template.clone(),
                 equity_csv_dir.clone(),
             );
+        }
+    }
+
+    // FlatMm — 0-fee flat-inventory churner: reservation-skew ladder + size
+    // skew + break-even flush. Sweeps step / skew(γ) / flush bps.
+    if included("flat-mm", &allow) {
+        let step_sweep = parse_decimal_list(&args.flat_mm_step_bps_list)?;
+        let inner_sweep = parse_decimal_list(&args.flat_mm_inner_bps_list)?;
+        let skew_sweep = parse_decimal_list(&args.flat_mm_skew_bps_list)?;
+        let imb_sweep = parse_decimal_list(&args.flat_mm_imbalance_bps_list)?;
+        let flush_sweep = parse_decimal_list(&args.flat_mm_flush_bps_list)?;
+        let uw_sweep = parse_decimal_list(&args.flat_mm_underwater_frac_list)?;
+        let chase_sweep = parse_decimal_list(&args.flat_mm_chase_list)?;
+        let flushfrac_sweep = parse_decimal_list(&args.flat_mm_flush_frac_list)?;
+        let skew_unit = {
+            let u = Decimal::from_str(&args.flat_mm_skew_unit)?;
+            if u > Decimal::ZERO {
+                u
+            } else {
+                flat_mm_notional * Decimal::from(20)
+            }
+        };
+        for &step in &step_sweep {
+            for &inner in &inner_sweep {
+                for &skew in &skew_sweep {
+                    for &flush in &flush_sweep {
+                        for &uw in &uw_sweep {
+                            for &chase in &chase_sweep {
+                                for &ffrac in &flushfrac_sweep {
+                                    for &imb in &imb_sweep {
+                                        let label = format!(
+                                            "FlatMm in={inner} step={step} skew={skew} imb={imb} flush={flush} ff={ffrac} uw={uw} chase={chase} lv={}",
+                                            args.flat_mm_levels
+                                        );
+                                        spawn_preset(
+                                            &mut handles,
+                                            &shared_data,
+                                            &symbol,
+                                            &label,
+                                            FlatMm::new(FlatMmConfig {
+                                                notional_per_order: flat_mm_notional,
+                                                inner_bps: inner,
+                                                step_bps: step,
+                                                levels: args.flat_mm_levels,
+                                                reservation_skew_bps: skew,
+                                                imbalance_skew_bps: imb,
+                                                skew_unit_notional: skew_unit,
+                                                flush_bps: flush,
+                                                chase_boost_pct: chase,
+                                                flush_frac: ffrac,
+                                                underwater_reduce_frac: uw,
+                                            }),
+                                            fees,
+                                            skim_cfg,
+                                            funding_cfg,
+                                            sim_cfg_template.clone(),
+                                            equity_csv_dir.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
