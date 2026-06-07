@@ -47,8 +47,8 @@ min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
-levels = 40
-round_trips = 20
+levels = 20
+round_trips = 10
 steps_bps = 1
 auto_inner = false        # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 1           # only used when auto_inner = false
