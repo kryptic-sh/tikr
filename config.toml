@@ -49,7 +49,7 @@ kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
 levels = 20
 round_trips = 10
-steps_bps = 10
+steps_bps = 1
 auto_inner = true            # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 0              # only used when auto_inner = false
 force_refill_secs = 120      # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
