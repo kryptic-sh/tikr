@@ -1,7 +1,7 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "0.2"
+order_balance_pct = "1"
 max_position_pct = "0"
 auto_scale = true                      # wallet-aware: N = min(rampage.top_n, floor(wallet/min_bot_capital_usdc)); each bot orders (wallet/N)×order_balance_pct
 min_bot_capital_usdc = "250"           # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
@@ -55,4 +55,4 @@ auto_step = false            # auto-size the lattice step (k×mean candle gap, f
 auto_step_k = "0.25"         # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
 relattice_drift_pct = "0.02" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
-size_mult = "1.25"           # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
+size_mult = "1"              # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
