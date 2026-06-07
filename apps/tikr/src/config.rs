@@ -197,6 +197,20 @@ pub struct AccountConfig {
     /// `inventory_boost_profit_gated`. Default 50 bps.
     #[serde(default = "default_inventory_boost_profit_full_bps")]
     pub inventory_boost_profit_full_bps: Decimal,
+    /// Adding-side (averaging-down) boost, the mirror of `inventory_boost_pct`.
+    /// In profit-gated mode, enlarge each ADDING-side quote priced past avg in
+    /// the unfavorable direction (long: bids below avg; short: asks above avg)
+    /// by how far underwater it sits — averaging down harder the deeper price
+    /// strays below your average. A tamer, position-aware cousin of `size_mult`
+    /// (only fires when actually underwater). `0` (default) = off (reducing
+    /// only). Runs even if `inventory_boost_pct = 0`.
+    #[serde(default)]
+    pub inventory_boost_add_pct: Decimal,
+    /// Underwater distance past avg-entry, in bps, at which `inventory_boost_add_pct`
+    /// saturates. Ignored unless profit-gated with `inventory_boost_add_pct > 0`.
+    /// Default 50 bps.
+    #[serde(default = "default_inventory_boost_profit_full_bps")]
+    pub inventory_boost_add_full_bps: Decimal,
     /// Account-level bagger (inventory-risk flatten). All mechanisms default
     /// off; populate the `[account.bagger]` table to enable one. Applied to
     /// every bot by the runner.
@@ -352,22 +366,30 @@ impl AccountConfig {
     ///
     /// Both use `inventory_boost_curve` for the ramp shape.
     pub fn inventory_boost(&self) -> Option<tikr_paper::InventoryBoostConfig> {
+        // The adding-side (avg-down) boost can run even when the reducing boost
+        // is off, so build the config whenever EITHER side is enabled.
         if self.avg_chase_boost_pct > Decimal::ZERO {
             Some(tikr_paper::InventoryBoostConfig {
                 max_boost_pct: self.avg_chase_boost_pct,
                 curve_exponent: self.inventory_boost_curve,
                 chase: true,
-                // Profit-gating only applies to the reducing side.
+                // Profit-gating + avg-down only apply to the reducing-side path.
                 profit_gated: false,
                 profit_full_bps: Decimal::ZERO,
+                add_boost_pct: Decimal::ZERO,
+                add_full_bps: Decimal::ZERO,
             })
-        } else if self.inventory_boost_pct > Decimal::ZERO {
+        } else if self.inventory_boost_pct > Decimal::ZERO
+            || self.inventory_boost_add_pct > Decimal::ZERO
+        {
             Some(tikr_paper::InventoryBoostConfig {
                 max_boost_pct: self.inventory_boost_pct,
                 curve_exponent: self.inventory_boost_curve,
                 chase: false,
                 profit_gated: self.inventory_boost_profit_gated,
                 profit_full_bps: self.inventory_boost_profit_full_bps,
+                add_boost_pct: self.inventory_boost_add_pct,
+                add_full_bps: self.inventory_boost_add_full_bps,
             })
         } else {
             None

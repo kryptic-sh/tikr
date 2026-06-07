@@ -274,6 +274,18 @@ pub struct InventoryBoostConfig {
     /// `(profit_bps / profit_full_bps).clamp(0,1)^curve_exponent`. Ignored
     /// unless `profit_gated`. Non-positive disables the profit-gated boost.
     pub profit_full_bps: Decimal,
+    /// Adding-side (averaging-down) boost, the mirror of the reducing boost.
+    /// In `profit_gated` mode, enlarge each ADDING-side quote priced *past avg
+    /// in the UNfavorable direction* (long: bids below avg; short: asks above
+    /// avg) by how far underwater it sits — so the bag averages down harder the
+    /// deeper price strays below your average. A tamer, position-aware cousin of
+    /// `size_mult`: it only fires when actually underwater, not on a static
+    /// ladder. `0` (default) disables it (reducing-only). A buy priced ABOVE avg
+    /// (would worsen the average) is never enlarged.
+    pub add_boost_pct: Decimal,
+    /// Underwater distance past avg-entry, in bps, at which `add_boost_pct`
+    /// saturates. Ignored unless `profit_gated` and `add_boost_pct > 0`.
+    pub add_full_bps: Decimal,
 }
 
 /// Perp funding accrual parameters. Binance USD-M typically pays/charges
@@ -2837,12 +2849,21 @@ fn apply_inventory_size_boost(
         if e == Decimal::ONE { r } else { r.powd(e) }
     };
 
-    // Profit-gated mode: each reducing-side quote is boosted by how far its
-    // price sits past avg-entry in the favorable direction, so the bag is only
-    // shed harder when the fill banks a gain. Needs no cap reference (works
-    // cap-off). Only sensible on the reducing side — chase is left alone.
+    // Profit-gated mode: size each quote by how far its price sits past avg in
+    // the relevant direction. The REDUCING side (boost_side) is boosted by its
+    // FAVORABLE distance (banks a gain — `max_boost_pct`/`profit_full_bps`); the
+    // ADDING side (the opposite) is boosted by its UNFAVORABLE distance (averages
+    // down a long / up a short — `add_boost_pct`/`add_full_bps`), a tamer cousin
+    // of `size_mult` that only fires when actually underwater. Needs no cap
+    // reference (works cap-off). chase mode is left alone.
     if cfg.profit_gated && !cfg.chase {
-        if avg_price <= Decimal::ZERO || cfg.profit_full_bps <= Decimal::ZERO {
+        let add_side = match boost_side {
+            Side::Ask => Side::Bid,
+            Side::Bid => Side::Ask,
+        };
+        let reduce_on = cfg.max_boost_pct > Decimal::ZERO && cfg.profit_full_bps > Decimal::ZERO;
+        let add_on = cfg.add_boost_pct > Decimal::ZERO && cfg.add_full_bps > Decimal::ZERO;
+        if avg_price <= Decimal::ZERO || (!reduce_on && !add_on) {
             return actions;
         }
         let bps = Decimal::from(10_000);
@@ -2852,22 +2873,31 @@ fn apply_inventory_size_boost(
                 let tikr_strategy::Action::Quote(mut intent) = action else {
                     return action;
                 };
-                if intent.side != boost_side {
+                // Pick the knobs for this quote's side. Reducing side uses the
+                // profit boost; adding side uses the (tamer) avg-down boost.
+                let (pct, full) = if intent.side == boost_side && reduce_on {
+                    (cfg.max_boost_pct, cfg.profit_full_bps)
+                } else if intent.side == add_side && add_on {
+                    (cfg.add_boost_pct, cfg.add_full_bps)
+                } else {
                     return tikr_strategy::Action::Quote(intent);
-                }
-                // Favorable distance past avg: long reduces via Asks priced
-                // ABOVE avg; short reduces via Bids priced BELOW avg.
-                let profit_bps = match boost_side {
+                };
+                // Side-appropriate distance past avg. Ask: priced above avg;
+                // Bid: priced below avg. For the reducing side a positive value
+                // means "in profit" (sell above / buy below avg); for the adding
+                // side it means "underwater" (buy below / sell above avg). Either
+                // way we only enlarge when the quote is on the correct side of
+                // avg — a reducing quote that would lock a loss, or an adding
+                // quote that would worsen the average, is left untouched.
+                let dist_bps = match intent.side {
                     Side::Ask => (intent.price.0 - avg_price) / avg_price * bps,
                     Side::Bid => (avg_price - intent.price.0) / avg_price * bps,
                 };
-                if profit_bps <= Decimal::ZERO {
-                    // Quote would lock a loss (wrong side of avg) — never enlarge.
+                if dist_bps <= Decimal::ZERO {
                     return tikr_strategy::Action::Quote(intent);
                 }
-                let ratio = (profit_bps / cfg.profit_full_bps).min(Decimal::ONE);
-                let mult =
-                    Decimal::ONE + (cfg.max_boost_pct / Decimal::from(100)) * exponent_of(ratio);
+                let ratio = (dist_bps / full).min(Decimal::ONE);
+                let mult = Decimal::ONE + (pct / Decimal::from(100)) * exponent_of(ratio);
                 if mult > Decimal::ONE {
                     let scale = intent.size.0.scale();
                     let boosted = (intent.size.0 * mult).round_dp(scale);
@@ -3750,6 +3780,8 @@ mod tests {
             chase: false,
             profit_gated: false,
             profit_full_bps: Decimal::ZERO,
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
         let out = apply_inventory_size_boost(
@@ -3773,6 +3805,8 @@ mod tests {
             chase: true,
             profit_gated: false,
             profit_full_bps: Decimal::ZERO,
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
         let out = apply_inventory_size_boost(
@@ -3806,6 +3840,8 @@ mod tests {
             chase: false,
             profit_gated: false,
             profit_full_bps: Decimal::ZERO,
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid), boost_quote(Side::Ask)];
         let out = apply_inventory_size_boost(
@@ -3829,6 +3865,8 @@ mod tests {
             chase: false,
             profit_gated: false,
             profit_full_bps: Decimal::ZERO,
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         let actions = vec![boost_quote(Side::Bid)];
         let out = apply_inventory_size_boost(
@@ -3849,6 +3887,8 @@ mod tests {
             chase: false,
             profit_gated: false,
             profit_full_bps: Decimal::ZERO,
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         // Flat position: nothing to reduce.
         let flat = apply_inventory_size_boost(
@@ -3871,6 +3911,8 @@ mod tests {
                 chase: false,
                 profit_gated: false,
                 profit_full_bps: Decimal::ZERO,
+                add_boost_pct: Decimal::ZERO,
+                add_full_bps: Decimal::ZERO,
             },
         );
         assert_eq!(quote_size(&off[0]), Decimal::new(1000, 3));
@@ -3898,6 +3940,8 @@ mod tests {
             chase: false,
             profit_gated: true,
             profit_full_bps: Decimal::from(50),
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         let avg = Decimal::from(100);
         // Ask at 100.50 = +50 bps past avg → ratio 1.0 → ×2.0.
@@ -3928,6 +3972,8 @@ mod tests {
             chase: false,
             profit_gated: true,
             profit_full_bps: Decimal::from(50),
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         };
         let avg = Decimal::from(100);
         let actions = vec![
@@ -3940,6 +3986,53 @@ mod tests {
         assert_eq!(quote_size(&out[0]), Decimal::new(2000, 3));
         assert_eq!(quote_size(&out[1]), Decimal::new(1000, 3));
         assert_eq!(quote_size(&out[2]), Decimal::new(1000, 3));
+    }
+
+    #[test]
+    fn profit_gated_adding_boost_enlarges_below_avg_buys() {
+        // Long bag, avg 100. Reduce boost 100%@50bps (asks above avg) PLUS an
+        // adding boost 50%@50bps (bids below avg). cap = 0 (off).
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: true,
+            profit_full_bps: Decimal::from(50),
+            add_boost_pct: Decimal::from(50),
+            add_full_bps: Decimal::from(50),
+        };
+        let avg = Decimal::from(100);
+        let actions = vec![
+            boost_quote_at(Side::Ask, Decimal::new(10050, 2)), // +50bps → reduce ×2.0
+            boost_quote_at(Side::Bid, Decimal::new(9950, 2)),  // −50bps → add ×1.5
+            boost_quote_at(Side::Bid, Decimal::new(9975, 2)),  // −25bps → add ×1.25
+            boost_quote_at(Side::Bid, Decimal::new(10010, 2)), // above avg → untouched
+        ];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(600), Decimal::ZERO, avg, boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(2000, 3)); // ask +50bps ×2.0
+        assert_eq!(quote_size(&out[1]), Decimal::new(1500, 3)); // bid −50bps ×1.5
+        assert_eq!(quote_size(&out[2]), Decimal::new(1250, 3)); // bid −25bps ×1.25
+        assert_eq!(quote_size(&out[3]), Decimal::new(1000, 3)); // bid above avg → untouched
+    }
+
+    #[test]
+    fn adding_boost_off_by_default_leaves_buys_alone() {
+        // add_boost_pct = 0 → reducing-only, identical to the original behavior.
+        let boost = InventoryBoostConfig {
+            max_boost_pct: Decimal::from(100),
+            curve_exponent: Decimal::ONE,
+            chase: false,
+            profit_gated: true,
+            profit_full_bps: Decimal::from(50),
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
+        };
+        let avg = Decimal::from(100);
+        let actions = vec![boost_quote_at(Side::Bid, Decimal::new(9950, 2))];
+        let out =
+            apply_inventory_size_boost(actions, Decimal::from(600), Decimal::ZERO, avg, boost);
+        assert_eq!(quote_size(&out[0]), Decimal::new(1000, 3)); // untouched
     }
 
     struct MockVenue {

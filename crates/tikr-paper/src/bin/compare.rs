@@ -1168,6 +1168,16 @@ struct Args {
     /// saturates to `--sim-inventory-boost-pct`. Default 50.
     #[arg(long, default_value = "50")]
     sim_inventory_boost_profit_full_bps: String,
+    /// Adding-side (averaging-down) boost in profit-gated mode: enlarge ADDING-
+    /// side quotes priced past avg in the UNfavorable direction (long: bids
+    /// below avg) by how far underwater they sit — a tamer cousin of size_mult.
+    /// `0` (default) = off. Runs even if `--sim-inventory-boost-pct 0`.
+    #[arg(long, default_value = "0")]
+    sim_inventory_boost_add_pct: String,
+    /// Underwater distance past avg-entry, in bps, at which the adding-side boost
+    /// saturates to `--sim-inventory-boost-add-pct`. Default 50.
+    #[arg(long, default_value = "50")]
+    sim_inventory_boost_add_full_bps: String,
 
     /// Account leverage. Like the live bot, leverage does NOT affect order
     /// sizing or the position cap (those are wallet-relative) — it only sets
@@ -1471,6 +1481,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let chase_pct = Decimal::from_str(&args.sim_avg_chase_boost_pct)?;
     // avg-chase (adding side) takes precedence over inventory-boost (reducing
     // side) — they're opposite directions sharing one runner slot.
+    let inv_add_pct = Decimal::from_str(&args.sim_inventory_boost_add_pct)?;
     let inv_boost = if chase_pct > Decimal::ZERO {
         Some(InventoryBoostConfig {
             max_boost_pct: chase_pct,
@@ -1478,14 +1489,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chase: true,
             profit_gated: false,
             profit_full_bps: Decimal::ZERO,
+            add_boost_pct: Decimal::ZERO,
+            add_full_bps: Decimal::ZERO,
         })
-    } else if inv_boost_pct > Decimal::ZERO {
+    } else if inv_boost_pct > Decimal::ZERO || inv_add_pct > Decimal::ZERO {
         Some(InventoryBoostConfig {
             max_boost_pct: inv_boost_pct,
             curve_exponent: Decimal::from_str(&args.sim_inventory_boost_curve)?,
             chase: false,
             profit_gated: args.sim_inventory_boost_profit_gated,
             profit_full_bps: Decimal::from_str(&args.sim_inventory_boost_profit_full_bps)?,
+            add_boost_pct: inv_add_pct,
+            add_full_bps: Decimal::from_str(&args.sim_inventory_boost_add_full_bps)?,
         })
     } else {
         None
