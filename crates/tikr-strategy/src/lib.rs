@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 
 pub mod avellaneda_stoikov;
+pub mod flat_mm;
 pub mod glft;
 pub mod hawk;
 pub mod hydra;
@@ -56,6 +57,7 @@ pub mod volley;
 pub mod wave;
 
 pub use avellaneda_stoikov::{AvellanedaStoikov, AvellanedaStoikovConfig};
+pub use flat_mm::{FlatMm, FlatMmConfig};
 pub use glft::{Glft, GlftConfig};
 pub use hawk::{Hawk, HawkConfig};
 pub use hydra::{Hydra, HydraConfig};
