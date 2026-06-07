@@ -56,6 +56,6 @@ force_refill_secs = 300   # slow-market valve: refill vacant slots after 5min re
 auto_step = false         # auto-size the lattice step (k×mean candle gap, floored at 2× maker fee, capped at steps_bps); false = fixed steps_bps
 auto_step_k = "0.25"      # when auto_step=true: each step targets this fraction of the mean 1s candle range
 auto_candle_window = 10   # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
-relattice_drift_pct = "1" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
+relattice_drift_pct = "5" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
 size_mult = "1"           # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
 size_ramp = "3"           # LINEAR inner→outer size ramp: innermost order 1×, outermost size_ramp×, straight-line between; 1.0 = uniform
