@@ -13,5 +13,5 @@ strategy = "wave"
 levels = 5
 round_trips = 2
 steps_inner = 1
-steps_bps = 5
+steps_bps = 2
 relattice_drift_pct = "5"
