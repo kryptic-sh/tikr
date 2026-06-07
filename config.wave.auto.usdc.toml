@@ -1,15 +1,15 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "0.1"
+order_balance_pct = "1"
 max_position_pct = "0"
-take_profit_pct = "0"       # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
+take_profit_pct = "0"                   # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 25
-inventory_boost_pct = "25"   # profit-gated reducing-side size boost: enlarge reducing orders up to +25% as they sit further past avg
+inventory_boost_pct = "25"              # profit-gated reducing-side size boost: enlarge reducing orders up to +25% as they sit further past avg
 inventory_boost_curve = "1"
-inventory_boost_profit_gated = true            # gate the boost on per-order profit vs avg (never enlarge a loss-locking quote); works cap-off
-inventory_boost_profit_full_bps = "150"        # boost saturates at 150bps past avg-entry
-bnb_refill_enabled = true   # this is the manager process; enable on exactly ONE process per account
+inventory_boost_profit_gated = true     # gate the boost on per-order profit vs avg (never enlarge a loss-locking quote); works cap-off
+inventory_boost_profit_full_bps = "150" # boost saturates at 150bps past avg-entry
+bnb_refill_enabled = true               # this is the manager process; enable on exactly ONE process per account
 # bnb_min_balance_usdc = "1"     # refill trigger (default $1)
 # bnb_target_balance_usdc = "10" # top-up target (default $10)
 
