@@ -3,6 +3,8 @@ env = "futures-mainnet"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "0"
+auto_scale = true                       # wallet-aware: N = min(rampage.top_n, floor(wallet/min_bot_capital_usdc)); each bot orders (wallet/N)×order_balance_pct
+min_bot_capital_usdc = "250"            # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
 take_profit_pct = "0"                   # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 25
 inventory_boost_pct = "25"              # profit-gated reducing-side size boost: enlarge reducing orders up to +25% as they sit further past avg
