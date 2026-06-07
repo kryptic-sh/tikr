@@ -4,7 +4,7 @@ asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "0"
 auto_scale = true                       # wallet-aware: N = min(rampage.top_n, floor(wallet/min_bot_capital_usdc)); each bot orders (wallet/N)×order_balance_pct
-min_bot_capital_usdc = "250"            # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
+min_bot_capital_usdc = "200"            # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
 take_profit_pct = "0"                   # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 25
 inventory_boost_pct = "0"               # profit-gated reducing-side size boost: enlarge reducing (in-profit) orders as they sit further past avg
@@ -23,9 +23,9 @@ bnb_refill_enabled = true               # this is the manager process; enable on
 # monotonic profit ratchet — each +2% of growth is realized and the bar steps up.
 # All other mechanisms off.
 [account.bagger]
-profit_lock_pct = "5" # bank the bag + re-baseline every +2% equity growth
-loss_lock_pct = "10"  # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
-exit_taker = false    # reduce-only maker exit (don't pay the spread)
+#profit_lock_pct = "5" # bank the bag + re-baseline every +2% equity growth
+#loss_lock_pct = "10" # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
+#exit_taker = false   # reduce-only maker exit (don't pay the spread)
 
 [rampage]
 enabled = true
