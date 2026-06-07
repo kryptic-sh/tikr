@@ -3,17 +3,15 @@ env = "futures-mainnet"
 asset = "USDC"
 order_balance_pct = "1"
 max_position_pct = "0"
-leverage = 10
+leverage = 25
 
 [[bot]]
 symbol = "BTCUSDC"
 strategy = "wave"
 
 [bot.wave]
-levels = 10
-round_trips = 5
+levels = 20
+round_trips = 10
 steps_inner = 1
 steps_bps = 1
-force_refill_secs = 120
-relattice_drift_pct = "0.02"
-size_mult = "1.5"
+relattice_drift_pct = "5"
