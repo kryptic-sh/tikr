@@ -943,7 +943,7 @@ async fn main() -> anyhow::Result<()> {
         key_material: key_material.clone(),
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
         order_balance_pct: cfg.account.order_balance_pct,
-        wallet_asset,
+        wallet_asset: wallet_asset.clone(),
         shutdown: global_shutdown_rx.clone(),
         bnb_price_tx,
     });
@@ -964,6 +964,7 @@ async fn main() -> anyhow::Result<()> {
         key_material: key_material.clone(),
         min_balance_usdt: cfg.account.bnb_min_balance_usdt,
         target_balance_usdt: cfg.account.bnb_target_balance_usdt,
+        margin_asset: wallet_asset.clone(),
         refill_enabled: cfg.account.bnb_refill_enabled,
         shutdown: global_shutdown_rx.clone(),
     });

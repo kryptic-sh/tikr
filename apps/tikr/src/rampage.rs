@@ -475,12 +475,15 @@ pub fn spawn_rampage_manager(
                             );
                         } else {
                             let from_amount = format!("{convert_usd:.2}");
+                            // Convert FROM the account's margin asset (USDC/USDT),
+                            // not a hard-coded "USDT" — a USDC account holds no
+                            // USDT, so the accept would otherwise always fail.
                             match tikr_binance::futs::convert_futures(
                                 &http,
                                 account.env.rest_base_url(),
                                 &account.api_key,
                                 &account.key_material,
-                                "USDT",
+                                &cfg.quote_asset,
                                 "BNB",
                                 &from_amount,
                             )
@@ -493,6 +496,15 @@ pub fn spawn_rampage_manager(
                                     convert_usd = %from_amount,
                                     bnb_received = %bnb_received,
                                     "rampage: retired profit → BNB"
+                                ),
+                                // The venue couldn't quote this (amount below the
+                                // pair's min convertible size) — expected on tiny
+                                // rotations, not a failure. Skip quietly.
+                                Err(tikr_venue::VenueError::Rejected { reason }) => info!(
+                                    symbol = %symbol,
+                                    convert_usd = %from_amount,
+                                    %reason,
+                                    "rampage: retire profit→BNB skipped — venue declined quote (amount below min)"
                                 ),
                                 Err(e) => {
                                     if let tikr_venue::VenueError::RateLimited { retry_after_ms } =

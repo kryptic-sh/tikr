@@ -1739,15 +1739,21 @@ pub async fn convert_get_quote(
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
-    let quote_id = body
-        .get("quoteId")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            VenueError::Internal(Box::new(std::io::Error::other(format!(
-                "convert getQuote: missing quoteId in response: {body}"
-            ))))
-        })?;
+    let quote_id = match body.get("quoteId").and_then(Value::as_str) {
+        Some(id) => id.to_owned(),
+        None => {
+            // No Binance error code (checked above) yet no actionable quoteId —
+            // the venue returned an indicative ratio it can't execute, virtually
+            // always because the amount is below the pair's minimum convertible
+            // size. Terminal but EXPECTED; surface as Rejected so callers can
+            // skip quietly rather than log it as an internal failure.
+            return Err(VenueError::Rejected {
+                reason: format!(
+                    "convert getQuote returned no quoteId (amount likely below minimum): {body}"
+                ),
+            });
+        }
+    };
     // `toAmount` is a string; absent/garbage → 0 (caller logs the received qty).
     let to_amount = body
         .get("toAmount")

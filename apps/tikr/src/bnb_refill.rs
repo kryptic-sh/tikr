@@ -32,8 +32,12 @@ pub struct BnbMonitorConfig {
     pub key_material: Arc<BinanceKeyMaterial>,
     /// Low bound: refill when `bnb_value_usdt < min_balance_usdt`.
     pub min_balance_usdt: Decimal,
-    /// Target: convert enough USDT→BNB to bring the value up to this.
+    /// Target: convert enough margin-asset→BNB to bring the value up to this.
     pub target_balance_usdt: Decimal,
+    /// Margin asset the futures wallet holds (`"USDC"` / `"USDT"`) — the convert
+    /// source. A USDC account holds no USDT, so converting from a hard-coded
+    /// "USDT" would always fail at accept.
+    pub margin_asset: String,
     pub refill_enabled: bool,
     pub shutdown: watch::Receiver<bool>,
 }
@@ -134,22 +138,23 @@ pub fn spawn_bnb_monitor(cfg: BnbMonitorConfig) {
                             .max(Decimal::ZERO)
                             .min(cfg.target_balance_usdt);
                         if needed >= MIN_CONVERT_USDT {
-                            let from_amount = format!("{needed:.2}"); // USDT, 2 dp
+                            let from_amount = format!("{needed:.2}"); // margin asset, 2 dp
                             info!(
                                 bnb_balance = %balance,
                                 bnb_price = %price,
                                 bnb_value_usdt = %usdt_value.round_dp(4),
                                 low_usdt = %cfg.min_balance_usdt,
                                 target_usdt = %cfg.target_balance_usdt,
-                                buy_usdt = %from_amount,
-                                "BNB low — auto-converting USDT→BNB on futures (live read)"
+                                buy = %from_amount,
+                                from_asset = %cfg.margin_asset,
+                                "BNB low — auto-converting margin asset→BNB on futures (live read)"
                             );
                             match tikr_binance::futs::convert_futures(
                                 &http,
                                 base_url,
                                 &cfg.api_key,
                                 &cfg.key_material,
-                                "USDT",
+                                &cfg.margin_asset,
                                 "BNB",
                                 &from_amount,
                             )
@@ -170,13 +175,24 @@ pub fn spawn_bnb_monitor(cfg: BnbMonitorConfig) {
                                         "bnb_refill: convert succeeded"
                                     );
                                 }
+                                // Venue couldn't quote (amount below the pair's
+                                // min convertible size) — expected, not a failure.
+                                Err(tikr_venue::VenueError::Rejected { reason }) => {
+                                    last_convert = Some(Instant::now());
+                                    info!(
+                                        buy = %from_amount,
+                                        from_asset = %cfg.margin_asset,
+                                        %reason,
+                                        "bnb_refill: convert skipped — venue declined quote (amount below min)"
+                                    );
+                                }
                                 Err(e) => {
                                     // Brief cooldown on failure too so a hard
                                     // error (e.g. below-min convert amount)
                                     // doesn't retry every minute.
                                     last_convert = Some(Instant::now());
                                     note_if_rate_limited(&e, &cfg.shared_state);
-                                    warn!(error = ?e, "bnb_refill: convert USDT→BNB failed");
+                                    warn!(error = ?e, from_asset = %cfg.margin_asset, "bnb_refill: convert margin asset→BNB failed");
                                 }
                             }
                         }
