@@ -105,6 +105,22 @@ pub struct AccountConfig {
     /// Default `80`.
     #[serde(default = "default_max_position_pct")]
     pub max_position_pct: Decimal,
+    /// Wallet-aware auto-scaling. When `true`, rampage derives the active bot
+    /// count and per-bot order size from the live wallet instead of always
+    /// running `rampage.top_n` bots at `order_balance_pct` of the FULL wallet:
+    /// `N = clamp(floor(wallet / min_bot_capital_usdc), 1, top_n)` and each bot
+    /// orders `(wallet / N) × order_balance_pct` (still floored at the venue
+    /// min-notional). As the wallet grows it fills bots up to `top_n` first,
+    /// then grows order sizes — keeping total order flow ≈ `wallet × pct`
+    /// regardless of N. `false` (default) preserves the legacy behavior
+    /// (every bot orders `wallet × order_balance_pct`, count fixed at `top_n`).
+    #[serde(default)]
+    pub auto_scale: bool,
+    /// Auto-scale margin gate: minimum wallet (in the margin asset) required to
+    /// justify each additional bot. `N = min(top_n, floor(wallet / this))`.
+    /// Ignored unless `auto_scale`. Default `$250`.
+    #[serde(default = "default_min_bot_capital_usdc")]
+    pub min_bot_capital_usdc: Decimal,
     /// Take-profit: when ANY bot's UNREALIZED P&L exceeds this percent of the
     /// account wallet balance, the runner rests a reduce-only maker limit at the
     /// touch to close HALF that bot's position, locking in profit. Account-level
@@ -390,6 +406,9 @@ fn default_inventory_boost_curve() -> Decimal {
 }
 fn default_inventory_boost_profit_full_bps() -> Decimal {
     Decimal::from(50)
+}
+fn default_min_bot_capital_usdc() -> Decimal {
+    Decimal::from(250)
 }
 
 fn default_leverage() -> u32 {

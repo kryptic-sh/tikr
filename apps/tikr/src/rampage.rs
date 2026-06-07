@@ -53,6 +53,10 @@ pub struct RampageAccountCtx {
     pub notional_rx: watch::Receiver<Decimal>,
     pub max_position_rx: watch::Receiver<Decimal>,
     pub wallet_rx: watch::Receiver<Decimal>,
+    /// Wallet-derived active-bot-count target (auto-scale). The account poller
+    /// updates it from the live wallet; rampage uses it as the live cap instead
+    /// of the static `top_n`. Pinned at `top_n` when `auto_scale` is off.
+    pub active_bots_rx: watch::Receiver<u32>,
     pub take_profit_pct: Decimal,
     pub bagger: tikr_paper::bagger::BaggerConfig,
     pub bnb_price_rx: watch::Receiver<Decimal>,
@@ -316,9 +320,12 @@ pub fn spawn_rampage_manager(
                 }
             };
 
-            // 4. Rank desc, take top_n.
+            // 4. Rank desc, take the live active-bot target. With auto_scale on
+            //    this is wallet-derived (≤ top_n); otherwise it's pinned at top_n.
+            let effective_top_n =
+                (*account.active_bots_rx.borrow()).clamp(1, cfg.top_n.max(1) as u32) as usize;
             scored.sort_by_key(|(_, sc)| std::cmp::Reverse(*sc));
-            scored.truncate(cfg.top_n);
+            scored.truncate(effective_top_n);
             let qualifying: HashSet<String> = scored.iter().map(|(s, _)| s.clone()).collect();
             info!(
                 candidates = qualifying.len(),
@@ -505,11 +512,12 @@ pub fn spawn_rampage_manager(
             }
 
             // 4b. Spawn new entrants into free slots, highest score first,
-            // capped so total active (incl. deferred drainers) ≤ top_n. A
-            // deferred underwater bot holds its slot, so a stuck bag delays a
+            // capped so total active (incl. deferred drainers) ≤ the live target
+            // (`effective_top_n` — wallet-derived under auto_scale, else top_n).
+            // A deferred underwater bot holds its slot, so a stuck bag delays a
             // new entrant — it never forces a realized loss.
             for (symbol, _score) in &scored {
-                if active.len() >= cfg.top_n {
+                if active.len() >= effective_top_n {
                     break;
                 }
                 if active.contains_key(symbol) {

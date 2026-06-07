@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -252,11 +253,58 @@ async fn flatten_all_open_positions(
     futures::future::join_all(closes).await;
 }
 
+/// Derive the wallet-aware active-bot count and per-bot order notional.
+///
+/// Auto-scale ON: the bot count is margin-gated —
+/// `N = clamp(floor(wallet / min_bot_capital), 1, top_n)` — and each bot orders
+/// `(wallet / N) × order_balance_pct`, so the N bots together commit ≈ the same
+/// `wallet × pct` total regardless of N (the safety invariant). As the wallet
+/// grows it fills bots up to `top_n` first, then grows per-bot order size.
+///
+/// Auto-scale OFF (legacy): `N = top_n` and every bot orders `wallet × pct`.
+///
+/// The returned notional is PRE-floor — the venue min-notional clamp is applied
+/// downstream at order placement.
+fn auto_scale_plan(
+    wallet: Decimal,
+    min_bot_capital: Decimal,
+    top_n: u32,
+    order_balance_pct: Decimal,
+    auto_scale: bool,
+) -> (u32, Decimal) {
+    let top_n = top_n.max(1);
+    let active = if auto_scale && min_bot_capital > Decimal::ZERO {
+        (wallet / min_bot_capital)
+            .floor()
+            .to_u32()
+            .unwrap_or(1)
+            .clamp(1, top_n)
+    } else {
+        top_n
+    };
+    let sizing_base = if auto_scale {
+        wallet / Decimal::from(active.max(1))
+    } else {
+        wallet
+    };
+    (active, sizing_base * order_balance_pct / Decimal::from(100))
+}
+
 struct AccountPollerConfig {
     shared_state: SharedBotState,
     notional_tx: watch::Sender<Decimal>,
     max_position_tx: watch::Sender<Decimal>,
     wallet_tx: watch::Sender<Decimal>,
+    /// Active-bot-count target, derived from the wallet when `auto_scale` is on.
+    /// Rampage reads this instead of the static `top_n`. When `auto_scale` is
+    /// off it stays pinned at `top_n`.
+    active_bots_tx: watch::Sender<u32>,
+    /// Wallet-aware auto-scaling (see [`AccountConfig::auto_scale`]).
+    auto_scale: bool,
+    /// Margin gate: minimum wallet per bot. `N = min(top_n, floor(wallet/this))`.
+    min_bot_capital: Decimal,
+    /// Bot-count ceiling (rampage `top_n`); also the fixed count when `auto_scale` is off.
+    top_n: u32,
     max_position_pct: Decimal,
     env: tikr_binance::BinanceEnv,
     api_key: String,
@@ -573,10 +621,22 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     fetched_at_ms: current_time_ms(),
                 });
 
-                // Sizing is wallet-relative + per-bot (NOT split across bots):
-                // `order_balance_pct`/`max_position_pct` are each a % of the full
-                // multi-asset wallet. Leverage only affects the venue margin call.
-                let notional = wallet_usd * cfg.order_balance_pct / Decimal::from(100);
+                // Wallet-aware auto-scaling: derive the active bot count + per-bot
+                // order notional from the live wallet (margin gate + slice split),
+                // so total order flow stays ≈ `wallet × pct` as bots fan out. Off →
+                // legacy behavior: every bot orders `wallet × pct`, count = top_n.
+                let (active_bots, notional) = auto_scale_plan(
+                    wallet_usd,
+                    cfg.min_bot_capital,
+                    cfg.top_n,
+                    cfg.order_balance_pct,
+                    cfg.auto_scale,
+                );
+                if active_bots != *cfg.active_bots_tx.borrow() {
+                    let _ = cfg.active_bots_tx.send(active_bots);
+                }
+                // The venue min-notional floor is applied downstream at order
+                // placement; leverage only affects the venue margin call.
                 if notional != *cfg.notional_tx.borrow() {
                     let _ = cfg.notional_tx.send(notional);
                 }
@@ -814,6 +874,15 @@ async fn main() -> anyhow::Result<()> {
     let (global_shutdown_tx, global_shutdown_rx) = watch::channel(false);
     let (notional_tx, notional_rx) = watch::channel(Decimal::ZERO);
     let (max_position_tx, max_position_rx) = watch::channel(Decimal::ZERO);
+    // Wallet-derived active-bot-count target (auto-scale). Seeded at top_n so the
+    // legacy path and the first pre-poll spawn behave exactly as before.
+    let rampage_top_n = cfg
+        .rampage
+        .as_ref()
+        .filter(|c| c.enabled)
+        .map(|c| c.top_n as u32)
+        .unwrap_or(1);
+    let (active_bots_tx, active_bots_rx) = watch::channel(rampage_top_n);
     // Live account wallet balance (wallet + BNB value); drives take-profit.
     let (wallet_tx, wallet_rx) = watch::channel(Decimal::ZERO);
     // Live BNBUSDT mid; account poller refreshes when feeBurn is on.
@@ -864,6 +933,10 @@ async fn main() -> anyhow::Result<()> {
         notional_tx,
         max_position_tx,
         wallet_tx,
+        active_bots_tx,
+        auto_scale: cfg.account.auto_scale,
+        min_bot_capital: cfg.account.min_bot_capital_usdc,
+        top_n: rampage_top_n,
         max_position_pct: cfg.account.max_position_pct,
         env,
         api_key: api_key.clone(),
@@ -919,6 +992,7 @@ async fn main() -> anyhow::Result<()> {
                 notional_rx: notional_rx.clone(),
                 max_position_rx: max_position_rx.clone(),
                 wallet_rx: wallet_rx.clone(),
+                active_bots_rx: active_bots_rx.clone(),
                 take_profit_pct: cfg.account.take_profit_pct,
                 bagger: cfg.account.bagger(),
                 bnb_price_rx: bnb_price_rx.clone(),
@@ -1031,4 +1105,71 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod auto_scale_tests {
+    use super::auto_scale_plan;
+    use rust_decimal::Decimal;
+
+    // 0.1% as a Decimal (the order_balance_pct value, a percent).
+    fn pct_tenth() -> Decimal {
+        Decimal::new(1, 1) // 0.1
+    }
+
+    // Notional is PRE-min-notional-floor; the venue clamps to $5 downstream.
+    fn plan(wallet: i64, mbc: i64, top_n: u32, pct: Decimal, on: bool) -> (u32, Decimal) {
+        auto_scale_plan(Decimal::from(wallet), Decimal::from(mbc), top_n, pct, on)
+    }
+
+    #[test]
+    fn off_keeps_legacy_full_wallet_sizing() {
+        // Auto-scale off: N = top_n, every bot orders wallet × pct (not split).
+        let (n, notional) = plan(519, 250, 2, pct_tenth(), false);
+        assert_eq!(n, 2);
+        assert_eq!(notional, Decimal::new(519, 3)); // 519 × 0.1% = 0.519, floors to $5
+    }
+
+    #[test]
+    fn user_example_519_gives_2_bots() {
+        // $519, $250/bot, top_n 2, 0.1% → 2 bots; slice 259.5 × 0.1% = $0.2595
+        // (floors to the $5 min-notional at placement).
+        let (n, notional) = plan(519, 250, 2, pct_tenth(), true);
+        assert_eq!(n, 2);
+        assert_eq!(notional, Decimal::new(2595, 4)); // 0.2595
+    }
+
+    #[test]
+    fn fills_bots_up_to_top_n_then_grows_orders() {
+        let pct = pct_tenth();
+        // Phase 1: count grows 1 per $250, capped at top_n=10.
+        assert_eq!(plan(519, 250, 10, pct, true).0, 2);
+        assert_eq!(plan(750, 250, 10, pct, true).0, 3);
+        assert_eq!(plan(2_500, 250, 10, pct, true).0, 10);
+        assert_eq!(plan(9_999, 250, 10, pct, true).0, 10); // saturated
+        // Phase 2: count pinned at 10, order notional grows with the slice.
+        let (n, notional) = plan(100_000, 250, 10, pct, true);
+        assert_eq!(n, 10);
+        assert_eq!(notional, Decimal::from(10)); // (100000/10) × 0.1% = $10
+    }
+
+    #[test]
+    fn never_zero_bots_on_tiny_wallet() {
+        // Below one min_bot_capital still runs a single bot (clamped to 1).
+        let (n, notional) = plan(100, 250, 5, pct_tenth(), true);
+        assert_eq!(n, 1);
+        assert_eq!(notional, Decimal::new(1, 1)); // 100 × 0.1% = 0.1
+    }
+
+    #[test]
+    fn total_order_flow_is_invariant_to_n() {
+        // The safety invariant: N bots each at (wallet/N)×pct = wallet×pct total.
+        let pct = Decimal::new(5, 1); // 0.5%
+        let (n, per_bot) = plan(2_000, 250, 10, pct, true);
+        assert_eq!(n, 8); // floor(2000/250)
+        assert_eq!(
+            per_bot * Decimal::from(n),
+            Decimal::from(2_000) * pct / Decimal::from(100)
+        );
+    }
 }
