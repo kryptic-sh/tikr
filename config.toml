@@ -25,7 +25,7 @@ bnb_refill_enabled = true               # this is the manager process; enable on
 [account.bagger]
 profit_lock_pct = "2" # bank the bag + re-baseline every +2% equity growth
 loss_lock_pct = "3"   # cut the bag + re-baseline every −2% equity drop (two-sided bracket)
-#exit_taker = false    # reduce-only maker exit (don't pay the spread)
+exit_taker = false    # reduce-only maker exit (don't pay the spread)
 
 [rampage]
 enabled = true
@@ -58,4 +58,4 @@ auto_step_k = "0.25"         # when auto_step=true: each step targets this fract
 auto_candle_window = 10      # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
 relattice_drift_pct = "0.02" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
 size_mult = "1.0"            # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
-size_ramp = "3"              # LINEAR inner→outer size ramp: innermost order 1×, outermost size_ramp×, straight-line between; 1.0 = uniform
+size_ramp = "10"             # LINEAR inner→outer size ramp: innermost order 1×, outermost size_ramp×, straight-line between; 1.0 = uniform
