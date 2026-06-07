@@ -10,8 +10,8 @@ symbol = "BTCUSDC"
 strategy = "wave"
 
 [bot.wave]
-levels = 20
-round_trips = 10
+levels = 5
+round_trips = 2
 steps_inner = 1
-steps_bps = 1
+steps_bps = 5
 relattice_drift_pct = "5"
