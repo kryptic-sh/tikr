@@ -150,6 +150,31 @@ pub fn spawn_rampage_manager(
             "rampage: starting discovery loop"
         );
 
+        // Fetch exchangeInfo once (filters are ~static) for the `max_notional`
+        // candidate filter: exclude symbols whose minimum order notional —
+        // `max(MIN_NOTIONAL filter, minQty × price)` — exceeds the cap.
+        let ex_filters: tikr_binance::exchange_info::ExchangeInfoCache = if cfg.max_notional
+            > Decimal::ZERO
+        {
+            match tikr_binance::futs::get_exchange_info(&http, account.env.rest_base_url()).await {
+                Ok(resp) => {
+                    let c = tikr_binance::exchange_info::parse_exchange_info(&resp);
+                    info!(
+                        symbols = c.len(),
+                        max_notional = %cfg.max_notional,
+                        "rampage: max_notional filter armed"
+                    );
+                    c
+                }
+                Err(e) => {
+                    warn!(error = ?e, "rampage: exchangeInfo fetch failed — max_notional filter off this run");
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -218,6 +243,16 @@ pub fn spawn_rampage_manager(
                 .filter(|r| {
                     (allowlist.is_empty() || allowlist.contains(r.symbol.as_str()))
                         && r.quote_volume_24h >= cfg.min_volume_usdt
+                        // max_notional: drop symbols whose minimum order
+                        // (max of MIN_NOTIONAL and minQty×price) exceeds the cap.
+                        // Unknown filters (symbol absent / fetch failed) are kept.
+                        && (cfg.max_notional <= Decimal::ZERO
+                            || match ex_filters.get(r.symbol.as_str()) {
+                                Some(f) => {
+                                    f.min_notional.max(f.min_qty * r.price) <= cfg.max_notional
+                                }
+                                None => true,
+                            })
                 })
                 .map(|r| r.symbol.clone())
                 .collect();

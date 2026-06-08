@@ -1126,8 +1126,18 @@ pub struct RampageConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Minimum 24h quote volume in USDT for a symbol to qualify.
-    #[serde(default = "tide_auto_default_min_volume_usdt")]
+    /// (Accepts `min_volume_usdc` as an alias — existing configs use that name.)
+    #[serde(
+        default = "tide_auto_default_min_volume_usdt",
+        alias = "min_volume_usdc"
+    )]
     pub min_volume_usdt: Decimal,
+    /// Maximum minimum-order notional (USD): a symbol is excluded when its
+    /// minimum order — `max(MIN_NOTIONAL filter, minQty × price)` — exceeds this.
+    /// Keeps the bot off expensive-min markets (e.g. BTC, where one order is
+    /// $60+) so small-wallet grids stay affordable. `0` (default) = no filter.
+    #[serde(default)]
+    pub max_notional: Decimal,
     /// How often to re-discover + re-rank (seconds). Clamped to ≥ 10s.
     #[serde(default = "tide_auto_default_recheck_interval_secs")]
     pub recheck_interval_secs: u64,
