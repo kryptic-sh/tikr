@@ -41,6 +41,6 @@ underwater_reduce_frac = "1"
 # Freeze a price grid at first mid and NEVER reprice: only add missing levels,
 # re-size drifted ones, and trim the farthest outskirts at the cap. Fills flip a
 # level to the opposite side automatically (buy below mid / sell above mid).
-frozen_lattice = true        # enable the static grid
-lattice_band_levels = 25     # grid levels per side around mid (seeds 25 buys + 25 sells)
-lattice_max_open = 180       # trim farthest outskirts once total resting hits this
+frozen_lattice = true    # enable the static grid
+lattice_band_levels = 25 # grid levels per side around mid (seeds 25 buys + 25 sells)
+lattice_max_open = 180   # trim farthest outskirts once total resting hits this
