@@ -141,6 +141,15 @@ pub struct FlatMm {
     /// touched our innermost order, so nothing filled and the ladder is still
     /// valid → skip the requote (rate-limit defence). `None` until first placed.
     last_quote_mid: Option<Decimal>,
+    /// Cached `1/tick_size` — rounding multiplies by this instead of dividing
+    /// (Decimal division is ~10× a multiply, and `intent` is on the hot path).
+    /// `0` when `tick_size == 0` (rounding disabled).
+    inv_tick: Decimal,
+    /// Cached `1/step_size`. `0` when `step_size == 0`.
+    inv_step: Decimal,
+    /// Cached `min_notional / step_size` — lets the min-notional bump do one
+    /// division (`/price`) instead of two.
+    min_over_step: Decimal,
 }
 
 impl FlatMm {
@@ -186,26 +195,26 @@ impl FlatMm {
     }
 
     fn intent(&self, symbol: &Symbol, side: Side, price: Decimal, size: Decimal) -> QuoteIntent {
-        // Round price to nearest tick_size.
-        let price = if self.config.tick_size > Decimal::ZERO {
-            (price / self.config.tick_size).round() * self.config.tick_size
+        // Round price to nearest tick (multiply by cached 1/tick, not divide).
+        let price = if self.inv_tick > Decimal::ZERO {
+            (price * self.inv_tick).round() * self.config.tick_size
         } else {
             price
         };
-        // Floor size to step_size.
-        let size = if self.config.step_size > Decimal::ZERO {
-            (size / self.config.step_size).floor() * self.config.step_size
+        // Floor size to the lot step (multiply by cached 1/step).
+        let size = if self.inv_step > Decimal::ZERO {
+            (size * self.inv_step).floor() * self.config.step_size
         } else {
             size
         };
-        // Bump size up by whole step_size lots until size * price >= min_notional.
+        // Bump size up to clear min_notional. `min_over_step` is cached, so this
+        // is one division (`/price`) instead of two.
         let size = if self.config.min_notional > Decimal::ZERO
             && self.config.step_size > Decimal::ZERO
             && price > Decimal::ZERO
             && size * price < self.config.min_notional
         {
-            let mut needed = (self.config.min_notional / price / self.config.step_size).ceil()
-                * self.config.step_size;
+            let mut needed = (self.min_over_step / price).ceil() * self.config.step_size;
             // Guard: Decimal ceil can land one lot short due to truncation; bump
             // by whole lots until the notional actually clears min_notional.
             while needed * price < self.config.min_notional {
@@ -411,9 +420,27 @@ impl Strategy for FlatMm {
     type Config = FlatMmConfig;
 
     fn new(config: Self::Config) -> Self {
+        let inv_tick = if config.tick_size > Decimal::ZERO {
+            Decimal::ONE / config.tick_size
+        } else {
+            Decimal::ZERO
+        };
+        let inv_step = if config.step_size > Decimal::ZERO {
+            Decimal::ONE / config.step_size
+        } else {
+            Decimal::ZERO
+        };
+        let min_over_step = if config.step_size > Decimal::ZERO {
+            config.min_notional / config.step_size
+        } else {
+            Decimal::ZERO
+        };
         Self {
             config,
             last_quote_mid: None,
+            inv_tick,
+            inv_step,
+            min_over_step,
         }
     }
 

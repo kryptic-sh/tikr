@@ -56,6 +56,8 @@ pub mod sign;
 pub mod spot;
 pub mod trade_stream;
 pub mod user_stream;
+/// Persistent authenticated WebSocket order client for Binance USD-M Futures.
+pub mod ws_order;
 
 pub use sign::BinanceKeyMaterial;
 
@@ -265,6 +267,11 @@ pub struct BinanceClient {
     ///
     /// Entries are removed on successful cancel.
     quote_symbols: Arc<Mutex<HashMap<QuoteId, (String, String)>>>,
+    /// Persistent WebSocket order client (futures + Ed25519 only). When
+    /// present, single-order `quote`/`requote`/`cancel` route over the WS-API
+    /// (`order.place`/`modify`/`cancel`) — lower latency, session-authed once.
+    /// `None` → all orders go over REST (spot, HMAC key, or WS connect failed).
+    ws_order: Option<Arc<crate::ws_order::WsOrderClient>>,
 }
 
 impl fmt::Debug for BinanceClient {
@@ -384,6 +391,26 @@ impl BinanceClient {
             }
         }
 
+        // Optional WS-API order client: futures + Ed25519 + writes allowed.
+        // On any failure we log and leave it None → orders fall back to REST.
+        let ws_order = if env.is_futures()
+            && matches!(key_material, BinanceKeyMaterial::Ed25519 { .. })
+            && (!env.is_mainnet() || mainnet_writes_enabled)
+        {
+            match crate::ws_order::WsOrderClient::connect(env, &api_key, &key_material).await {
+                Ok(c) => {
+                    info!("ws order: WS-API connected — single orders route over WebSocket");
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    warn!(error = ?e, "ws order: connect failed — orders fall back to REST");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let client = Self {
             env,
             http,
@@ -393,6 +420,7 @@ impl BinanceClient {
             exchange_info_cache,
             commission_maker_bps,
             quote_symbols: Arc::new(Mutex::new(HashMap::new())),
+            ws_order,
         };
 
         // Futures: set per-symbol leverage at startup. Gated by mainnet flag —
@@ -773,7 +801,19 @@ impl Venue for BinanceClient {
         let size_str = Self::format_decimal(size.0);
         let base_url = self.env.rest_base_url();
 
-        let venue_qid = if self.env.is_futures() {
+        let venue_qid = if let Some(ws) = &self.ws_order {
+            // WS-API order.place (futures + Ed25519). Same coid → same
+            // orderId-derived QuoteId, so the map recording below is unchanged.
+            ws.place(
+                &sym_str,
+                intent.side,
+                &price_str,
+                &size_str,
+                &coid,
+                intent.tif,
+            )
+            .await?
+        } else if self.env.is_futures() {
             crate::futs::place_order(
                 &self.http,
                 base_url,
@@ -923,19 +963,24 @@ impl Venue for BinanceClient {
             let price_str = Self::format_decimal(price.0);
             let size_str = Self::format_decimal(size.0);
 
-            match crate::futs::modify_order(
-                &self.http,
-                base_url,
-                &self.api_key,
-                &self.key_material,
-                &sym_str,
-                intent.side,
-                &price_str,
-                &size_str,
-                order_id,
-            )
-            .await
-            {
+            let modify_res = if let Some(ws) = &self.ws_order {
+                ws.modify(&sym_str, intent.side, &price_str, &size_str, order_id)
+                    .await
+            } else {
+                crate::futs::modify_order(
+                    &self.http,
+                    base_url,
+                    &self.api_key,
+                    &self.key_material,
+                    &sym_str,
+                    intent.side,
+                    &price_str,
+                    &size_str,
+                    order_id,
+                )
+                .await
+            };
+            match modify_res {
                 Ok(_qid) => {
                     // orderId is unchanged — the quote_symbols map entry stays valid.
                     info!(
@@ -1017,7 +1062,10 @@ impl Venue for BinanceClient {
             return Ok(());
         };
         let base_url = self.env.rest_base_url();
-        let result = if self.env.is_futures() {
+        let result = if let Some(ws) = &self.ws_order {
+            // WS-API order.cancel by origClientOrderId (idempotent on -2011/-2013).
+            ws.cancel(&sym_str, &coid).await
+        } else if self.env.is_futures() {
             crate::futs::cancel_order(
                 &self.http,
                 base_url,
@@ -1060,6 +1108,12 @@ impl Venue for BinanceClient {
                 out.push(self.quote(intent).await);
             }
             return out;
+        }
+        // WS-API has no batch endpoint — fan out to concurrent single places.
+        // The actor multiplexes; the order-count rate limit is identical to a
+        // REST batch (it counts orders, not requests), and latency is lower.
+        if self.ws_order.is_some() {
+            return futures::future::join_all(intents.into_iter().map(|i| self.quote(i))).await;
         }
         let base_url = self.env.rest_base_url();
         let mut results: Vec<Option<Result<QuoteId, VenueError>>> =
@@ -1148,6 +1202,10 @@ impl Venue for BinanceClient {
             }
             return out;
         }
+        // WS-API: fan out to concurrent single cancels (no batch endpoint).
+        if self.ws_order.is_some() {
+            return futures::future::join_all(ids.into_iter().map(|id| self.cancel(id))).await;
+        }
         let base_url = self.env.rest_base_url();
         let mut results: Vec<Option<Result<(), VenueError>>> =
             (0..ids.len()).map(|_| None).collect();
@@ -1222,6 +1280,16 @@ impl Venue for BinanceClient {
                 out.push(self.requote(id, intent).await);
             }
             return out;
+        }
+        // WS-API: fan out to concurrent single amends. `requote` self-heals
+        // (modify → place on not-found, no-op → ok, zero-id → place).
+        if self.ws_order.is_some() {
+            return futures::future::join_all(
+                items
+                    .into_iter()
+                    .map(|(id, intent)| self.requote(id, intent)),
+            )
+            .await;
         }
         let base_url = self.env.rest_base_url();
         let n = items.len();
