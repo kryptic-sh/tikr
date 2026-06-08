@@ -24,7 +24,7 @@ enabled = true
 min_volume_usdc = "20000000" # $20M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDC"
-top_n = 1                    # run the top 5 markets
+top_n = 2                    # run the top 5 markets
 rotate_loss_pct = "0.01"     # accept NET loss up to 1% of wallet on rotate
 big_bag_pct = "0"
 retire_bnb_pct = "50"        # convert 50% of a retired bot's NET profit to BNB (VIP-tier fee accrual)
@@ -38,8 +38,8 @@ min_candle_pct = "0"
 [rampage.strategy]
 kind = "flat_mm"
 [rampage.strategy.params]
-inner_bps = "1"              # half-spread: innermost level 1bps off the reservation price
-step_bps = "1"               # spacing between ladder levels
+inner_bps = "2"              # half-spread: innermost level 1bps off the reservation price
+step_bps = "2"               # spacing between ladder levels
 levels = 5                   # levels per side
 reservation_skew_bps = "2"   # γ: max ladder shift away from inventory (keeps it flat)
 imbalance_skew_bps = "0"     # book-imbalance edge vs adverse selection; 0 = off (sweep to tune)

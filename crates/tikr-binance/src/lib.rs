@@ -610,6 +610,14 @@ impl BinanceClient {
 /// `VenueError` isn't `Clone`, so we rebuild the variants the caller acts on —
 /// `RateLimited` (arms the runner's cooldown) and `UnknownQuote` (idempotent) —
 /// and fall back to a string-cloned `Rejected` for everything else.
+/// `-5027 "No need to modify the order"` — Binance refuses a no-op modify whose
+/// new price+qty are identical to the resting order (common after tick-rounding
+/// turns a sub-tick price change into the same wire price). The order is already
+/// in the desired state, so the requote succeeded; treat it as `Ok`, not error.
+fn is_no_modify_needed(e: &VenueError) -> bool {
+    matches!(e, VenueError::Rejected { reason } if reason.contains("code -5027"))
+}
+
 fn clone_batch_err(e: &VenueError, reason: &str) -> VenueError {
     match e {
         VenueError::RateLimited { retry_after_ms } => VenueError::RateLimited {
@@ -894,6 +902,13 @@ impl Venue for BinanceClient {
             // reverse is `id.0.as_u128() as u64`.
             let order_id = id.0.as_u128() as u64;
 
+            // No valid venue orderId to amend (placeholder/zero id) → Binance
+            // rejects a modify with orderId=0 as `-1102 malformed`. Place a
+            // fresh order instead.
+            if order_id == 0 {
+                return self.quote(intent).await.map(|_| ());
+            }
+
             let price = round_price_for_side(
                 &self.exchange_info_cache,
                 &sym_str,
@@ -945,6 +960,10 @@ impl Venue for BinanceClient {
                     }
                     self.quote(intent).await.map(|_| ())
                 }
+                // `-5027 "No need to modify"`: the order is ALREADY at the
+                // requested price/qty (our tick-rounded modify is a no-op).
+                // That's the desired end state → success, not a failure.
+                Err(ref e) if is_no_modify_needed(e) => Ok(()),
                 Err(e) => Err(e),
             }
         } else {
@@ -1248,6 +1267,14 @@ impl Venue for BinanceClient {
                 continue;
             }
             let order_id = id.0.as_u128() as u64;
+            // A zero/placeholder orderId can't be modified (Binance -1102), and
+            // one bad element rejects the WHOLE batch — so place it fresh out of
+            // band instead of letting it poison the chunk.
+            if order_id == 0 {
+                let r = self.quote(intent.clone()).await.map(|_| ());
+                results[idx] = Some(r);
+                continue;
+            }
             prepped.push(PrepItem {
                 orig_idx: idx,
                 sym: sym_str,
@@ -1319,18 +1346,26 @@ impl Venue for BinanceClient {
                                     let r = self.quote(p.intent.clone()).await.map(|_| ());
                                     results[orig_idx] = Some(r);
                                 }
+                                // No-op modify (order already current) → success.
+                                Err(ref e) if is_no_modify_needed(e) => {
+                                    results[orig_idx] = Some(Ok(()));
+                                }
                                 Err(e) => {
                                     results[orig_idx] = Some(Err(e));
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        // Request-level failure: fan the error out to all elements
-                        // in this chunk (same pattern as batch_quote/batch_cancel).
-                        let reason = format!("batch modify request failed: {e:?}");
+                    Err(_e) => {
+                        // Request-level failure (e.g. one malformed element
+                        // rejects the whole chunk). Retry each element on its own
+                        // via `requote`, which self-heals: modify → place on
+                        // not-found, no-op → ok, zero-id → place.
                         for &pi in chunk {
-                            results[prepped[pi].orig_idx] = Some(Err(clone_batch_err(&e, &reason)));
+                            let orig_idx = prepped[pi].orig_idx;
+                            let oid = items[orig_idx].0;
+                            let intent = prepped[pi].intent.clone();
+                            results[orig_idx] = Some(self.requote(oid, intent).await);
                         }
                     }
                 }
