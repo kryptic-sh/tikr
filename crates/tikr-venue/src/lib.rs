@@ -180,6 +180,23 @@ pub trait Venue: Send + Sync {
         out
     }
 
+    /// Requote many quotes in as few requests as the venue allows, returning
+    /// one result per input item (in input order). The default loops
+    /// [`requote`]; batch-capable adapters (e.g. Binance Futures via
+    /// `PUT /fapi/v1/batchOrders`) override this for efficiency.
+    ///
+    /// [`requote`]: Venue::requote
+    async fn batch_requote(
+        &self,
+        items: Vec<(QuoteId, QuoteIntent)>,
+    ) -> Vec<Result<(), VenueError>> {
+        let mut out = Vec::with_capacity(items.len());
+        for (id, intent) in items {
+            out.push(self.requote(id, intent).await);
+        }
+        out
+    }
+
     /// Cancel all outstanding quotes on `symbol`.
     async fn cancel_all(&self, symbol: &Symbol) -> Result<(), VenueError>;
 

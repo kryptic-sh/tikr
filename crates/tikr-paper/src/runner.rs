@@ -1688,12 +1688,34 @@ where
                             }
                             continue;
                         }
-                        match &filtered[i] {
-                            tikr_strategy::Action::Requote { id, intent } => {
-                                match venue.requote(*id, intent.clone()).await {
+                        if matches!(filtered[i], tikr_strategy::Action::Requote { .. }) {
+                            // Gather a run of consecutive Requotes and fire them
+                            // as one batch (`PUT /fapi/v1/batchOrders`) — same
+                            // pattern as the Quote and Cancel gather above.
+                            let mut requote_items: Vec<(QuoteId, QuoteIntent)> = Vec::new();
+                            let mut requote_actions: Vec<tikr_strategy::Action> = Vec::new();
+                            while i < filtered.len() {
+                                if let tikr_strategy::Action::Requote { id, intent } =
+                                    &filtered[i]
+                                {
+                                    requote_items.push((*id, intent.clone()));
+                                    requote_actions.push(filtered[i].clone());
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let results = venue.batch_requote(requote_items.clone()).await;
+                            for ((id, intent), r) in
+                                requote_items.into_iter().zip(results.into_iter())
+                            {
+                                match r {
                                     Ok(()) => info!(
-                                        side = ?intent.side, price = %intent.price.0, size = %intent.size.0,
-                                        old_id = ?id, "live: order requoted"
+                                        side = ?intent.side,
+                                        price = %intent.price.0,
+                                        size = %intent.size.0,
+                                        old_id = ?id,
+                                        "live: order requoted"
                                     ),
                                     Err(e) => {
                                         if let VenueError::RateLimited { retry_after_ms } = e {
@@ -1706,6 +1728,13 @@ where
                                     }
                                 }
                             }
+                            // Requotes still use FillSim's delayed replace path.
+                            for action in requote_actions {
+                                fill_sim.on_action(action, ts);
+                            }
+                            continue;
+                        }
+                        match &filtered[i] {
                             tikr_strategy::Action::Cancel(_) => {
                                 // Handled by the batched cancel-gather above.
                                 unreachable!("Cancel handled before match")
@@ -1729,10 +1758,7 @@ where
                             }
                             tikr_strategy::Action::NoOp => {}
                             tikr_strategy::Action::Quote(_) => unreachable!(),
-                        }
-                        if matches!(filtered[i], tikr_strategy::Action::Requote { .. }) {
-                            // Requotes still use FillSim's delayed replace path.
-                            fill_sim.on_action(filtered[i].clone(), ts);
+                            tikr_strategy::Action::Requote { .. } => unreachable!(),
                         }
                         i += 1;
                     }
@@ -3156,12 +3182,39 @@ async fn dispatch_post_fill_actions<V, S>(
             }
             continue;
         }
-        match &actions[i] {
-            tikr_strategy::Action::Requote { id, intent } => {
-                if let Err(e) = venue.requote(*id, intent.clone()).await {
-                    warn!(error = ?e, "live: venue.requote failed (post-fill)");
+        if matches!(actions[i], tikr_strategy::Action::Requote { .. }) {
+            // Gather a run of consecutive Requotes and batch them.
+            let mut requote_items: Vec<(QuoteId, QuoteIntent)> = Vec::new();
+            while i < actions.len() {
+                if let tikr_strategy::Action::Requote { id, intent } = &actions[i] {
+                    requote_items.push((*id, intent.clone()));
+                    i += 1;
+                } else {
+                    break;
                 }
             }
+            let results = venue.batch_requote(requote_items.clone()).await;
+            for ((id, intent), r) in requote_items.into_iter().zip(results) {
+                match r {
+                    Ok(()) => info!(
+                        side = ?intent.side,
+                        price = %intent.price.0,
+                        size = %intent.size.0,
+                        old_id = ?id,
+                        "live: order requoted (post-fill)"
+                    ),
+                    Err(e) => {
+                        if let VenueError::RateLimited { retry_after_ms } = e {
+                            *rate_limited_until =
+                                Some(Instant::now() + Duration::from_millis(retry_after_ms));
+                        }
+                        warn!(error = ?e, "live: venue.requote failed (post-fill)");
+                    }
+                }
+            }
+            continue;
+        }
+        match &actions[i] {
             tikr_strategy::Action::CancelAll => {
                 side_fails.remove(symbol.base.0.as_ref());
                 match venue.cancel_all(symbol).await {
@@ -3170,7 +3223,9 @@ async fn dispatch_post_fill_actions<V, S>(
                 }
             }
             tikr_strategy::Action::NoOp => {}
-            tikr_strategy::Action::Quote(_) | tikr_strategy::Action::Cancel(_) => unreachable!(),
+            tikr_strategy::Action::Quote(_)
+            | tikr_strategy::Action::Cancel(_)
+            | tikr_strategy::Action::Requote { .. } => unreachable!(),
         }
         i += 1;
     }

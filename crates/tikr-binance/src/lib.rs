@@ -868,43 +868,112 @@ impl Venue for BinanceClient {
         Ok(())
     }
 
-    /// Cancel the old quote then place a new one.
+    /// Requote an existing order.
+    ///
+    /// **Futures**: uses `PUT /fapi/v1/order` (Binance Modify Order) to amend
+    /// price/size in place. The `orderId` is recovered from `id.0.as_u128() as u64`
+    /// — the same derivation that `place_order` uses to produce the QuoteId, so
+    /// the map entry stays valid after a successful modify (orderId is unchanged).
+    ///
+    /// Fallback: if the modify returns `UnknownQuote` (order is already gone —
+    /// filled, self-cancelled, or expired), we fall back to a fresh
+    /// `self.quote(intent)` placement. Other errors propagate so
+    /// `RateLimited` still surfaces to the runner.
+    ///
+    /// **Spot**: no equivalent modify endpoint exists — falls back to the
+    /// cancel-then-place path.
     async fn requote(&self, id: QuoteId, intent: QuoteIntent) -> Result<(), VenueError> {
         self.check_mainnet_gate()?;
 
         let sym_str = binance_symbol(&intent.symbol);
-        let coid = Self::client_order_id(id);
         let base_url = self.env.rest_base_url();
 
-        // Cancel old (idempotent).
-        let cancel_result = if self.env.is_futures() {
-            crate::futs::cancel_order(
-                &self.http,
-                base_url,
-                &self.api_key,
-                &self.key_material,
-                &sym_str,
-                &coid,
-            )
-            .await
-        } else {
-            crate::spot::cancel_order(
-                &self.http,
-                base_url,
-                &self.api_key,
-                &self.key_material,
-                &sym_str,
-                &coid,
-            )
-            .await
-        };
-        if let Err(e) = cancel_result {
-            warn!(error = ?e, "requote: cancel failed; proceeding with new quote");
-        }
+        if self.env.is_futures() {
+            // Recover the venue orderId from the QuoteId. QuoteId is
+            // `QuoteId::from_uuid(Uuid::from_u128(order_id as u128))`, so the
+            // reverse is `id.0.as_u128() as u64`.
+            let order_id = id.0.as_u128() as u64;
 
-        // Place new.
-        self.quote(intent).await?;
-        Ok(())
+            let price = round_price_for_side(
+                &self.exchange_info_cache,
+                &sym_str,
+                intent.price,
+                intent.side,
+            )?;
+            let rounded = round_size(&self.exchange_info_cache, &sym_str, intent.size)?;
+            let size =
+                bump_size_for_min_notional(&self.exchange_info_cache, &sym_str, rounded, price);
+            validate_qty(&self.exchange_info_cache, &sym_str, size, price)?;
+
+            let price_str = Self::format_decimal(price.0);
+            let size_str = Self::format_decimal(size.0);
+
+            match crate::futs::modify_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.key_material,
+                &sym_str,
+                intent.side,
+                &price_str,
+                &size_str,
+                order_id,
+            )
+            .await
+            {
+                Ok(_qid) => {
+                    // orderId is unchanged — the quote_symbols map entry stays valid.
+                    info!(
+                        order_id,
+                        symbol = sym_str,
+                        side = ?intent.side,
+                        price = price_str,
+                        size = size_str,
+                        "futures: order amended in place"
+                    );
+                    Ok(())
+                }
+                Err(VenueError::UnknownQuote) => {
+                    // Order is gone (filled/expired) — clean up map and place fresh.
+                    warn!(
+                        order_id,
+                        symbol = sym_str,
+                        "futures: modify found order gone — placing fresh order"
+                    );
+                    if let Ok(mut map) = self.quote_symbols.lock() {
+                        map.remove(&id);
+                    }
+                    self.quote(intent).await.map(|_| ())
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            // Spot: no modify endpoint — cancel + replace.
+            let entry = match self.quote_symbols.lock() {
+                Ok(map) => map.get(&id).cloned(),
+                Err(_) => None,
+            };
+            let coid = if let Some((_, c)) = entry {
+                c
+            } else {
+                // Unknown id — just place a fresh quote.
+                warn!(?id, "requote (spot): unknown id — placing fresh order");
+                return self.quote(intent).await.map(|_| ());
+            };
+            let cancel_result = crate::spot::cancel_order(
+                &self.http,
+                base_url,
+                &self.api_key,
+                &self.key_material,
+                &sym_str,
+                &coid,
+            )
+            .await;
+            if let Err(e) = cancel_result {
+                warn!(error = ?e, "requote (spot): cancel failed; proceeding with new quote");
+            }
+            self.quote(intent).await.map(|_| ())
+        }
     }
 
     /// Cancel a single quote by id. Idempotent — an unknown id is treated
@@ -1112,6 +1181,162 @@ impl Venue for BinanceClient {
                 }
             }
         }
+        results.into_iter().map(|r| r.unwrap_or(Ok(()))).collect()
+    }
+
+    /// Batch-requote via `PUT /fapi/v1/batchOrders` (≤5/request) on futures.
+    ///
+    /// Groups items by symbol, chunks to ≤5, rounds each item, calls
+    /// [`futs::modify_batch_orders`]. Per-element `UnknownQuote` falls back to
+    /// a fresh `self.quote(intent)` for that element. Results are returned in
+    /// the same order as the input `items`.
+    ///
+    /// Falls back to the per-order loop on spot / closed mainnet gate
+    /// (same as the trait default, but explicit here for clarity).
+    async fn batch_requote(
+        &self,
+        items: Vec<(QuoteId, QuoteIntent)>,
+    ) -> Vec<Result<(), VenueError>> {
+        if !self.env.is_futures() || self.check_mainnet_gate().is_err() {
+            let mut out = Vec::with_capacity(items.len());
+            for (id, intent) in items {
+                out.push(self.requote(id, intent).await);
+            }
+            return out;
+        }
+        let base_url = self.env.rest_base_url();
+        let n = items.len();
+        let mut results: Vec<Option<Result<(), VenueError>>> = (0..n).map(|_| None).collect();
+
+        // Prep each item: round price/size, build wire strings. A per-item prep
+        // failure (e.g. unknown symbol, qty below min) lands directly in results.
+        struct PrepItem {
+            orig_idx: usize,
+            sym: String,
+            order_id: u64,
+            price_str: String,
+            size_str: String,
+            side: Side,
+            intent: QuoteIntent,
+        }
+        let mut prepped: Vec<PrepItem> = Vec::with_capacity(n);
+        for (idx, (id, intent)) in items.iter().enumerate() {
+            let sym_str = binance_symbol(&intent.symbol);
+            let price = match round_price_for_side(
+                &self.exchange_info_cache,
+                &sym_str,
+                intent.price,
+                intent.side,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    results[idx] = Some(Err(e));
+                    continue;
+                }
+            };
+            let rounded = match round_size(&self.exchange_info_cache, &sym_str, intent.size) {
+                Ok(s) => s,
+                Err(e) => {
+                    results[idx] = Some(Err(e));
+                    continue;
+                }
+            };
+            let size =
+                bump_size_for_min_notional(&self.exchange_info_cache, &sym_str, rounded, price);
+            if let Err(e) = validate_qty(&self.exchange_info_cache, &sym_str, size, price) {
+                results[idx] = Some(Err(e));
+                continue;
+            }
+            let order_id = id.0.as_u128() as u64;
+            prepped.push(PrepItem {
+                orig_idx: idx,
+                sym: sym_str,
+                order_id,
+                price_str: Self::format_decimal(price.0),
+                size_str: Self::format_decimal(size.0),
+                side: intent.side,
+                intent: intent.clone(),
+            });
+        }
+
+        // Group by symbol (single-symbol in practice, but stay correct).
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        for (pi, p) in prepped.iter().enumerate() {
+            if let Some(g) = groups.iter_mut().find(|g| g.0 == p.sym) {
+                g.1.push(pi);
+            } else {
+                groups.push((p.sym.clone(), vec![pi]));
+            }
+        }
+
+        for (sym, pis) in groups {
+            for chunk in pis.chunks(5) {
+                let mods: Vec<(Side, String, String, u64)> = chunk
+                    .iter()
+                    .map(|&pi| {
+                        let p = &prepped[pi];
+                        (p.side, p.price_str.clone(), p.size_str.clone(), p.order_id)
+                    })
+                    .collect();
+                let batch_res = crate::futs::modify_batch_orders(
+                    &self.http,
+                    base_url,
+                    &self.api_key,
+                    &self.key_material,
+                    &sym,
+                    &mods,
+                )
+                .await;
+                match batch_res {
+                    Ok(per_el) => {
+                        for (&pi, el_res) in chunk.iter().zip(per_el) {
+                            let p = &prepped[pi];
+                            let orig_idx = p.orig_idx;
+                            match el_res {
+                                Ok(_qid) => {
+                                    info!(
+                                        order_id = p.order_id,
+                                        symbol = %p.sym,
+                                        side = ?p.side,
+                                        price = %p.price_str,
+                                        size = %p.size_str,
+                                        "futures: batch order amended"
+                                    );
+                                    results[orig_idx] = Some(Ok(()));
+                                }
+                                Err(VenueError::UnknownQuote) => {
+                                    // Order gone — fall back to fresh placement.
+                                    warn!(
+                                        order_id = p.order_id,
+                                        symbol = %p.sym,
+                                        "futures: batch modify found order gone — placing fresh"
+                                    );
+                                    // Remove stale map entry before placing new.
+                                    let old_id = items[orig_idx].0;
+                                    if let Ok(mut map) = self.quote_symbols.lock() {
+                                        map.remove(&old_id);
+                                    }
+                                    let r = self.quote(p.intent.clone()).await.map(|_| ());
+                                    results[orig_idx] = Some(r);
+                                }
+                                Err(e) => {
+                                    results[orig_idx] = Some(Err(e));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Request-level failure: fan the error out to all elements
+                        // in this chunk (same pattern as batch_quote/batch_cancel).
+                        let reason = format!("batch modify request failed: {e:?}");
+                        for &pi in chunk {
+                            results[prepped[pi].orig_idx] = Some(Err(clone_batch_err(&e, &reason)));
+                        }
+                    }
+                }
+            }
+        }
+
         results.into_iter().map(|r| r.unwrap_or(Ok(()))).collect()
     }
 

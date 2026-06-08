@@ -468,6 +468,175 @@ pub async fn cancel_batch_orders(
     Ok(arr.iter().map(parse_cancel_element).collect())
 }
 
+/// Modify (amend) an existing LIMIT order on USD-M Futures.
+///
+/// Endpoint: `PUT /fapi/v1/order`
+/// Auth: API-key header + signed query.
+///
+/// `order_id` must match the venue's `orderId` for the resting order.
+/// `side` must equal the order's original side — Binance rejects a
+/// side change. `price` and `quantity` are pre-rounded wire strings.
+///
+/// On success: returns `QuoteId` derived from `order_id` (unchanged).
+/// On `-2011` / `-2013` (order no longer exists): returns
+/// [`VenueError::UnknownQuote`] so the caller can fall back to a fresh
+/// `place_order`. On other errors: propagates `VenueError`.
+#[allow(clippy::too_many_arguments)]
+pub async fn modify_order(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    side: Side,
+    price: &str,
+    quantity: &str,
+    order_id: u64,
+) -> Result<QuoteId, VenueError> {
+    let side_str = match side {
+        Side::Bid => "BUY",
+        Side::Ask => "SELL",
+    };
+    let params = format!(
+        "symbol={symbol}&side={side_str}&quantity={quantity}&price={price}&orderId={order_id}"
+    );
+    let signed = append_auth_dispatch(&params, key_material);
+
+    info!(
+        symbol,
+        side = side_str,
+        price,
+        quantity,
+        order_id,
+        "futures: modifying order"
+    );
+
+    let url = format!("{base_url}/fapi/v1/order?{signed}");
+    let resp = http
+        .put(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let body: Value = match read_json(resp).await {
+        Ok(b) => b,
+        // -2011/-2013 from the HTTP layer → order no longer exists.
+        Err(VenueError::UnknownQuote) => return Err(VenueError::UnknownQuote),
+        Err(e) => return Err(e),
+    };
+
+    if let Some(e) = try_parse_error(&body) {
+        return Err(e);
+    }
+
+    // The orderId is unchanged after a successful modify; we re-derive the
+    // QuoteId from it (same derivation as place_order) so the caller's map
+    // entry stays valid.
+    let returned_id = body
+        .get("orderId")
+        .and_then(Value::as_u64)
+        .unwrap_or(order_id);
+
+    info!(order_id = returned_id, symbol, "futures: order modified");
+    Ok(QuoteId::from_uuid(Uuid::from_u128(returned_id as u128)))
+}
+
+/// Build the `batchOrders` JSON array string for a modify batch. Pure +
+/// testable; the caller percent-encodes + signs it.
+pub(crate) fn build_modify_batch_json(
+    symbol: &str,
+    mods: &[(Side, String, String, u64)],
+) -> String {
+    let arr: Vec<Value> = mods
+        .iter()
+        .map(|(side, price, qty, order_id)| {
+            serde_json::json!({
+                "symbol": symbol,
+                "side": match side { Side::Bid => "BUY", Side::Ask => "SELL" },
+                "type": "LIMIT",
+                "quantity": qty,
+                "price": price,
+                "orderId": order_id,
+            })
+        })
+        .collect();
+    Value::Array(arr).to_string()
+}
+
+/// Parse one element of a batchOrders modify response.
+/// An element with `orderId` → Ok(QuoteId). An element with a negative
+/// `code` equal to a not-found sentinel (-2011/-2013) → Err(UnknownQuote).
+/// Other negative codes → Err(Rejected).
+fn parse_modify_element(el: &Value) -> Result<QuoteId, VenueError> {
+    if let Some(code) = el.get("code").and_then(Value::as_i64)
+        && code < 0
+    {
+        let code = code as i32;
+        let msg = el.get("msg").and_then(Value::as_str).unwrap_or("unknown");
+        return Err(parse_binance_error_code(code, msg));
+    }
+    let order_id = el.get("orderId").and_then(Value::as_u64).ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures batchModify: missing orderId in element: {el}"
+        ))))
+    })?;
+    Ok(QuoteId::from_uuid(Uuid::from_u128(order_id as u128)))
+}
+
+/// Modify up to 5 open LIMIT orders in ONE request.
+///
+/// Endpoint: `PUT /fapi/v1/batchOrders` (max 5; weight 5).
+///
+/// `mods` is a slice of `(side, price, quantity, order_id)` tuples.
+/// Caller is responsible for chunking to ≤5 before calling this fn.
+///
+/// Returns one `Result<QuoteId, VenueError>` per input element:
+/// - `Ok(qid)` — the order was successfully amended (orderId unchanged).
+/// - `Err(UnknownQuote)` — order no longer exists; caller should fall
+///   back to placing a fresh order.
+/// - `Err(_)` — other error; propagate to the caller.
+///
+/// A request-level failure (auth / rate-limit / malformed) returns a
+/// single top-level `Err` for the whole call.
+pub async fn modify_batch_orders(
+    http: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    key_material: &BinanceKeyMaterial,
+    symbol: &str,
+    mods: &[(Side, String, String, u64)],
+) -> Result<Vec<Result<QuoteId, VenueError>>, VenueError> {
+    if mods.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json = build_modify_batch_json(symbol, mods);
+    let params = format!("batchOrders={}", percent_encode_value(&json));
+    let signed = append_auth_dispatch(&params, key_material);
+
+    info!(
+        symbol,
+        count = mods.len(),
+        "futures: modifying batch orders"
+    );
+
+    let url = format!("{base_url}/fapi/v1/batchOrders?{signed}");
+    let resp = http
+        .put(&url)
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(network_err)?;
+
+    let body: Value = read_json(resp).await?;
+    let arr = body.as_array().ok_or_else(|| {
+        VenueError::Internal(Box::new(std::io::Error::other(format!(
+            "futures batchModify: expected array response: {body}"
+        ))))
+    })?;
+    Ok(arr.iter().map(parse_modify_element).collect())
+}
+
 /// Cancel an order by `origClientOrderId` on Futures.
 ///
 /// Endpoint: `DELETE /fapi/v1/order`
@@ -2041,5 +2210,67 @@ mod batch_tests {
         );
         // other negative code = Err.
         assert!(parse_cancel_element(&serde_json::json!({"code": -1102, "msg": "bad"})).is_err());
+    }
+
+    #[test]
+    fn build_modify_json_shape() {
+        let mods = vec![
+            (
+                Side::Bid,
+                "0.0331".to_string(),
+                "150".to_string(),
+                111222333u64,
+            ),
+            (
+                Side::Ask,
+                "0.0341".to_string(),
+                "146".to_string(),
+                444555666u64,
+            ),
+        ];
+        let json = build_modify_batch_json("PORTALUSDT", &mods);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // First element — bid
+        assert_eq!(arr[0]["symbol"], "PORTALUSDT");
+        assert_eq!(arr[0]["side"], "BUY");
+        assert_eq!(arr[0]["type"], "LIMIT");
+        assert_eq!(arr[0]["price"], "0.0331");
+        assert_eq!(arr[0]["quantity"], "150");
+        assert_eq!(arr[0]["orderId"], 111222333u64);
+        // Second element — ask
+        assert_eq!(arr[1]["side"], "SELL");
+        assert_eq!(arr[1]["orderId"], 444555666u64);
+        // No newClientOrderId (modify doesn't take one)
+        assert!(arr[0].get("newClientOrderId").is_none());
+    }
+
+    #[test]
+    fn modify_element_ok_and_not_found() {
+        // Successful modify response — orderId present, no negative code.
+        let ok = serde_json::json!({"orderId": 987654321u64, "status": "NEW"});
+        let qid = parse_modify_element(&ok).unwrap();
+        assert_eq!(
+            qid,
+            QuoteId::from_uuid(uuid::Uuid::from_u128(987654321u128))
+        );
+        // Order no longer exists → UnknownQuote.
+        let not_found_2011 = serde_json::json!({"code": -2011, "msg": "unknown order"});
+        assert!(matches!(
+            parse_modify_element(&not_found_2011),
+            Err(VenueError::UnknownQuote)
+        ));
+        let not_found_2013 = serde_json::json!({"code": -2013, "msg": "order does not exist"});
+        assert!(matches!(
+            parse_modify_element(&not_found_2013),
+            Err(VenueError::UnknownQuote)
+        ));
+        // Other error → propagated (Rejected or other variant).
+        let other_err = serde_json::json!({"code": -2010, "msg": "insufficient balance"});
+        assert!(matches!(
+            parse_modify_element(&other_err),
+            Err(VenueError::InsufficientBalance { .. })
+        ));
     }
 }
