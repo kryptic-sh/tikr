@@ -267,9 +267,11 @@ pub struct BinanceClient {
     ///
     /// Entries are removed on successful cancel.
     quote_symbols: Arc<Mutex<HashMap<QuoteId, (String, String)>>>,
-    /// Persistent WebSocket order client (futures + Ed25519 only). When
-    /// present, single-order `quote`/`requote`/`cancel` route over the WS-API
-    /// (`order.place`/`modify`/`cancel`) — lower latency, session-authed once.
+    /// Persistent WebSocket order client (futures + Ed25519 only). When present,
+    /// ALL `quote`/`requote`/`cancel` route over the WS-API
+    /// (`order.place`/`modify`/`cancel`) — and the batch methods fan out to
+    /// concurrent WS frames (the WS-API has no batch endpoint). Lower latency,
+    /// session-authed once. Only `cancel_all` and taker closes stay REST.
     /// `None` → all orders go over REST (spot, HMAC key, or WS connect failed).
     ws_order: Option<Arc<crate::ws_order::WsOrderClient>>,
 }
@@ -399,7 +401,11 @@ impl BinanceClient {
         {
             match crate::ws_order::WsOrderClient::connect(env, &api_key, &key_material).await {
                 Ok(c) => {
-                    info!("ws order: WS-API connected — single orders route over WebSocket");
+                    info!(
+                        "ws order: WS-API connected — all place/modify/cancel route over \
+                         WebSocket (batches fan out to concurrent WS frames; cancel-all and \
+                         taker closes stay REST)"
+                    );
                     Some(Arc::new(c))
                 }
                 Err(e) => {
