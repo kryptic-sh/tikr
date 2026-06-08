@@ -784,8 +784,14 @@ impl FillSim {
                 }
                 Op::Replace { id, intent } => {
                     self.cancel_id(id);
+                    // PRESERVE the id across a replace. A requote amends in place
+                    // (WS/REST `order.modify` keeps the venue `orderId`), so the
+                    // tracked id must stay equal to the venue id — otherwise the
+                    // replaced quote gets a fresh random `QuoteId::default()`,
+                    // which the next requote recovers as a garbage orderId and
+                    // the venue rejects with `-1102`.
                     if let Some(f) =
-                        self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns), None)
+                        self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns), Some(id))
                     {
                         fills.push(f);
                     }
