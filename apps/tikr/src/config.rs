@@ -662,6 +662,24 @@ pub struct FlatMmParams {
     /// Size multiplier for underwater reducing levels. Default 1.
     #[serde(default = "flat_mm_default_underwater_reduce_frac")]
     pub underwater_reduce_frac: Decimal,
+    /// Frozen-lattice mode: fix the price grid once and never reprice — only
+    /// add/re-size/trim. Kills order-rate-limit pressure. Default false.
+    #[serde(default)]
+    pub frozen_lattice: bool,
+    /// Grid levels per side to keep populated around mid (frozen mode). Default 25.
+    #[serde(default = "flat_mm_default_lattice_band_levels")]
+    pub lattice_band_levels: u32,
+    /// Max total resting orders before trimming the farthest outskirts. Default 180.
+    #[serde(default = "flat_mm_default_lattice_max_open")]
+    pub lattice_max_open: u32,
+}
+
+fn flat_mm_default_lattice_band_levels() -> u32 {
+    25
+}
+
+fn flat_mm_default_lattice_max_open() -> u32 {
+    180
 }
 
 fn flat_mm_default_inner_bps() -> Decimal {
@@ -1062,6 +1080,12 @@ pub enum RampageStrategy {
         flush_frac: Decimal,
         #[serde(default = "flat_mm_default_underwater_reduce_frac")]
         underwater_reduce_frac: Decimal,
+        #[serde(default)]
+        frozen_lattice: bool,
+        #[serde(default = "flat_mm_default_lattice_band_levels")]
+        lattice_band_levels: u32,
+        #[serde(default = "flat_mm_default_lattice_max_open")]
+        lattice_max_open: u32,
     },
     /// Spawn a Tide (at-touch grid) bot.
     Tide {

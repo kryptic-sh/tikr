@@ -788,6 +788,9 @@ fn spawn_one_bot(
             chase_boost_pct,
             flush_frac,
             underwater_reduce_frac,
+            frozen_lattice,
+            lattice_band_levels,
+            lattice_max_open,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
@@ -804,6 +807,9 @@ fn spawn_one_bot(
                     chase_boost_pct: *chase_boost_pct,
                     flush_frac: *flush_frac,
                     underwater_reduce_frac: *underwater_reduce_frac,
+                    frozen_lattice: *frozen_lattice,
+                    lattice_band_levels: *lattice_band_levels,
+                    lattice_max_open: *lattice_max_open,
                 }),
                 wave: None,
                 tide: None,

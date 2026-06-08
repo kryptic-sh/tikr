@@ -29,6 +29,9 @@
 //! to the runner-level bagger (`bp_flat_pct` taker cap) — this strategy only
 //! manages the quoting. It does NOT chase profit, widen on its own, or hold.
 
+use std::collections::HashMap;
+
+use rust_decimal::prelude::ToPrimitive as _;
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
 
@@ -100,6 +103,24 @@ pub struct FlatMmConfig {
     /// drops when underwater). Between = keep them *smaller* (a little loss for
     /// a lot of volume), snapping back to full size once a level is above water.
     pub underwater_reduce_frac: Decimal,
+
+    // ── Frozen-lattice mode ────────────────────────────────────────────────
+    /// Enable the frozen-lattice quoting mode. When `true`, the strategy fixes
+    /// a price grid at the first usable mid and **never reprices** existing
+    /// orders — it only adds missing levels, re-sizes changed ones, and trims
+    /// the farthest outskirts when the open-order cap is hit. This virtually
+    /// eliminates order-rate-limit pressure. The reservation-skew reconcile
+    /// path is completely bypassed. Default `false`.
+    pub frozen_lattice: bool,
+    /// Number of grid levels **per side** to keep populated around the current
+    /// mid. The live band spans `[k_mid − band, k_mid + band]` where `k_mid`
+    /// is the grid index nearest the current mid. Default `25`.
+    pub lattice_band_levels: u32,
+    /// Maximum total resting orders (both sides combined) before the strategy
+    /// starts trimming. When `open_quotes.len() >= lattice_max_open`, the
+    /// farthest-from-mid outskirt orders are cancelled first to make room for
+    /// new band levels. Default `180`.
+    pub lattice_max_open: u32,
 }
 
 impl FlatMmConfig {
@@ -120,6 +141,9 @@ impl FlatMmConfig {
             chase_boost_pct: Decimal::ZERO,
             flush_frac: Decimal::ONE,
             underwater_reduce_frac: Decimal::ONE,
+            frozen_lattice: false,
+            lattice_band_levels: 25,
+            lattice_max_open: 180,
         }
     }
 }
@@ -150,6 +174,10 @@ pub struct FlatMm {
     /// Cached `min_notional / step_size` — lets the min-notional bump do one
     /// division (`/price`) instead of two.
     min_over_step: Decimal,
+    /// Fixed price at which the frozen lattice was anchored. `None` until the
+    /// first usable mid is seen in frozen-lattice mode. Once set it never
+    /// changes; the grid is `origin + k * step` for all integers k.
+    lattice_origin: Option<Decimal>,
 }
 
 impl FlatMm {
@@ -407,6 +435,167 @@ impl FlatMm {
         actions
     }
 
+    /// Frozen-lattice reconcile. Fixes `lattice_origin` on the first call,
+    /// then computes the desired band of grid levels around the current mid and
+    /// diffs it against resting orders. Existing orders at exact grid prices
+    /// are **never repriced** — only new levels are quoted, size-changed ones
+    /// requoted, and outskirts trimmed when the open-order cap is hit.
+    fn frozen_reconcile(&mut self, ctx: &StrategyContext<'_>) -> Vec<Action> {
+        // Step 1 — require a usable mid.
+        let Some(mid_price) = compute_mid_strict(ctx.latest_book) else {
+            return Vec::new();
+        };
+        let mid = mid_price.0;
+
+        // Step 2 — freeze origin on first call.
+        if self.lattice_origin.is_none() {
+            self.lattice_origin = Some(mid);
+        }
+        let origin = self.lattice_origin.unwrap();
+
+        // Step 3 — grid geometry.
+        let step = origin * Self::bps(self.config.step_bps);
+        let inner = origin * Self::bps(self.config.inner_bps);
+        if step <= Decimal::ZERO {
+            return Vec::new();
+        }
+
+        // Best bid / ask for cross-guard.
+        let best_bid = ctx.latest_book.bids.first().map(|l| l.price.0);
+        let best_ask = ctx.latest_book.asks.first().map(|l| l.price.0);
+
+        // k index of the current mid in the grid.
+        let k_mid_raw = (mid - origin) / step;
+        // Round to nearest integer k.
+        let k_mid = k_mid_raw.round().to_i64().unwrap_or(0);
+        let band = self.config.lattice_band_levels as i64;
+
+        // Step 4 — build desired band: map from canonical rounded price (as
+        // Decimal key via to_string for exact equality) to (side, QuoteIntent).
+        // We use a BTreeMap-style approach but HashMap is fine here.
+        let mut desired: HashMap<String, (Side, QuoteIntent)> = HashMap::new();
+
+        for k in (k_mid - band)..=(k_mid + band) {
+            let p = origin + Decimal::from(k) * step;
+            if p <= Decimal::ZERO {
+                continue;
+            }
+
+            // Assign side based on position relative to mid ± inner dead zone.
+            let side = if p < mid - inner {
+                Side::Bid
+            } else if p > mid + inner {
+                Side::Ask
+            } else {
+                // Dead zone — no order at this level.
+                continue;
+            };
+
+            // Cross-guard: skip bids that would cross the touch.
+            if side == Side::Bid
+                && let Some(ba) = best_ask
+                && p >= ba
+            {
+                continue;
+            }
+            // Cross-guard: skip asks that would cross the touch.
+            if side == Side::Ask
+                && let Some(bb) = best_bid
+                && p <= bb
+            {
+                continue;
+            }
+
+            // Size = notional / price. Keep it simple: uniform size across the
+            // whole band in v1 (no inventory skew in frozen mode).
+            let raw_size = if p > Decimal::ZERO {
+                self.config.notional_per_order / p
+            } else {
+                continue;
+            };
+            let intent = self.intent(ctx.symbol, side, p, raw_size);
+            // Canonical key = the rounded price after tick quantisation.
+            let key = intent.price.0.to_string();
+            desired.insert(key, (side, intent));
+        }
+
+        // Step 5 — reconcile desired band against resting open_quotes.
+        //
+        // Build a lookup from (price_key, side) → (QuoteId, QuoteIntent) for
+        // fast matching. Note: two resting orders can share the same price+side
+        // key only in degenerate states; we take the first match.
+        let mut resting_map: HashMap<(String, Side), (tikr_venue::QuoteId, QuoteIntent)> =
+            HashMap::new();
+        for (id, intent) in ctx.open_quotes {
+            let key = (intent.price.0.to_string(), intent.side);
+            resting_map.entry(key).or_insert((*id, intent.clone()));
+        }
+
+        let mut actions: Vec<Action> = Vec::new();
+        let mut claimed_ids: std::collections::HashSet<tikr_venue::QuoteId> =
+            std::collections::HashSet::new();
+        // Count how many new Quote actions we'll add — needed for cap math.
+        let mut new_quote_count: usize = 0;
+
+        for (price_key, (side, intent)) in &desired {
+            let resting_key = (price_key.clone(), *side);
+            match resting_map.get(&resting_key) {
+                Some((id, resting_intent)) => {
+                    // Level already resting at the exact price+side.
+                    claimed_ids.insert(*id);
+                    // Only requote if size drifted beyond tolerance (rare in v1).
+                    let rel = if intent.size.0 > Decimal::ZERO {
+                        (resting_intent.size.0 - intent.size.0).abs() / intent.size.0
+                    } else {
+                        Decimal::ONE
+                    };
+                    if rel > Self::size_tol() {
+                        actions.push(Action::Requote {
+                            id: *id,
+                            intent: intent.clone(),
+                        });
+                    }
+                    // Exact match → leave it (preserve queue position).
+                }
+                None => {
+                    // Missing level — quote it.
+                    actions.push(Action::Quote(intent.clone()));
+                    new_quote_count += 1;
+                }
+            }
+        }
+
+        // Outskirt orders: resting orders NOT in the desired band.
+        // Normally we leave these alone (frozen: never reprice outskirts).
+        // Exception: when total resting count hits lattice_max_open, trim the
+        // farthest-from-mid outskirts to make room.
+        let outskirts: Vec<(tikr_venue::QuoteId, Decimal)> = ctx
+            .open_quotes
+            .iter()
+            .filter(|(id, _)| !claimed_ids.contains(id))
+            .map(|(id, intent)| (*id, (intent.price.0 - mid).abs()))
+            .collect();
+
+        let total_after = ctx.open_quotes.len() + new_quote_count;
+        let cap = self.config.lattice_max_open as usize;
+        if total_after >= cap && !outskirts.is_empty() {
+            // How many to cancel: enough to get total back under cap.
+            // Cancel = outskirt count consumed, new_quote_count adds back.
+            let excess = total_after.saturating_sub(cap);
+            let to_cancel = excess.min(outskirts.len());
+
+            // Sort outskirts farthest-from-mid first.
+            let mut sorted_outskirts = outskirts;
+            sorted_outskirts.sort_by_key(|x| std::cmp::Reverse(x.1));
+
+            for (id, _) in sorted_outskirts.into_iter().take(to_cancel) {
+                actions.push(Action::Cancel(id));
+            }
+        }
+
+        actions
+    }
+
     fn requote(&self, ctx: &StrategyContext<'_>) -> Vec<Action> {
         let Some(mid) = compute_mid_strict(ctx.latest_book) else {
             return Vec::new();
@@ -441,6 +630,7 @@ impl Strategy for FlatMm {
             inv_tick,
             inv_step,
             min_over_step,
+            lattice_origin: None,
         }
     }
 
@@ -449,6 +639,15 @@ impl Strategy for FlatMm {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
+        // Frozen-lattice mode: all market events route to frozen_reconcile.
+        // The existing reservation-skew path is completely bypassed.
+        if self.config.frozen_lattice {
+            return match event {
+                MarketEvent::Fill(_) | MarketEvent::BookUpdate { .. } => self.frozen_reconcile(ctx),
+                MarketEvent::Heartbeat { .. } | MarketEvent::Trade { .. } => Vec::new(),
+            };
+        }
+
         match event {
             // A fill is the only thing that changes inventory (and thus the skew
             // and break-even flush), so it always re-quotes.
@@ -590,6 +789,9 @@ mod tests {
             chase_boost_pct: Decimal::ZERO,
             flush_frac: Decimal::ONE,
             underwater_reduce_frac: Decimal::ONE,
+            frozen_lattice: false,
+            lattice_band_levels: 25,
+            lattice_max_open: 180,
         }
     }
 
@@ -909,6 +1111,246 @@ mod tests {
             top_bid(&a_heavy) > top_bid(&a_bal),
             "bid-heavy book shifts the ladder up vs balanced"
         );
+    }
+
+    // ── Frozen-lattice tests ───────────────────────────────────────────────
+
+    /// Config helper for frozen-lattice tests: band_levels=3, max_open=200
+    /// (high cap so trim doesn't fire incidentally), no tick/lot rounding.
+    fn cfg_frozen(band_levels: u32, max_open: u32) -> FlatMmConfig {
+        FlatMmConfig {
+            notional_per_order: Decimal::from(5),
+            tick_size: Decimal::ZERO,
+            step_size: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
+            inner_bps: Decimal::ONE,
+            step_bps: Decimal::from(2), // 2bps steps so levels spread visibly
+            levels: 3,
+            reservation_skew_bps: Decimal::ZERO,
+            imbalance_skew_bps: Decimal::ZERO,
+            skew_unit_notional: Decimal::from(100),
+            flush_bps: Decimal::ZERO, // no flush in frozen mode
+            chase_boost_pct: Decimal::ZERO,
+            flush_frac: Decimal::ONE,
+            underwater_reduce_frac: Decimal::ONE,
+            frozen_lattice: true,
+            lattice_band_levels: band_levels,
+            lattice_max_open: max_open,
+        }
+    }
+
+    #[test]
+    fn frozen_seed_places_full_band() {
+        // With band_levels=3 and a clean book (no resting orders), the first
+        // BookUpdate should emit exactly 2×3=6 Quotes: 3 bids below mid,
+        // 3 asks above mid, no Cancels, all at distinct frozen prices.
+        let s = sym();
+        // Use a round mid so arithmetic is easy to reason about.
+        let b = book_mid(&s, Decimal::ONE);
+        let p = pos(&s, Decimal::ZERO, Decimal::ZERO);
+        let mut st = FlatMm::new(cfg_frozen(3, 200));
+
+        let acts = st.on_event(
+            &ctx(&s, &b, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+
+        let qs = quotes(&acts);
+        let cancels = acts
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel(_)))
+            .count();
+
+        assert_eq!(cancels, 0, "no cancels on seed: {acts:?}");
+        assert_eq!(qs.len(), 6, "expected 6 quotes (3 bid + 3 ask): {qs:?}");
+        assert_eq!(
+            qs.iter().filter(|q| q.side == Side::Bid).count(),
+            3,
+            "3 bid levels"
+        );
+        assert_eq!(
+            qs.iter().filter(|q| q.side == Side::Ask).count(),
+            3,
+            "3 ask levels"
+        );
+
+        // All prices must be distinct.
+        let prices: std::collections::HashSet<String> =
+            qs.iter().map(|q| q.price.0.to_string()).collect();
+        assert_eq!(prices.len(), 6, "all 6 prices distinct");
+
+        // Bids sit strictly below mid, asks strictly above.
+        let mid = Decimal::ONE;
+        assert!(
+            qs.iter()
+                .filter(|q| q.side == Side::Bid)
+                .all(|q| q.price.0 < mid),
+            "all bids below mid"
+        );
+        assert!(
+            qs.iter()
+                .filter(|q| q.side == Side::Ask)
+                .all(|q| q.price.0 > mid),
+            "all asks above mid"
+        );
+    }
+
+    #[test]
+    fn frozen_no_reprice_on_small_move() {
+        // After seeding, a subsequent BookUpdate with mid moved by less than
+        // one step should emit NO Requotes and NO price changes to existing
+        // orders. At most it can add a new Quote if a fresh level enters the
+        // band — but it must never amend an existing order's price.
+        let s = sym();
+        let mid0 = Decimal::ONE;
+        let b0 = book_mid(&s, mid0);
+        let p = pos(&s, Decimal::ZERO, Decimal::ZERO);
+        let mut st = FlatMm::new(cfg_frozen(3, 200));
+
+        // Seed pass.
+        let seed_acts = st.on_event(
+            &ctx(&s, &b0, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: b0.clone(),
+            },
+        );
+        let resting = as_resting(&seed_acts);
+        assert!(!resting.is_empty(), "seed must place orders");
+
+        // Move mid by half a step (step = 2bps of 1.0 = 0.0002; half = 0.0001).
+        let half_step = Decimal::new(1, 4); // 0.0001
+        let b1 = book_mid(&s, mid0 + half_step);
+        let acts = st.on_event(
+            &ctx(&s, &b1, &p, &resting),
+            &MarketEvent::BookUpdate {
+                snapshot: b1.clone(),
+            },
+        );
+
+        // No Requote actions at all.
+        let requotes = acts
+            .iter()
+            .filter(|a| matches!(a, Action::Requote { .. }))
+            .count();
+        assert_eq!(requotes, 0, "no requotes on small move: {acts:?}");
+
+        // No existing resting price should appear as a new Quote at a different
+        // price — i.e. none of the new Quotes must collide with a resting price
+        // at a different side (would indicate a reprice attempt through cancel+new).
+        // Simpler: assert no Cancel actions either (we didn't hit the cap).
+        let cancels = acts
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel(_)))
+            .count();
+        assert_eq!(cancels, 0, "no cancels on small move under cap: {acts:?}");
+    }
+
+    #[test]
+    fn frozen_trim_only_at_cap() {
+        // With lattice_max_open=8 and 8 outskirt orders already resting (none
+        // in the desired band), adding a 6-Quote seed should trigger trimming
+        // of the 6 farthest outskirts (to make room). With cap=8 and
+        // total_after = 8+6 = 14, excess = 14-8 = 6 → cancel 6 farthest.
+        let s = sym();
+        let mid = Decimal::ONE;
+        let b = book_mid(&s, mid);
+        let p = pos(&s, Decimal::ZERO, Decimal::ZERO);
+
+        // Low cap so trimming fires.
+        let cap = 8u32;
+        let mut st = FlatMm::new(cfg_frozen(3, cap));
+
+        // Build 8 synthetic outskirt orders far from mid (prices 0.80..0.87),
+        // all asks so they don't collide with the desired band on the bid side.
+        // These are deliberately far from mid so they qualify as outskirts and
+        // won't be in the desired band.
+        let far_ask_prices: Vec<Decimal> = (0u32..8)
+            .map(|i| Decimal::new(80, 2) + Decimal::new(i as i64, 2)) // 0.80..0.87
+            .collect();
+        let outskirt_resting: Vec<(QuoteId, QuoteIntent)> = far_ask_prices
+            .iter()
+            .map(|&px| {
+                let qi = QuoteIntent {
+                    symbol: s.clone(),
+                    side: Side::Ask,
+                    price: Price(px),
+                    size: Size(Decimal::from(1)),
+                    tif: TimeInForce::PostOnly,
+                    kind: QuoteKind::Point,
+                };
+                (QuoteId::new(), qi)
+            })
+            .collect();
+
+        // First call: 8 outskirts resting, 0 in desired band → strategy wants
+        // to add 6 new Quotes; total_after = 14 >= cap=8 → trim 6 farthest.
+        let acts = st.on_event(
+            &ctx(&s, &b, &p, &outskirt_resting),
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+
+        let new_quotes = quotes(&acts).len();
+        let cancels: Vec<_> = acts
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel(_)))
+            .collect();
+
+        assert!(new_quotes > 0, "seed quotes must fire");
+        assert!(
+            !cancels.is_empty(),
+            "cancels must fire when total_after >= cap: {acts:?}"
+        );
+
+        // All cancelled orders must be from outskirt_resting (not new band orders).
+        let outskirt_ids: std::collections::HashSet<QuoteId> =
+            outskirt_resting.iter().map(|(id, _)| *id).collect();
+        for a in &acts {
+            if let Action::Cancel(id) = a {
+                assert!(
+                    outskirt_ids.contains(id),
+                    "cancel targets an outskirt order"
+                );
+            }
+        }
+
+        // The cancelled orders should be the farthest-from-mid ones (highest
+        // absolute distance). Our outskirt prices are 0.80..0.87; farthest = 0.80.
+        // Check that 0.80 is among the cancelled IDs.
+        let cancelled_prices: std::collections::HashSet<String> = acts
+            .iter()
+            .filter_map(|a| {
+                if let Action::Cancel(id) = a {
+                    outskirt_resting
+                        .iter()
+                        .find(|(rid, _)| rid == id)
+                        .map(|(_, qi)| qi.price.0.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            cancelled_prices.contains(&Decimal::new(80, 2).to_string()),
+            "farthest outskirt (0.80) must be cancelled first: {cancelled_prices:?}"
+        );
+
+        // Verify no cancels fire when total is under cap.
+        let mut st2 = FlatMm::new(cfg_frozen(3, 200)); // high cap
+        let acts2 = st2.on_event(
+            &ctx(&s, &b, &p, &outskirt_resting),
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+        let cancels2 = acts2
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel(_)))
+            .count();
+        assert_eq!(cancels2, 0, "no cancels when under high cap: {acts2:?}");
     }
 
     #[test]

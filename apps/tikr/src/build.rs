@@ -617,6 +617,9 @@ fn build_flat_mm(
         chase_boost_pct: flat.chase_boost_pct,
         flush_frac: flat.flush_frac,
         underwater_reduce_frac: flat.underwater_reduce_frac,
+        frozen_lattice: flat.frozen_lattice,
+        lattice_band_levels: flat.lattice_band_levels,
+        lattice_max_open: flat.lattice_max_open,
     }))
 }
 

@@ -746,6 +746,20 @@ struct Args {
     #[arg(long, default_value = "0")]
     flat_mm_skew_unit: String,
 
+    /// FlatMm: enable frozen-lattice mode. When `true`, the grid is anchored
+    /// at the first mid and never repriced; only missing levels are added and
+    /// far outskirts are trimmed at the open-order cap.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    flat_mm_frozen_lattice: bool,
+    /// FlatMm (frozen-lattice): number of grid levels per side to keep
+    /// populated around the current mid.
+    #[arg(long, default_value_t = 25u32)]
+    flat_mm_lattice_band: u32,
+    /// FlatMm (frozen-lattice): maximum total resting orders before the
+    /// farthest-from-mid outskirts are trimmed.
+    #[arg(long, default_value_t = 180u32)]
+    flat_mm_lattice_max_open: u32,
+
     /// Per-order notional (USDT) shared by the flat-notional strategies
     /// (SimpleGap, LadderReentry, MicroMeanReversion, Tide, Wave). When
     /// balance-compounding is enabled (`--sim-initial-balance` +
@@ -2566,6 +2580,9 @@ async fn run_sweep_collect(
                                                 chase_boost_pct: chase,
                                                 flush_frac: ffrac,
                                                 underwater_reduce_frac: uw,
+                                                frozen_lattice: args.flat_mm_frozen_lattice,
+                                                lattice_band_levels: args.flat_mm_lattice_band,
+                                                lattice_max_open: args.flat_mm_lattice_max_open,
                                             }),
                                             fees,
                                             skim_cfg,
