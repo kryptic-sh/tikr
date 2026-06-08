@@ -21,13 +21,13 @@ bnb_refill_enabled = true     # this is the manager process; enable on exactly O
 
 [rampage]
 enabled = true
-min_volume_usdc = "20000000000" # $20B 24h quote volume floor
+min_volume_usdc = "20000000" # $20M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDC"
-top_n = 1                       # run the top 5 markets
-rotate_loss_pct = "0.01"        # accept NET loss up to 1% of wallet on rotate
+top_n = 1                    # run the top 5 markets
+rotate_loss_pct = "0.01"     # accept NET loss up to 1% of wallet on rotate
 big_bag_pct = "0"
-retire_bnb_pct = "50"           # convert 50% of a retired bot's NET profit to BNB (VIP-tier fee accrual)
+retire_bnb_pct = "50"        # convert 50% of a retired bot's NET profit to BNB (VIP-tier fee accrual)
 
 [rampage.score]
 mode = "candle_height" # rank candidates by recent candle range (volatility = spread to capture)
@@ -53,6 +53,6 @@ underwater_reduce_frac = "1" # full size on below-break-even reducers (1 = the b
 # Fix a price grid at first mid and NEVER reprice: only add missing levels,
 # re-size drifted ones, and trim the farthest outskirts at the cap. Fills flip a
 # level to the opposite side automatically (buy below mid / sell above mid).
-frozen_lattice = true        # enable the static grid
-lattice_band_levels = 25     # grid levels per side around mid (seeds 25 buys + 25 sells)
-lattice_max_open = 180       # trim farthest outskirts once total resting hits this
+frozen_lattice = true    # enable the static grid
+lattice_band_levels = 25 # grid levels per side around mid (seeds 25 buys + 25 sells)
+lattice_max_open = 180   # trim farthest outskirts once total resting hits this
