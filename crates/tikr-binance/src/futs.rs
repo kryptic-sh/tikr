@@ -551,13 +551,15 @@ pub(crate) fn build_modify_batch_json(
     let arr: Vec<Value> = mods
         .iter()
         .map(|(side, price, qty, order_id)| {
+            // Binance `batchOrders` requires EVERY element value to be a JSON
+            // string (a numeric orderId is rejected as malformed → -1102).
+            // `type` is not a modify parameter and is omitted.
             serde_json::json!({
                 "symbol": symbol,
                 "side": match side { Side::Bid => "BUY", Side::Ask => "SELL" },
-                "type": "LIMIT",
                 "quantity": qty,
                 "price": price,
-                "orderId": order_id,
+                "orderId": order_id.to_string(),
             })
         })
         .collect();
@@ -2235,13 +2237,14 @@ mod batch_tests {
         // First element — bid
         assert_eq!(arr[0]["symbol"], "PORTALUSDT");
         assert_eq!(arr[0]["side"], "BUY");
-        assert_eq!(arr[0]["type"], "LIMIT");
         assert_eq!(arr[0]["price"], "0.0331");
         assert_eq!(arr[0]["quantity"], "150");
-        assert_eq!(arr[0]["orderId"], 111222333u64);
+        // orderId must be a STRING (numeric → -1102 malformed), and no `type`.
+        assert_eq!(arr[0]["orderId"], "111222333");
+        assert!(arr[0].get("type").is_none());
         // Second element — ask
         assert_eq!(arr[1]["side"], "SELL");
-        assert_eq!(arr[1]["orderId"], 444555666u64);
+        assert_eq!(arr[1]["orderId"], "444555666");
         // No newClientOrderId (modify doesn't take one)
         assert!(arr[0].get("newClientOrderId").is_none());
     }
