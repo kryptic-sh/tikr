@@ -7,8 +7,8 @@ env = "futures-mainnet"
 asset = "USDC"
 order_balance_pct = "1"       # order notional = 1% of wallet
 max_position_pct = "0"        # no hard cap; FlatMM stays flat via skew + flush
-auto_scale = false            # each bot orders FULL wallet×order_balance_pct (no /bot split); N = rampage.top_n
-min_bot_capital_usdc = "200"  # margin gate (unused when auto_scale = false)
+auto_scale = true             # each bot orders FULL wallet×order_balance_pct (no /bot split); N = rampage.top_n
+min_bot_capital_usdc = "500"  # margin gate (unused when auto_scale = false)
 take_profit_pct = "0"
 leverage = 25
 inventory_boost_pct = "0"     # wave-only knob; off for FlatMM
@@ -39,8 +39,8 @@ min_candle_pct = "0"
 [rampage.strategy]
 kind = "flat_mm"
 [rampage.strategy.params]
-inner_bps = "30"             # half-spread: innermost level 1bps off the reservation price
-step_bps = "20"              # spacing between ladder levels
+inner_bps = "10"             # half-spread: innermost level 1bps off the reservation price
+step_bps = "5"               # spacing between ladder levels
 levels = 1                   # levels per side
 reservation_skew_bps = "2"   # γ: max ladder shift away from inventory (keeps it flat)
 imbalance_skew_bps = "0"     # book-imbalance edge vs adverse selection; 0 = off (sweep to tune)
