@@ -222,6 +222,35 @@ impl FlatMm {
         (b - a) / total
     }
 
+    /// Floor a size to the venue lot step (multiply by cached `1/step`).
+    /// `step_size == 0` → no lot grid, pass through.
+    fn floor_to_lot(&self, size: Decimal) -> Decimal {
+        if self.inv_step > Decimal::ZERO {
+            (size * self.inv_step).floor() * self.config.step_size
+        } else {
+            size
+        }
+    }
+
+    /// Smallest lot-aligned size whose notional clears `min_notional` at `price`.
+    /// `min_over_step` is cached so this is one division (`/price`). When the
+    /// venue has no lot grid (`step_size == 0`) returns the exact `min/price`.
+    fn min_clear_size(&self, price: Decimal) -> Decimal {
+        if self.config.step_size <= Decimal::ZERO || price <= Decimal::ZERO {
+            if price > Decimal::ZERO {
+                return self.config.min_notional / price;
+            }
+            return Decimal::ZERO;
+        }
+        let mut needed = (self.min_over_step / price).ceil() * self.config.step_size;
+        // Guard: Decimal ceil can land one lot short due to truncation; bump
+        // by whole lots until the notional actually clears min_notional.
+        while needed * price < self.config.min_notional {
+            needed += self.config.step_size;
+        }
+        needed
+    }
+
     fn intent(&self, symbol: &Symbol, side: Side, price: Decimal, size: Decimal) -> QuoteIntent {
         // Round price to nearest tick (multiply by cached 1/tick, not divide).
         let price = if self.inv_tick > Decimal::ZERO {
@@ -229,26 +258,15 @@ impl FlatMm {
         } else {
             price
         };
-        // Floor size to the lot step (multiply by cached 1/step).
-        let size = if self.inv_step > Decimal::ZERO {
-            (size * self.inv_step).floor() * self.config.step_size
-        } else {
-            size
-        };
-        // Bump size up to clear min_notional. `min_over_step` is cached, so this
-        // is one division (`/price`) instead of two.
+        // Floor size to the lot step.
+        let size = self.floor_to_lot(size);
+        // Bump size up to clear min_notional if the floored lot fell short.
         let size = if self.config.min_notional > Decimal::ZERO
             && self.config.step_size > Decimal::ZERO
             && price > Decimal::ZERO
             && size * price < self.config.min_notional
         {
-            let mut needed = (self.min_over_step / price).ceil() * self.config.step_size;
-            // Guard: Decimal ceil can land one lot short due to truncation; bump
-            // by whole lots until the notional actually clears min_notional.
-            while needed * price < self.config.min_notional {
-                needed += self.config.step_size;
-            }
-            needed
+            self.min_clear_size(price)
         } else {
             size
         };
@@ -475,6 +493,9 @@ impl FlatMm {
         // We use a BTreeMap-style approach but HashMap is fine here.
         let mut desired: HashMap<String, (Side, QuoteIntent)> = HashMap::new();
 
+        // First pass — collect the (price, side) rungs that survive the dead
+        // zone + cross-guards. Sizing is decided afterward over the whole band.
+        let mut rungs: Vec<(Decimal, Side)> = Vec::new();
         for k in (k_mid - band)..=(k_mid + band) {
             let p = origin + Decimal::from(k) * step;
             if p <= Decimal::ZERO {
@@ -506,13 +527,35 @@ impl FlatMm {
                 continue;
             }
 
-            // Size = notional / price. Keep it simple: uniform size across the
-            // whole band in v1 (no inventory skew in frozen mode).
-            let raw_size = if p > Decimal::ZERO {
-                self.config.notional_per_order / p
-            } else {
-                continue;
-            };
+            rungs.push((p, side));
+        }
+
+        // Sizing — normally each rung carries `notional_per_order` (uniform
+        // notional, size = notional/price). But when the configured notional is
+        // below the venue min_notional (small wallet), per-rung min-bumping
+        // would round each rung to a DIFFERENT lot count → non-uniform sizes →
+        // the winning/losing rungs get re-weighted and the grid stops being a
+        // faithful scaled-down version of a larger-wallet grid. Instead, when
+        // ANY rung would breach min, give EVERY rung ONE uniform contract size:
+        // the lots needed to clear min_notional at the lowest-priced rung (the
+        // binding rung). Every rung then clears min at identical size → P&L
+        // scales cleanly, full grid density preserved (deploys ~k× the
+        // configured per-rung capital — the accepted cost of uniform density).
+        let needs_bump = rungs.iter().any(|(p, _)| {
+            self.floor_to_lot(self.config.notional_per_order / p) * p < self.config.min_notional
+        });
+        let uniform_size = if needs_bump {
+            rungs
+                .iter()
+                .map(|(p, _)| *p)
+                .min()
+                .map(|p_lo| self.min_clear_size(p_lo))
+        } else {
+            None
+        };
+
+        for (p, side) in rungs {
+            let raw_size = uniform_size.unwrap_or(self.config.notional_per_order / p);
             let intent = self.intent(ctx.symbol, side, p, raw_size);
             // Canonical key = the rounded price after tick quantisation.
             let key = intent.price.0.to_string();
