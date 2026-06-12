@@ -18,6 +18,11 @@ ignore = [
   # Phase 5). The paste macro is a proc-macro used at compile time only; no
   # runtime exposure. Revisit when alloy-primitives drops the dependency.
   { id = "RUSTSEC-2024-0436", reason = "transitive via alloy-primitives; compile-time proc-macro only, no runtime exposure" },
+  # proc-macro-error2: fork of proc-macro-error, now also unmaintained. Pulled
+  # in transitively by polars (-> polars-error). Compile-time proc-macro only;
+  # no runtime exposure. No safe upgrade until polars drops it. Revisit on
+  # polars bump.
+  { id = "RUSTSEC-2026-0173", reason = "transitive via polars; compile-time proc-macro only, no runtime exposure" },
 ]
 
 [licenses]
