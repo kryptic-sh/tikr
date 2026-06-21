@@ -70,6 +70,9 @@ pub struct KeelConfig {
     /// Stop *adding* once `|position notional| ≥` this (quote currency). `0` =
     /// uncapped. Reductions are always allowed.
     pub max_position_notional: Decimal,
+    /// Max total resting orders before the farthest-from-mid outskirts are
+    /// trimmed. Bounds the resting set as the frozen band slides with mid.
+    pub max_open: u32,
     /// Which averaging mechanic to use.
     pub mode: KeelMode,
 }
@@ -88,6 +91,7 @@ impl KeelConfig {
             size_ramp: Decimal::ZERO,
             reduce_bps: Decimal::from(2),
             max_position_notional: Decimal::ZERO,
+            max_open: 60,
             mode: KeelMode::Trailing,
         }
     }
@@ -98,6 +102,10 @@ pub struct Keel {
     config: KeelConfig,
     /// Frozen lattice anchor. `None` until the first usable mid is seen.
     origin: Option<Decimal>,
+    /// Mid at which the band was last reconciled. Used by the deadband: between
+    /// reconciles we skip the work unless mid has moved a full step or a fill
+    /// landed — this is the live rate-limit defence (no per-tick reprice).
+    last_reconcile_mid: Option<Decimal>,
     /// Cached `1/tick_size` (0 when tick disabled).
     inv_tick: Decimal,
     /// Cached `1/step_size` (0 when step disabled).
@@ -269,13 +277,20 @@ impl Keel {
         desired
     }
 
-    /// Reconcile desired against resting: place missing, requote drifted, cancel
-    /// everything not desired (full reconcile so a position flip / avg move
-    /// cleans up stale orders). Deterministic k-order.
+    /// Reconcile desired against resting — **frozen-incremental** (live-feasible,
+    /// NOT full reconcile). Places missing band levels, requotes only on size
+    /// drift, and NEVER reprices a resting band order as mid slides. Un-desired
+    /// resting is left in place (it flips side on fill / sits as an outskirt);
+    /// the farthest outskirts are trimmed only when total resting hits
+    /// `max_open`. The one exception is the trailing reduce: after a position
+    /// flip the now-stale reduce-side grid is cancelled (a bounded, on-transition
+    /// burst, not per-tick churn). Deterministic k-order. This mirrors the
+    /// FlatMM frozen-lattice rate-limit defence — see project_flatmm_frozen_lattice.
     fn reconcile(
         &self,
         ctx: &StrategyContext<'_>,
         desired: &[(String, Side, QuoteIntent)],
+        mid: Decimal,
     ) -> Vec<Action> {
         let mut resting_map: HashMap<(String, Side), (QuoteId, QuoteIntent)> = HashMap::new();
         for (id, intent) in ctx.open_quotes {
@@ -286,6 +301,7 @@ impl Keel {
         let mut actions: Vec<Action> = Vec::new();
         let mut claimed: HashSet<QuoteId> = HashSet::new();
 
+        let mut new_quote_count: usize = 0;
         for (price_key, side, intent) in desired {
             match resting_map.get(&(price_key.clone(), *side)) {
                 Some((id, resting)) => {
@@ -302,15 +318,52 @@ impl Keel {
                         });
                     }
                 }
-                None => actions.push(Action::Quote(intent.clone())),
+                None => {
+                    actions.push(Action::Quote(intent.clone()));
+                    new_quote_count += 1;
+                }
             }
         }
 
-        // Cancel any resting order not in the desired set (stale band level,
-        // old reduce after an avg move, or the reduce-side lattice after a flip).
-        for (id, _) in ctx.open_quotes {
-            if !claimed.contains(id) {
+        // Trailing mode while holding: the reduce side is served by the single
+        // avg-pegged order (already in `desired`, claimed above). Any OTHER
+        // resting order on the reduce side is a stale grid level from before the
+        // flip — cancel it. This fires only on a flat→holding transition, not
+        // per tick.
+        let pos = ctx.position.size.0;
+        let reduce_side = if self.config.mode == KeelMode::Trailing && pos != Decimal::ZERO {
+            Some(if pos > Decimal::ZERO {
+                Side::Ask
+            } else {
+                Side::Bid
+            })
+        } else {
+            None
+        };
+
+        // Un-claimed resting: stale reduce-side grid → cancel; everything else is
+        // an out-of-band outskirt that we LEAVE (frozen: no reprice) until the
+        // resting count hits the cap, then trim the farthest from mid.
+        let mut outskirts: Vec<(QuoteId, Decimal)> = Vec::new();
+        for (id, intent) in ctx.open_quotes {
+            if claimed.contains(id) {
+                continue;
+            }
+            if reduce_side == Some(intent.side) {
                 actions.push(Action::Cancel(*id));
+                continue;
+            }
+            outskirts.push((*id, (intent.price.0 - mid).abs()));
+        }
+
+        let total_after = ctx.open_quotes.len() + new_quote_count;
+        let cap = self.config.max_open as usize;
+        if total_after >= cap && !outskirts.is_empty() {
+            let excess = total_after.saturating_sub(cap);
+            let to_cancel = excess.min(outskirts.len());
+            outskirts.sort_by_key(|x| std::cmp::Reverse(x.1));
+            for (id, _) in outskirts.into_iter().take(to_cancel) {
+                actions.push(Action::Cancel(id));
             }
         }
 
@@ -343,6 +396,7 @@ impl Strategy for Keel {
         Self {
             config,
             origin: None,
+            last_reconcile_mid: None,
             inv_tick,
             inv_step,
             min_over_step,
@@ -354,10 +408,32 @@ impl Strategy for Keel {
     }
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, _event: &MarketEvent) -> Vec<Action> {
+        let Some(mid) = compute_mid_strict(ctx.latest_book) else {
+            return vec![Action::NoOp];
+        };
+        let mid = mid.0;
+        if mid <= Decimal::ZERO {
+            return vec![Action::NoOp];
+        }
+        // Deadband (live rate-limit defence): skip the reconcile entirely unless
+        // a fill landed (inventory/avg changed → must re-quote), the band is
+        // empty (cold start), or mid has slid at least one step since the last
+        // reconcile (a new level would enter the frozen band). Between those,
+        // the frozen grid is still valid → do nothing.
+        let had_fill = !ctx.recent_fills.is_empty();
+        if !had_fill
+            && !ctx.open_quotes.is_empty()
+            && let Some(last) = self.last_reconcile_mid
+            && (mid - last).abs() / mid < Self::bps(self.config.step_bps)
+        {
+            return vec![Action::NoOp];
+        }
+        self.last_reconcile_mid = Some(mid);
+
         let desired = self.desired(ctx);
         if desired.is_empty() && ctx.open_quotes.is_empty() {
             return vec![Action::NoOp];
         }
-        self.reconcile(ctx, &desired)
+        self.reconcile(ctx, &desired, mid)
     }
 }

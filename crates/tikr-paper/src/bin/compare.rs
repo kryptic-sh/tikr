@@ -780,6 +780,9 @@ struct Args {
     /// Keel: stop adding past this position notional (USDC). `0` = uncapped.
     #[arg(long, default_value = "0")]
     keel_max_position: String,
+    /// Keel: max total resting orders before trimming farthest outskirts.
+    #[arg(long, default_value_t = 60u32)]
+    keel_max_open: u32,
     /// Keel sweep: comma-separated modes — `trailing` (avg-pegged reduce,
     /// guarantees avg_sell>avg_buy) and/or `lattice` (symmetric grid).
     #[arg(long, default_value = "trailing")]
@@ -2670,6 +2673,7 @@ async fn run_sweep_collect(
                                     size_ramp: ramp,
                                     reduce_bps: reduce,
                                     max_position_notional: keel_max_pos,
+                                    max_open: args.keel_max_open,
                                     mode,
                                 }),
                                 fees,
