@@ -488,13 +488,9 @@ impl FlatMm {
         let k_mid = k_mid_raw.round().to_i64().unwrap_or(0);
         let band = self.config.lattice_band_levels as i64;
 
-        // Step 4 — build desired band: map from canonical rounded price (as
-        // Decimal key via to_string for exact equality) to (side, QuoteIntent).
-        // We use a BTreeMap-style approach but HashMap is fine here.
-        let mut desired: HashMap<String, (Side, QuoteIntent)> = HashMap::new();
-
-        // First pass — collect the (price, side) rungs that survive the dead
-        // zone + cross-guards. Sizing is decided afterward over the whole band.
+        // Step 4 — collect the (price, side) rungs that survive the dead zone +
+        // cross-guards, in deterministic k-order (low price → high). Sizing is
+        // decided afterward over the whole band.
         let mut rungs: Vec<(Decimal, Side)> = Vec::new();
         for k in (k_mid - band)..=(k_mid + band) {
             let p = origin + Decimal::from(k) * step;
@@ -554,12 +550,23 @@ impl FlatMm {
             None
         };
 
+        // Emit in deterministic k-order — NOT HashMap order. A HashMap's
+        // iteration order is per-process randomised (RandomState seed), which
+        // made the placement order of new quotes vary run-to-run → the band /
+        // lattice_max_open trim / margin-cap rejection resolved differently each
+        // run → non-reproducible fills at the margins (±$700 on 110k-fill WLD
+        // i2/s2). A HashSet dedups same-rounded-price rungs (membership only,
+        // order-independent); the Vec preserves k-order for a stable emit.
+        let mut desired: Vec<(String, Side, QuoteIntent)> = Vec::with_capacity(rungs.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (p, side) in rungs {
             let raw_size = uniform_size.unwrap_or(self.config.notional_per_order / p);
             let intent = self.intent(ctx.symbol, side, p, raw_size);
             // Canonical key = the rounded price after tick quantisation.
             let key = intent.price.0.to_string();
-            desired.insert(key, (side, intent));
+            if seen.insert(key.clone()) {
+                desired.push((key, side, intent));
+            }
         }
 
         // Step 5 — reconcile desired band against resting open_quotes.
@@ -580,7 +587,7 @@ impl FlatMm {
         // Count how many new Quote actions we'll add — needed for cap math.
         let mut new_quote_count: usize = 0;
 
-        for (price_key, (side, intent)) in &desired {
+        for (price_key, side, intent) in &desired {
             let resting_key = (price_key.clone(), *side);
             match resting_map.get(&resting_key) {
                 Some((id, resting_intent)) => {
