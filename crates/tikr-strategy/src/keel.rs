@@ -130,9 +130,14 @@ pub struct Keel {
     last_reconcile_mid: Option<Decimal>,
     /// Timestamp (ns) of the last flip, for the cooldown hysteresis.
     last_flip_ts: Option<u64>,
-    /// Rolling (ts_ns, mid) samples for the trend-gate regime estimate. Empty
-    /// when the trend-gate is off (`trend_window_secs == 0`).
+    /// Rolling (ts_ns, mid) samples for the trend-gate regime estimate,
+    /// DOWNSAMPLED to ~1s spacing so the window holds ~`trend_window_secs`
+    /// points (not one per event). Empty when the trend-gate is off.
     mid_history: std::collections::VecDeque<(u64, Decimal)>,
+    /// Running sum of `|Δmid|` across consecutive `mid_history` samples (the
+    /// path length), maintained incrementally on push/pop so the trend-gate
+    /// check is O(1) instead of O(window) per event.
+    path_sum: Decimal,
     /// Cached `1/tick_size` (0 when tick disabled).
     inv_tick: Decimal,
     /// Cached `1/step_size` (0 when step disabled).
@@ -401,18 +406,29 @@ impl Keel {
     }
 
     /// Roll the mid-history window forward (no-op when the trend-gate is off).
+    /// Samples are DOWNSAMPLED to ≥1s spacing (the regime is a multi-second
+    /// signal; recording every event would make the window ~60k points and the
+    /// per-event check O(window)). `path_sum` is updated incrementally on
+    /// push/pop so the trend-gate stays O(1).
     fn record_mid(&mut self, now: u64, mid: Decimal) {
         if self.config.trend_window_secs == 0 {
             return;
         }
-        self.mid_history.push_back((now, mid));
-        let cutoff = now.saturating_sub(self.config.trend_window_secs * 1_000_000_000);
-        while let Some(&(ts, _)) = self.mid_history.front() {
-            if ts < cutoff {
-                self.mid_history.pop_front();
-            } else {
-                break;
+        const MIN_SPACING_NS: u64 = 1_000_000_000; // 1s
+        if let Some(&(last_ts, _)) = self.mid_history.back() {
+            if now.saturating_sub(last_ts) < MIN_SPACING_NS {
+                return;
             }
+            self.path_sum += (mid - self.mid_history.back().expect("non-empty").1).abs();
+        }
+        self.mid_history.push_back((now, mid));
+
+        let cutoff = now.saturating_sub(self.config.trend_window_secs * 1_000_000_000);
+        while self.mid_history.len() > 1 && self.mid_history[0].0 < cutoff {
+            let leaving = self.mid_history[0].1;
+            let next = self.mid_history[1].1;
+            self.path_sum -= (next - leaving).abs();
+            self.mid_history.pop_front();
         }
     }
 
@@ -438,17 +454,15 @@ impl Keel {
         }
 
         // Trend-gate — monotonic price run over the rolling window, against bag.
-        if self.config.trend_window_secs > 0 && self.mid_history.len() >= 3 {
+        // O(1): `path_sum` is maintained incrementally in `record_mid`.
+        if self.config.trend_window_secs > 0
+            && self.mid_history.len() >= 3
+            && self.path_sum > Decimal::ZERO
+        {
             let first = self.mid_history.front().expect("non-empty").1;
             let last = self.mid_history.back().expect("non-empty").1;
             let net = last - first;
-            let mut path = Decimal::ZERO;
-            let mut prev = first;
-            for &(_, m) in self.mid_history.iter().skip(1) {
-                path += (m - prev).abs();
-                prev = m;
-            }
-            if path > Decimal::ZERO && net.abs() / path >= self.config.trend_min_ratio {
+            if net.abs() / self.path_sum >= self.config.trend_min_ratio {
                 let adverse = if long {
                     net < Decimal::ZERO
                 } else {
@@ -509,6 +523,7 @@ impl Strategy for Keel {
             last_reconcile_mid: None,
             last_flip_ts: None,
             mid_history: std::collections::VecDeque::new(),
+            path_sum: Decimal::ZERO,
             inv_tick,
             inv_step,
             min_over_step,
