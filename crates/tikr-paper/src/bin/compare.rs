@@ -31,7 +31,8 @@ use tikr_paper::{
 };
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, FlatMm, FlatMmConfig, Glft, GlftConfig,
-    Hawk, HawkConfig, Hydra, HydraConfig, LadderReentry, LadderReentryConfig, LayeredGrid,
+    Hawk, HawkConfig, Hydra, HydraConfig, Keel, KeelConfig, KeelMode, LadderReentry,
+    LadderReentryConfig, LayeredGrid,
     LayeredGridConfig, LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig,
     MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig,
     StaticGrid, StaticGridConfig, Strategy, Tidal, TidalConfig, Tide, TideConfig, TopOfBook,
@@ -759,6 +760,30 @@ struct Args {
     /// farthest-from-mid outskirts are trimmed.
     #[arg(long, default_value_t = 180u32)]
     flat_mm_lattice_max_open: u32,
+
+    /// Keel sweep: comma-separated dead-zone half-spread (inner), in bps.
+    #[arg(long, default_value = "2")]
+    keel_inner_bps_list: String,
+    /// Keel sweep: comma-separated lattice step spacing, in bps.
+    #[arg(long, default_value = "2")]
+    keel_step_bps_list: String,
+    /// Keel: levels per side in the band.
+    #[arg(long, default_value_t = 10u32)]
+    keel_levels: u32,
+    /// Keel sweep: comma-separated depth size-ramp values. Size at a level
+    /// `d` steps from mid = `base × (1 + ramp×d)`. `0` = uniform.
+    #[arg(long, default_value = "0")]
+    keel_size_ramp_list: String,
+    /// Keel sweep: comma-separated trailing-reduce offset from avg, in bps.
+    #[arg(long, default_value = "2")]
+    keel_reduce_bps_list: String,
+    /// Keel: stop adding past this position notional (USDC). `0` = uncapped.
+    #[arg(long, default_value = "0")]
+    keel_max_position: String,
+    /// Keel sweep: comma-separated modes — `trailing` (avg-pegged reduce,
+    /// guarantees avg_sell>avg_buy) and/or `lattice` (symmetric grid).
+    #[arg(long, default_value = "trailing")]
+    keel_mode_list: String,
 
     /// Per-order notional (USDT) shared by the flat-notional strategies
     /// (SimpleGap, LadderReentry, MicroMeanReversion, Tide, Wave). When
@@ -2059,6 +2084,7 @@ async fn run_sweep_collect(
     };
     let simple_gap_notional = notional;
     let flat_mm_notional = notional;
+    let keel_notional = notional;
     let ladder_reentry_notional = notional;
     let micro_mean_reversion_notional = notional;
     let tide_notional = notional;
@@ -2593,6 +2619,65 @@ async fn run_sweep_collect(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if included("keel", &allow) {
+        let step_sweep = parse_decimal_list(&args.keel_step_bps_list)?;
+        let inner_sweep = parse_decimal_list(&args.keel_inner_bps_list)?;
+        let ramp_sweep = parse_decimal_list(&args.keel_size_ramp_list)?;
+        let reduce_sweep = parse_decimal_list(&args.keel_reduce_bps_list)?;
+        let keel_max_pos = Decimal::from_str(&args.keel_max_position)?;
+        let modes: Vec<KeelMode> = args
+            .keel_mode_list
+            .split(',')
+            .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "lattice" => Ok(KeelMode::Lattice),
+                "trailing" => Ok(KeelMode::Trailing),
+                other => Err(format!("unknown keel mode: {other}")),
+            })
+            .collect::<Result<_, String>>()?;
+        for &mode in &modes {
+            for &step in &step_sweep {
+                for &inner in &inner_sweep {
+                    for &ramp in &ramp_sweep {
+                        for &reduce in &reduce_sweep {
+                            let mode_s = match mode {
+                                KeelMode::Trailing => "trail",
+                                KeelMode::Lattice => "latt",
+                            };
+                            let label = format!(
+                                "Keel mode={mode_s} in={inner} step={step} ramp={ramp} red={reduce} lv={} cap={keel_max_pos}",
+                                args.keel_levels
+                            );
+                            spawn_preset(
+                                &mut handles,
+                                &shared_data,
+                                &symbol,
+                                &label,
+                                Keel::new(KeelConfig {
+                                    notional_per_order: keel_notional,
+                                    tick_size: tick,
+                                    step_size: lot_step,
+                                    min_notional,
+                                    inner_bps: inner,
+                                    step_bps: step,
+                                    levels: args.keel_levels,
+                                    size_ramp: ramp,
+                                    reduce_bps: reduce,
+                                    max_position_notional: keel_max_pos,
+                                    mode,
+                                }),
+                                fees,
+                                skim_cfg,
+                                funding_cfg,
+                                sim_cfg_template.clone(),
+                                equity_csv_dir.clone(),
+                            );
                         }
                     }
                 }

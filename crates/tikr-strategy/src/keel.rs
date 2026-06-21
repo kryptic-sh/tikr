@@ -1,0 +1,363 @@
+//! Keel — averaging grid that keeps **avg_buy below avg_sell** by sizing.
+//!
+//! A fresh strategy (not a FlatMM mode) exploring the user's idea: a tight fixed
+//! lattice whose order *sizes* are shaped so the position's average entry is
+//! pulled toward the side that's accumulating — a long bag built on a descent
+//! gets a progressively lower average buy, so a small bounce closes it green.
+//!
+//! Two modes share one engine so they can be A/B'd on identical data:
+//!
+//! - [`KeelMode::Trailing`] — the **reducing** side is a single order pegged at
+//!   `avg ± reduce_bps`. It *trails the average*: as the bag averages down, the
+//!   reduce price falls with it, so any bounce above the (falling) average
+//!   realizes a profit. Guarantees `avg_sell > avg_buy` **by construction** — we
+//!   never place a reduce below our own average. The adding side is a
+//!   depth-ramped lattice (deeper levels carry more size → average chases price).
+//!
+//! - [`KeelMode::Lattice`] — both sides are the depth-ramped grid (buy below mid,
+//!   sell above mid). Closes happen per grid level, not against the global
+//!   average; `avg_sell > avg_buy` holds per matched pair but not strictly on
+//!   open trend inventory. This is the "fixed lattice + bigger orders deeper"
+//!   reading of the idea.
+//!
+//! Both: frozen price origin (grid = `origin + k·step`), depth-ramp size
+//! `base · (1 + size_ramp · depth_levels)`, optional `max_position_notional`
+//! that stops *adding* past a cap (reductions always allowed), deterministic
+//! k-order emit. The backtest — which models round trips AND cross-margin
+//! liquidation — is the judge of whether the bag stays bounded by bounces or
+//! grows to a wipe.
+
+use std::collections::{HashMap, HashSet};
+
+use rust_decimal::prelude::ToPrimitive as _;
+use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
+use tikr_venue::{QuoteId, QuoteIntent};
+
+use crate::{Action, Strategy, StrategyContext, compute_mid_strict};
+
+/// Which averaging mechanic the strategy uses (see module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeelMode {
+    /// Single reduce pegged at `avg ± reduce_bps`; guarantees avg_sell > avg_buy.
+    Trailing,
+    /// Symmetric depth-ramped grid; per-pair closes (buy below mid / sell above).
+    Lattice,
+}
+
+/// Configuration for [`Keel`].
+#[derive(Debug, Clone)]
+pub struct KeelConfig {
+    /// Base order notional (quote currency) at the innermost level.
+    pub notional_per_order: Decimal,
+    /// Venue price tick. `0` = no rounding.
+    pub tick_size: Decimal,
+    /// Venue lot step. `0` = no rounding.
+    pub step_size: Decimal,
+    /// Venue min order notional. `0` = no minimum.
+    pub min_notional: Decimal,
+    /// Dead-zone half-spread (bps): no orders within `± inner_bps` of mid.
+    pub inner_bps: Decimal,
+    /// Lattice spacing between levels (bps of the frozen origin).
+    pub step_bps: Decimal,
+    /// Levels per side kept populated in the band around the current mid.
+    pub levels: u32,
+    /// Depth ramp: size at a level `depth` steps from mid is
+    /// `base · (1 + size_ramp · depth)`. `0` = uniform size.
+    pub size_ramp: Decimal,
+    /// Trailing-mode reduce offset from the average entry (bps). The reduce
+    /// rests at `avg · (1 ± reduce_bps)`, clamped to the touch so it can't cross.
+    pub reduce_bps: Decimal,
+    /// Stop *adding* once `|position notional| ≥` this (quote currency). `0` =
+    /// uncapped. Reductions are always allowed.
+    pub max_position_notional: Decimal,
+    /// Which averaging mechanic to use.
+    pub mode: KeelMode,
+}
+
+impl KeelConfig {
+    /// Sensible defaults for a tight grid.
+    pub fn defaults(notional_per_order: Decimal) -> Self {
+        Self {
+            notional_per_order,
+            tick_size: Decimal::ZERO,
+            step_size: Decimal::ZERO,
+            min_notional: Decimal::ZERO,
+            inner_bps: Decimal::from(2),
+            step_bps: Decimal::from(2),
+            levels: 10,
+            size_ramp: Decimal::ZERO,
+            reduce_bps: Decimal::from(2),
+            max_position_notional: Decimal::ZERO,
+            mode: KeelMode::Trailing,
+        }
+    }
+}
+
+/// Averaging-grid market maker. See module docs.
+pub struct Keel {
+    config: KeelConfig,
+    /// Frozen lattice anchor. `None` until the first usable mid is seen.
+    origin: Option<Decimal>,
+    /// Cached `1/tick_size` (0 when tick disabled).
+    inv_tick: Decimal,
+    /// Cached `1/step_size` (0 when step disabled).
+    inv_step: Decimal,
+    /// Cached `min_notional / step_size`.
+    min_over_step: Decimal,
+}
+
+impl Keel {
+    fn bps(v: Decimal) -> Decimal {
+        v / Decimal::from(10_000)
+    }
+
+    /// Requote a level only when its size drifts more than this fraction.
+    fn size_tol() -> Decimal {
+        Decimal::new(20, 2) // 0.20
+    }
+
+    /// Round price to tick, floor size to lot, bump size to clear min_notional.
+    fn intent(&self, symbol: &Symbol, side: Side, price: Decimal, size: Decimal) -> QuoteIntent {
+        let price = if self.inv_tick > Decimal::ZERO {
+            (price * self.inv_tick).round() * self.config.tick_size
+        } else {
+            price
+        };
+        let size = if self.inv_step > Decimal::ZERO {
+            (size * self.inv_step).floor() * self.config.step_size
+        } else {
+            size
+        };
+        let size = if self.config.min_notional > Decimal::ZERO
+            && self.config.step_size > Decimal::ZERO
+            && price > Decimal::ZERO
+            && size * price < self.config.min_notional
+        {
+            let mut needed = (self.min_over_step / price).ceil() * self.config.step_size;
+            while needed * price < self.config.min_notional {
+                needed += self.config.step_size;
+            }
+            needed
+        } else {
+            size
+        };
+        QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price: Price(price),
+            size: Size(size),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        }
+    }
+
+    /// Build the desired order set for the current book + position.
+    fn desired(&mut self, ctx: &StrategyContext<'_>) -> Vec<(String, Side, QuoteIntent)> {
+        let Some(mid) = compute_mid_strict(ctx.latest_book) else {
+            return Vec::new();
+        };
+        let mid = mid.0;
+        if mid <= Decimal::ZERO {
+            return Vec::new();
+        }
+        let best_bid = ctx.latest_book.bids.first().map(|l| l.price.0);
+        let best_ask = ctx.latest_book.asks.first().map(|l| l.price.0);
+
+        let origin = *self.origin.get_or_insert(mid);
+        let step = origin * Self::bps(self.config.step_bps);
+        if step <= Decimal::ZERO {
+            return Vec::new();
+        }
+        let inner = mid * Self::bps(self.config.inner_bps);
+
+        let pos = ctx.position.size.0; // signed base units
+        let avg = ctx.position.avg_entry.0;
+        let pos_notional = pos.abs() * mid;
+        let capped = self.config.max_position_notional > Decimal::ZERO
+            && pos_notional >= self.config.max_position_notional;
+
+        // Adding side grows |pos| in the current direction. Flat → both seed.
+        let adding_side = if pos >= Decimal::ZERO {
+            Side::Bid
+        } else {
+            Side::Ask
+        };
+        let flat = pos == Decimal::ZERO;
+
+        let band = self.config.levels as i64;
+        let k_mid = ((mid - origin) / step).round().to_i64().unwrap_or(0);
+
+        let base = self.config.notional_per_order;
+        let mut desired: Vec<(String, Side, QuoteIntent)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for k in (k_mid - band)..=(k_mid + band) {
+            let p = origin + Decimal::from(k) * step;
+            if p <= Decimal::ZERO {
+                continue;
+            }
+            let side = if p < mid - inner {
+                Side::Bid
+            } else if p > mid + inner {
+                Side::Ask
+            } else {
+                continue; // dead zone
+            };
+            // Post-only cross guards.
+            if side == Side::Bid && best_ask.is_some_and(|ba| p >= ba) {
+                continue;
+            }
+            if side == Side::Ask && best_bid.is_some_and(|bb| p <= bb) {
+                continue;
+            }
+
+            let is_add = flat || side == adding_side;
+
+            // In Trailing mode the reducing side is NOT a lattice — it's a single
+            // pegged order emitted below. Skip reduce-side rungs here.
+            if self.config.mode == KeelMode::Trailing && !is_add {
+                continue;
+            }
+            // Respect the position cap: stop *adding*, keep reducing.
+            if is_add && !flat && capped {
+                continue;
+            }
+
+            // Depth-ramp size: deeper levels carry more (averaging weight).
+            let depth = ((p - mid).abs() / step).round();
+            let notional = base * (Decimal::ONE + self.config.size_ramp * depth);
+            let raw_size = notional / p;
+            let intent = self.intent(ctx.symbol, side, p, raw_size);
+            let key = intent.price.0.to_string();
+            if seen.insert(key.clone()) {
+                desired.push((key, side, intent));
+            }
+        }
+
+        // Trailing-mode reduce: single order pegged at avg ± reduce_bps, clamped
+        // to the touch (post-only). Guarantees the close is on the right side of
+        // the average → avg_sell > avg_buy.
+        if self.config.mode == KeelMode::Trailing && !flat && avg > Decimal::ZERO {
+            let off = Self::bps(self.config.reduce_bps);
+            if pos > Decimal::ZERO {
+                // Long → sell at max(avg·(1+off), best_ask): never below avg, never crossing.
+                let rp = (avg * (Decimal::ONE + off)).max(best_ask.unwrap_or(Decimal::ZERO));
+                if rp > Decimal::ZERO {
+                    let intent = self.intent(ctx.symbol, Side::Ask, rp, pos.abs());
+                    let key = intent.price.0.to_string();
+                    if seen.insert(key.clone()) {
+                        desired.push((key, Side::Ask, intent));
+                    }
+                }
+            } else {
+                // Short → buy at min(avg·(1−off), best_bid).
+                let raw = avg * (Decimal::ONE - off);
+                let rp = match best_bid {
+                    Some(bb) => raw.min(bb),
+                    None => raw,
+                };
+                if rp > Decimal::ZERO {
+                    let intent = self.intent(ctx.symbol, Side::Bid, rp, pos.abs());
+                    let key = intent.price.0.to_string();
+                    if seen.insert(key.clone()) {
+                        desired.push((key, Side::Bid, intent));
+                    }
+                }
+            }
+        }
+
+        desired
+    }
+
+    /// Reconcile desired against resting: place missing, requote drifted, cancel
+    /// everything not desired (full reconcile so a position flip / avg move
+    /// cleans up stale orders). Deterministic k-order.
+    fn reconcile(
+        &self,
+        ctx: &StrategyContext<'_>,
+        desired: &[(String, Side, QuoteIntent)],
+    ) -> Vec<Action> {
+        let mut resting_map: HashMap<(String, Side), (QuoteId, QuoteIntent)> = HashMap::new();
+        for (id, intent) in ctx.open_quotes {
+            let key = (intent.price.0.to_string(), intent.side);
+            resting_map.entry(key).or_insert((*id, intent.clone()));
+        }
+
+        let mut actions: Vec<Action> = Vec::new();
+        let mut claimed: HashSet<QuoteId> = HashSet::new();
+
+        for (price_key, side, intent) in desired {
+            match resting_map.get(&(price_key.clone(), *side)) {
+                Some((id, resting)) => {
+                    claimed.insert(*id);
+                    let rel = if intent.size.0 > Decimal::ZERO {
+                        (resting.size.0 - intent.size.0).abs() / intent.size.0
+                    } else {
+                        Decimal::ONE
+                    };
+                    if rel > Self::size_tol() {
+                        actions.push(Action::Requote {
+                            id: *id,
+                            intent: intent.clone(),
+                        });
+                    }
+                }
+                None => actions.push(Action::Quote(intent.clone())),
+            }
+        }
+
+        // Cancel any resting order not in the desired set (stale band level,
+        // old reduce after an avg move, or the reduce-side lattice after a flip).
+        for (id, _) in ctx.open_quotes {
+            if !claimed.contains(id) {
+                actions.push(Action::Cancel(*id));
+            }
+        }
+
+        if actions.is_empty() {
+            actions.push(Action::NoOp);
+        }
+        actions
+    }
+}
+
+impl Strategy for Keel {
+    type Config = KeelConfig;
+
+    fn new(config: KeelConfig) -> Self {
+        let inv_tick = if config.tick_size > Decimal::ZERO {
+            Decimal::ONE / config.tick_size
+        } else {
+            Decimal::ZERO
+        };
+        let inv_step = if config.step_size > Decimal::ZERO {
+            Decimal::ONE / config.step_size
+        } else {
+            Decimal::ZERO
+        };
+        let min_over_step = if config.step_size > Decimal::ZERO {
+            config.min_notional / config.step_size
+        } else {
+            Decimal::ZERO
+        };
+        Self {
+            config,
+            origin: None,
+            inv_tick,
+            inv_step,
+            min_over_step,
+        }
+    }
+
+    fn name(&self) -> &str {
+        "keel"
+    }
+
+    fn on_event(&mut self, ctx: &StrategyContext<'_>, _event: &MarketEvent) -> Vec<Action> {
+        let desired = self.desired(ctx);
+        if desired.is_empty() && ctx.open_quotes.is_empty() {
+            return vec![Action::NoOp];
+        }
+        self.reconcile(ctx, &desired)
+    }
+}
