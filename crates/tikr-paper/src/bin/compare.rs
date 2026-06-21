@@ -32,11 +32,10 @@ use tikr_paper::{
 use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, FlatMm, FlatMmConfig, Glft, GlftConfig,
     Hawk, HawkConfig, Hydra, HydraConfig, Keel, KeelConfig, KeelMode, LadderReentry,
-    LadderReentryConfig, LayeredGrid,
-    LayeredGridConfig, LiqFade, LiqFadeConfig, MicroMeanReversion, MicroMeanReversionConfig,
-    MicroPrice, MicroPriceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig,
-    StaticGrid, StaticGridConfig, Strategy, Tidal, TidalConfig, Tide, TideConfig, TopOfBook,
-    TopOfBookConfig, Wave, WaveConfig,
+    LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
+    MicroMeanReversion, MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap,
+    SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, Tidal,
+    TidalConfig, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -783,6 +782,18 @@ struct Args {
     /// Keel: max total resting orders before trimming farthest outskirts.
     #[arg(long, default_value_t = 60u32)]
     keel_max_open: u32,
+    /// Keel sweep: comma-separated SAR flip triggers (bps past avg). `0` = off.
+    #[arg(long, default_value = "0")]
+    keel_sar_trigger_bps_list: String,
+    /// Keel: trend-gate rolling window (seconds). `0` = off.
+    #[arg(long, default_value_t = 0u64)]
+    keel_trend_window_secs: u64,
+    /// Keel: trend-gate min |net|/path ratio to flip (monotonic ⇒ trending).
+    #[arg(long, default_value = "0.6")]
+    keel_trend_min_ratio: String,
+    /// Keel: minimum seconds between flips (hysteresis).
+    #[arg(long, default_value_t = 5u64)]
+    keel_flip_cooldown_secs: u64,
     /// Keel sweep: comma-separated modes — `trailing` (avg-pegged reduce,
     /// guarantees avg_sell>avg_buy) and/or `lattice` (symmetric grid).
     #[arg(long, default_value = "trailing")]
@@ -2634,7 +2645,9 @@ async fn run_sweep_collect(
         let inner_sweep = parse_decimal_list(&args.keel_inner_bps_list)?;
         let ramp_sweep = parse_decimal_list(&args.keel_size_ramp_list)?;
         let reduce_sweep = parse_decimal_list(&args.keel_reduce_bps_list)?;
+        let sar_sweep = parse_decimal_list(&args.keel_sar_trigger_bps_list)?;
         let keel_max_pos = Decimal::from_str(&args.keel_max_position)?;
+        let keel_trend_ratio = Decimal::from_str(&args.keel_trend_min_ratio)?;
         let modes: Vec<KeelMode> = args
             .keel_mode_list
             .split(',')
@@ -2649,39 +2662,55 @@ async fn run_sweep_collect(
                 for &inner in &inner_sweep {
                     for &ramp in &ramp_sweep {
                         for &reduce in &reduce_sweep {
-                            let mode_s = match mode {
-                                KeelMode::Trailing => "trail",
-                                KeelMode::Lattice => "latt",
-                            };
-                            let label = format!(
-                                "Keel mode={mode_s} in={inner} step={step} ramp={ramp} red={reduce} lv={} cap={keel_max_pos}",
-                                args.keel_levels
-                            );
-                            spawn_preset(
-                                &mut handles,
-                                &shared_data,
-                                &symbol,
-                                &label,
-                                Keel::new(KeelConfig {
-                                    notional_per_order: keel_notional,
-                                    tick_size: tick,
-                                    step_size: lot_step,
-                                    min_notional,
-                                    inner_bps: inner,
-                                    step_bps: step,
-                                    levels: args.keel_levels,
-                                    size_ramp: ramp,
-                                    reduce_bps: reduce,
-                                    max_position_notional: keel_max_pos,
-                                    max_open: args.keel_max_open,
-                                    mode,
-                                }),
-                                fees,
-                                skim_cfg,
-                                funding_cfg,
-                                sim_cfg_template.clone(),
-                                equity_csv_dir.clone(),
-                            );
+                            for &sar in &sar_sweep {
+                                let mode_s = match mode {
+                                    KeelMode::Trailing => "trail",
+                                    KeelMode::Lattice => "latt",
+                                };
+                                let flip_s = if sar > Decimal::ZERO {
+                                    format!("sar={sar}")
+                                } else if args.keel_trend_window_secs > 0 {
+                                    format!(
+                                        "trend={}s/{keel_trend_ratio}",
+                                        args.keel_trend_window_secs
+                                    )
+                                } else {
+                                    "noflip".to_string()
+                                };
+                                let label = format!(
+                                    "Keel mode={mode_s} in={inner} step={step} ramp={ramp} red={reduce} {flip_s} lv={} cap={keel_max_pos}",
+                                    args.keel_levels
+                                );
+                                spawn_preset(
+                                    &mut handles,
+                                    &shared_data,
+                                    &symbol,
+                                    &label,
+                                    Keel::new(KeelConfig {
+                                        notional_per_order: keel_notional,
+                                        tick_size: tick,
+                                        step_size: lot_step,
+                                        min_notional,
+                                        inner_bps: inner,
+                                        step_bps: step,
+                                        levels: args.keel_levels,
+                                        size_ramp: ramp,
+                                        reduce_bps: reduce,
+                                        max_position_notional: keel_max_pos,
+                                        max_open: args.keel_max_open,
+                                        mode,
+                                        sar_trigger_bps: sar,
+                                        trend_window_secs: args.keel_trend_window_secs,
+                                        trend_min_ratio: keel_trend_ratio,
+                                        flip_cooldown_secs: args.keel_flip_cooldown_secs,
+                                    }),
+                                    fees,
+                                    skim_cfg,
+                                    funding_cfg,
+                                    sim_cfg_template.clone(),
+                                    equity_csv_dir.clone(),
+                                );
+                            }
                         }
                     }
                 }

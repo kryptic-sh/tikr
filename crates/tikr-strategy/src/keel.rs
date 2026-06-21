@@ -75,6 +75,24 @@ pub struct KeelConfig {
     pub max_open: u32,
     /// Which averaging mechanic to use.
     pub mode: KeelMode,
+
+    // ── Flip layer (stop-and-reverse / trend-gate) ──────────────────────────
+    /// SAR: market-flip the bag (close + reverse to the opposite side) once
+    /// price moves this many bps AGAINST the average entry (a long that is
+    /// `sar_trigger_bps` below avg, or a short that far above). Position-
+    /// triggered — reacts to your own drawdown. `0` = off. Taker order.
+    pub sar_trigger_bps: Decimal,
+    /// Trend-gate: rolling window (seconds) over which the price-path regime is
+    /// measured. `0` = off (no trend-gate). Price-triggered, independent of the
+    /// position.
+    pub trend_window_secs: u64,
+    /// Trend-gate: flip when `|net displacement| / path length` over the window
+    /// is at least this (monotonic ⇒ trending) AND the trend runs against the
+    /// bag. `1.0` = perfectly monotonic; `0.6` = mostly one-way.
+    pub trend_min_ratio: Decimal,
+    /// Minimum seconds between flips (hysteresis) — stops flip-flop whipsaw and
+    /// double-emitting before the taker fill lands. Applies to both triggers.
+    pub flip_cooldown_secs: u64,
 }
 
 impl KeelConfig {
@@ -93,6 +111,10 @@ impl KeelConfig {
             max_position_notional: Decimal::ZERO,
             max_open: 60,
             mode: KeelMode::Trailing,
+            sar_trigger_bps: Decimal::ZERO,
+            trend_window_secs: 0,
+            trend_min_ratio: Decimal::new(6, 1), // 0.6
+            flip_cooldown_secs: 5,
         }
     }
 }
@@ -106,6 +128,11 @@ pub struct Keel {
     /// reconciles we skip the work unless mid has moved a full step or a fill
     /// landed — this is the live rate-limit defence (no per-tick reprice).
     last_reconcile_mid: Option<Decimal>,
+    /// Timestamp (ns) of the last flip, for the cooldown hysteresis.
+    last_flip_ts: Option<u64>,
+    /// Rolling (ts_ns, mid) samples for the trend-gate regime estimate. Empty
+    /// when the trend-gate is off (`trend_window_secs == 0`).
+    mid_history: std::collections::VecDeque<(u64, Decimal)>,
     /// Cached `1/tick_size` (0 when tick disabled).
     inv_tick: Decimal,
     /// Cached `1/step_size` (0 when step disabled).
@@ -372,6 +399,89 @@ impl Keel {
         }
         actions
     }
+
+    /// Roll the mid-history window forward (no-op when the trend-gate is off).
+    fn record_mid(&mut self, now: u64, mid: Decimal) {
+        if self.config.trend_window_secs == 0 {
+            return;
+        }
+        self.mid_history.push_back((now, mid));
+        let cutoff = now.saturating_sub(self.config.trend_window_secs * 1_000_000_000);
+        while let Some(&(ts, _)) = self.mid_history.front() {
+            if ts < cutoff {
+                self.mid_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Should the bag be flipped this event? True when either trigger fires
+    /// AGAINST the current inventory: SAR (price `sar_trigger_bps` past avg) or
+    /// trend-gate (monotonic run over the window, `ratio ≥ trend_min_ratio`).
+    fn should_flip(&self, pos: Decimal, avg: Decimal, mid: Decimal) -> bool {
+        if pos == Decimal::ZERO || avg <= Decimal::ZERO {
+            return false;
+        }
+        let long = pos > Decimal::ZERO;
+
+        // SAR — adverse excursion from the average entry.
+        if self.config.sar_trigger_bps > Decimal::ZERO {
+            let adverse = if long {
+                (avg - mid) / avg
+            } else {
+                (mid - avg) / avg
+            };
+            if adverse >= Self::bps(self.config.sar_trigger_bps) {
+                return true;
+            }
+        }
+
+        // Trend-gate — monotonic price run over the rolling window, against bag.
+        if self.config.trend_window_secs > 0 && self.mid_history.len() >= 3 {
+            let first = self.mid_history.front().expect("non-empty").1;
+            let last = self.mid_history.back().expect("non-empty").1;
+            let net = last - first;
+            let mut path = Decimal::ZERO;
+            let mut prev = first;
+            for &(_, m) in self.mid_history.iter().skip(1) {
+                path += (m - prev).abs();
+                prev = m;
+            }
+            if path > Decimal::ZERO && net.abs() / path >= self.config.trend_min_ratio {
+                let adverse = if long {
+                    net < Decimal::ZERO
+                } else {
+                    net > Decimal::ZERO
+                };
+                if adverse {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Taker stop-and-reverse: close the bag AND open the opposite side
+    /// (size = 2×|pos|) with one IOC that crosses the touch. The frozen grid
+    /// re-seeds on the new side at the next reconcile.
+    fn emit_flip(&self, ctx: &StrategyContext<'_>, pos: Decimal) -> Vec<Action> {
+        let long = pos > Decimal::ZERO;
+        // Long flips by SELLING at the bid; short flips by BUYING at the ask.
+        let (side, px) = if long {
+            (Side::Ask, ctx.latest_book.bids.first().map(|l| l.price.0))
+        } else {
+            (Side::Bid, ctx.latest_book.asks.first().map(|l| l.price.0))
+        };
+        let Some(px) = px else {
+            return vec![Action::NoOp];
+        };
+        let size = pos.abs() * Decimal::from(2);
+        let mut intent = self.intent(ctx.symbol, side, px, size);
+        intent.tif = TimeInForce::IOC;
+        vec![Action::Quote(intent)]
+    }
 }
 
 impl Strategy for Keel {
@@ -397,6 +507,8 @@ impl Strategy for Keel {
             config,
             origin: None,
             last_reconcile_mid: None,
+            last_flip_ts: None,
+            mid_history: std::collections::VecDeque::new(),
             inv_tick,
             inv_step,
             min_over_step,
@@ -415,6 +527,24 @@ impl Strategy for Keel {
         if mid <= Decimal::ZERO {
             return vec![Action::NoOp];
         }
+        let now = ctx.now.0;
+        self.record_mid(now, mid);
+
+        // Flip layer (SAR / trend-gate) — evaluated every event (NOT deadbanded),
+        // gated by the flip cooldown so we don't double-emit before the taker
+        // fill lands or flip-flop on chop.
+        let flip_armed =
+            self.config.sar_trigger_bps > Decimal::ZERO || self.config.trend_window_secs > 0;
+        if flip_armed && ctx.position.size.0 != Decimal::ZERO {
+            let cooling = self.last_flip_ts.is_some_and(|t| {
+                now.saturating_sub(t) < self.config.flip_cooldown_secs * 1_000_000_000
+            });
+            if !cooling && self.should_flip(ctx.position.size.0, ctx.position.avg_entry.0, mid) {
+                self.last_flip_ts = Some(now);
+                return self.emit_flip(ctx, ctx.position.size.0);
+            }
+        }
+
         // Deadband (live rate-limit defence): skip the reconcile entirely unless
         // a fill landed (inventory/avg changed → must re-quote), the band is
         // empty (cold start), or mid has slid at least one step since the last
