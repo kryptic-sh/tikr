@@ -48,6 +48,11 @@ pub struct FillSimConfig {
     /// insufficient" reason if applying the quote would push
     /// |position| past this cap. Simulates Binance `-2019`.
     pub max_position_notional_usdt: Option<Decimal>,
+    /// Account leverage. With the running wallet (see [`FillSim::set_wallet`]),
+    /// the margin gate rejects any order whose worst-case position would exceed
+    /// `wallet × leverage` (the venue's real buying-power limit). `0` (default)
+    /// disables the wallet-based gate (falls back to `max_position_notional_usdt`).
+    pub leverage: Decimal,
     /// Per-minute probability that any individual live quote gets
     /// silently dropped, simulating venue-side cancel/expire that the
     /// user_stream WS misses (the live reconciliation loop normally
@@ -288,6 +293,10 @@ pub struct FillSim {
     /// Maintained by maker fills (`match_trade`) and taker fills
     /// (`place_or_reject` IOC arm). Used for synthetic margin rejects.
     position_notional: HashMap<Symbol, Decimal>,
+    /// Running account wallet (margin balance), pushed by the runner via
+    /// [`FillSim::set_wallet`]. With `cfg.leverage` it forms the buying-power
+    /// margin gate. `0` = unset (gate falls back to the configured cap).
+    current_wallet: Decimal,
     /// xorshift64 state for silent-cancellation rolls.
     rng_state: u64,
     /// Separate xorshift64 state for latency-jitter draws. Kept distinct from
@@ -333,6 +342,7 @@ impl FillSim {
             book_state: HashMap::new(),
             pending_rejections: Vec::new(),
             position_notional: HashMap::new(),
+            current_wallet: Decimal::ZERO,
             rng_state,
             latency_rng_state,
             last_event_ts_ns: None,
@@ -340,6 +350,14 @@ impl FillSim {
             open_quotes_cache_sig: None,
             open_quotes_cache_symbol: None,
         }
+    }
+
+    /// Update the running account wallet (margin balance) used by the
+    /// buying-power margin gate (`wallet × leverage`). The runner calls this as
+    /// the wallet moves (initial + realized − fees). No-op effect until
+    /// `cfg.leverage > 0`.
+    pub fn set_wallet(&mut self, wallet: Decimal) {
+        self.current_wallet = wallet;
     }
 
     /// Maker fee in bps (for runner-side synthetic fills, e.g. the bagger).
@@ -860,7 +878,25 @@ impl FillSim {
         //     Σ(bid notionals). Long must not breach cap.
         //   - all asks fill, no bids fill → position grows short by
         //     Σ(ask notionals). Short must not breach cap.
-        if let Some(cap) = self.cfg.max_position_notional_usdt {
+        // Margin gate (`-2019`): the binding limit is **actual buying power =
+        // wallet × leverage** — the venue rejects any order whose worst-case
+        // resulting position would exceed it, regardless of strategy-level caps.
+        // The optional `max_position_notional_usdt` is an ADDITIONAL constraint
+        // (whichever is smaller binds). `current_wallet == 0` (unset) falls back
+        // to the configured cap only (test/back-compat path).
+        let buying_power =
+            if self.cfg.leverage > Decimal::ZERO && self.current_wallet > Decimal::ZERO {
+                Some((self.current_wallet * self.cfg.leverage).round_dp(8))
+            } else {
+                None
+            };
+        let effective_cap = match (buying_power, self.cfg.max_position_notional_usdt) {
+            (Some(bp), Some(c)) => Some(bp.min(c)),
+            (Some(bp), None) => Some(bp),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        if let Some(cap) = effective_cap {
             // Scale-bounded: the position_notional accumulator path
             // re-rounds to 8 dp, but `intent.price × intent.size` can
             // independently produce a high-scale value (DOGE
@@ -1485,6 +1521,7 @@ mod tests {
                 taker_bps: 0,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -1913,6 +1950,7 @@ mod tests {
                 taker_bps: 0,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -1957,6 +1995,7 @@ mod tests {
                 taker_bps: 5,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -2016,6 +2055,7 @@ mod tests {
                 taker_bps: 0,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 42,
             latency_jitter_ms: 50,

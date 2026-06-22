@@ -1180,6 +1180,16 @@ where
                     last_funding_ts = Some(ts);
                 }
 
+                // Feed the running wallet to the fill sim so its buying-power
+                // margin gate (wallet × leverage) rejects over-margin orders —
+                // the venue's real constraint. Once per event, before the
+                // strategy places (the wallet only moves on fills). Backtest
+                // only; live uses the real venue's margin engine.
+                if !live_mode {
+                    fill_sim
+                        .set_wallet(initial_balance + tracker.realized().0 - tracker.fees().0);
+                }
+
                 // Forced liquidation (paper/backtest only — live venue runs
                 // its own). Checked against the current mark (book-mid proxy)
                 // BEFORE the strategy reacts, so the strategy sees a freshly
@@ -4202,6 +4212,7 @@ mod tests {
                 taker_bps: 0,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -4822,6 +4833,7 @@ mod tests {
                 taker_bps: 0,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -4925,6 +4937,7 @@ mod tests {
                 taker_bps: 0,
             },
             max_position_notional_usdt: None,
+            leverage: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,

@@ -2207,6 +2207,9 @@ async fn run_sweep_collect(
         cancel_latency_ms: args.sim_cancel_latency_ms,
         fees,
         max_position_notional_usdt: hard_position_cap,
+        // Backtest the venue's real buying-power margin gate: orders whose
+        // worst-case position would exceed wallet × leverage are rejected.
+        leverage,
         silent_cancel_rate_per_min: args.sim_silent_cancel_rate_per_min,
         rng_seed: args.sim_rng_seed,
         latency_jitter_ms: args.sim_latency_jitter_ms,
