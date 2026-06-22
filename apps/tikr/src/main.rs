@@ -271,6 +271,7 @@ fn auto_scale_plan(
     top_n: u32,
     order_balance_pct: Decimal,
     auto_scale: bool,
+    fixed_notional: Option<Decimal>,
 ) -> (u32, Decimal) {
     let top_n = top_n.max(1);
     let active = if auto_scale && min_bot_capital > Decimal::ZERO {
@@ -282,12 +283,20 @@ fn auto_scale_plan(
     } else {
         top_n
     };
-    let sizing_base = if auto_scale {
-        wallet / Decimal::from(active.max(1))
-    } else {
-        wallet
+    // A configured fixed notional overrides the wallet-relative sizing entirely
+    // (the bot COUNT still scales). Avoids the per-balance compounding.
+    let notional = match fixed_notional {
+        Some(n) if n > Decimal::ZERO => n,
+        _ => {
+            let sizing_base = if auto_scale {
+                wallet / Decimal::from(active.max(1))
+            } else {
+                wallet
+            };
+            sizing_base * order_balance_pct / Decimal::from(100)
+        }
     };
-    (active, sizing_base * order_balance_pct / Decimal::from(100))
+    (active, notional)
 }
 
 struct AccountPollerConfig {
@@ -311,6 +320,9 @@ struct AccountPollerConfig {
     key_material: Arc<tikr_binance::BinanceKeyMaterial>,
     symbols: Vec<String>,
     order_balance_pct: Decimal,
+    /// Fixed per-order notional from the strategy config (`Some` → overrides the
+    /// wallet-relative `order_balance_pct` sizing; bot COUNT still scales).
+    fixed_notional: Option<Decimal>,
     /// Margin asset polled for wallet balance + displayed in TUI.
     /// Typically "USDT" for USDT-M perps, "USDC" for USDC-M.
     wallet_asset: String,
@@ -631,6 +643,7 @@ fn spawn_account_balance_poller(cfg: AccountPollerConfig) {
                     cfg.top_n,
                     cfg.order_balance_pct,
                     cfg.auto_scale,
+                    cfg.fixed_notional,
                 );
                 if active_bots != *cfg.active_bots_tx.borrow() {
                     let _ = cfg.active_bots_tx.send(active_bots);
@@ -777,8 +790,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(lev) = args.leverage {
         cfg.account.leverage = lev;
     }
-    if cfg.account.order_balance_pct <= Decimal::ZERO {
-        anyhow::bail!("order_balance_pct must be positive");
+    // `order_balance_pct = 0` is valid: fixed-notional mode (no wallet-relative
+    // compounding) — the per-order size comes from the strategy's `notional`.
+    if cfg.account.order_balance_pct < Decimal::ZERO {
+        anyhow::bail!("order_balance_pct must be >= 0");
     }
     if cfg.account.leverage == 0 {
         anyhow::bail!("leverage must be >= 1");
@@ -943,6 +958,10 @@ async fn main() -> anyhow::Result<()> {
         key_material: key_material.clone(),
         symbols: cfg.bots.iter().map(|b| b.symbol.clone()).collect(),
         order_balance_pct: cfg.account.order_balance_pct,
+        fixed_notional: cfg
+            .rampage
+            .as_ref()
+            .and_then(|r| r.strategy.strategy_notional()),
         wallet_asset: wallet_asset.clone(),
         shutdown: global_shutdown_rx.clone(),
         bnb_price_tx,
@@ -1120,7 +1139,41 @@ mod auto_scale_tests {
 
     // Notional is PRE-min-notional-floor; the venue clamps to $5 downstream.
     fn plan(wallet: i64, mbc: i64, top_n: u32, pct: Decimal, on: bool) -> (u32, Decimal) {
-        auto_scale_plan(Decimal::from(wallet), Decimal::from(mbc), top_n, pct, on)
+        auto_scale_plan(
+            Decimal::from(wallet),
+            Decimal::from(mbc),
+            top_n,
+            pct,
+            on,
+            None,
+        )
+    }
+
+    #[test]
+    fn fixed_notional_overrides_pct_but_count_still_scales() {
+        // $2000, $500/bot, top_n 4, fixed $5 → 4 bots, every order $5 (count
+        // scales with wallet, size does NOT compound).
+        let (n, notional) = auto_scale_plan(
+            Decimal::from(2_000),
+            Decimal::from(500),
+            4,
+            Decimal::ZERO,
+            true,
+            Some(Decimal::from(5)),
+        );
+        assert_eq!(n, 4);
+        assert_eq!(notional, Decimal::from(5));
+        // $500 wallet → 1 bot, still fixed $5.
+        let (n1, notional1) = auto_scale_plan(
+            Decimal::from(500),
+            Decimal::from(500),
+            4,
+            Decimal::ZERO,
+            true,
+            Some(Decimal::from(5)),
+        );
+        assert_eq!(n1, 1);
+        assert_eq!(notional1, Decimal::from(5));
     }
 
     #[test]

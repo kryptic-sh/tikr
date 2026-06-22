@@ -1452,6 +1452,9 @@ fn live_config_to_args(t: &toml::Table) -> Vec<String> {
     out.push("--strategies".to_string());
     out.push(if kind == "flat_mm" { "flat-mm" } else { kind }.to_string());
     let pp = |k: &'static str| ["rampage", "strategy", "params", k];
+    // Per-strategy fixed notional (the `notional` param) maps to the global
+    // `--notional`. Set `order_balance_pct = 0` alongside for a truly fixed size.
+    emit_arg(&mut out, t, "--notional", &pp("notional"));
     match kind {
         "wave" => {
             emit_arg(&mut out, t, "--wave-grid-levels-list", &pp("levels"));

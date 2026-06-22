@@ -843,12 +843,13 @@ fn spawn_one_bot(
             relattice_drift_pct,
             size_mult,
             size_ramp,
+            notional,
         } => {
             let bc = BotConfig {
                 symbol: symbol.to_string(),
                 strategy: "wave".to_string(),
                 wave: Some(WaveParams {
-                    notional: None,
+                    notional: *notional,
                     levels: *levels,
                     steps_bps: *steps_bps,
                     steps_inner: *steps_inner,

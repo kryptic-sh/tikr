@@ -1045,6 +1045,18 @@ fn score_default_net_penalty() -> Decimal {
     Decimal::from(2)
 }
 
+impl RampageStrategy {
+    /// The fixed per-order notional configured on the strategy, if any. Used to
+    /// drive the live per-order size when `order_balance_pct = 0` (fixed-notional
+    /// mode). `None` = account-derived (wallet-relative) sizing.
+    pub fn strategy_notional(&self) -> Option<Decimal> {
+        match self {
+            RampageStrategy::Wave { notional, .. } => *notional,
+            _ => None,
+        }
+    }
+}
+
 /// Strategy spawned by the rampage manager for each qualifying symbol.
 ///
 /// Uses an adjacently-tagged representation for `toml` crate compatibility.
@@ -1077,6 +1089,11 @@ pub enum RampageStrategy {
         size_mult: Decimal,
         #[serde(default = "wave_default_size_mult")]
         size_ramp: Decimal,
+        /// Fixed per-order notional. `None` (default) = account-derived from
+        /// `order_balance_pct`. Set this (and `order_balance_pct = 0`) for a
+        /// FIXED order size, avoiding the per-balance compounding.
+        #[serde(default)]
+        notional: Option<Decimal>,
     },
     /// Spawn a FlatMm (flat-inventory 0-fee market maker) bot.
     FlatMm {
@@ -1912,6 +1929,7 @@ mod tests {
                 relattice_drift_pct,
                 size_mult,
                 size_ramp,
+                ..
             } => {
                 assert_eq!(*levels, 10);
                 assert_eq!(*steps_bps, 30);
