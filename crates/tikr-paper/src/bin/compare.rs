@@ -160,7 +160,11 @@ fn liquidation_modeled() -> bool {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "compare",
-    about = "Run a strategy suite over recorded parquet data and print a comparison"
+    about = "Run a strategy suite over recorded parquet data and print a comparison",
+    // `--config` injects TOML-derived flags BEFORE the CLI flags; allowing an
+    // arg to repeat (last-wins) is what lets an explicit CLI flag override the
+    // config value. Without this clap errors "cannot be used multiple times".
+    args_override_self = true
 )]
 struct Args {
     /// Directory containing `book_<BASE>_*.parquet` + `trades_<BASE>_*.parquet`.
@@ -1376,9 +1380,146 @@ fn toml_to_args(path: &std::path::Path) -> Result<Vec<String>, String> {
     let table = value
         .as_table()
         .ok_or_else(|| format!("{}: top-level must be a TOML table", path.display()))?;
+    // A LIVE config (the same file the bot runs) has `[account]` / `[rampage]`
+    // sections whose keys DON'T match compare's flags — translate those to the
+    // right backtest flags so one config drives both backtest and live. Anything
+    // else is treated as a sweep-template (flag-named keys, flattened verbatim).
+    if table.contains_key("rampage") || table.contains_key("account") {
+        return Ok(live_config_to_args(table));
+    }
     let mut out: Vec<String> = Vec::new();
     flatten_table(table, "", &mut out);
     Ok(out)
+}
+
+/// Fetch a nested value by table path (`["rampage","strategy","kind"]`).
+fn toml_get<'a>(t: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut cur = t.get(path[0])?;
+    for k in &path[1..] {
+        cur = cur.as_table()?.get(*k)?;
+    }
+    Some(cur)
+}
+
+/// Stringify a scalar TOML value for an argv slot.
+fn toml_scalar(v: &toml::Value) -> String {
+    match v {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Translate a LIVE bot config (`[account]` + `[rampage.strategy]`) into
+/// backtest CLI args. Only the params compare can backtest are mapped (single
+/// values become 1-element sweep lists); selection/rampage-rotation is not
+/// simulated here (that needs the rotation harness). Emitted before CLI flags,
+/// so any explicit `--flag` still overrides. Unmapped keys are skipped (so an
+/// unknown live param never produces an invalid flag).
+fn emit_arg(out: &mut Vec<String>, t: &toml::Table, flag: &str, path: &[&str]) {
+    if let Some(v) = toml_get(t, path) {
+        out.push(flag.to_string());
+        out.push(toml_scalar(v));
+    }
+}
+
+fn live_config_to_args(t: &toml::Table) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // ── account ──────────────────────────────────────────────────────────
+    emit_arg(&mut out, t, "--leverage", &["account", "leverage"]);
+    emit_arg(
+        &mut out,
+        t,
+        "--sim-order-balance-pct",
+        &["account", "order_balance_pct"],
+    );
+    emit_arg(
+        &mut out,
+        t,
+        "--sim-max-position-pct",
+        &["account", "max_position_pct"],
+    );
+
+    // ── strategy ─────────────────────────────────────────────────────────
+    let Some(kind) = toml_get(t, &["rampage", "strategy", "kind"]).and_then(|v| v.as_str()) else {
+        return out;
+    };
+    out.push("--strategies".to_string());
+    out.push(if kind == "flat_mm" { "flat-mm" } else { kind }.to_string());
+    let pp = |k: &'static str| ["rampage", "strategy", "params", k];
+    match kind {
+        "wave" => {
+            emit_arg(&mut out, t, "--wave-grid-levels-list", &pp("levels"));
+            emit_arg(&mut out, t, "--wave-step-bps-list", &pp("steps_bps"));
+            emit_arg(&mut out, t, "--wave-inner-steps-list", &pp("steps_inner"));
+            emit_arg(&mut out, t, "--wave-refill-threshold", &pp("round_trips"));
+            emit_arg(&mut out, t, "--wave-size-mult", &pp("size_mult"));
+            emit_arg(&mut out, t, "--wave-size-ramp", &pp("size_ramp"));
+            emit_arg(&mut out, t, "--wave-auto-inner", &pp("auto_inner"));
+            emit_arg(&mut out, t, "--wave-auto-step", &pp("auto_step"));
+            emit_arg(
+                &mut out,
+                t,
+                "--wave-force-refill-secs",
+                &pp("force_refill_secs"),
+            );
+            emit_arg(&mut out, t, "--wave-auto-step-k-list", &pp("auto_step_k"));
+            emit_arg(
+                &mut out,
+                t,
+                "--wave-auto-candle-window",
+                &pp("auto_candle_window"),
+            );
+        }
+        "flat_mm" => {
+            emit_arg(&mut out, t, "--flat-mm-inner-bps-list", &pp("inner_bps"));
+            emit_arg(&mut out, t, "--flat-mm-step-bps-list", &pp("step_bps"));
+            emit_arg(&mut out, t, "--flat-mm-levels", &pp("levels"));
+            emit_arg(
+                &mut out,
+                t,
+                "--flat-mm-skew-bps-list",
+                &pp("reservation_skew_bps"),
+            );
+            emit_arg(
+                &mut out,
+                t,
+                "--flat-mm-imbalance-bps-list",
+                &pp("imbalance_skew_bps"),
+            );
+            emit_arg(&mut out, t, "--flat-mm-flush-bps-list", &pp("flush_bps"));
+            emit_arg(&mut out, t, "--flat-mm-chase-list", &pp("chase_boost_pct"));
+            emit_arg(&mut out, t, "--flat-mm-flush-frac-list", &pp("flush_frac"));
+            emit_arg(
+                &mut out,
+                t,
+                "--flat-mm-underwater-frac-list",
+                &pp("underwater_reduce_frac"),
+            );
+            emit_arg(
+                &mut out,
+                t,
+                "--flat-mm-frozen-lattice",
+                &pp("frozen_lattice"),
+            );
+            emit_arg(
+                &mut out,
+                t,
+                "--flat-mm-lattice-band",
+                &pp("lattice_band_levels"),
+            );
+            emit_arg(
+                &mut out,
+                t,
+                "--flat-mm-lattice-max-open",
+                &pp("lattice_max_open"),
+            );
+        }
+        _ => {} // tide / template / keel: strategy selected, params left at CLI/defaults
+    }
+    out
 }
 
 /// Recursive helper for `toml_to_args`. `prefix` is the section path
