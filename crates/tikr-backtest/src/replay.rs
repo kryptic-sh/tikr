@@ -377,6 +377,110 @@ impl LoadedReplayData {
         let max = *samples.last().unwrap();
         Some((median, max))
     }
+
+    /// Per-symbol series of top-of-book mid "closes" bucketed into
+    /// `bucket_secs` windows — the LAST completed-snapshot mid in each bucket,
+    /// mirroring an exchange's `bucket_secs`-resolution kline close. One inner
+    /// `Vec` per configured symbol (index = `symbol_idx`), each chronological.
+    ///
+    /// Reuses the same full-snapshot rebuild as [`Self::book_spread_stats_bps`]
+    /// (each ts boundary is a complete `@depth` snapshot, so the book is
+    /// cleared per ts). Used by `compare --score-dump` to reproduce the live
+    /// rampage `grid_vol` selection metric offline (the metric is a ratio of
+    /// price moves, so the absolute `tick_size` cancels — any tick gives the
+    /// same bps score).
+    pub fn minute_close_mids(&self, bucket_secs: u64) -> Vec<Vec<Decimal>> {
+        let tick = self.cfg.tick_size;
+        let n = self.cfg.symbols.len().max(1);
+        let bucket_ns = bucket_secs.max(1).saturating_mul(1_000_000_000);
+        let mut books: Vec<BookState> = (0..n).map(|_| BookState::default()).collect();
+        let mut closes: Vec<Vec<Decimal>> = vec![Vec::new(); n];
+        let mut cur_bucket: Vec<Option<u64>> = vec![None; n];
+        let mid_of = |book: &BookState| -> Option<Decimal> {
+            if let (Some((bid_ticks, _)), Some((ask_ticks, _))) =
+                (book.bids.iter().next_back(), book.asks.iter().next())
+            {
+                let bid_px = Decimal::from(*bid_ticks) * tick;
+                let ask_px = Decimal::from(*ask_ticks) * tick;
+                if bid_px > Decimal::ZERO && ask_px > bid_px {
+                    return Some((bid_px + ask_px) / Decimal::from(2));
+                }
+            }
+            None
+        };
+        // Push `mid` as the close of the bucket `ts_ns` falls in: overwrite the
+        // current bucket's running close, or open a new bucket.
+        let record = |idx: usize,
+                      ts_ns: u64,
+                      mid: Decimal,
+                      closes: &mut Vec<Vec<Decimal>>,
+                      cur_bucket: &mut Vec<Option<u64>>| {
+            let bucket = ts_ns / bucket_ns;
+            match cur_bucket[idx] {
+                Some(b) if b == bucket => {
+                    if let Some(last) = closes[idx].last_mut() {
+                        *last = mid;
+                    } else {
+                        closes[idx].push(mid);
+                    }
+                }
+                _ => {
+                    closes[idx].push(mid);
+                    cur_bucket[idx] = Some(bucket);
+                }
+            }
+        };
+        for ev in &self.events {
+            if let EventPayload::BookDelta {
+                side,
+                price_ticks,
+                size,
+                ..
+            } = &ev.payload
+            {
+                let book = &mut books[ev.symbol_idx];
+                // ts boundary → previous snapshot is complete; record its mid.
+                if ev.ts_ns != book.last_applied_ts {
+                    if let Some(m) = mid_of(book) {
+                        record(
+                            ev.symbol_idx,
+                            book.last_applied_ts,
+                            m,
+                            &mut closes,
+                            &mut cur_bucket,
+                        );
+                    }
+                    book.bids.clear();
+                    book.asks.clear();
+                    book.last_applied_ts = ev.ts_ns;
+                }
+                let levels = if *side == 0 {
+                    &mut book.bids
+                } else {
+                    &mut book.asks
+                };
+                if size.is_zero() {
+                    levels.remove(price_ticks);
+                } else {
+                    let price = Price(Decimal::from(*price_ticks) * tick);
+                    levels.insert(
+                        *price_ticks,
+                        Level {
+                            price,
+                            size: Size(*size),
+                        },
+                    );
+                }
+            }
+        }
+        // Flush the final snapshot.
+        for (idx, book) in books.iter().enumerate() {
+            if let Some(m) = mid_of(book) {
+                record(idx, book.last_applied_ts, m, &mut closes, &mut cur_bucket);
+            }
+        }
+        closes
+    }
 }
 
 /// Parquet-backed [`Replay`] implementation.

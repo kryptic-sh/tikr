@@ -191,6 +191,28 @@ struct Args {
     #[arg(long, default_value = "")]
     symbols_filter: String,
 
+    /// Score-dump mode (basket only): instead of running backtests, compute
+    /// the live rampage `grid_vol` selection metric per symbol over a sweep
+    /// of `net_penalty` values and print a ranking table, then exit. Use to
+    /// pick a `[rampage.score].net_penalty` that admits chop markets and
+    /// rejects trends BEFORE committing to a live config.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    score_dump: bool,
+
+    /// `--score-dump` rolling window length in candles (mirrors
+    /// `[rampage.score].candle_count`; live default 60).
+    #[arg(long, default_value_t = 60usize)]
+    score_window: usize,
+
+    /// `--score-dump` candle bucket size in seconds (live klines are 1m = 60).
+    #[arg(long, default_value_t = 60u64)]
+    score_bucket_secs: u64,
+
+    /// `--score-dump` comma-separated `net_penalty` values to sweep across
+    /// the columns of the ranking table.
+    #[arg(long, default_value = "0,0.5,1,1.5,2,3")]
+    score_net_penalties: String,
+
     /// Output format: `table` (default, pretty-aligned columns), `csv`
     /// (one row per preset, header on first line), or `markdown`
     /// (pipe-separated table). CSV is suitable for piping into
@@ -1866,6 +1888,9 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if args.score_dump {
+        return run_score_dump(&args, &symbols);
+    }
     info!(
         symbol_count = symbols.len(),
         root = %root.display(),
@@ -1914,6 +1939,145 @@ async fn run_basket(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // total basket NET. Skipped when only one symbol contributed
     // results (the per-symbol table already shows the same info).
     print_basket_summary(&per_symbol, args.sim_max_position_notional);
+    Ok(())
+}
+
+/// `grid_vol` selection score (bps) over one window of closes:
+/// `(path − net_penalty·net) / first × 10_000`, where `path` = summed
+/// |close-to-close| and `net` = |last − first|. Mirrors the live
+/// `apps/tikr/src/rampage.rs::grid_vol_bps`. Pure chop → path≫net → high;
+/// clean trend → path≈net → penalty drives it ≤0 (the live `>0` gate rejects).
+fn grid_vol_window(closes: &[Decimal], net_penalty: Decimal) -> Option<Decimal> {
+    if closes.len() < 2 {
+        return None;
+    }
+    let base = *closes.first()?;
+    if base <= Decimal::ZERO {
+        return None;
+    }
+    let net = (*closes.last()? - base).abs();
+    let mut path = Decimal::ZERO;
+    for pair in closes.windows(2) {
+        path += (pair[1] - pair[0]).abs();
+    }
+    Some(((path - net_penalty * net) / base) * Decimal::from(10_000))
+}
+
+/// `--score-dump`: reproduce the live rampage `grid_vol` selection metric
+/// offline. For each symbol, build `score_bucket_secs` mid "closes", slide a
+/// `score_window`-candle window across them, and report — per `net_penalty` —
+/// the MEAN window score (bps) and the fraction of windows that clear the
+/// live `>0` admission gate. Lets the operator pick a `net_penalty` that keeps
+/// chop markets and culls trend markets before touching the live config.
+fn run_score_dump(
+    args: &Args,
+    symbols: &[(String, PathBuf)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let penalties: Vec<Decimal> = args
+        .score_net_penalties
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(Decimal::from_str)
+        .collect::<Result<_, _>>()?;
+    if penalties.is_empty() {
+        return Err("--score-net-penalties parsed to empty".into());
+    }
+    let window = args.score_window.max(2);
+    println!(
+        "\ngrid_vol score dump — bucket={}s window={} candles  (cell = mean window bps | %windows >0 gate)",
+        args.score_bucket_secs, window
+    );
+    // Header.
+    print!("{:<10} {:>8} {:>9}", "symbol", "closes", "range%");
+    for k in &penalties {
+        print!("  {:>15}", format!("k={}", k));
+    }
+    println!();
+
+    // Collected (symbol, mean_score_at_each_k) for a final ranking line.
+    for (sym, dir) in symbols {
+        // The metric is a ratio of price moves, so absolute tick cancels — but
+        // the parquet loader ROUNDS price/tick to i64 ticks, so a coarse tick
+        // collapses sub-dollar prices to 0. Use 1e-8 to preserve resolution for
+        // any symbol (ZEC ~$400 → 4e10 ticks, fits i64). Single-symbol per dir.
+        let tick = Decimal::new(1, 8);
+        let base = sym
+            .trim_end_matches("USDT")
+            .trim_end_matches("USDC")
+            .trim_end_matches("BUSD")
+            .trim_end_matches("TUSD");
+        let symbol = Symbol {
+            base: Asset::new(base),
+            quote: Asset::new("USDC"),
+            venue: VenueId::new("binance"),
+            kind: MarketKind::Perp,
+        };
+        let loaded = match LoadedReplayData::load(ReplayConfig {
+            heartbeat_ms: 1000,
+            symbols: vec![symbol],
+            data_dir: dir.clone(),
+            tick_size: tick,
+            allow_seq_gaps: true,
+        }) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("{sym:<10}  load failed: {e}");
+                continue;
+            }
+        };
+        let closes = loaded.minute_close_mids(args.score_bucket_secs);
+        let series = closes.into_iter().next().unwrap_or_default();
+        if series.len() < window {
+            println!(
+                "{:<10} {:>8} {:>9}  (fewer than {} closes — skipped)",
+                sym,
+                series.len(),
+                "—",
+                window
+            );
+            continue;
+        }
+        // range% over the whole series (max-min)/first.
+        let first = series[0];
+        let (mut lo, mut hi) = (series[0], series[0]);
+        for &c in &series {
+            if c < lo {
+                lo = c;
+            }
+            if c > hi {
+                hi = c;
+            }
+        }
+        let range_pct = if first > Decimal::ZERO {
+            (hi - lo) / first * Decimal::from(100)
+        } else {
+            Decimal::ZERO
+        };
+        print!("{:<10} {:>8} {:>8.2}", sym, series.len(), range_pct);
+        let n_windows = series.len() - window + 1;
+        for k in &penalties {
+            let mut sum = Decimal::ZERO;
+            let mut passed = 0usize;
+            for w in series.windows(window) {
+                if let Some(s) = grid_vol_window(w, *k) {
+                    sum += s;
+                    if s > Decimal::ZERO {
+                        passed += 1;
+                    }
+                }
+            }
+            let mean = sum / Decimal::from(n_windows);
+            let pass_pct = (passed as f64 / n_windows as f64) * 100.0;
+            print!("  {:>9.1}|{:>3.0}%", mean, pass_pct);
+        }
+        println!();
+    }
+    println!(
+        "\nLive gate admits a window only when score > 0. A symbol with low %>0 \n\
+         at a given k would be REJECTED most cycles → pick the smallest k that \n\
+         pushes the trend markets' %>0 toward 0 while chop stays high."
+    );
     Ok(())
 }
 
