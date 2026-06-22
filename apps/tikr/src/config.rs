@@ -1023,6 +1023,26 @@ pub enum ScoreMode {
         #[serde(default = "tide_auto_default_min_tick_bps")]
         min_tick_bps: Decimal,
     },
+    /// Score by **grid-harvestable volatility**: `path − net_penalty × net`,
+    /// where `path` = summed |close-to-close move| and `net` = |last − first|
+    /// over the window (both as bps of the first close). Rewards oscillation
+    /// (what a grid harvests) and PENALIZES net drift (trend = the bag risk a
+    /// grid pays). `net_penalty = 0` ⇒ pure path-length; `2` ⇒ strong trend
+    /// penalty (best in backtest — steers selection off trending symbols onto
+    /// choppy-flat ones). Gated by `min_tick_bps`. Fetches 1m klines per
+    /// candidate (like RealizedVol).
+    GridVol {
+        #[serde(default = "wave_auto_default_candle_count")]
+        candle_count: u32,
+        #[serde(default = "score_default_net_penalty")]
+        net_penalty: Decimal,
+        #[serde(default = "tide_auto_default_min_tick_bps")]
+        min_tick_bps: Decimal,
+    },
+}
+
+fn score_default_net_penalty() -> Decimal {
+    Decimal::from(2)
 }
 
 /// Strategy spawned by the rampage manager for each qualifying symbol.

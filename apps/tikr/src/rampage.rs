@@ -133,6 +133,13 @@ pub fn spawn_rampage_manager(
                 candle_count,
                 min_tick_bps,
             } => format!("realized_vol(count={candle_count}, min_tick_bps={min_tick_bps})"),
+            ScoreMode::GridVol {
+                candle_count,
+                net_penalty,
+                min_tick_bps,
+            } => format!(
+                "grid_vol(count={candle_count}, net_penalty={net_penalty}, min_tick_bps={min_tick_bps})"
+            ),
         };
         let strategy_label = match &cfg.strategy {
             RampageStrategy::Wave { .. } => "wave",
@@ -347,6 +354,49 @@ pub fn spawn_rampage_manager(
                                     Err(_) => Decimal::ZERO,
                                 };
                                 (sym, rv - fee_bps)
+                            }
+                        })
+                        .buffer_unordered(16)
+                        .collect()
+                        .await;
+                    raw.into_iter()
+                        .filter(|(_, s)| *s > Decimal::ZERO)
+                        .collect()
+                }
+                ScoreMode::GridVol {
+                    candle_count,
+                    net_penalty,
+                    min_tick_bps,
+                } => {
+                    // Gate by tick_bps, then score by grid-harvestable volatility
+                    // (path − net_penalty × net) over the 1m closes. Fetches
+                    // klines per candidate (concurrent, cap 16).
+                    let tick_map: HashMap<String, Decimal> = discovered
+                        .iter()
+                        .map(|r| (r.symbol.clone(), r.tick_bps))
+                        .collect();
+                    let min_tick = *min_tick_bps;
+                    let k = *net_penalty;
+                    let gated: Vec<String> = candidates
+                        .into_iter()
+                        .filter(|s| tick_map.get(s).copied().unwrap_or_default() >= min_tick)
+                        .collect();
+                    let base_url = account.env.rest_base_url().to_string();
+                    let n = *candle_count;
+                    let http_ref = &http;
+                    let raw: Vec<(String, Decimal)> = futures::stream::iter(gated)
+                        .map(|sym| {
+                            let base = base_url.clone();
+                            async move {
+                                let score = match tikr_binance::futs::get_1m_closes(
+                                    http_ref, &base, &sym, n,
+                                )
+                                .await
+                                {
+                                    Ok(closes) => grid_vol_bps(&closes, k),
+                                    Err(_) => Decimal::ZERO,
+                                };
+                                (sym, score)
                             }
                         })
                         .buffer_unordered(16)
@@ -751,6 +801,24 @@ fn realized_vol_bps(closes: &[Decimal]) -> Decimal {
     } else {
         total / n
     }
+}
+
+/// Grid-harvestable volatility score (bps): `path − net_penalty × net`, where
+/// `path` is the summed |close-to-close| move and `net` is |last − first|, both
+/// as bps of the first close. High when the window oscillates a lot (harvestable
+/// by a grid) but ends near where it started (no trend bag). Negative for a
+/// clean trend (path ≈ net, penalty bites) — filtered out by the `> 0` gate.
+fn grid_vol_bps(closes: &[Decimal], net_penalty: Decimal) -> Decimal {
+    if closes.len() < 2 || closes[0] <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let base = closes[0];
+    let mut path = Decimal::ZERO;
+    for pair in closes.windows(2) {
+        path += (pair[1] - pair[0]).abs();
+    }
+    let net = (closes[closes.len() - 1] - base).abs();
+    ((path - net_penalty * net) / base) * Decimal::from(10_000)
 }
 
 fn spawn_one_bot(
