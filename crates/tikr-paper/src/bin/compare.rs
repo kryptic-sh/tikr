@@ -488,7 +488,8 @@ struct Args {
     liq_window_secs: u32,
 
     /// LiqFade: fiat notional per fade entry.
-    #[arg(long, default_value = "100")]
+    /// LiqFade per-order notional. `0` (default) = use the global `--notional`.
+    #[arg(long, default_value = "0")]
     liq_notional: String,
 
     /// LiqFade: per-side liquidation USDT threshold to arm.
@@ -533,7 +534,8 @@ struct Args {
     liq_max_pos_usdt: String,
 
     /// Hawk: fiat notional per quote level.
-    #[arg(long, default_value = "100")]
+    /// Hawk per-order notional. `0` (default) = use the global `--notional`.
+    #[arg(long, default_value = "0")]
     hawk_notional: String,
 
     /// Hawk: comma-separated `levels_per_side` sweep.
@@ -1111,7 +1113,8 @@ struct Args {
     tidal_sl_close_pct: u32,
 
     /// SpreadScalp notional per order.
-    #[arg(long, default_value = "100")]
+    /// SpreadScalp per-order notional. `0` (default) = use the global `--notional`.
+    #[arg(long, default_value = "0")]
     spread_scalp_notional: String,
 
     /// SpreadScalp sweep: comma-separated min spread in bps.
@@ -2244,13 +2247,22 @@ async fn run_sweep_collect(
     let micro_mean_reversion_notional = notional;
     let tide_notional = notional;
     let wave_notional = notional;
-    let spread_scalp_notional = Decimal::from_str(&args.spread_scalp_notional)?;
+    // Per-strategy notional flags fall back to the global `--notional` when left
+    // at the `0` default, so `--notional` is honored across every algo unless a
+    // strategy-specific override is explicitly set.
+    let spread_scalp_notional = {
+        let n = Decimal::from_str(&args.spread_scalp_notional)?;
+        if n > Decimal::ZERO { n } else { notional }
+    };
     let spread_scalp_max_pos = Decimal::from_str(&args.spread_scalp_max_pos_usdt)?;
     let spread_scalp_tp_usdt = Decimal::from_str(&args.spread_scalp_take_profit_usdt)?;
     let sg_regime_eff_threshold = Decimal::from_str(&args.sg_regime_efficiency_threshold)?;
     let sg_max_pos = Decimal::from_str(&args.sg_max_pos_usdt)?;
     let lg_max_pos = Decimal::from_str(&args.lg_max_pos_usdt)?;
-    let liq_notional = Decimal::from_str(&args.liq_notional)?;
+    let liq_notional = {
+        let n = Decimal::from_str(&args.liq_notional)?;
+        if n > Decimal::ZERO { n } else { notional }
+    };
     let liq_arm_threshold = Decimal::from_str(&args.liq_arm_threshold_usdt)?;
     let liq_arm_dominance = Decimal::from_str(&args.liq_arm_dominance)?;
     let liq_max_pos = Decimal::from_str(&args.liq_max_pos_usdt)?;
@@ -3234,7 +3246,7 @@ async fn run_sweep_collect(
                                         &symbol,
                                         &label,
                                         StaticGrid::new(StaticGridConfig {
-                                            notional_per_order: Decimal::from(100),
+                                            notional_per_order: notional,
                                             levels_per_side: levels,
                                             inner_bps: inner,
                                             step_bps: step,
@@ -3270,7 +3282,10 @@ async fn run_sweep_collect(
 
     // Hawk — SS spread-gate + SG ladder + always-alive close-side.
     if included("hawk", &allow) {
-        let hawk_notional = Decimal::from_str(&args.hawk_notional)?;
+        let hawk_notional = {
+            let n = Decimal::from_str(&args.hawk_notional)?;
+            if n > Decimal::ZERO { n } else { notional }
+        };
         let hawk_max_pos = Decimal::from_str(&args.hawk_max_pos_usdt)?;
         let hawk_levels = parse_u32_list(&args.hawk_levels_list)?;
         let hawk_inner = parse_u32_list(&args.hawk_inner_bps_list)?;
