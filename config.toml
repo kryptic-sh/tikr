@@ -1,10 +1,10 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "1"
+order_balance_pct = "0"                # 0 = disable wallet-relative (compounding) sizing → use the strategy's fixed `notional` below. Bot COUNT still auto-scales.
 max_position_pct = "0"
-auto_scale = false                     # false = each bot orders FULL wallet×order_balance_pct (no /bot split); N = rampage.top_n
-min_bot_capital_usdc = "200"           # margin gate: $250 wallet per bot (e.g. $519 → 2 bots)
+auto_scale = true                      # true = active-bot count scales with wallet: floor(wallet / min_bot_capital_usdc), clamped to [1, top_n]
+min_bot_capital_usdc = "500"           # $500 wallet per bot → $500 = 1 bot, $2000 = 4 bots (capped at top_n)
 take_profit_pct = "0"                  # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
 leverage = 25
 inventory_boost_pct = "0"              # profit-gated reducing-side size boost: enlarge reducing (in-profit) orders as they sit further past avg
@@ -32,23 +32,25 @@ enabled = true
 min_volume_usdc = "20000000" # $20M 24h quote volume floor
 recheck_interval_secs = 60
 quote_asset = "USDC"
-top_n = 2
+top_n = 4
 # defer_underwater defaults true (don't rotate a bot holding a losing bag)
 rotate_loss_pct = "0.01" # accept NET loss up to 1% of wallet on rotate (NET = realized+unrealized−fees)
 big_bag_pct = "0"        # hold (don't rotate) a bot in POSITIVE unrealized whose bag ≥ this % of wallet — work it down instead of dumping; 0 = off
 retire_bnb_pct = "50"    # on retire, convert this % of the bot's final NET PROFIT to BNB (VIP-tier fee accrual); loss = no-op; 0 = off
 
 [rampage.score]
-mode = "candle_height" # "candle_height" (Wave signal) | "tick_bps" (Tide signal)
+mode = "grid_vol"      # grid-harvestable volatility: path − net_penalty×net over the window (rewards oscillation, penalizes trend-drift)
 [rampage.score.params]
-candle_count = 30    # average the last 60 one-minute candles (~1h window)
-min_candle_pct = "0" # min avg candle height % to qualify (0 = no floor)
+candle_count = 60      # 1m closes averaged (~1h window)
+net_penalty = "0"      # trend penalty. BACKTEST: optimal k INVERTS with top_n — k=2 best for top_n=1 (dodge trend-bagging), but k≥1 DROPS the winner mid-ride for top_n≥3. For multi-market top_n>1 keep this LOW (0 = pure path-length, keeps winners always-on, only culls genuine stragglers). Raise toward 1-2 only for single-market top_n=1.
+min_tick_bps = "6"     # round-trip viability gate: tick_size/price×10000 ≥ this
 
 [rampage.strategy]
 kind = "wave" # "wave" | "tide"
 [rampage.strategy.params]
-levels = 5
-round_trips = 2
+notional = "5"            # FIXED $5/order (account order_balance_pct = 0 → no compounding). Bot count still auto-scales with wallet.
+levels = 10
+round_trips = 5
 steps_bps = 5
 auto_inner = false        # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
 steps_inner = 1           # only used when auto_inner = false
