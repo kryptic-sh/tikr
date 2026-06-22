@@ -2187,9 +2187,11 @@ async fn run_sweep_collect(
     // `--sim-max-position-notional` when compounding is off.
     let (bc_initial, bc_order_pct, bc_max_pct) = balance_compounding();
     let leverage = Decimal::from_str(&args.leverage)?;
-    let hard_position_cap = if bc_initial > Decimal::ZERO && bc_order_pct > Decimal::ZERO {
-        Some((bc_initial * leverage).round_dp(8))
-    } else if args.sim_max_position_notional > 0.0 {
+    // Explicit FIXED position cap (USDT). The `%`-of-wallet cap and the
+    // buying-power limit are both handled DYNAMICALLY in the fill sim
+    // (`max_position_frac` + `leverage` vs the running wallet), so this is only
+    // the optional hard-dollar override.
+    let hard_position_cap = if args.sim_max_position_notional > 0.0 {
         Some(Decimal::try_from(args.sim_max_position_notional)?)
     } else {
         None
@@ -2210,6 +2212,9 @@ async fn run_sweep_collect(
         // Backtest the venue's real buying-power margin gate: orders whose
         // worst-case position would exceed wallet × leverage are rejected.
         leverage,
+        // Strategy `%`-of-wallet position cap, DYNAMIC vs the running wallet
+        // (grows with the account). `max_position_pct` (e.g. 300) → 3.0.
+        max_position_frac: bc_max_pct / Decimal::from(100),
         silent_cancel_rate_per_min: args.sim_silent_cancel_rate_per_min,
         rng_seed: args.sim_rng_seed,
         latency_jitter_ms: args.sim_latency_jitter_ms,

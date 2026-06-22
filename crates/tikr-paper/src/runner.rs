@@ -802,6 +802,16 @@ where
         .as_ref()
         .map(|rx| *rx.borrow())
         .unwrap_or(Decimal::ZERO);
+    // Fixed-notional / non-compounding mode (`order_balance_pct = 0`):
+    // `max_position_rx` isn't wired, so derive the cap from
+    // `max_position_pct × wallet`. Seeded at the session-start wallet here, then
+    // updated DYNAMICALLY vs the running wallet as it moves (grows with the
+    // account — true `%`-of-wallet semantics). The compounding path keeps using
+    // its `max_position_rx` channel instead.
+    let derive_maxpos_from_wallet = !compounding_enabled && max_position_pct > Decimal::ZERO;
+    if derive_maxpos_from_wallet && initial_balance > Decimal::ZERO {
+        current_max_position = initial_balance * max_position_pct / Decimal::from(100);
+    }
     // Runner-side inventory-aware order-size boost (applies to every
     // strategy). Static config; the live cap above is the curve denominator.
     let inventory_boost = config.inventory_boost;
@@ -1185,9 +1195,26 @@ where
                 // the venue's real constraint. Once per event, before the
                 // strategy places (the wallet only moves on fills). Backtest
                 // only; live uses the real venue's margin engine.
-                if !live_mode {
-                    fill_sim
-                        .set_wallet(initial_balance + tracker.realized().0 - tracker.fees().0);
+                {
+                    // Current wallet: backtest = initial + realized − fees;
+                    // live = the account-poll balance (`wallet_rx`).
+                    let w = if live_mode {
+                        wallet_rx
+                            .as_ref()
+                            .map(|rx| *rx.borrow())
+                            .unwrap_or(initial_balance)
+                    } else {
+                        initial_balance + tracker.realized().0 - tracker.fees().0
+                    };
+                    if !live_mode {
+                        fill_sim.set_wallet(w);
+                    }
+                    // Dynamic %-of-wallet cap (non-compounding path): track the
+                    // running wallet so the cap grows with the account. The
+                    // compounding path uses its `max_position_rx` channel instead.
+                    if derive_maxpos_from_wallet && w > Decimal::ZERO {
+                        current_max_position = w * max_position_pct / Decimal::from(100);
+                    }
                 }
 
                 // Forced liquidation (paper/backtest only — live venue runs
@@ -4213,6 +4240,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -4834,6 +4862,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -4938,6 +4967,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,

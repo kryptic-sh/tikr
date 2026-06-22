@@ -53,6 +53,11 @@ pub struct FillSimConfig {
     /// `wallet × leverage` (the venue's real buying-power limit). `0` (default)
     /// disables the wallet-based gate (falls back to `max_position_notional_usdt`).
     pub leverage: Decimal,
+    /// Strategy position cap as a FRACTION of the running wallet (e.g. `3.0` =
+    /// 300% = cap the bag at 3× wallet). Dynamic — tracks the wallet via
+    /// [`FillSim::set_wallet`], so it grows as the account does. `0` (default) =
+    /// no `%` cap.
+    pub max_position_frac: Decimal,
     /// Per-minute probability that any individual live quote gets
     /// silently dropped, simulating venue-side cancel/expire that the
     /// user_stream WS misses (the live reconciliation loop normally
@@ -884,18 +889,25 @@ impl FillSim {
         // The optional `max_position_notional_usdt` is an ADDITIONAL constraint
         // (whichever is smaller binds). `current_wallet == 0` (unset) falls back
         // to the configured cap only (test/back-compat path).
-        let buying_power =
-            if self.cfg.leverage > Decimal::ZERO && self.current_wallet > Decimal::ZERO {
-                Some((self.current_wallet * self.cfg.leverage).round_dp(8))
-            } else {
-                None
-            };
-        let effective_cap = match (buying_power, self.cfg.max_position_notional_usdt) {
-            (Some(bp), Some(c)) => Some(bp.min(c)),
-            (Some(bp), None) => Some(bp),
-            (None, Some(c)) => Some(c),
-            (None, None) => None,
-        };
+        // Three constraints, all DYNAMIC vs the running wallet so they grow as
+        // the account does (true `%`-of-wallet semantics, not frozen):
+        //   - buying_power = wallet × leverage (the venue's hard margin limit)
+        //   - position cap  = wallet × max_position_frac (strategy `%` cap)
+        //   - plus an optional explicit fixed `max_position_notional_usdt`.
+        // The tightest present binds. `current_wallet == 0` (unset) → fall back
+        // to the explicit fixed cap only (test/back-compat path).
+        let wallet_caps = [
+            (self.cfg.leverage > Decimal::ZERO).then(|| self.current_wallet * self.cfg.leverage),
+            (self.cfg.max_position_frac > Decimal::ZERO)
+                .then(|| self.current_wallet * self.cfg.max_position_frac),
+        ];
+        let mut effective_cap = self.cfg.max_position_notional_usdt;
+        if self.current_wallet > Decimal::ZERO {
+            for c in wallet_caps.into_iter().flatten() {
+                let c = c.round_dp(8);
+                effective_cap = Some(effective_cap.map_or(c, |e| e.min(c)));
+            }
+        }
         if let Some(cap) = effective_cap {
             // Scale-bounded: the position_notional accumulator path
             // re-rounds to 8 dp, but `intent.price × intent.size` can
@@ -1522,6 +1534,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -1951,6 +1964,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -1996,6 +2010,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 0,
             latency_jitter_ms: 0,
@@ -2056,6 +2071,7 @@ mod tests {
             },
             max_position_notional_usdt: None,
             leverage: rust_decimal::Decimal::ZERO,
+            max_position_frac: rust_decimal::Decimal::ZERO,
             silent_cancel_rate_per_min: 0.0,
             rng_seed: 42,
             latency_jitter_ms: 50,
