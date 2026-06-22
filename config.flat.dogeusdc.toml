@@ -1,0 +1,47 @@
+# FlatMM frozen-lattice on a single symbol: ETHUSDC.
+# Static price grid (seed once, never reprice) for high volume + near-flat
+# inventory at ~break-even, with minimal order-API pressure. Order size = 1% of
+# the full wallet balance.
+
+[account]
+env = "futures-mainnet"
+asset = "USDC"
+order_balance_pct = "0.1"     # order notional = 1% of wallet
+max_position_pct = "0"        # no hard cap
+auto_scale = false            # single bot orders FULL wallet × order_balance_pct
+leverage = 25
+inventory_boost_pct = "0"     # wave-only knob; off for FlatMM
+inventory_boost_add_pct = "0"
+bnb_refill_enabled = true     # this is the manager process; enable on exactly ONE process per account
+
+[account.bagger]
+# Bagger off by default. NOTE: frozen-lattice v1 has no break-even flush / skew,
+# so it relies on price mean-reversion to stay flat — in a sustained trend the
+# bag can grow unchecked. If you run this in trendy conditions, enable a loss cut:
+# loss_lock_pct = "3"   # flatten the bag on a −3% equity drop
+# exit_taker = false    # reduce-only maker exit
+
+[[bot]]
+symbol = "DOGEUSDC"
+strategy = "flat-mm"
+
+[bot.flat_mm]
+# notional omitted → account-derived (wallet × order_balance_pct).
+notional = 5
+inner_bps = "1"              # half-spread: innermost level 1bps off mid (dead-zone half-width)
+step_bps = "1"               # grid spacing between adjacent levels, in bps
+levels = 1                   # (reservation-mode only; ignored in frozen mode)
+reservation_skew_bps = "2"   # (reservation-mode only; ignored in frozen mode)
+imbalance_skew_bps = "0"
+flush_bps = "1"
+chase_boost_pct = "0"
+flush_frac = "1"
+underwater_reduce_frac = "1"
+
+# ── Frozen-lattice mode (the rate-limit fix) ─────────────────────────────────
+# Freeze a price grid at first mid and NEVER reprice: only add missing levels,
+# re-size drifted ones, and trim the farthest outskirts at the cap. Fills flip a
+# level to the opposite side automatically (buy below mid / sell above mid).
+frozen_lattice = true    # enable the static grid
+lattice_band_levels = 25 # grid levels per side around mid (seeds 25 buys + 25 sells)
+lattice_max_open = 180   # trim farthest outskirts once total resting hits this
