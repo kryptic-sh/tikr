@@ -2,7 +2,7 @@
 env = "futures-mainnet"
 asset = "USDC"
 order_balance_pct = "0"                # 0 = disable wallet-relative (compounding) sizing → use the strategy's fixed `notional` below. Bot COUNT still auto-scales.
-max_position_pct = "0"
+max_position_pct = "1000"              # 10x wallet hard cap on the bag (pct × current wallet, dynamic). GLFT self-limits to ~1.9x at a healthy wallet so this rarely binds there; it's the safety net for smaller wallets (bag/wallet ratio grows as wallet shrinks).
 auto_scale = true                      # true = active-bot count scales with wallet: floor(wallet / min_bot_capital_usdc), clamped to [1, top_n]
 min_bot_capital_usdc = "500"           # $500 wallet per bot → $500 = 1 bot, $2000 = 4 bots (capped at top_n)
 take_profit_pct = "0"                  # unrealized > 2% of wallet → rest a reduce-only maker limit to lock in HALF the bag; 0 = off
