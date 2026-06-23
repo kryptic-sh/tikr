@@ -156,6 +156,18 @@ pub struct WaveConfig {
     /// always (not gated on profit/avg), and composes multiplicatively with
     /// `size_mult` (use either or both). `1.0` (default) = uniform (no ramp).
     pub size_ramp: Decimal,
+
+    /// Active between-refill reduce repositioning (catch-bounce). When `true`,
+    /// the reduce side is re-slid to the last-fill-floored band on EVERY event
+    /// while holding inventory — not just on refills — so a bounce is picked off
+    /// sooner without waiting for a round-trip/side-empty refill. `false`
+    /// (default) repositions the reduce side only on refills.
+    ///
+    /// NOTE: the underlying last-fill anchor (the reduce side never reprices
+    /// below the last filled order on the accumulating side — the trend-bleed
+    /// fix) is ALWAYS ON regardless of this flag; see [`Wave::reduce_anchor_band`].
+    /// This flag only controls the extra mid-lattice responsiveness.
+    pub reduce_to_avg: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +212,14 @@ pub struct Wave {
     dyn_step_bps: u32,
     /// Event-time (ns) of the last refill, for the `force_refill_secs` valve.
     last_refill_ns: Option<u64>,
+    /// Most recent fill price on each side (from `ctx.recent_fills`). Used by
+    /// `reduce_to_avg` to anchor the reduce ladder at the LAST FILLED order on
+    /// the accumulating side — long → asks floored at `last_bid_fill`, short →
+    /// bids floored at `last_ask_fill` — so the reduce side never reprices below
+    /// what we just paid (the refill mid-anchor bleed). `None` until the first
+    /// fill on that side is seen.
+    last_bid_fill: Option<Decimal>,
+    last_ask_fill: Option<Decimal>,
 }
 
 impl Wave {
@@ -793,6 +813,75 @@ impl Wave {
             }
         }
     }
+
+    /// Last-fill-anchored reduce band — ALWAYS ON (a base-lattice correctness
+    /// fix, NOT gated by `reduce_to_avg`). `None` only when no position is held.
+    /// Returns the side being REDUCED plus a `levels`-wide window anchored at the
+    /// **last-fill-floored touch** `max(touch, last_fill)`, where `last_fill` is
+    /// the price of the most recent fill on the ACCUMULATING side (long →
+    /// `last_bid_fill`, short → `last_ask_fill`), falling back to `avg_entry`
+    /// until a fill is seen:
+    /// - Underwater (price the wrong side of the last fill) → the floor binds:
+    ///   the reduce ladder sits at the last fill and steps away, so a bounce
+    ///   back to it is picked off. Sells may be BELOW avg (a loss on the
+    ///   average) but never below the last buy — catching the bounce / partially
+    ///   closing while bounding the bleed. This fixes the base bug where the
+    ///   refill's mid-anchored window dragged exits below every fill.
+    /// - In profit (price already past the last fill) → the touch binds: the
+    ///   reduce ladder is the normal touch band.
+    ///
+    /// Anchored on EVERY placement while holding (refill + between). The
+    /// `reduce_to_avg` flag does NOT gate this — it only controls the EXTRA
+    /// between-refill active repositioning in `on_event`. `bid_touch` /
+    /// `ask_touch` are the already-computed touch bands.
+    fn reduce_anchor_band(
+        &self,
+        ctx: &StrategyContext<'_>,
+        bid_touch: WindowRange,
+        ask_touch: WindowRange,
+    ) -> Option<(Side, WindowRange)> {
+        let _step = self.lattice_step?;
+        let pos = ctx.position.size.0;
+        let avg = ctx.position.avg_entry.0;
+        if pos == Decimal::ZERO {
+            return None;
+        }
+        let levels = self.config.levels.max(1) as i64;
+        if pos > Decimal::ZERO {
+            // Long reduce = asks. Floor at the last BUY (fallback avg). Higher
+            // ask k = higher price → anchor is the MAX k of (touch, floor).
+            let floor_px = self.last_bid_fill.unwrap_or(avg);
+            if floor_px <= Decimal::ZERO {
+                return None;
+            }
+            let floor_k = self.ask_k_at_or_above(floor_px)?;
+            let low_k = ask_touch.low_k.max(floor_k);
+            Some((
+                Side::Ask,
+                WindowRange {
+                    low_k,
+                    high_k: low_k + levels - 1,
+                },
+            ))
+        } else {
+            // Short reduce = bids. Floor at the last SELL (fallback avg). Higher
+            // bid k = LOWER price → "never cover above the last sell" is the
+            // MAX k of (touch, floor).
+            let floor_px = self.last_ask_fill.unwrap_or(avg);
+            if floor_px <= Decimal::ZERO {
+                return None;
+            }
+            let floor_k = self.bid_k_at_or_below(floor_px)?;
+            let low_k = bid_touch.low_k.max(floor_k);
+            Some((
+                Side::Bid,
+                WindowRange {
+                    low_k,
+                    high_k: low_k + levels - 1,
+                },
+            ))
+        }
+    }
 }
 
 impl Strategy for Wave {
@@ -819,6 +908,8 @@ impl Strategy for Wave {
             inner_dirty: false,
             dyn_step_bps,
             last_refill_ns: None,
+            last_bid_fill: None,
+            last_ask_fill: None,
         }
     }
 
@@ -845,6 +936,16 @@ impl Strategy for Wave {
         self.emitted_this_event_bid.clear();
         self.emitted_this_event_ask.clear();
         let mut actions: Vec<Action> = Vec::new();
+
+        // Track the most-recent fill price per side (for the reduce_to_avg
+        // last-fill anchor). recent_fills is in chronological order, so the last
+        // one on each side wins.
+        for f in ctx.recent_fills {
+            match f.side {
+                Side::Bid => self.last_bid_fill = Some(f.price.0),
+                Side::Ask => self.last_ask_fill = Some(f.price.0),
+            }
+        }
 
         let best_bid = ctx.latest_book.bids.first().map(|l| l.price);
         let best_ask = ctx.latest_book.asks.first().map(|l| l.price);
@@ -954,7 +1055,21 @@ impl Strategy for Wave {
             })
         });
 
-        if let (Some(bb), Some(ab)) = (bid_band, ask_band) {
+        if let (Some(bb_touch), Some(ab_touch)) = (bid_band, ask_band) {
+            // While holding inventory, the REDUCE side is anchored at the
+            // last-fill-floored touch (never repriced below the last fill on the
+            // accumulating side). ALWAYS ON — applied on EVERY placement, refill
+            // included — because the refill's mid-anchored band is exactly what
+            // dragged the exits below cost (the base bleed bug). The ADD side
+            // keeps tracking the touch (keep averaging in; that lowers the floor).
+            let reduce = self.reduce_anchor_band(ctx, bb_touch, ab_touch);
+            let (bb, ab) = match reduce {
+                Some((Side::Bid, rb)) => (rb, ab_touch),
+                Some((Side::Ask, rb)) => (bb_touch, rb),
+                _ => (bb_touch, ab_touch),
+            };
+            let reduce_side = reduce.map(|(s, _)| s);
+
             let bid_drained = self.band_missing(ctx, Side::Bid, bb);
             let ask_drained = self.band_missing(ctx, Side::Ask, ab);
             let thr = self.config.round_trips.max(1);
@@ -970,6 +1085,24 @@ impl Strategy for Wave {
                     ctx.now.0.saturating_sub(last)
                         >= self.config.force_refill_secs.saturating_mul(1_000_000_000)
                 });
+
+            // Per-side prune: the reduce side FULL-prunes (relocate cleanly to the
+            // last-fill-anchored band — cancels both below-last-fill stragglers
+            // and the far tail); the adding side keeps its TRAILING-tail prune
+            // (never slid out from under incoming price). Emit always precedes
+            // prune below → place-before-cancel.
+            let prune_side = |w: &mut Wave,
+                              ctx: &StrategyContext<'_>,
+                              side: Side,
+                              band: WindowRange,
+                              actions: &mut Vec<Action>| {
+                if reduce_side == Some(side) {
+                    w.prune_full_window(ctx, side, band, actions);
+                } else {
+                    w.prune_trailing_tail(ctx, side, band, actions);
+                }
+            };
+
             // After a relattice the stale orders are already queued for cancel,
             // so seed the fresh grid directly and skip prune (avoids a redundant
             // double-cancel of those same ids).
@@ -978,24 +1111,32 @@ impl Strategy for Wave {
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
                 self.last_refill_ns = Some(ctx.now.0);
             } else if inner_dirty {
-                // Auto-inner changed → deliberate reposition to the new offset:
-                // re-emit and FULL-prune (near-touch orders inside the new dead
-                // zone must move).
+                // Auto-inner changed → deliberate reposition to the new offset.
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
                 self.prune_full_window(ctx, Side::Bid, bb, &mut actions);
                 self.prune_full_window(ctx, Side::Ask, ab, &mut actions);
                 self.last_refill_ns = Some(ctx.now.0);
             } else if round_trip || side_empty || force_refill {
-                // Price-tracking refill: re-emit empty slots and prune only the
-                // TRAILING tail. Orders price is moving INTO are left to fill —
-                // never slid out from under an incoming price. `force_refill`
-                // adds the slow-market valve on top of the round-trip triggers.
+                // Price-tracking refill. Emit then prune (place-before-cancel).
                 self.emit_window_slots(ctx, Side::Bid, bb, &mut actions);
                 self.emit_window_slots(ctx, Side::Ask, ab, &mut actions);
-                self.prune_trailing_tail(ctx, Side::Bid, bb, &mut actions);
-                self.prune_trailing_tail(ctx, Side::Ask, ab, &mut actions);
+                prune_side(self, ctx, Side::Bid, bb, &mut actions);
+                prune_side(self, ctx, Side::Ask, ab, &mut actions);
                 self.last_refill_ns = Some(ctx.now.0);
+            } else if self.config.reduce_to_avg
+                && let Some(side) = reduce_side
+            {
+                // EXTRA (opt-in via `reduce_to_avg`): between refills, actively
+                // re-slide the resting reduce orders to the last-fill-floored band
+                // as the last fill moves — picking off a bounce sooner without
+                // waiting for a refill. The always-on anchor already handles
+                // refill placement; this just makes it responsive mid-lattice.
+                // Place the moved/missing slots FIRST, then cancel the out-of-band
+                // ones (place-before-cancel — the side is never momentarily bare).
+                let band = if side == Side::Bid { bb } else { ab };
+                self.emit_window_slots(ctx, side, band, &mut actions);
+                self.prune_full_window(ctx, side, band, &mut actions);
             }
         }
 
@@ -1018,7 +1159,8 @@ impl Strategy for Wave {
 mod tests {
     use super::*;
     use tikr_core::{
-        Asset, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp, VenueId,
+        Asset, Fill, Level, MarketKind, Notional, Position, SignedSize, Snapshot, Timestamp,
+        VenueId,
     };
     use tikr_venue::QuoteId;
 
@@ -1056,6 +1198,7 @@ mod tests {
             // Uniform sizing by default; the size-curve has its own test.
             size_mult: Decimal::ONE,
             size_ramp: Decimal::ONE,
+            reduce_to_avg: false,
         }
     }
 
@@ -1910,6 +2053,233 @@ mod tests {
             Decimal::from(5)
         );
         assert_eq!(w.reduce_size_boost(-long, mark, Side::Ask), Decimal::ONE);
+    }
+
+    /// Build a wave with the lattice frozen at bid 99.0 / ask 99.1, returning
+    /// the strategy plus the seeded resting orders. levels=5, step≈0.1,
+    /// steps_inner=2. `reduce_to_avg` gates ONLY the between-refill active
+    /// repositioning; the last-fill anchor is always on regardless.
+    fn seed_wave(reduce_to_avg: bool) -> (Wave, Symbol, Vec<(QuoteId, QuoteIntent)>) {
+        let mut c = cfg();
+        c.levels = 5;
+        c.steps_bps = 10;
+        c.steps_inner = 2;
+        c.auto_inner = false;
+        c.auto_step = false;
+        c.round_trips = 5;
+        c.reduce_to_avg = reduce_to_avg;
+        let sm = sym();
+        let s0 = snap(Decimal::from(99), Decimal::new(991, 1)); // 99.0 / 99.1
+        let mut w = Wave::new(c);
+        let seeded = w.on_event(
+            &ctx(&sm, &s0, &pos_flat(), &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
+        let open: Vec<(QuoteId, QuoteIntent)> = seeded
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) => Some((QuoteId::new(), q.clone())),
+                _ => None,
+            })
+            .collect();
+        (w, sm, open)
+    }
+
+    /// Between refills (lattice valid: nothing drained), a long with avg ABOVE
+    /// the frozen mid gets profitable catch-bounce asks placed at `avg + gap`,
+    /// and the far out-of-band asks are cancelled — but only AFTER the new
+    /// orders are emitted (place-before-cancel). Bids (adding side) untouched.
+    #[test]
+    fn reduce_to_avg_pulls_in_between_refills_long() {
+        let (mut w, sm, mut open) = seed_wave(true);
+        // Inject two far asks above where the avg-anchored target will reach
+        // (target tops out at 100.3); these must be cancelled by the pull-in.
+        let far_ask = |px: Decimal| QuoteIntent {
+            symbol: sym(),
+            side: Side::Ask,
+            price: Price(px),
+            size: Size(Decimal::ONE),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        };
+        open.push((QuoteId::new(), far_ask(Decimal::from(101))));
+        open.push((QuoteId::new(), far_ask(Decimal::from(102))));
+
+        // Same book → nothing drains → no refill. Long 0.5 @ avg 99.7 (avg+gap
+        // = 99.9, above the 99.05 mid).
+        let s = snap(Decimal::from(99), Decimal::new(991, 1));
+        let long = Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::new(5, 1)),
+            avg_entry: Price(Decimal::new(997, 1)), // 99.7
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let acts = w.on_event(
+            &ctx(&sm, &s, &long, &open),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+
+        let ask_quotes: Vec<Decimal> = acts
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !ask_quotes.is_empty(),
+            "feature must place catch-bounce asks between refills"
+        );
+        let min_ask = ask_quotes.iter().copied().min().unwrap();
+        assert!(
+            min_ask >= Decimal::new(997, 1),
+            "placed asks must be profitable (>= avg 99.7), got {min_ask}"
+        );
+        // No bid-side actions — adding side is left alone.
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::Quote(q) if q.side == Side::Bid)),
+            "feature must not touch the adding (bid) side"
+        );
+        // Place-before-cancel: every Quote precedes every Cancel.
+        let last_quote = acts.iter().rposition(|a| matches!(a, Action::Quote(_)));
+        let first_cancel = acts.iter().position(|a| matches!(a, Action::Cancel(_)));
+        assert!(
+            first_cancel.is_some(),
+            "far out-of-band asks must be cancelled"
+        );
+        if let (Some(lq), Some(fc)) = (last_quote, first_cancel) {
+            assert!(
+                lq < fc,
+                "replacements must be emitted before any cancel (place-before-cancel)"
+            );
+        }
+    }
+
+    /// The reduce ladder is floored at the LAST FILLED buy, not avg: a recent
+    /// bid fill at 99.5 (below avg 99.7) anchors the asks at 99.5 — so sells
+    /// BELOW avg but ABOVE the last buy are allowed to rest (catch the bounce /
+    /// partial close), while nothing reprices below 99.5 (the bleed floor).
+    #[test]
+    fn reduce_anchors_at_last_filled_buy_not_avg() {
+        let (mut w, sm, seeded) = seed_wave(false);
+        // Bids-only open so the full reduce ask band is (re)emitted and its
+        // shallowest slot is observable (rather than partly already-resting).
+        let open: Vec<(QuoteId, QuoteIntent)> = seeded
+            .into_iter()
+            .filter(|(_, q)| q.side == Side::Bid)
+            .collect();
+        let s = snap(Decimal::from(99), Decimal::new(991, 1)); // touch 99.0 / 99.1
+        let long = Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::new(5, 1)),
+            avg_entry: Price(Decimal::new(997, 1)), // avg 99.7
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        // Most recent BUY filled at 99.5 (below avg) → this is the floor.
+        let fills = [Fill {
+            quote_id: QuoteId::new(),
+            price: Price(Decimal::new(995, 1)), // 99.5
+            size: Size(Decimal::ONE),
+            fee_asset: Asset::new("USDC"),
+            fee_amount: Decimal::ZERO,
+            fee_quote: Notional(Decimal::ZERO),
+            side: Side::Bid,
+            ts: Timestamp(2),
+            is_full: true,
+            trade_id: None,
+        }];
+        let cx = StrategyContext {
+            symbol: &sm,
+            now: Timestamp(2),
+            position: &long,
+            recent_fills: &fills,
+            latest_book: &s,
+            open_quotes: &open,
+            recent_liqs: &[],
+        };
+        let acts = w.on_event(
+            &cx,
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let min_ask = acts
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .min()
+            .expect("must place reduce asks anchored at the last buy");
+        assert_eq!(
+            min_ask,
+            Decimal::new(995, 1),
+            "asks must anchor at the last buy 99.5 (not avg 99.7), allowing \
+             below-avg-above-last-buy fills; got {min_ask}"
+        );
+        // A sell at 99.6 — below avg 99.7 but above the last buy 99.5 — is
+        // allowed to rest (catch the bounce / partial close).
+        assert!(
+            acts.iter().any(|a| matches!(a,
+                Action::Quote(q) if q.side == Side::Ask && q.price.0 == Decimal::new(996, 1))),
+            "a below-avg-above-last-buy sell (99.6) must rest"
+        );
+    }
+
+    /// The cost floor holds during a REBUILD too: on a side-empty refill with
+    /// the window slid below cost, the reduce (ask) side never re-emits below
+    /// `avg_entry` — the below-cost slots are skipped (that's the trend-bleed
+    /// fix). The pull-in (between-refill repositioning) is what's suppressed on
+    /// a refill; the floor is always on.
+    #[test]
+    fn cost_floor_blocks_below_cost_reduce_on_refill() {
+        let (mut w, sm, open) = seed_wave(false);
+        // Keep only the resting BIDS → the ask side reads fully empty → refill.
+        let bids_only: Vec<(QuoteId, QuoteIntent)> = open
+            .into_iter()
+            .filter(|(_, q)| q.side == Side::Bid)
+            .collect();
+        let s = snap(Decimal::from(99), Decimal::new(991, 1)); // touch 99.0 / 99.1
+        // avg 99.5 sits inside the refill ask band (99.3,99.4 | 99.5,99.6,99.7):
+        // 99.3/99.4 are below cost and MUST be skipped; 99.5+ may rest.
+        let long = Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::new(5, 1)),
+            avg_entry: Price(Decimal::new(995, 1)), // 99.5
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let acts = w.on_event(
+            &ctx(&sm, &s, &long, &bids_only),
+            &MarketEvent::BookUpdate {
+                snapshot: s.clone(),
+            },
+        );
+        let asks: Vec<Decimal> = acts
+            .iter()
+            .filter_map(|a| match a {
+                Action::Quote(q) if q.side == Side::Ask => Some(q.price.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            asks.iter().all(|&p| p >= Decimal::new(995, 1)),
+            "no reduce ask may be placed below cost 99.5, got {asks:?}"
+        );
+        // The reduce band is ANCHORED at the floor (99.5, the avg fallback when
+        // no fills are tracked), not at the 99.1 touch — so the shallowest ask
+        // sits at 99.5, never down at the mid (that's the bleed fix).
+        let min_ask = asks.iter().copied().min().unwrap();
+        assert_eq!(
+            min_ask,
+            Decimal::new(995, 1),
+            "reduce band must anchor at the cost floor 99.5, not the 99.1 touch"
+        );
     }
 
     #[test]

@@ -1004,6 +1004,12 @@ struct Args {
     /// `--wave-size-mult`; composes with it. `1.0` (default) = uniform.
     #[arg(long, default_value = "1.0")]
     wave_size_ramp: String,
+    /// Wave: active between-refill reduce repositioning (catch-bounce). When
+    /// `true`, the reduce side is re-slid to the last-fill-floored band on every
+    /// event while holding (not just refills). `false` (default) repositions only
+    /// on refills. The last-fill anti-bleed anchor is ALWAYS on regardless.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    wave_reduce_to_avg: bool,
 
     // ─── Bagger (inventory-risk flatten) ──────────────────────────────────
     /// Bagger preset(s), composable with `+`: `fixed` | `ratchet` | `dual` |
@@ -1533,6 +1539,7 @@ fn emit_strategy_params(out: &mut Vec<String>, kind: &str, params: &toml::Table)
             emit(out, "--wave-refill-threshold", "round_trips");
             emit(out, "--wave-size-mult", "size_mult");
             emit(out, "--wave-size-ramp", "size_ramp");
+            emit(out, "--wave-reduce-to-avg", "reduce_to_avg");
             emit(out, "--wave-auto-inner", "auto_inner");
             emit(out, "--wave-auto-step", "auto_step");
             emit(out, "--wave-force-refill-secs", "force_refill_secs");
@@ -3217,6 +3224,7 @@ async fn run_sweep_collect(
                                 relattice_drift_pct: wave_relattice_drift,
                                 size_mult: wave_size_mult,
                                 size_ramp: wave_size_ramp,
+                                reduce_to_avg: args.wave_reduce_to_avg,
                             }),
                             fees,
                             skim_cfg,

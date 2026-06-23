@@ -843,6 +843,7 @@ fn spawn_one_bot(
             relattice_drift_pct,
             size_mult,
             size_ramp,
+            reduce_to_avg,
             notional,
         } => {
             let bc = BotConfig {
@@ -862,6 +863,7 @@ fn spawn_one_bot(
                     relattice_drift_pct: *relattice_drift_pct,
                     size_mult: *size_mult,
                     size_ramp: *size_ramp,
+                    reduce_to_avg: *reduce_to_avg,
                 }),
                 flat_mm: None,
                 tide: None,

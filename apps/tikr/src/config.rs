@@ -586,6 +586,16 @@ pub struct WaveParams {
     /// e.g. `2.0` → outermost order is 2× the innermost.
     #[serde(default = "wave_default_size_mult")]
     pub size_ramp: Decimal,
+
+    /// Active between-refill reduce repositioning (catch-bounce). When `true`,
+    /// the reduce side is re-slid to the last-fill-floored band on every event
+    /// while holding inventory (not just on refills), picking off a bounce
+    /// sooner. `false` (default) repositions only on refills. NOTE: the
+    /// underlying last-fill anchor — the reduce side never reprices below the
+    /// last filled order, the trend-bleed fix — is ALWAYS ON regardless of this
+    /// flag; this only controls the extra mid-lattice responsiveness.
+    #[serde(default)]
+    pub reduce_to_avg: bool,
 }
 
 fn wave_default_auto_inner() -> bool {
@@ -1089,6 +1099,10 @@ pub enum RampageStrategy {
         size_mult: Decimal,
         #[serde(default = "wave_default_size_mult")]
         size_ramp: Decimal,
+        /// Active between-refill reduce repositioning; see `WaveParams::reduce_to_avg`.
+        /// (The last-fill anti-bleed anchor is always on regardless.)
+        #[serde(default)]
+        reduce_to_avg: bool,
         /// Fixed per-order notional. `None` (default) = account-derived from
         /// `order_balance_pct`. Set this (and `order_balance_pct = 0`) for a
         /// FIXED order size, avoiding the per-balance compounding.

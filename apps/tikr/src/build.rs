@@ -585,6 +585,7 @@ fn build_wave(
         relattice_drift_pct: wave.relattice_drift_pct,
         size_mult: wave.size_mult,
         size_ramp: wave.size_ramp,
+        reduce_to_avg: wave.reduce_to_avg,
     }))
 }
 
