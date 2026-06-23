@@ -1563,8 +1563,18 @@ fn draw_chart(
             )
         })
         .unwrap_or_default();
-    // Coin price precision (venue tick), so chart prices match Binance.
-    let price_dp = active.and_then(|v| v.price_decimals);
+    // Coin price precision (venue tick), so chart prices match Binance. Until
+    // exchangeInfo populates the venue tick (`price_decimals` is `None` for a
+    // freshly-rotated-in symbol), infer the precision from our own tick-aligned
+    // resting order prices — otherwise the BUY/SELL/AVG/LIQ labels fall back to
+    // raw full-scale Decimal printing (too many decimal places).
+    let price_dp = active.and_then(|v| v.price_decimals).or_else(|| {
+        [best_buy.0, best_sell.0]
+            .into_iter()
+            .filter(|p| *p > Decimal::ZERO)
+            .map(|p| p.scale().min(8))
+            .max()
+    });
 
     // Y bounds over visible candles + in-window fills + our resting orders, so
     // the order lines are always on-screen. 2% padding.
@@ -2407,7 +2417,11 @@ fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {
 fn fmt_price(price: rust_decimal::Decimal, decimals: Option<u32>) -> String {
     match decimals {
         Some(n) => format!("{:.*}", n as usize, price),
-        None => price.normalize().to_string(),
+        // No known precision: strip trailing zeros but CAP the scale so a
+        // high-precision value (e.g. an API avg-entry / liquidation price, which
+        // isn't tick-aligned) can't print 15+ decimal places. 8 is the max real
+        // tick precision on Binance futures.
+        None => price.round_dp(8).normalize().to_string(),
     }
 }
 
@@ -2483,5 +2497,37 @@ fn format_ago(s: u64) -> String {
         format!("{}m{:02}s", s / 60, s % 60)
     } else {
         format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_price;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    #[test]
+    fn fmt_price_clamps_to_known_decimals() {
+        let p = Decimal::from_str("99.123456789").unwrap();
+        assert_eq!(fmt_price(p, Some(2)), "99.12");
+        assert_eq!(fmt_price(p, Some(4)), "99.1234"); // Decimal Display truncates
+    }
+
+    #[test]
+    fn fmt_price_unknown_decimals_caps_scale_and_strips_zeros() {
+        // High-precision (non-tick-aligned) value: must NOT print 15+ places.
+        let liq = Decimal::from_str("0.5123456789012345").unwrap();
+        let s = fmt_price(liq, None);
+        let frac = s.split('.').nth(1).map_or(0, |f| f.len());
+        assert!(frac <= 8, "unknown-precision price capped at 8 dp, got {s}");
+        // Tick-aligned value keeps its natural (trimmed) precision.
+        assert_eq!(
+            fmt_price(Decimal::from_str("100.50").unwrap(), None),
+            "100.5"
+        );
+        assert_eq!(
+            fmt_price(Decimal::from_str("0.5123").unwrap(), None),
+            "0.5123"
+        );
     }
 }
