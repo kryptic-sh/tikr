@@ -489,6 +489,12 @@ pub struct BotConfig {
     /// FlatMm params (only honored when `strategy = "flat-mm"`).
     #[serde(default)]
     pub flat_mm: Option<FlatMmParams>,
+    /// Avellaneda-Stoikov params (only honored when `strategy = "avellaneda-stoikov"`).
+    #[serde(default)]
+    pub avellaneda_stoikov: Option<AsParams>,
+    /// GLFT params (only honored when `strategy = "glft"`).
+    #[serde(default)]
+    pub glft: Option<GlftParams>,
     /// Mantis params (only honored when `strategy = "mantis"`).
     #[serde(default)]
     pub mantis: Option<MantisParams>,
@@ -632,6 +638,102 @@ fn wave_default_round_trips() -> u32 {
 
 fn wave_default_levels() -> u32 {
     12
+}
+
+fn as_default_gamma() -> Decimal {
+    Decimal::new(1, 1) // 0.1
+}
+fn as_default_spread_bps() -> u32 {
+    5
+}
+fn as_default_horizon_sec() -> u64 {
+    3600
+}
+fn as_default_min_requote_ms() -> u64 {
+    1000
+}
+fn as_default_level_step_bps() -> u32 {
+    1
+}
+fn as_default_ewma_half_life() -> f64 {
+    60.0
+}
+fn as_default_ewma_initial_var() -> Decimal {
+    Decimal::new(1, 6) // 0.000001
+}
+
+/// Avellaneda-Stoikov inventory-skew market maker. Inventory pushes the
+/// reservation price away from the loaded side so the bag mean-reverts to flat.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsParams {
+    /// Fixed per-quote notional. `None` → account-derived (wallet ×
+    /// order_balance_pct), pushed via the balance poller.
+    pub notional: Option<Decimal>,
+    /// Risk aversion γ. Higher → stronger inventory mean-reversion.
+    pub gamma: Decimal,
+    /// Half-spread in bps (per side).
+    pub base_spread_bps: u32,
+    /// Pinned horizon T−t in seconds (inventory-urgency knob; not wall-clock).
+    pub horizon_sec: u64,
+    /// Minimum ms between full requotes.
+    pub min_requote_ms: u64,
+    /// Mid-drift early-requote threshold, in bps.
+    pub level_step_bps: u32,
+    /// Volatility EWMA half-life, seconds.
+    pub ewma_half_life_sec: f64,
+    /// Volatility EWMA seed variance.
+    pub ewma_initial_var: Decimal,
+}
+
+impl Default for AsParams {
+    fn default() -> Self {
+        Self {
+            notional: None,
+            gamma: as_default_gamma(),
+            base_spread_bps: as_default_spread_bps(),
+            horizon_sec: as_default_horizon_sec(),
+            min_requote_ms: as_default_min_requote_ms(),
+            level_step_bps: as_default_level_step_bps(),
+            ewma_half_life_sec: as_default_ewma_half_life(),
+            ewma_initial_var: as_default_ewma_initial_var(),
+        }
+    }
+}
+
+/// GLFT inventory-skew market maker. Same inventory-skew idea as A-S without the
+/// finite-horizon multiplier (infinite-horizon reservation price).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlftParams {
+    /// Fixed per-quote notional. `None` → account-derived.
+    pub notional: Option<Decimal>,
+    /// Risk aversion γ.
+    pub gamma: Decimal,
+    /// Half-spread in bps (per side).
+    pub base_spread_bps: u32,
+    /// Minimum ms between full requotes.
+    pub min_requote_ms: u64,
+    /// Mid-drift early-requote threshold, in bps.
+    pub level_step_bps: u32,
+    /// Volatility EWMA half-life, seconds.
+    pub ewma_half_life_sec: f64,
+    /// Volatility EWMA seed variance.
+    pub ewma_initial_var: Decimal,
+}
+
+impl Default for GlftParams {
+    fn default() -> Self {
+        Self {
+            notional: None,
+            gamma: as_default_gamma(),
+            base_spread_bps: as_default_spread_bps(),
+            min_requote_ms: as_default_min_requote_ms(),
+            level_step_bps: as_default_level_step_bps(),
+            ewma_half_life_sec: as_default_ewma_half_life(),
+            ewma_initial_var: as_default_ewma_initial_var(),
+        }
+    }
 }
 
 /// FlatMm — flat-inventory 0-fee market maker.
@@ -1062,6 +1164,8 @@ impl RampageStrategy {
     pub fn strategy_notional(&self) -> Option<Decimal> {
         match self {
             RampageStrategy::Wave { notional, .. } => *notional,
+            RampageStrategy::AvellanedaStoikov { notional, .. } => *notional,
+            RampageStrategy::Glft { notional, .. } => *notional,
             _ => None,
         }
     }
@@ -1163,6 +1267,42 @@ pub enum RampageStrategy {
     Template {
         /// Strategy name to match against a `[[bot]]` template's `strategy`.
         name: String,
+    },
+    /// Spawn an Avellaneda-Stoikov (inventory-skew) bot. `kind = "avellaneda_stoikov"`.
+    AvellanedaStoikov {
+        #[serde(default)]
+        notional: Option<Decimal>,
+        #[serde(default = "as_default_gamma")]
+        gamma: Decimal,
+        #[serde(default = "as_default_spread_bps")]
+        base_spread_bps: u32,
+        #[serde(default = "as_default_horizon_sec")]
+        horizon_sec: u64,
+        #[serde(default = "as_default_min_requote_ms")]
+        min_requote_ms: u64,
+        #[serde(default = "as_default_level_step_bps")]
+        level_step_bps: u32,
+        #[serde(default = "as_default_ewma_half_life")]
+        ewma_half_life_sec: f64,
+        #[serde(default = "as_default_ewma_initial_var")]
+        ewma_initial_var: Decimal,
+    },
+    /// Spawn a GLFT (inventory-skew) bot. `kind = "glft"`.
+    Glft {
+        #[serde(default)]
+        notional: Option<Decimal>,
+        #[serde(default = "as_default_gamma")]
+        gamma: Decimal,
+        #[serde(default = "as_default_spread_bps")]
+        base_spread_bps: u32,
+        #[serde(default = "as_default_min_requote_ms")]
+        min_requote_ms: u64,
+        #[serde(default = "as_default_level_step_bps")]
+        level_step_bps: u32,
+        #[serde(default = "as_default_ewma_half_life")]
+        ewma_half_life_sec: f64,
+        #[serde(default = "as_default_ewma_initial_var")]
+        ewma_initial_var: Decimal,
     },
 }
 

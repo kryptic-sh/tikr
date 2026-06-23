@@ -54,8 +54,17 @@ pub struct AvellanedaStoikovConfig {
     /// Pinned horizon T-t in seconds. Default 3600 (1 hour). NOT a wall-clock
     /// countdown — controls how aggressively the strategy pushes inventory to zero.
     pub horizon_sec: u64,
-    /// Size placed at each quote level (both bid and ask).
+    /// Size placed at each quote level (both bid and ask). Used as the fixed
+    /// fallback when `notional_per_quote` is `None`.
     pub size_per_quote: Size,
+    /// When `Some`, each quote is sized to this USDT notional instead of the
+    /// fixed `size_per_quote`: `size = floor(notional / price, step_size)`. Lets
+    /// the account-level notional / live balance poller drive sizing like the
+    /// other strategies (see `on_notional_updated`). `None` → fixed size.
+    pub notional_per_quote: Option<Decimal>,
+    /// Lot step for notional-based sizing. Ignored when `notional_per_quote`
+    /// is `None`.
+    pub step_size: Decimal,
     /// Minimum time between full requotes, in milliseconds.
     pub min_requote_interval_ms: u64,
     /// Mid-drift threshold for early requote: `|new_mid - last_mid| / last_mid > (level_step_bps/2) / 10_000`.
@@ -81,6 +90,22 @@ impl AvellanedaStoikov {
     /// Returns the count of computed-return samples seen so far.
     pub fn samples_seen(&self) -> u32 {
         self.estimator.samples_seen()
+    }
+
+    /// Per-quote size: `notional_per_quote / price` lot-floored to `step_size`
+    /// when notional sizing is on, else the fixed `size_per_quote`.
+    fn quote_size(&self, price: Decimal) -> Size {
+        match self.config.notional_per_quote {
+            Some(n)
+                if n > Decimal::ZERO
+                    && price > Decimal::ZERO
+                    && self.config.step_size > Decimal::ZERO =>
+            {
+                let lots = (n / price / self.config.step_size).floor();
+                Size((lots * self.config.step_size).max(self.config.step_size))
+            }
+            _ => self.config.size_per_quote,
+        }
     }
 }
 
@@ -132,21 +157,34 @@ impl Strategy for AvellanedaStoikov {
         let delta = mid.0 * Decimal::from(self.config.base_spread_bps) / Decimal::from(10_000);
         self.last_requote_ts = Some(snapshot.ts);
         self.last_quoted_mid = Some(mid);
+        let bid_px = r - delta;
+        let ask_px = r + delta;
         vec![
             Action::CancelAll,
             Action::Quote(make_post_only_intent(
                 ctx.symbol,
                 Side::Bid,
-                Price(r - delta),
-                self.config.size_per_quote,
+                Price(bid_px),
+                self.quote_size(bid_px),
             )),
             Action::Quote(make_post_only_intent(
                 ctx.symbol,
                 Side::Ask,
-                Price(r + delta),
-                self.config.size_per_quote,
+                Price(ask_px),
+                self.quote_size(ask_px),
             )),
         ]
+    }
+
+    fn on_notional_updated(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        notional_per_order: Decimal,
+    ) -> Vec<Action> {
+        if notional_per_order > Decimal::ZERO {
+            self.config.notional_per_quote = Some(notional_per_order);
+        }
+        Vec::new()
     }
 }
 
@@ -217,6 +255,8 @@ mod tests {
             base_spread_bps: 5,
             horizon_sec: 3600,
             size_per_quote: Size(Decimal::from(1)),
+            notional_per_quote: None,
+            step_size: Decimal::ZERO,
             min_requote_interval_ms: 1000,
             level_step_bps: 10,
             volatility: EwmaConfig {

@@ -81,6 +81,8 @@ fn avellaneda_stoikov_config() -> AvellanedaStoikovConfig {
         base_spread_bps: 30,
         horizon_sec: 3600,
         size_per_quote: Size(Decimal::from(1)),
+        notional_per_quote: None,
+        step_size: Decimal::ZERO,
         min_requote_interval_ms: 100_000,
         level_step_bps: 10,
         volatility: EwmaConfig {
@@ -96,6 +98,8 @@ fn glft_config() -> GlftConfig {
         // 20 bps → bid = 100.5*(1-0.002) ≈ 99.9 at mid=100.5; different from A-S (30 bps)
         base_spread_bps: 20,
         size_per_quote: Size(Decimal::from(1)),
+        notional_per_quote: None,
+        step_size: Decimal::ZERO,
         min_requote_interval_ms: 100_000,
         level_step_bps: 10,
         volatility: EwmaConfig {

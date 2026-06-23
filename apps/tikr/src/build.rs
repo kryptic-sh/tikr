@@ -10,9 +10,10 @@ use tikr_binance::BinanceClient;
 use tikr_core::Symbol;
 use tikr_paper::{BotSpec, InventoryBoostConfig, RunnerConfig, StrategyChoice};
 use tikr_strategy::{
-    FlatMmConfig, HydraConfig, JokerConfig, LadderReentryConfig, LayeredGridConfig, LiqFadeConfig,
-    MantisConfig, MicroMeanReversionConfig, RsiMrConfig, SimpleGapConfig, SpreadScalpConfig,
-    StaticGridConfig, StranglerConfig, TideConfig, VolleyConfig, WaveConfig,
+    AvellanedaStoikovConfig, EwmaConfig, FlatMmConfig, GlftConfig, HydraConfig, JokerConfig,
+    LadderReentryConfig, LayeredGridConfig, LiqFadeConfig, MantisConfig, MicroMeanReversionConfig,
+    RsiMrConfig, SimpleGapConfig, SpreadScalpConfig, StaticGridConfig, StranglerConfig, TideConfig,
+    VolleyConfig, WaveConfig,
 };
 use tokio::sync::watch;
 
@@ -87,12 +88,14 @@ pub fn to_spec(
         "rsi-mr" | "rsimr" => build_rsi_mr(cfg, &symbol, venue, default_notional)?,
         "wave" | "wv" => build_wave(cfg, &symbol, venue, default_notional)?,
         "flat-mm" | "fm" => build_flat_mm(cfg, &symbol, venue, default_notional)?,
+        "avellaneda-stoikov" | "as" => build_as(cfg, &symbol, venue, default_notional)?,
+        "glft" => build_glft(cfg, &symbol, venue, default_notional)?,
         "mantis" | "mn" => build_mantis(cfg, &symbol, venue, default_notional)?,
         "volley" | "vl" => build_volley(cfg, &symbol, venue, default_notional)?,
         "strangler" | "st" => build_strangler(cfg, &symbol, venue, default_notional)?,
         other => {
             return Err(anyhow::anyhow!(
-                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, flat-mm, mantis, volley, strangler)"
+                "unknown strategy '{other}' (supported: static-grid, layered-grid, ladder-reentry, simple-gap, micro-mean-reversion, spread-scalp, liq-fade, hydra, tide, joker, rsi-mr, wave, flat-mm, avellaneda-stoikov, glft, mantis, volley, strangler)"
             ));
         }
     };
@@ -215,6 +218,8 @@ fn strategy_notional(cfg: &BotConfig) -> Result<Option<Decimal>> {
         "rsi-mr" | "rsimr" => Ok(cfg.rsi_mr.as_ref().and_then(|p| p.notional)),
         "wave" | "wv" => Ok(cfg.wave.as_ref().and_then(|p| p.notional)),
         "flat-mm" | "fm" => Ok(cfg.flat_mm.as_ref().and_then(|p| p.notional)),
+        "avellaneda-stoikov" | "as" => Ok(cfg.avellaneda_stoikov.as_ref().and_then(|p| p.notional)),
+        "glft" => Ok(cfg.glft.as_ref().and_then(|p| p.notional)),
         "mantis" | "mn" => Ok(cfg.mantis.as_ref().and_then(|p| p.notional)),
         "volley" | "vl" => Ok(cfg.volley.as_ref().and_then(|p| p.notional)),
         "strangler" | "st" => Ok(cfg.strangler.as_ref().and_then(|p| p.notional)),
@@ -623,6 +628,57 @@ fn build_flat_mm(
         frozen_lattice: flat.frozen_lattice,
         lattice_band_levels: flat.lattice_band_levels,
         lattice_max_open: flat.lattice_max_open,
+    }))
+}
+
+fn build_as(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let p = cfg.avellaneda_stoikov.clone().unwrap_or_default();
+    let notional = autobump_notional(p.notional.unwrap_or(default_notional), symbol, venue)?;
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    Ok(StrategyChoice::AvellanedaStoikov(AvellanedaStoikovConfig {
+        gamma: p.gamma,
+        base_spread_bps: p.base_spread_bps,
+        horizon_sec: p.horizon_sec,
+        // notional-based sizing drives the live size; size_per_quote is the
+        // unused fallback (lot-rounded notional/price is computed per quote).
+        size_per_quote: tikr_core::Size(Decimal::ONE),
+        notional_per_quote: Some(notional),
+        step_size,
+        min_requote_interval_ms: p.min_requote_ms,
+        level_step_bps: p.level_step_bps,
+        volatility: EwmaConfig {
+            half_life_sec: p.ewma_half_life_sec,
+            initial_var: p.ewma_initial_var,
+        },
+    }))
+}
+
+fn build_glft(
+    cfg: &BotConfig,
+    symbol: &Symbol,
+    venue: &BinanceClient,
+    default_notional: Decimal,
+) -> Result<StrategyChoice> {
+    let p = cfg.glft.clone().unwrap_or_default();
+    let notional = autobump_notional(p.notional.unwrap_or(default_notional), symbol, venue)?;
+    let step_size = venue.step_size(symbol).unwrap_or(Decimal::ONE);
+    Ok(StrategyChoice::Glft(GlftConfig {
+        gamma: p.gamma,
+        base_spread_bps: p.base_spread_bps,
+        size_per_quote: tikr_core::Size(Decimal::ONE),
+        notional_per_quote: Some(notional),
+        step_size,
+        min_requote_interval_ms: p.min_requote_ms,
+        level_step_bps: p.level_step_bps,
+        volatility: EwmaConfig {
+            half_life_sec: p.ewma_half_life_sec,
+            initial_var: p.ewma_initial_var,
+        },
     }))
 }
 

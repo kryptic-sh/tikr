@@ -31,7 +31,8 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::config::{
-    BotConfig, FlatMmParams, RampageConfig, RampageStrategy, ScoreMode, TideParams, WaveParams,
+    AsParams, BotConfig, FlatMmParams, GlftParams, RampageConfig, RampageStrategy, ScoreMode,
+    TideParams, WaveParams,
 };
 use crate::state::{BotStatus, BotView, SharedBotState};
 use crate::supervisor::{SupervisorCtx, reset_symbol_state, spawn_supervisor};
@@ -146,6 +147,8 @@ pub fn spawn_rampage_manager(
             RampageStrategy::FlatMm { .. } => "flat-mm",
             RampageStrategy::Tide { .. } => "tide",
             RampageStrategy::Template { name } => name.as_str(),
+            RampageStrategy::AvellanedaStoikov { .. } => "avellaneda-stoikov",
+            RampageStrategy::Glft { .. } => "glft",
         };
         info!(
             min_volume_usdt = %cfg.min_volume_usdt,
@@ -821,6 +824,34 @@ fn grid_vol_bps(closes: &[Decimal], net_penalty: Decimal) -> Decimal {
     ((path - net_penalty * net) / base) * Decimal::from(10_000)
 }
 
+/// A `BotConfig` for `symbol`/`strategy` with every per-strategy param table
+/// `None` — the caller sets the one it needs. Avoids repeating the full
+/// all-`None` field list per rampage spawn arm.
+fn bot_with_strategy(symbol: &str, strategy: &str) -> BotConfig {
+    BotConfig {
+        symbol: symbol.to_string(),
+        strategy: strategy.to_string(),
+        sg: None,
+        lg: None,
+        ladder_reentry: None,
+        simple_gap: None,
+        micro_mean_reversion: None,
+        spread_scalp: None,
+        liq_fade: None,
+        hydra: None,
+        tide: None,
+        joker: None,
+        rsi_mr: None,
+        wave: None,
+        flat_mm: None,
+        avellaneda_stoikov: None,
+        glft: None,
+        mantis: None,
+        volley: None,
+        strangler: None,
+    }
+}
+
 fn spawn_one_bot(
     symbol: &str,
     account: &RampageAccountCtx,
@@ -880,6 +911,8 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
                 strangler: None,
+                avellaneda_stoikov: None,
+                glft: None,
             };
             (bc, "wave".to_string())
         }
@@ -932,6 +965,8 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
                 strangler: None,
+                avellaneda_stoikov: None,
+                glft: None,
             };
             (bc, "flat-mm".to_string())
         }
@@ -973,6 +1008,8 @@ fn spawn_one_bot(
                 mantis: None,
                 volley: None,
                 strangler: None,
+                avellaneda_stoikov: None,
+                glft: None,
             };
             (bc, "tide".to_string())
         }
@@ -984,6 +1021,50 @@ fn spawn_one_bot(
                 .clone();
             bc.symbol = symbol.to_string();
             (bc, name.clone())
+        }
+        RampageStrategy::AvellanedaStoikov {
+            notional,
+            gamma,
+            base_spread_bps,
+            horizon_sec,
+            min_requote_ms,
+            level_step_bps,
+            ewma_half_life_sec,
+            ewma_initial_var,
+        } => {
+            let mut bc = bot_with_strategy(symbol, "avellaneda-stoikov");
+            bc.avellaneda_stoikov = Some(AsParams {
+                notional: *notional,
+                gamma: *gamma,
+                base_spread_bps: *base_spread_bps,
+                horizon_sec: *horizon_sec,
+                min_requote_ms: *min_requote_ms,
+                level_step_bps: *level_step_bps,
+                ewma_half_life_sec: *ewma_half_life_sec,
+                ewma_initial_var: *ewma_initial_var,
+            });
+            (bc, "avellaneda-stoikov".to_string())
+        }
+        RampageStrategy::Glft {
+            notional,
+            gamma,
+            base_spread_bps,
+            min_requote_ms,
+            level_step_bps,
+            ewma_half_life_sec,
+            ewma_initial_var,
+        } => {
+            let mut bc = bot_with_strategy(symbol, "glft");
+            bc.glft = Some(GlftParams {
+                notional: *notional,
+                gamma: *gamma,
+                base_spread_bps: *base_spread_bps,
+                min_requote_ms: *min_requote_ms,
+                level_step_bps: *level_step_bps,
+                ewma_half_life_sec: *ewma_half_life_sec,
+                ewma_initial_var: *ewma_initial_var,
+            });
+            (bc, "glft".to_string())
         }
     };
     shared_state.insert(
