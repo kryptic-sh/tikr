@@ -1468,86 +1468,97 @@ fn live_config_to_args(t: &toml::Table) -> Vec<String> {
     );
 
     // ── strategy ─────────────────────────────────────────────────────────
-    let Some(kind) = toml_get(t, &["rampage", "strategy", "kind"]).and_then(|v| v.as_str()) else {
-        return out;
-    };
+    // Two source shapes are accepted:
+    //   1. `[rampage.strategy]` — kind + `params.*` sub-table (rampage configs).
+    //   2. `[[bot]]` — `strategy` + a `[bot.<kind>]` params sub-table (the
+    //      per-bot configs, e.g. config.flat.zecusdc.toml). The FIRST bot wins
+    //      (compare backtests one strategy/symbol per call; basket/symbol come
+    //      from CLI). `strategy = "flat-mm"` (dash) normalises to `flat_mm`.
+    let (kind, params): (String, Option<&toml::Table>) =
+        if let Some(k) = toml_get(t, &["rampage", "strategy", "kind"]).and_then(|v| v.as_str()) {
+            (
+                k.replace('-', "_"),
+                toml_get(t, &["rampage", "strategy", "params"]).and_then(|v| v.as_table()),
+            )
+        } else if let Some(bot) = first_bot(t) {
+            match bot.get("strategy").and_then(|v| v.as_str()) {
+                // params live under `[bot.<kind>]` (sub-table named for the
+                // strategy, snake_case): `flat_mm` / `wave` / `tide` / …
+                Some(s) => {
+                    let kind = s.replace('-', "_");
+                    let params = bot.get(&kind).and_then(|v| v.as_table());
+                    (kind, params)
+                }
+                None => return out,
+            }
+        } else {
+            return out;
+        };
+
     out.push("--strategies".to_string());
-    out.push(if kind == "flat_mm" { "flat-mm" } else { kind }.to_string());
-    let pp = |k: &'static str| ["rampage", "strategy", "params", k];
-    // Per-strategy fixed notional (the `notional` param) maps to the global
-    // `--notional`. Set `order_balance_pct = 0` alongside for a truly fixed size.
-    emit_arg(&mut out, t, "--notional", &pp("notional"));
+    out.push(if kind == "flat_mm" {
+        "flat-mm".to_string()
+    } else {
+        kind.clone()
+    });
+    if let Some(p) = params {
+        emit_strategy_params(&mut out, &kind, p);
+    }
+    out
+}
+
+/// First `[[bot]]` element as a table, or `None` if absent / not a table array.
+fn first_bot(t: &toml::Table) -> Option<&toml::Table> {
+    t.get("bot")?.as_array()?.first()?.as_table()
+}
+
+/// Emit the per-strategy backtest flags for `kind`, reading each param by key
+/// straight from `params` (the `[rampage.strategy.params]` or `[bot.<kind>]`
+/// sub-table). A `notional` param maps to the global `--notional` (set
+/// `order_balance_pct = 0` alongside for a truly fixed size). Unmapped keys are
+/// skipped, so an unknown param never produces an invalid flag.
+fn emit_strategy_params(out: &mut Vec<String>, kind: &str, params: &toml::Table) {
+    let emit = |out: &mut Vec<String>, flag: &str, key: &str| {
+        if let Some(v) = params.get(key) {
+            out.push(flag.to_string());
+            out.push(toml_scalar(v));
+        }
+    };
+    emit(out, "--notional", "notional");
     match kind {
         "wave" => {
-            emit_arg(&mut out, t, "--wave-grid-levels-list", &pp("levels"));
-            emit_arg(&mut out, t, "--wave-step-bps-list", &pp("steps_bps"));
-            emit_arg(&mut out, t, "--wave-inner-steps-list", &pp("steps_inner"));
-            emit_arg(&mut out, t, "--wave-refill-threshold", &pp("round_trips"));
-            emit_arg(&mut out, t, "--wave-size-mult", &pp("size_mult"));
-            emit_arg(&mut out, t, "--wave-size-ramp", &pp("size_ramp"));
-            emit_arg(&mut out, t, "--wave-auto-inner", &pp("auto_inner"));
-            emit_arg(&mut out, t, "--wave-auto-step", &pp("auto_step"));
-            emit_arg(
-                &mut out,
-                t,
-                "--wave-force-refill-secs",
-                &pp("force_refill_secs"),
-            );
-            emit_arg(&mut out, t, "--wave-auto-step-k-list", &pp("auto_step_k"));
-            emit_arg(
-                &mut out,
-                t,
-                "--wave-auto-candle-window",
-                &pp("auto_candle_window"),
-            );
+            emit(out, "--wave-grid-levels-list", "levels");
+            emit(out, "--wave-step-bps-list", "steps_bps");
+            emit(out, "--wave-inner-steps-list", "steps_inner");
+            emit(out, "--wave-refill-threshold", "round_trips");
+            emit(out, "--wave-size-mult", "size_mult");
+            emit(out, "--wave-size-ramp", "size_ramp");
+            emit(out, "--wave-auto-inner", "auto_inner");
+            emit(out, "--wave-auto-step", "auto_step");
+            emit(out, "--wave-force-refill-secs", "force_refill_secs");
+            emit(out, "--wave-auto-step-k-list", "auto_step_k");
+            emit(out, "--wave-auto-candle-window", "auto_candle_window");
         }
         "flat_mm" => {
-            emit_arg(&mut out, t, "--flat-mm-inner-bps-list", &pp("inner_bps"));
-            emit_arg(&mut out, t, "--flat-mm-step-bps-list", &pp("step_bps"));
-            emit_arg(&mut out, t, "--flat-mm-levels", &pp("levels"));
-            emit_arg(
-                &mut out,
-                t,
-                "--flat-mm-skew-bps-list",
-                &pp("reservation_skew_bps"),
-            );
-            emit_arg(
-                &mut out,
-                t,
-                "--flat-mm-imbalance-bps-list",
-                &pp("imbalance_skew_bps"),
-            );
-            emit_arg(&mut out, t, "--flat-mm-flush-bps-list", &pp("flush_bps"));
-            emit_arg(&mut out, t, "--flat-mm-chase-list", &pp("chase_boost_pct"));
-            emit_arg(&mut out, t, "--flat-mm-flush-frac-list", &pp("flush_frac"));
-            emit_arg(
-                &mut out,
-                t,
+            emit(out, "--flat-mm-inner-bps-list", "inner_bps");
+            emit(out, "--flat-mm-step-bps-list", "step_bps");
+            emit(out, "--flat-mm-levels", "levels");
+            emit(out, "--flat-mm-skew-bps-list", "reservation_skew_bps");
+            emit(out, "--flat-mm-imbalance-bps-list", "imbalance_skew_bps");
+            emit(out, "--flat-mm-flush-bps-list", "flush_bps");
+            emit(out, "--flat-mm-chase-list", "chase_boost_pct");
+            emit(out, "--flat-mm-flush-frac-list", "flush_frac");
+            emit(
+                out,
                 "--flat-mm-underwater-frac-list",
-                &pp("underwater_reduce_frac"),
+                "underwater_reduce_frac",
             );
-            emit_arg(
-                &mut out,
-                t,
-                "--flat-mm-frozen-lattice",
-                &pp("frozen_lattice"),
-            );
-            emit_arg(
-                &mut out,
-                t,
-                "--flat-mm-lattice-band",
-                &pp("lattice_band_levels"),
-            );
-            emit_arg(
-                &mut out,
-                t,
-                "--flat-mm-lattice-max-open",
-                &pp("lattice_max_open"),
-            );
+            emit(out, "--flat-mm-frozen-lattice", "frozen_lattice");
+            emit(out, "--flat-mm-lattice-band", "lattice_band_levels");
+            emit(out, "--flat-mm-lattice-max-open", "lattice_max_open");
         }
         _ => {} // tide / template / keel: strategy selected, params left at CLI/defaults
     }
-    out
 }
 
 /// Recursive helper for `toml_to_args`. `prefix` is the section path
