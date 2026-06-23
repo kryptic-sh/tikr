@@ -55,7 +55,7 @@ kind = "glft" # "wave" | "tide" | "flat_mm" | "avellaneda_stoikov" | "glft"
 # the sweet spot — tighter (≤2bps) detonates (spread < adverse-selection cost,
 # bag → ~10x wallet); wider (≥5bps) earns less and trades less.
 notional = "5"            # FIXED $5/quote (account order_balance_pct = 0 → no compounding). Bot count still auto-scales.
-gamma = "0.2"             # risk aversion: inventory mean-reversion strength (reservation-price skew = q·γ·σ²)
+gamma = "0.1"             # risk aversion (skew = q·γ·σ²). Sweep winner: γ=0.1 edges 0.2 (+216 vs +208 NET) at same vol 389k / peak 1603
 base_spread_bps = 4       # half-spread per side (8 bps round-trip); the tuned sweet spot
 min_requote_ms = 500      # tuned: 500ms requote — fresher quotes, slightly more volume + lower peak vs 1000
 level_step_bps = 2        # tuned: requote on >=1bps mid drift — fewer mid-chasing requotes, cuts peak inventory ~16% (1904->1603) at same volume+profit
