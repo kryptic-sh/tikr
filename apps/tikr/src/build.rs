@@ -260,7 +260,12 @@ fn strategy_max_position(cfg: &BotConfig) -> Result<Option<Decimal>> {
         | "volley"
         | "vl"
         | "strangler"
-        | "st" => None,
+        | "st"
+        // A-S / GLFT bound inventory via the reservation-price skew (γ), not a
+        // hard max-position cap — never override.
+        | "avellaneda-stoikov"
+        | "as"
+        | "glft" => None,
         other => return Err(anyhow::anyhow!("unknown strategy '{other}'")),
     };
     Ok(cap.filter(|v| *v > Decimal::ZERO))
