@@ -43,21 +43,21 @@ mode = "grid_vol"      # grid-harvestable volatility: path − net_penalty×net 
 [rampage.score.params]
 candle_count = 60      # 1m closes averaged (~1h window)
 net_penalty = "0"      # trend penalty. BACKTEST: optimal k INVERTS with top_n — k=2 best for top_n=1 (dodge trend-bagging), but k≥1 DROPS the winner mid-ride for top_n≥3. For multi-market top_n>1 keep this LOW (0 = pure path-length, keeps winners always-on, only culls genuine stragglers). Raise toward 1-2 only for single-market top_n=1.
-min_tick_bps = "6"     # round-trip viability gate: tick_size/price×10000 ≥ this
+min_tick_bps = "0"     # tick_size/price×10000 ≥ this. 6 filters the ENTIRE liquid USDC universe (BTC/ETH/SOL/... all have fine ticks, tick_bps 0.016–1.45) → 0 candidates → no trading. 0 = no gate.
 
 [rampage.strategy]
-kind = "wave" # "wave" | "tide"
+kind = "glft" # "wave" | "tide" | "flat_mm" | "avellaneda_stoikov" | "glft"
 [rampage.strategy.params]
-notional = "5"            # FIXED $5/order (account order_balance_pct = 0 → no compounding). Bot count still auto-scales with wallet.
-levels = 10
-round_trips = 5
-steps_bps = 5
-auto_inner = false        # inner dead-zone auto-sized to ~½ avg 60×1s candle gap; steps_inner ignored
-steps_inner = 1           # only used when auto_inner = false
-force_refill_secs = 5     # slow-market valve: refill vacant slots after 5min regardless of round_trips; 0 = off
-auto_step = false         # auto-size the lattice step (k×mean candle gap, floored at 2× maker fee, capped at steps_bps); false = fixed steps_bps
-auto_step_k = "0.25"      # when auto_step=true: each step targets this fraction of the mean 1s candle range
-auto_candle_window = 10   # trailing 1s candles averaged for the auto-step/auto-inner vol signal (fewer = faster reaction)
-relattice_drift_pct = "5" # relattice/reposition deadband: re-place only when computed step differs from placed by ≥ this fraction
-size_mult = "1"           # geometric order-size multiplier per lattice step (deeper orders bigger); 1.0 = uniform
-size_ramp = "1"           # LINEAR inner→outer size ramp: innermost order 1×, outermost size_ramp×, straight-line between; 1.0 = uniform
+# GLFT inventory-skew MM. Tuned winner from the γ × spread sweep
+# (NEAR/SUI/WLD/ZEC, $1k/25x, 0-fee), ranked on profit + flat + volume:
+# γ=0.2 + 4bps → realized +201, NET +196, unrealized ≈ 0 (FLAT), volume 385k,
+# all 4 symbols positive, WLD trades freely (no A-S horizon freeze). 4bps is
+# the sweet spot — tighter (≤2bps) detonates (spread < adverse-selection cost,
+# bag → ~10x wallet); wider (≥5bps) earns less and trades less.
+notional = "5"            # FIXED $5/quote (account order_balance_pct = 0 → no compounding). Bot count still auto-scales.
+gamma = "0.2"             # risk aversion: inventory mean-reversion strength (reservation-price skew = q·γ·σ²)
+base_spread_bps = 4       # half-spread per side (8 bps round-trip); the tuned sweet spot
+min_requote_ms = 1000     # min time between full requotes (rate-limit guard)
+level_step_bps = 1        # mid-drift early-requote threshold, in bps
+ewma_half_life_sec = 60.0 # volatility EWMA half-life (this field is f64, not Decimal)
+ewma_initial_var = "0.000001" # volatility EWMA seed variance
