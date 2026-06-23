@@ -496,19 +496,28 @@ impl Wave {
         }
     }
 
-    /// Base lattice gap = `steps_bps` of mid, snapped up to tick (min 1 tick).
-    /// `steps_bps = 0` → 1-tick gap. This is the distance from origin to the
-    /// first level.
+    /// Base lattice gap = `steps_bps` of mid, snapped UP to a whole tick, with a
+    /// floor of **1.2× tick** on coarse-tick markets. `steps_bps = 0` → 1-tick.
+    ///
+    /// On a large-tick market the requested `steps_bps` can map to less than one
+    /// tick (`steps_bps` of mid < tick), so the gap would otherwise collapse to a
+    /// single tick and the bps setting wouldn't really apply. Flooring the target
+    /// at `1.2 × tick` before the tick-snap forces the gap to the next whole tick
+    /// (≥ 2 ticks) there, giving a real spread between levels instead of a
+    /// 1-tick-wide grid. The result stays a tick multiple so every lattice price
+    /// (`origin ± k·step`) remains on-tick.
     fn compute_step(&self, mid: Decimal) -> Decimal {
         let tick = self.config.tick_size;
         let sbps = self.effective_step_bps();
         if sbps > 0 && mid > Decimal::ZERO && tick > Decimal::ZERO {
             let target = mid * Decimal::from(sbps) / Decimal::from(10_000);
-            return if target > tick {
-                (target / tick).ceil() * tick
-            } else {
-                tick
-            };
+            if target < tick {
+                // Coarse-tick market: the bps step is finer than one tick, so it
+                // would collapse to a 1-tick grid (bps not really applied). Floor
+                // at 1.2× tick, which snaps up to the next whole tick (2 ticks).
+                return (Decimal::new(12, 1) * tick / tick).ceil() * tick;
+            }
+            return (target / tick).ceil() * tick;
         }
         tick
     }
@@ -1754,11 +1763,10 @@ mod tests {
 
     #[test]
     fn relattice_skips_when_tick_limited() {
-        // tick=0.1, steps_bps=10 → bps target is one tick at mid 100 and below
-        // it for any lower mid. Freeze at mid ~50 (step already pinned to the 0.1
-        // tick) and drop to mid ~25: the ideal step stays below one tick, so the
-        // install-able step is still 0.1 — no improvement possible → no
-        // relattice (grid step stays fixed).
+        // tick=0.1, steps_bps=10 → bps target is sub-tick at mid 50 and below, so
+        // compute_step hits the 1.2×tick floor → 2 ticks (0.2). Freeze at mid ~50
+        // and drop to mid ~25: the ideal step stays sub-tick (still floored to the
+        // same 2 ticks), so the install-able step is unchanged → no relattice.
         let mut w = Wave::new(cfg());
         let s0 = snap(Decimal::from(50), Decimal::new(501, 1));
         let p = pos_flat();
@@ -1771,7 +1779,11 @@ mod tests {
         );
         let open = quotes_as_open(&seeded);
         let step0 = w.lattice_step.unwrap();
-        assert_eq!(step0, Decimal::new(1, 1), "freeze should pin to the tick");
+        assert_eq!(
+            step0,
+            Decimal::new(2, 1),
+            "sub-tick bps step floors to 1.2×tick → 2 ticks (0.2)"
+        );
 
         let s_dn = snap(Decimal::from(25), Decimal::new(251, 1));
         let _ = w.on_event(
@@ -2217,18 +2229,14 @@ mod tests {
             })
             .min()
             .expect("must place reduce asks anchored at the last buy");
-        assert_eq!(
-            min_ask,
-            Decimal::new(995, 1),
-            "asks must anchor at the last buy 99.5 (not avg 99.7), allowing \
-             below-avg-above-last-buy fills; got {min_ask}"
-        );
-        // A sell at 99.6 — below avg 99.7 but above the last buy 99.5 — is
-        // allowed to rest (catch the bounce / partial close).
+        // Anchored at the last buy (99.5), NOT avg (99.7): the shallowest ask is
+        // at-or-above the last buy but BELOW avg — i.e. it allows a
+        // below-avg-but-above-last-buy fill (catch the bounce / partial close),
+        // and never reprices below what we last paid. (Step-agnostic: exact slot
+        // depends on the lattice gap, but it must land in [last_buy, avg).)
         assert!(
-            acts.iter().any(|a| matches!(a,
-                Action::Quote(q) if q.side == Side::Ask && q.price.0 == Decimal::new(996, 1))),
-            "a below-avg-above-last-buy sell (99.6) must rest"
+            min_ask >= Decimal::new(995, 1) && min_ask < Decimal::new(997, 1),
+            "shallowest reduce ask must be in [last_buy 99.5, avg 99.7); got {min_ask}"
         );
     }
 
@@ -2273,12 +2281,12 @@ mod tests {
         );
         // The reduce band is ANCHORED at the floor (99.5, the avg fallback when
         // no fills are tracked), not at the 99.1 touch — so the shallowest ask
-        // sits at 99.5, never down at the mid (that's the bleed fix).
+        // sits AT the floor (within a lattice step of 99.5), never down at the
+        // mid. (Step-agnostic upper bound; exact slot depends on the gap.)
         let min_ask = asks.iter().copied().min().unwrap();
-        assert_eq!(
-            min_ask,
-            Decimal::new(995, 1),
-            "reduce band must anchor at the cost floor 99.5, not the 99.1 touch"
+        assert!(
+            (Decimal::new(995, 1)..Decimal::new(998, 1)).contains(&min_ask),
+            "reduce band must anchor at the cost floor (~99.5), not the 99.1 touch; got {min_ask}"
         );
     }
 
@@ -2309,6 +2317,36 @@ mod tests {
         let w = Wave::new(cfg()); // size_mult defaults to 1.0
         assert_eq!(w.depth_mult(0), Decimal::ONE);
         assert_eq!(w.depth_mult(5), Decimal::ONE, "no scaling at mult=1");
+    }
+
+    #[test]
+    fn compute_step_floors_sub_tick_at_1_2_tick() {
+        // Coarse-tick market: tick 0.5, steps_bps 2, mid 100 → bps target =
+        // 0.02 ≪ tick. Old behavior collapsed to 1 tick (0.5); new floor is
+        // 1.2×tick = 0.6 → snaps up to 2 ticks = 1.0.
+        let mut c = cfg();
+        c.tick_size = Decimal::new(5, 1); // 0.5
+        c.steps_bps = 2;
+        c.auto_step = false;
+        let w = Wave::new(c);
+        assert_eq!(
+            w.compute_step(Decimal::from(100)),
+            Decimal::ONE,
+            "sub-tick bps step floors to 1.2×tick → 2 ticks (1.0)"
+        );
+
+        // Non-coarse: tick 0.1, steps_bps 10, mid 100 → target = 0.1 = tick
+        // (NOT strictly below) → no floor, stays 1 tick (0.1).
+        let mut c2 = cfg();
+        c2.tick_size = Decimal::new(1, 1); // 0.1
+        c2.steps_bps = 10;
+        c2.auto_step = false;
+        let w2 = Wave::new(c2);
+        assert_eq!(
+            w2.compute_step(Decimal::from(100)),
+            Decimal::new(1, 1),
+            "target == tick is not floored (stays 1 tick)"
+        );
     }
 
     #[test]
