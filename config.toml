@@ -57,7 +57,7 @@ kind = "glft" # "wave" | "tide" | "flat_mm" | "avellaneda_stoikov" | "glft"
 notional = "5"            # FIXED $5/quote (account order_balance_pct = 0 → no compounding). Bot count still auto-scales.
 gamma = "0.2"             # risk aversion: inventory mean-reversion strength (reservation-price skew = q·γ·σ²)
 base_spread_bps = 4       # half-spread per side (8 bps round-trip); the tuned sweet spot
-min_requote_ms = 1000     # min time between full requotes (rate-limit guard)
-level_step_bps = 1        # mid-drift early-requote threshold, in bps
-ewma_half_life_sec = 60.0 # volatility EWMA half-life (this field is f64, not Decimal)
+min_requote_ms = 500      # tuned: 500ms requote — fresher quotes, slightly more volume + lower peak vs 1000
+level_step_bps = 2        # tuned: requote on >=1bps mid drift — fewer mid-chasing requotes, cuts peak inventory ~16% (1904->1603) at same volume+profit
+ewma_half_life_sec = 30.0 # tuned: faster vol estimate — skew adapts quicker, +6% NET
 ewma_initial_var = "0.000001" # volatility EWMA seed variance

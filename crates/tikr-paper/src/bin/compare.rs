@@ -1028,6 +1028,18 @@ struct Args {
     /// GLFT sweep: comma-separated half-spread values, in bps.
     #[arg(long, default_value = "5")]
     glft_spread_bps_list: String,
+    /// GLFT sweep: comma-separated min-requote-interval values, in ms. Lower =
+    /// fresher quotes (more fills/volume, less stale-quote adverse selection)
+    /// at the cost of more cancels (live API load).
+    #[arg(long, default_value = "1000")]
+    glft_requote_ms_list: String,
+    /// GLFT sweep: comma-separated mid-drift early-requote thresholds, in bps.
+    #[arg(long, default_value = "1")]
+    glft_level_step_bps_list: String,
+    /// GLFT sweep: comma-separated EWMA volatility half-life values, in seconds
+    /// (the σ² estimate that scales the inventory skew).
+    #[arg(long, default_value = "60")]
+    glft_ewma_halflife_list: String,
 
     // ─── Bagger (inventory-risk flatten) ──────────────────────────────────
     /// Bagger preset(s), composable with `+`: `fixed` | `ratchet` | `dual` |
@@ -2619,27 +2631,38 @@ async fn run_sweep_collect(
     if included("glft", &allow) {
         for g in parse_decimal_list(&args.glft_gamma_list)? {
             for sbps in parse_u32_list(&args.glft_spread_bps_list)? {
-                spawn_preset(
-                    &mut handles,
-                    &shared_data,
-                    &symbol,
-                    &format!("GLFT γ={g} {sbps}bps"),
-                    Glft::new(GlftConfig {
-                        gamma: g,
-                        base_spread_bps: sbps,
-                        size_per_quote,
-                        notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
-                        step_size: lot_step,
-                        min_requote_interval_ms: 1000,
-                        level_step_bps: 1,
-                        volatility: ewma.clone(),
-                    }),
-                    fees,
-                    skim_cfg,
-                    funding_cfg,
-                    sim_cfg_template.clone(),
-                    equity_csv_dir.clone(),
-                );
+                for rqms in parse_u32_list(&args.glft_requote_ms_list)? {
+                    for lstep in parse_u32_list(&args.glft_level_step_bps_list)? {
+                        for hl in parse_decimal_list(&args.glft_ewma_halflife_list)? {
+                            let hl_f64 = hl.to_string().parse::<f64>().unwrap_or(60.0);
+                            spawn_preset(
+                                &mut handles,
+                                &shared_data,
+                                &symbol,
+                                &format!("GLFT γ={g} {sbps}bps rq={rqms} ls={lstep} hl={hl}"),
+                                Glft::new(GlftConfig {
+                                    gamma: g,
+                                    base_spread_bps: sbps,
+                                    size_per_quote,
+                                    notional_per_quote: (notional > Decimal::ZERO)
+                                        .then_some(notional),
+                                    step_size: lot_step,
+                                    min_requote_interval_ms: rqms as u64,
+                                    level_step_bps: lstep,
+                                    volatility: EwmaConfig {
+                                        half_life_sec: hl_f64,
+                                        initial_var: ewma.initial_var,
+                                    },
+                                }),
+                                fees,
+                                skim_cfg,
+                                funding_cfg,
+                                sim_cfg_template.clone(),
+                                equity_csv_dir.clone(),
+                            );
+                        }
+                    }
+                }
             }
         }
     }
