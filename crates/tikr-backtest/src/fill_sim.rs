@@ -867,64 +867,44 @@ impl FillSim {
             ));
             return None;
         }
-        // Synthetic Binance `-2019` (margin insufficient). At place-time,
-        // the venue reserves margin for the WORST-CASE fill scenario
-        // across all currently-resting orders on this symbol plus the
-        // new intent. Margin reserved at place time stays reserved
-        // until the order fills or is cancelled, so the cap must
-        // account for the additive worst-case across all open orders
-        // — not just the new intent in isolation. Without this, layered
-        // grid strategies (LG/SG) place dozens of resting orders that
-        // individually pass the cap but collectively breach it on real
-        // venues.
+        // Two DISTINCT gates, both dynamic vs the running wallet. Conflating
+        // them (one worst-case-all-fill check against the tightest cap) made a
+        // dense frozen-lattice unusable: ~50 resting bids of $5 sum to ~$250, so
+        // a 200%-of-$100 position cap ($200) rejected EVERY bid on every
+        // reconcile even at zero position — stranding the grid one-sided. Split:
         //
-        // Worst-case direction-wise:
-        //   - all bids fill, no asks fill → position grows long by
-        //     Σ(bid notionals). Long must not breach cap.
-        //   - all asks fill, no bids fill → position grows short by
-        //     Σ(ask notionals). Short must not breach cap.
-        // Margin gate (`-2019`): the binding limit is **actual buying power =
-        // wallet × leverage** — the venue rejects any order whose worst-case
-        // resulting position would exceed it, regardless of strategy-level caps.
-        // The optional `max_position_notional_usdt` is an ADDITIONAL constraint
-        // (whichever is smaller binds). `current_wallet == 0` (unset) falls back
-        // to the configured cap only (test/back-compat path).
-        // Three constraints, all DYNAMIC vs the running wallet so they grow as
-        // the account does (true `%`-of-wallet semantics, not frozen):
-        //   - buying_power = wallet × leverage (the venue's hard margin limit)
-        //   - position cap  = wallet × max_position_frac (strategy `%` cap)
-        //   - plus an optional explicit fixed `max_position_notional_usdt`.
-        // The tightest present binds. `current_wallet == 0` (unset) → fall back
-        // to the explicit fixed cap only (test/back-compat path).
-        let wallet_caps = [
-            (self.cfg.leverage > Decimal::ZERO).then(|| self.current_wallet * self.cfg.leverage),
-            (self.cfg.max_position_frac > Decimal::ZERO)
-                .then(|| self.current_wallet * self.cfg.max_position_frac),
-        ];
-        let mut effective_cap = self.cfg.max_position_notional_usdt;
-        if self.current_wallet > Decimal::ZERO {
-            for c in wallet_caps.into_iter().flatten() {
-                let c = c.round_dp(8);
-                effective_cap = Some(effective_cap.map_or(c, |e| e.min(c)));
-            }
-        }
-        if let Some(cap) = effective_cap {
-            // Scale-bounded: the position_notional accumulator path
-            // re-rounds to 8 dp, but `intent.price × intent.size` can
-            // independently produce a high-scale value (DOGE
-            // 0.20123 × 5-decimal sizes → scale 8+). Round both
-            // operands BEFORE the addition so neither the inner
-            // multiplication nor the sum exceeds rust_decimal's
-            // 96-bit mantissa.
-            let pos = self
-                .position_notional
-                .get(&intent.symbol)
-                .copied()
-                .unwrap_or(Decimal::ZERO)
-                .round_dp(8);
-            let intent_delta = (intent.price.0 * intent.size.0).round_dp(8);
-            // Sum currently-resting notionals on the same symbol, split
-            // by side. New intent's notional is added to its own side.
+        //   Gate 1 — MARGIN / buying power (the real Binance `-2019`): total
+        //   EXPOSURE (open position + all resting orders on a side, worst-case
+        //   all-fill) must fit `wallet × leverage`. Resting orders reserve margin
+        //   until they fill/cancel, so the additive worst-case is right HERE — a
+        //   grid genuinely can't rest more notional than its buying power backs.
+        //   At 25× this is loose ($100 → $2,500), biting only over-leveraged
+        //   ladders.
+        //
+        //   Gate 2 — POSITION cap (`max_position_frac` × wallet, and the optional
+        //   fixed `max_position_notional_usdt`): bounds ACTUAL signed position,
+        //   PER-ORDER (projected `pos ± this order`), NOT all-resting-fill —
+        //   resting maker orders aren't position until they fill. `frozen_reconcile`
+        //   re-checks on every fill, so per-order holds |pos| at the cap plus at
+        //   most a few orders of slippage between reconciles, without mass-
+        //   rejecting the adding side.
+        //
+        // Scale note: `position_notional` is pre-rounded to 8 dp, but
+        // `price × size` can independently produce scale 8+ (e.g. DOGE
+        // 0.20123 × 5-dp size). Round both operands before adding so neither the
+        // product nor the sum overflows rust_decimal's 96-bit mantissa.
+        let pos = self
+            .position_notional
+            .get(&intent.symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+            .round_dp(8);
+        let intent_delta = (intent.price.0 * intent.size.0).round_dp(8);
+
+        // Gate 1 — margin / buying power (worst-case exposure vs wallet × lev).
+        // `current_wallet == 0` (unset) skips this gate (test/back-compat path).
+        if self.cfg.leverage > Decimal::ZERO && self.current_wallet > Decimal::ZERO {
+            let buying_power = (self.current_wallet * self.cfg.leverage).round_dp(8);
             let mut resting_bids = Decimal::ZERO;
             let mut resting_asks = Decimal::ZERO;
             for q in &self.live_quotes {
@@ -941,15 +921,41 @@ impl FillSim {
                 Side::Bid => resting_bids = (resting_bids + intent_delta).round_dp(8),
                 Side::Ask => resting_asks = (resting_asks + intent_delta).round_dp(8),
             }
-            // Worst-case long: all bids fill → pos + resting_bids.
-            // Worst-case short: all asks fill → pos − resting_asks.
             let worst_long = pos + resting_bids;
             let worst_short = pos - resting_asks;
-            if worst_long > cap || worst_short < -cap {
+            if worst_long > buying_power || worst_short < -buying_power {
                 self.pending_rejections.push((
                     intent.clone(),
                     "margin insufficient (paper -2019)".to_string(),
                 ));
+                return None;
+            }
+        }
+
+        // Gate 2 — strategy position cap (per-order projected |position|). The
+        // tightest of the `%`-of-wallet cap and the explicit fixed cap binds.
+        let pos_cap = {
+            let frac = (self.cfg.max_position_frac > Decimal::ZERO
+                && self.current_wallet > Decimal::ZERO)
+                .then(|| (self.current_wallet * self.cfg.max_position_frac).round_dp(8));
+            match (self.cfg.max_position_notional_usdt, frac) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, b) => b,
+            }
+        };
+        if let Some(cap) = pos_cap {
+            // Only THIS order's fill moves position; resting siblings aren't
+            // position yet. Reject if filling it would push signed position past
+            // ±cap. At the cap the adding side is rejected while the reducing
+            // side still rests — correct risk behaviour, not stranding.
+            let projected = match intent.side {
+                Side::Bid => pos + intent_delta,
+                Side::Ask => pos - intent_delta,
+            };
+            if projected > cap || projected < -cap {
+                self.pending_rejections
+                    .push((intent.clone(), "position cap reached (paper)".to_string()));
                 return None;
             }
         }
@@ -1632,6 +1638,136 @@ mod tests {
             sim.live_quotes.len(),
             3,
             "IOC does not occupy a resting slot"
+        );
+    }
+
+    // ── Margin / position-cap gates ──────────────────────────────────────────
+
+    /// A dense bid ladder whose SUMMED notional exceeds the position cap must
+    /// still all rest, as long as each order's own fill stays under the cap at
+    /// the current (zero) position. Regression for the old worst-case-all-fill
+    /// gate, which summed every resting bid and mass-rejected one whole side of
+    /// a frozen-lattice grid (stranding it) on a small-wallet `%` cap.
+    #[test]
+    fn dense_ladder_not_mass_rejected_under_position_cap() {
+        let sym = make_symbol();
+        let mut cfg = default_cfg();
+        cfg.submit_latency_ms = 0;
+        cfg.leverage = Decimal::from(25); // buying power 25 × 100 = 2500, loose
+        cfg.max_position_frac = Decimal::from(2); // cap = 2 × wallet = 200
+        let mut sim = FillSim::new(cfg);
+        sim.set_wallet(Decimal::from(100));
+
+        // bid=100/ask=101. Five resting bids ~ $90 each → Σ ≈ $450 > $200 cap,
+        // but each single fill (≤ $90) leaves |pos| under the cap.
+        let _ = sim.on_market_event(
+            &MarketEvent::BookUpdate {
+                snapshot: make_book(&sym, 100, 101),
+            },
+            Timestamp(0),
+        );
+        for (i, px) in [90, 89, 88, 87, 86].into_iter().enumerate() {
+            sim.on_action(
+                Action::Quote(make_intent(&sym, Side::Bid, px, 1, TimeInForce::PostOnly)),
+                Timestamp(i as u64),
+            );
+        }
+        let _ = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(1_000_000),
+            },
+            Timestamp(1_000_000),
+        );
+
+        assert_eq!(
+            sim.live_quotes.len(),
+            5,
+            "all 5 bids rest — per-order cap, not summed"
+        );
+        assert!(
+            sim.drain_rejections().is_empty(),
+            "no position-cap rejections at zero position"
+        );
+    }
+
+    /// The position cap still bounds: an order whose OWN fill would push signed
+    /// position past the cap is rejected (gate 2), while leverage is loose enough
+    /// that the margin gate (gate 1) does not fire.
+    #[test]
+    fn position_cap_rejects_single_order_past_cap() {
+        let sym = make_symbol();
+        let mut cfg = default_cfg();
+        cfg.submit_latency_ms = 0;
+        cfg.leverage = Decimal::from(25); // buying power 2500 — won't bind
+        cfg.max_position_frac = Decimal::new(5, 1); // 0.5 × 100 = cap 50
+        let mut sim = FillSim::new(cfg);
+        sim.set_wallet(Decimal::from(100));
+
+        let _ = sim.on_market_event(
+            &MarketEvent::BookUpdate {
+                snapshot: make_book(&sym, 100, 101),
+            },
+            Timestamp(0),
+        );
+        // One bid ~ $90 notional > $50 cap → rejected by the position gate.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 90, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let _ = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(1_000_000),
+            },
+            Timestamp(1_000_000),
+        );
+
+        assert_eq!(sim.live_quotes.len(), 0, "order past cap does not rest");
+        let rej = sim.drain_rejections();
+        assert_eq!(rej.len(), 1);
+        assert!(
+            rej[0].1.contains("position cap"),
+            "rejected by the position gate, got: {}",
+            rej[0].1
+        );
+    }
+
+    /// The margin gate (gate 1) still rejects when worst-case exposure exceeds
+    /// buying power = wallet × leverage, with the synthetic `-2019` reason.
+    #[test]
+    fn margin_gate_rejects_over_buying_power() {
+        let sym = make_symbol();
+        let mut cfg = default_cfg();
+        cfg.submit_latency_ms = 0;
+        cfg.leverage = Decimal::from(2); // buying power 2 × 10 = 20
+        // no max_position_frac → only the margin gate is active
+        let mut sim = FillSim::new(cfg);
+        sim.set_wallet(Decimal::from(10));
+
+        let _ = sim.on_market_event(
+            &MarketEvent::BookUpdate {
+                snapshot: make_book(&sym, 100, 101),
+            },
+            Timestamp(0),
+        );
+        // One bid ~ $90 ≫ $20 buying power → margin reject.
+        sim.on_action(
+            Action::Quote(make_intent(&sym, Side::Bid, 90, 1, TimeInForce::PostOnly)),
+            Timestamp(0),
+        );
+        let _ = sim.on_market_event(
+            &MarketEvent::Heartbeat {
+                ts: Timestamp(1_000_000),
+            },
+            Timestamp(1_000_000),
+        );
+
+        assert_eq!(sim.live_quotes.len(), 0, "order past buying power rejected");
+        let rej = sim.drain_rejections();
+        assert_eq!(rej.len(), 1);
+        assert!(
+            rej[0].1.contains("-2019"),
+            "rejected by the margin gate, got: {}",
+            rej[0].1
         );
     }
 
