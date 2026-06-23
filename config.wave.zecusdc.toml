@@ -11,7 +11,7 @@ strategy = "wave"
 
 [bot.wave]
 notional = 6
-levels = 20
+levels = 40
 auto_inner = false
 round_trips = 10
 steps_inner = 2
