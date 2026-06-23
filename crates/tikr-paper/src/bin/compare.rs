@@ -1011,6 +1011,19 @@ struct Args {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     wave_reduce_to_avg: bool,
 
+    /// A-S sweep: comma-separated risk-aversion γ values.
+    #[arg(long, default_value = "0.1")]
+    as_gamma_list: String,
+    /// A-S sweep: comma-separated half-spread values, in bps.
+    #[arg(long, default_value = "5")]
+    as_spread_bps_list: String,
+    /// GLFT sweep: comma-separated risk-aversion γ values.
+    #[arg(long, default_value = "0.1")]
+    glft_gamma_list: String,
+    /// GLFT sweep: comma-separated half-spread values, in bps.
+    #[arg(long, default_value = "5")]
+    glft_spread_bps_list: String,
+
     // ─── Bagger (inventory-risk flatten) ──────────────────────────────────
     /// Bagger preset(s), composable with `+`: `fixed` | `ratchet` | `dual` |
     /// `cap` | `equity` (e.g. `dual+cap`). Empty (default) = off. Individual
@@ -2569,51 +2582,59 @@ async fn run_sweep_collect(
         };
 
     if included("avellaneda-stoikov", &allow) {
-        spawn_preset(
-            &mut handles,
-            &shared_data,
-            &symbol,
-            "A-S γ=0.1 5bps",
-            AvellanedaStoikov::new(AvellanedaStoikovConfig {
-                gamma: Decimal::from_str("0.1")?,
-                base_spread_bps: 5,
-                horizon_sec: 3600,
-                size_per_quote,
-                notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
-                step_size: lot_step,
-                min_requote_interval_ms: 1000,
-                level_step_bps: 1,
-                volatility: ewma.clone(),
-            }),
-            fees,
-            skim_cfg,
-            funding_cfg,
-            sim_cfg_template.clone(),
-            equity_csv_dir.clone(),
-        );
+        for g in parse_decimal_list(&args.as_gamma_list)? {
+            for sbps in parse_u32_list(&args.as_spread_bps_list)? {
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &format!("A-S γ={g} {sbps}bps"),
+                    AvellanedaStoikov::new(AvellanedaStoikovConfig {
+                        gamma: g,
+                        base_spread_bps: sbps,
+                        horizon_sec: 3600,
+                        size_per_quote,
+                        notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
+                        step_size: lot_step,
+                        min_requote_interval_ms: 1000,
+                        level_step_bps: 1,
+                        volatility: ewma.clone(),
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
+            }
+        }
     }
     if included("glft", &allow) {
-        spawn_preset(
-            &mut handles,
-            &shared_data,
-            &symbol,
-            "GLFT γ=0.1 5bps",
-            Glft::new(GlftConfig {
-                gamma: Decimal::from_str("0.1")?,
-                base_spread_bps: 5,
-                size_per_quote,
-                notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
-                step_size: lot_step,
-                min_requote_interval_ms: 1000,
-                level_step_bps: 1,
-                volatility: ewma.clone(),
-            }),
-            fees,
-            skim_cfg,
-            funding_cfg,
-            sim_cfg_template.clone(),
-            equity_csv_dir.clone(),
-        );
+        for g in parse_decimal_list(&args.glft_gamma_list)? {
+            for sbps in parse_u32_list(&args.glft_spread_bps_list)? {
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &format!("GLFT γ={g} {sbps}bps"),
+                    Glft::new(GlftConfig {
+                        gamma: g,
+                        base_spread_bps: sbps,
+                        size_per_quote,
+                        notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
+                        step_size: lot_step,
+                        min_requote_interval_ms: 1000,
+                        level_step_bps: 1,
+                        volatility: ewma.clone(),
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
+            }
+        }
     }
     if included("top-of-book", &allow) {
         spawn_preset(

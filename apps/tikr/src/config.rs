@@ -2029,6 +2029,83 @@ mod tests {
     }
 
     #[test]
+    fn rampage_avellaneda_stoikov_variant_deserializes() {
+        let s = r#"
+            [account]
+            env = "futures-mainnet"
+
+            [rampage]
+            enabled = true
+
+            [rampage.score]
+            mode = "candle_height"
+            [rampage.score.params]
+            candle_count = 60
+            min_candle_pct = "0"
+
+            [rampage.strategy]
+            kind = "avellaneda_stoikov"
+            [rampage.strategy.params]
+            notional = "5"
+            gamma = "0.4"
+            base_spread_bps = 3
+        "#;
+        let cfg: DashboardConfig = toml::from_str(s).unwrap();
+        match cfg.rampage.expect("rampage").strategy {
+            RampageStrategy::AvellanedaStoikov {
+                notional,
+                gamma,
+                base_spread_bps,
+                horizon_sec,
+                ..
+            } => {
+                assert_eq!(notional, Some(Decimal::from(5)));
+                assert_eq!(gamma, Decimal::new(4, 1)); // 0.4
+                assert_eq!(base_spread_bps, 3);
+                assert_eq!(horizon_sec, 3600, "horizon_sec defaults to 3600");
+            }
+            other => panic!("expected AvellanedaStoikov, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rampage_glft_variant_deserializes() {
+        let s = r#"
+            [account]
+            env = "futures-mainnet"
+
+            [rampage]
+            enabled = true
+
+            [rampage.score]
+            mode = "candle_height"
+            [rampage.score.params]
+            candle_count = 60
+            min_candle_pct = "0"
+
+            [rampage.strategy]
+            kind = "glft"
+            [rampage.strategy.params]
+            gamma = "0.4"
+            base_spread_bps = 3
+        "#;
+        let cfg: DashboardConfig = toml::from_str(s).unwrap();
+        match cfg.rampage.expect("rampage").strategy {
+            RampageStrategy::Glft {
+                gamma,
+                base_spread_bps,
+                notional,
+                ..
+            } => {
+                assert_eq!(gamma, Decimal::new(4, 1));
+                assert_eq!(base_spread_bps, 3);
+                assert_eq!(notional, None, "notional defaults to None");
+            }
+            other => panic!("expected Glft, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rampage_wave_variant_deserializes() {
         let s = r#"
             [account]

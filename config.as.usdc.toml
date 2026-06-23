@@ -1,0 +1,65 @@
+# Avellaneda-Stoikov (inventory-skew) on the rampage market selector.
+#
+# Same account / rampage / scoring base as config.toml, but the per-symbol
+# strategy is A-S instead of wave. A-S quotes a single bid/ask around an
+# inventory-skewed reservation price (long → quotes shift DOWN so the ask fills
+# and the bag mean-reverts to flat), so it stays inventory-FLAT while booking
+# the spread — clearing the adverse-selection floor that wave's bag-riding
+# sits on.
+#
+# Params are the tuned winner from the γ × spread sweep (WLD/SUI/ZEC, $1k/25x,
+# 0-fee): γ=0.4 + 3bps half-spread. High γ is what makes the inventory
+# mean-reversion bite (peak inventory ~89 vs ~3141 at γ=0.1); the tight 3bps
+# spread drives volume up while the skew does the risk work. Basket: NET +96,
+# realized +67, peak inv 89, volume 174k — good profit, tiny bag, high churn.
+
+[account]
+env = "futures-mainnet"
+asset = "USDC"
+order_balance_pct = "0"                # 0 = fixed `notional` below (no compounding). Bot COUNT still auto-scales.
+max_position_pct = "0"
+auto_scale = true                      # active-bot count = floor(wallet / min_bot_capital_usdc), clamped to [1, top_n]
+min_bot_capital_usdc = "500"
+take_profit_pct = "0"
+leverage = 25
+inventory_boost_pct = "0"
+inventory_boost_curve = "1"
+inventory_boost_profit_gated = true
+inventory_boost_profit_full_bps = "50"
+inventory_boost_add_pct = "0"
+inventory_boost_add_full_bps = "50"
+bnb_refill_enabled = true              # this is the manager process; enable on exactly ONE process per account
+
+[account.bagger]
+#profit_lock_pct = "0.1"
+#loss_lock_pct = "10"
+#exit_taker = false
+
+[rampage]
+enabled = true
+min_volume_usdc = "20000000"           # $20M 24h quote volume floor
+recheck_interval_secs = 60
+quote_asset = "USDC"
+top_n = 4
+rotate_loss_pct = "0.01"
+big_bag_pct = "0"
+retire_bnb_pct = "50"
+
+[rampage.score]
+mode = "grid_vol"                      # rank by harvestable volatility (path − net_penalty×net over the window)
+[rampage.score.params]
+candle_count = 60
+net_penalty = "0"                      # multi-market top_n>1 → keep LOW (0 = pure path; keeps winners always-on)
+min_tick_bps = "6"
+
+[rampage.strategy]
+kind = "avellaneda_stoikov"           # A-S inventory-skew MM ("wave" | "tide" | "flat_mm" | "avellaneda_stoikov" | "glft")
+[rampage.strategy.params]
+notional = "5"                         # FIXED $5/quote (account order_balance_pct = 0). Bot count still auto-scales.
+gamma = "0.4"                          # risk aversion: HIGH γ drives strong inventory mean-reversion → flat bag (tuned winner)
+base_spread_bps = 3                    # half-spread per side (10 bps round-trip is 2×); tight spread = high volume
+horizon_sec = 3600                     # inventory-urgency horizon T−t (NOT wall-clock); larger = gentler push to flat
+min_requote_ms = 1000                  # min time between full requotes (rate-limit guard)
+level_step_bps = 1                     # mid-drift early-requote threshold, in bps
+ewma_half_life_sec = 60.0              # volatility EWMA half-life (TOML float; this field is f64, not Decimal)
+ewma_initial_var = "0.000001"          # volatility EWMA seed variance
