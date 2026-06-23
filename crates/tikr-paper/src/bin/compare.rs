@@ -1017,6 +1017,11 @@ struct Args {
     /// A-S sweep: comma-separated half-spread values, in bps.
     #[arg(long, default_value = "5")]
     as_spread_bps_list: String,
+    /// A-S sweep: comma-separated inventory-horizon T−t values, in seconds.
+    /// Smaller = gentler reservation-price skew (skew ∝ γ·σ²·horizon), so a
+    /// high-vol symbol keeps quoting instead of freezing after the first fill.
+    #[arg(long, default_value = "3600")]
+    as_horizon_sec_list: String,
     /// GLFT sweep: comma-separated risk-aversion γ values.
     #[arg(long, default_value = "0.1")]
     glft_gamma_list: String,
@@ -2584,28 +2589,30 @@ async fn run_sweep_collect(
     if included("avellaneda-stoikov", &allow) {
         for g in parse_decimal_list(&args.as_gamma_list)? {
             for sbps in parse_u32_list(&args.as_spread_bps_list)? {
-                spawn_preset(
-                    &mut handles,
-                    &shared_data,
-                    &symbol,
-                    &format!("A-S γ={g} {sbps}bps"),
-                    AvellanedaStoikov::new(AvellanedaStoikovConfig {
-                        gamma: g,
-                        base_spread_bps: sbps,
-                        horizon_sec: 3600,
-                        size_per_quote,
-                        notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
-                        step_size: lot_step,
-                        min_requote_interval_ms: 1000,
-                        level_step_bps: 1,
-                        volatility: ewma.clone(),
-                    }),
-                    fees,
-                    skim_cfg,
-                    funding_cfg,
-                    sim_cfg_template.clone(),
-                    equity_csv_dir.clone(),
-                );
+                for hz in parse_u32_list(&args.as_horizon_sec_list)? {
+                    spawn_preset(
+                        &mut handles,
+                        &shared_data,
+                        &symbol,
+                        &format!("A-S γ={g} {sbps}bps h={hz}"),
+                        AvellanedaStoikov::new(AvellanedaStoikovConfig {
+                            gamma: g,
+                            base_spread_bps: sbps,
+                            horizon_sec: hz as u64,
+                            size_per_quote,
+                            notional_per_quote: (notional > Decimal::ZERO).then_some(notional),
+                            step_size: lot_step,
+                            min_requote_interval_ms: 1000,
+                            level_step_bps: 1,
+                            volatility: ewma.clone(),
+                        }),
+                        fees,
+                        skim_cfg,
+                        funding_cfg,
+                        sim_cfg_template.clone(),
+                        equity_csv_dir.clone(),
+                    );
+                }
             }
         }
     }
