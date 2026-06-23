@@ -50,7 +50,11 @@ mode = "grid_vol"                      # rank by harvestable volatility (path �
 [rampage.score.params]
 candle_count = 60
 net_penalty = "0"                      # multi-market top_n>1 → keep LOW (0 = pure path; keeps winners always-on)
-min_tick_bps = "6"
+# min_tick_bps gates on tick_size/price×10000 ≥ this. 6 filters the ENTIRE
+# liquid USDC universe (BTC/ETH/SOL/XRP/BNB/ZEC/DOGE/SUI all have fine ticks,
+# tick_bps 0.016–1.45) → 0 candidates → no trading. 0 = no gate (let all
+# volume-qualifying markets into scoring; grid_vol + top_n pick the best).
+min_tick_bps = "0"
 
 [rampage.strategy]
 kind = "avellaneda_stoikov"           # A-S inventory-skew MM ("wave" | "tide" | "flat_mm" | "avellaneda_stoikov" | "glft")
