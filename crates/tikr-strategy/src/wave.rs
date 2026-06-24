@@ -941,6 +941,11 @@ impl Strategy for Wave {
         vec![("step_bps", step), ("inner", inner)]
     }
 
+    fn grid_step_bps(&self) -> Option<Decimal> {
+        let s = self.effective_step_bps();
+        (s > 0).then(|| Decimal::from(s))
+    }
+
     fn on_event(&mut self, ctx: &StrategyContext<'_>, _event: &MarketEvent) -> Vec<Action> {
         self.emitted_this_event_bid.clear();
         self.emitted_this_event_ask.clear();

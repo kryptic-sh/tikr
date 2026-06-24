@@ -4172,7 +4172,7 @@ fn format_eta(secs: f64) -> String {
 /// basket-mode CSV streams stay row-addressable when concatenated.
 fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
     println!(
-        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,mean_pos_usdt,realized,unrealized,fees,net,dollars_per_fill,roi_pct"
+        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,mean_pos_usdt,realized,unrealized,fees,net,projected_net,dollars_per_fill,roi_pct"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -4201,7 +4201,7 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             name.clone()
         };
         println!(
-            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
@@ -4214,6 +4214,7 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
             unrealized,
             fees,
             net,
+            decimal_to_f64(&r.projected_net.0),
             per_fill,
             roi,
         );
@@ -4227,10 +4228,10 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!("### {symbol}");
     println!();
     println!(
-        "| preset | fills | fills/min | peak/min | rej | liq | volume | peak_pos | realized | unrealized | fees | NET | $/fill | ROI% |"
+        "| preset | fills | fills/min | peak/min | rej | liq | volume | peak_pos | realized | unrealized | fees | NET | projNET | $/fill | ROI% |"
     );
     println!(
-        "|--------|------:|----------:|---------:|----:|----:|-------:|---------:|---------:|-----------:|-----:|----:|-------:|-----:|"
+        "|--------|------:|----------:|---------:|----:|----:|-------:|---------:|---------:|-----------:|-----:|----:|--------:|-------:|-----:|"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -4258,7 +4259,7 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
         // Markdown escape: pipes inside cell text break the row.
         let safe_name = name.replace('|', "\\|");
         println!(
-            "| {safe_name} | {} | {:.2} | {} | {} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
+            "| {safe_name} | {} | {:.2} | {} | {} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
@@ -4268,6 +4269,7 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
             unrealized,
             fees,
             net,
+            decimal_to_f64(&r.projected_net.0),
             per_fill,
         );
     }
@@ -4402,6 +4404,7 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             "unrealized",
             "fees",
             "NET",
+            "projNET",
             "$/fill",
             "ROI%",
         ]);
@@ -4444,6 +4447,7 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
                 format!("{:.4}", decimal_to_f64(&r.unrealized.0)),
                 format!("{:.4}", decimal_to_f64(&r.fees.0)),
                 format!("{net:.4}"),
+                format!("{:.4}", decimal_to_f64(&r.projected_net.0)),
                 format!("{dpf:.5}"),
                 roi,
             ];

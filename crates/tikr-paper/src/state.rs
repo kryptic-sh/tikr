@@ -76,6 +76,7 @@ mod tests {
             liquidations: 0,
             peak_fills_per_min: 0,
             rejected_orders: 0,
+            projected_net: Notional(Decimal::from(12)),
         }
     }
 

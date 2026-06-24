@@ -65,6 +65,7 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
     let mut fees = Decimal::ZERO;
     let mut funding = Decimal::ZERO;
     let mut net = Decimal::ZERO;
+    let mut projected_net = Decimal::ZERO;
     let mut max_runtime = 0u64;
     let mut max_sim_duration = 0u64;
     let mut total_events = 0u64;
@@ -104,6 +105,7 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         fees += r.fees.0;
         funding += r.funding.0;
         net += r.net.0;
+        projected_net += r.projected_net.0;
         max_runtime = max_runtime.max(r.runtime_secs);
         max_sim_duration = max_sim_duration.max(r.sim_duration_secs);
         total_events += r.events_processed;
@@ -174,5 +176,6 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         liquidations: total_liquidations,
         peak_fills_per_min: max_peak_fills_per_min,
         rejected_orders: total_rejected_orders,
+        projected_net: Notional(projected_net),
     }
 }

@@ -119,6 +119,13 @@ pub struct PaperReport {
     /// non-zero value means the strategy blew through its margin — the
     /// realized loss is already folded into `realized` / `net`.
     pub liquidations: u64,
+    /// Projected NET assuming the open bag round-trips out of the lattice —
+    /// each open unit recaptures one grid step on close (`net − unrealized +
+    /// |final notional| × grid_step_bps/10000`). For grid strategies this
+    /// estimates the NET once a held bag (transient unretraced excursion) fully
+    /// reverses and closes; equals `net` when the strategy has no fixed grid
+    /// step (`Strategy::grid_step_bps() == None`) or holds no position.
+    pub projected_net: Notional,
 }
 
 // --- serde wire format ---------------------------------------------------
@@ -176,6 +183,8 @@ struct PaperReportWire {
     peak_fills_per_min: u64,
     #[serde(default)]
     rejected_orders: u64,
+    #[serde(default)]
+    projected_net: String,
 }
 
 impl Serialize for PaperReport {
@@ -211,6 +220,7 @@ impl Serialize for PaperReport {
             liquidations: self.liquidations,
             peak_fills_per_min: self.peak_fills_per_min,
             rejected_orders: self.rejected_orders,
+            projected_net: self.projected_net.0.to_string(),
         }
         .serialize(serializer)
     }
@@ -301,6 +311,12 @@ impl<'de> Deserialize<'de> for PaperReport {
             liquidations: wire.liquidations,
             peak_fills_per_min: wire.peak_fills_per_min,
             rejected_orders: wire.rejected_orders,
+            // Older snapshots predate the field → fall back to `net`.
+            projected_net: if wire.projected_net.is_empty() {
+                parse(&wire.net)?
+            } else {
+                parse(&wire.projected_net)?
+            },
         })
     }
 }

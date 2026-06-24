@@ -2800,6 +2800,15 @@ where
     );
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
+    // Project the close-out of any open bag: each open unit recaptures one grid
+    // step if it round-trips out of the lattice. Needs the strategy's grid step,
+    // so it's computed here (not in `finalize`).
+    report.projected_net = project_net_for(
+        &report,
+        tracker.snapshot().size.0,
+        last_mark,
+        strategy.grid_step_bps(),
+    );
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
     }
@@ -3573,6 +3582,31 @@ fn finalize(
         liquidations,
         peak_fills_per_min,
         rejected_orders,
+        // Placeholder: the bag round-trip projection needs the strategy's grid
+        // step, which `finalize` doesn't have. The caller (which holds the
+        // strategy) overwrites this via `project_net_for`. Defaults to `net`.
+        projected_net: base.net,
+    }
+}
+
+/// Project NET assuming the open bag round-trips out of the lattice: each open
+/// unit recaptures one grid step on close. `net − unrealized + |final notional|
+/// × step_bps/10000`. Returns `net` unchanged when the strategy has no fixed
+/// grid step or the position is flat. `mark` is the final mark price; `size` the
+/// signed final position in base units.
+fn project_net_for(
+    report: &PaperReport,
+    size: Decimal,
+    mark: Price,
+    grid_step_bps: Option<Decimal>,
+) -> Notional {
+    match grid_step_bps {
+        Some(step_bps) if step_bps > Decimal::ZERO && !size.is_zero() => {
+            let final_notional = (size.abs() * mark.0).abs();
+            let recapture = final_notional * step_bps / Decimal::from(10_000);
+            Notional((report.net.0 - report.unrealized.0 + recapture).round_dp(8))
+        }
+        _ => report.net,
     }
 }
 
@@ -4651,6 +4685,7 @@ mod tests {
             liquidations: 0,
             peak_fills_per_min: 0,
             rejected_orders: 0,
+            projected_net: Notional(Decimal::ZERO),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -4711,6 +4746,7 @@ mod tests {
             liquidations: 0,
             peak_fills_per_min: 0,
             rejected_orders: 0,
+            projected_net: Notional(Decimal::ZERO),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);

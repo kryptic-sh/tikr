@@ -243,6 +243,14 @@ pub trait Strategy: Send {
     fn status_metrics(&self) -> Vec<(&'static str, String)> {
         Vec::new()
     }
+
+    /// Nominal grid step in basis points, for grid/lattice strategies — used to
+    /// project the spread an open bag would recapture if it round-tripped out
+    /// (each open unit captures one step on close). `None` (default) for
+    /// strategies without a fixed grid step (no projection possible).
+    fn grid_step_bps(&self) -> Option<Decimal> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
