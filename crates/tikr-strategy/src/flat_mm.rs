@@ -615,15 +615,26 @@ impl FlatMm {
             }
         }
 
-        // Outskirt orders: resting orders NOT in the desired band.
-        // Normally we leave these alone (frozen: never reprice outskirts).
-        // Exception: when total resting count hits lattice_max_open, trim the
-        // farthest-from-mid outskirts to make room.
+        // Outskirt orders: resting orders genuinely OUTSIDE the active band
+        // (stale, far from mid). Normally we leave these alone (frozen: never
+        // reprice outskirts). Exception: when total resting count hits
+        // lattice_max_open, trim the farthest-from-mid outskirts to make room.
+        //
+        // CRITICAL — only orders BEYOND the band are trim-eligible. A level the
+        // mid just vacated sits AT the touch (dropped from `desired` by the
+        // inner dead-zone, yet about to FILL on the next trade). If it were
+        // trim-eligible, a tight `lattice_max_open` (== band working set) would
+        // cancel it for each new level added → the price trades through a hole
+        // where the order used to be → zero fills. The trim must clip the
+        // farthest stale orders on the side the price moved AWAY from (e.g. the
+        // high sells after a down-move), never anything near the touch.
+        let band_reach = Decimal::from(band) * step;
         let outskirts: Vec<(tikr_venue::QuoteId, Decimal)> = ctx
             .open_quotes
             .iter()
             .filter(|(id, _)| !claimed_ids.contains(id))
             .map(|(id, intent)| (*id, (intent.price.0 - mid).abs()))
+            .filter(|(_, dist)| *dist > band_reach)
             .collect();
 
         let total_after = ctx.open_quotes.len() + new_quote_count;
@@ -1401,6 +1412,75 @@ mod tests {
             .filter(|a| matches!(a, Action::Cancel(_)))
             .count();
         assert_eq!(cancels2, 0, "no cancels when under high cap: {acts2:?}");
+    }
+
+    #[test]
+    fn frozen_trim_spares_at_touch_level_at_cap() {
+        // Regression: with lattice_max_open == the grid's working set (2×band),
+        // a 1-step mid move must NOT cancel the just-vacated level sitting AT the
+        // new touch — that order is dead-zoned out of `desired` but is about to
+        // FILL. The old trim treated it as an outskirt and (since to_cancel ==
+        // new_quote_count) cancelled it alongside the genuinely-far one, leaving
+        // a hole the price trades straight through → zero fills. The trim must
+        // only clip orders BEYOND the band; near-touch levels are spared.
+        let s = sym();
+        let mid0 = Decimal::ONE; // origin anchors here
+        let b0 = book_mid(&s, mid0);
+        let p = pos(&s, Decimal::ZERO, Decimal::ZERO);
+        // band 3 → working set = 6 orders (3 bid + 3 ask). cap == working set.
+        let mut st = FlatMm::new(cfg_frozen(3, 6));
+
+        // Seed the 6-order grid at the origin.
+        let seed = st.on_event(
+            &ctx(&s, &b0, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: b0.clone(),
+            },
+        );
+        let resting = as_resting(&seed);
+        assert_eq!(resting.len(), 6, "seed places the full 6-order grid");
+
+        // step = origin·step_bps = 1.0·2bps = 0.0002; band_reach = 3·step.
+        let step = mid0 * Decimal::from(2) / Decimal::from(10_000);
+        let band_reach = Decimal::from(3) * step;
+        let mid1 = mid0 + step; // move up exactly one rung
+        let at_touch = mid1; // the just-vacated ask now sits at the new mid
+
+        let acts = st.on_event(
+            &ctx(&s, &book_mid(&s, mid1), &p, &resting),
+            &MarketEvent::BookUpdate {
+                snapshot: book_mid(&s, mid1),
+            },
+        );
+
+        // Map every Cancel back to its resting price.
+        let cancelled_prices: Vec<Decimal> = acts
+            .iter()
+            .filter_map(|a| {
+                if let Action::Cancel(id) = a {
+                    resting
+                        .iter()
+                        .find(|(rid, _)| rid == id)
+                        .map(|(_, qi)| qi.price.0)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Invariant: every cancelled order is genuinely far from mid.
+        for px in &cancelled_prices {
+            assert!(
+                (*px - mid1).abs() > band_reach,
+                "trim cancelled a near-mid order {px} (mid {mid1}, band_reach {band_reach}); \
+                 cancels={cancelled_prices:?}"
+            );
+        }
+        // The at-touch level must survive (would be cancelled by the old bug).
+        assert!(
+            !cancelled_prices.contains(&at_touch),
+            "at-touch level {at_touch} must NOT be trimmed: {cancelled_prices:?}"
+        );
     }
 
     #[test]
