@@ -1,7 +1,7 @@
 [account]
 env = "futures-mainnet"
 asset = "USDC"
-order_balance_pct = "0.1"
+order_balance_pct = "0"
 max_position_pct = "0"
 leverage = 25
 
@@ -10,10 +10,10 @@ symbol = "ZECUSDC"
 strategy = "wave"
 
 [bot.wave]
-notional = 6
-levels = 40
 auto_inner = false
-round_trips = 10
-steps_inner = 2
-steps_bps = 1
+notional = 5
+levels = 10
+round_trips = 5
+steps_inner = 1
+steps_bps = 5
 relattice_drift_pct = "5"
