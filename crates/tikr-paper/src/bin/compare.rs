@@ -147,6 +147,19 @@ fn equity_csv_every_n() -> u32 {
     EQUITY_CSV_EVERY_N.get().copied().unwrap_or(1000)
 }
 
+/// Runner orphan-sweep threshold per strategy — MUST mirror apps/tikr
+/// `build.rs::max_open_orders_for`. Grid strategies manage their own resting
+/// book (many open orders by design), so the sweep is disabled (`0`); plain
+/// 1-per-side strategies emit at most 2. Keyed on `Strategy::name()` (canonical,
+/// no aliases). Backtests must match live or a grid would behave differently.
+fn max_expected_open_for(name: &str) -> usize {
+    match name {
+        "tide" | "joker" | "rsi-mr" | "wave" | "flat-mm" | "volley" | "strangler"
+        | "static-grid" | "layered-grid" | "spread-scalp" => 0,
+        _ => 2,
+    }
+}
+
 fn inventory_boost() -> Option<InventoryBoostConfig> {
     INVENTORY_BOOST.get().copied().flatten()
 }
@@ -3939,7 +3952,7 @@ async fn run_one<S: Strategy>(
         order_balance_pct: balance_compounding().1,
         max_position_pct: balance_compounding().2,
         min_notional: runner_min_notional(),
-        max_expected_open_orders: 2,
+        max_expected_open_orders: max_expected_open_for(strategy.name()),
         liquidation: liquidation(),
         mark_series: None,
         inventory_boost: inventory_boost(),
@@ -4036,7 +4049,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             order_balance_pct: balance_compounding().1,
             max_position_pct: balance_compounding().2,
             min_notional: runner_min_notional(),
-            max_expected_open_orders: 2,
+            max_expected_open_orders: max_expected_open_for(strategy.name()),
             liquidation: liquidation(),
             mark_series: None,
             inventory_boost: inventory_boost(),
