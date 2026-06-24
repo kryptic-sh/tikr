@@ -126,6 +126,10 @@ static BAGGER: OnceLock<tikr_paper::bagger::BaggerConfig> = OnceLock::new();
 /// because basket runs symbols sequentially and presets within a symbol only
 /// read it at spawn time after it's been set.
 static RUNNER_MIN_NOTIONAL: Mutex<Decimal> = Mutex::new(Decimal::ZERO);
+/// Equity-curve CSV sampling cadence (events per row), from
+/// `--equity-csv-every-n-events`. Read by the `run_one` /
+/// `spawn_preset_with_liqs` RunnerConfig builders when a CSV path is set.
+static EQUITY_CSV_EVERY_N: OnceLock<u32> = OnceLock::new();
 
 fn balance_compounding() -> (Decimal, Decimal, Decimal) {
     BALANCE_COMPOUNDING
@@ -136,6 +140,11 @@ fn balance_compounding() -> (Decimal, Decimal, Decimal) {
 
 fn runner_min_notional() -> Decimal {
     *RUNNER_MIN_NOTIONAL.lock().unwrap()
+}
+
+/// Equity-curve sampling cadence (events per row); defaults to 1000 when unset.
+fn equity_csv_every_n() -> u32 {
+    EQUITY_CSV_EVERY_N.get().copied().unwrap_or(1000)
 }
 
 fn inventory_boost() -> Option<InventoryBoostConfig> {
@@ -268,6 +277,13 @@ struct Args {
     /// symbol so per-symbol files don't collide.
     #[arg(long, default_value = "")]
     equity_csv_dir: String,
+
+    /// Equity-curve CSV sampling cadence: write a row every N processed
+    /// events. Only used when `--equity-csv-dir` is set. Default `1000`
+    /// (coarse — fine for million-event 72h runs). Set to `1` for a
+    /// per-event curve on short synthetic scenarios.
+    #[arg(long, default_value_t = 1000)]
+    equity_csv_every_n_events: u32,
 
     /// Order size per quote (applied to ALL presets).
     #[arg(long, default_value = "0.001")]
@@ -1870,6 +1886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let _ = LIQUIDATION.set(liq_cfg);
+    let _ = EQUITY_CSV_EVERY_N.set(args.equity_csv_every_n_events.max(1));
 
     if !args.data_root.is_empty() {
         return run_basket(args).await;
@@ -3904,7 +3921,11 @@ async fn run_one<S: Strategy>(
         // Equity-curve export needs snapshot ticks; default `0` (no
         // ticks) → no rows. Force a modest cadence when CSV requested
         // so the curve has resolution without spamming dashboards.
-        snapshot_every_n_events: if equity_csv_path.is_some() { 1000 } else { 0 },
+        snapshot_every_n_events: if equity_csv_path.is_some() {
+            equity_csv_every_n()
+        } else {
+            0
+        },
         skim,
         funding,
         snapshot_tap: None,
@@ -3997,7 +4018,11 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
             wallet_rx: None,
             take_profit_pct: tikr_core::Decimal::ZERO,
-            snapshot_every_n_events: if equity_csv_path.is_some() { 1000 } else { 0 },
+            snapshot_every_n_events: if equity_csv_path.is_some() {
+                equity_csv_every_n()
+            } else {
+                0
+            },
             skim,
             funding,
             snapshot_tap: None,
