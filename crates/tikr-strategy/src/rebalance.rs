@@ -17,26 +17,27 @@
 //! rebalances to `target_asset_frac` of the total value *at that rung's price*
 //! (`T` decreases with price: hold fewer units when it's expensive).
 //!
-//! # Inventory-aware sizing
+//! # Frozen orders, mirror on fill
 //!
-//! Side is fixed by price — **sells above mid, buys below** — and the *size* is
-//! the gap between current holdings and the rung's target `T[j]`, walking outward
-//! from mid (sells shed down to each lower target as price rises; buys add up to
-//! each higher target as price falls). A rung is quoted only when there is
-//! inventory to move toward its target.
+//! The ladder is placed exactly once, at the anchor: a BUY at every rung below
+//! and a SELL at every rung above, each sized to its gap's `T`-increment. Because
+//! `T` is built recursively, a level's size already accounts for every order
+//! between it and the anchor — the precomputed quantity is exactly the trade that
+//! restores 50/50 at that rung *given the inner rungs have filled*.
 //!
-//! This is what keeps it a *rebalancer*. A naive "buy if rung < mid" rule breaks
-//! when price runs past the band: every rung ends up below mid and flips to a buy,
-//! so the bot accumulates into the rally (observed: WLD +28% → ended 94% asset).
-//! Sizing against the target instead means that once we have shed to the
-//! top-of-band target, no further buys fire above where they belong — the
-//! rebalancer holds (and stays cash-heavy) through a runaway trend.
+//! Orders then **rest untouched**. The strategy does nothing on subsequent book
+//! updates — it never recomputes or cancels. Only a fill moves the lattice: a
+//! filled order is mirrored one rung toward where price came from, carrying the
+//! same quantity (buy at `r_j` → sell at `r_{j+1}`; sell at `r_j` → buy at
+//! `r_{j-1}`). That mirror is the offsetting leg that books the round-trip and
+//! settles inventory back to balance, and it keeps the sizes frozen forever.
 //!
-//! # Reconcile
-//!
-//! On every book update / fill the strategy recomputes the desired ladder for the
-//! current mid + `held` (anchor seed + runner-tracked net position) and diffs it
-//! against the resting orders, emitting only the needed placements/cancels.
+//! This is what makes it correct through a runaway trend: a rung above the anchor
+//! is a SELL until it fills, then it becomes a BUY *one rung lower* — it never
+//! turns into a buy at its own (high) price, so the bot can't accumulate into a
+//! rally. Within the band the holding always equals the balanced `T` for the
+//! current price, so cash ≈ asset value; only past the band (ladder exhausted)
+//! does the ratio drift.
 //!
 //! Anchor is fixed (frozen lattice, like [`crate::wave::Wave`]).
 
@@ -145,110 +146,86 @@ impl Rebalance {
         self.anchor = Some(anchor);
     }
 
-    /// Desired resting orders given the current `mid` and `held` units.
-    ///
-    /// Inventory-aware: each rung drives the holding toward that rung's balanced
-    /// target `T[j]`. Walking the sell side UP from mid, we shed down to each
-    /// (lower) target; walking the buy side DOWN, we add up to each (higher)
-    /// target. A rung is only quoted when there is inventory to move toward its
-    /// target — so once we have sold out to the band top (high price), no buys
-    /// are placed above where they belong, and a runaway rally leaves us holding
-    /// the (small) top-of-band target rather than buying into it.
-    ///
-    /// Side is fixed by price (sells above mid, buys below); the size is the
-    /// signed gap to the target, skipped when already past it. This cannot flip
-    /// a rung to the wrong side the way a pure mid-vs-rung rule did.
-    fn desired(&self, symbol: &Symbol, mid: Price, held: Decimal) -> Vec<QuoteIntent> {
-        let len = self.rung_prices.len();
-        let min_n = self.config.min_order_notional;
-        let mut out = Vec::with_capacity(len);
-
-        let mk = |side: Side, r: Decimal, size: Decimal| QuoteIntent {
+    fn mk(&self, symbol: &Symbol, side: Side, idx: usize, size: Decimal) -> QuoteIntent {
+        QuoteIntent {
             symbol: symbol.clone(),
             side,
-            price: Price(r),
+            price: Price(self.rung_prices[idx]),
             size: Size(size),
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
-        };
+        }
+    }
 
-        // SELLS — rungs strictly above mid, ascending price. As price rises we
-        // shed holdings down to each rung's (lower) target.
-        let mut proj = held;
+    /// The one-time frozen ladder placed at the anchor: a BUY at every rung below
+    /// the anchor and a SELL at every rung above. Each order is sized to the
+    /// `T`-increment of the gap it guards — i.e. the exact quantity that, when it
+    /// fills, restores the 50/50 balance at that rung (the recursive `T` already
+    /// folds in every inner rung's fill, so a level "knows about" the orders
+    /// closer to the anchor). Orders then rest untouched; fills are mirrored one
+    /// rung over by [`Self::mirror`].
+    fn initial_ladder(&self, symbol: &Symbol, mid: Price) -> Vec<Action> {
+        let len = self.rung_prices.len();
+        let min_n = self.config.min_order_notional;
+        let mut out = Vec::with_capacity(len);
         for idx in 0..len {
             let r = self.rung_prices[idx];
-            if r <= mid.0 {
+            if r <= Decimal::ZERO {
                 continue;
             }
-            let target = self.rung_units[idx];
-            if proj <= target {
-                continue; // hold too little to sell here
-            }
-            let sell = (proj - target).round_dp(8);
-            if min_n > Decimal::ZERO && sell * r < min_n {
-                continue; // dust — let it roll into a higher rung
-            }
-            out.push(mk(Side::Ask, r, sell));
-            proj = target;
-        }
-
-        // BUYS — rungs strictly below mid, descending price. As price falls we
-        // add holdings up to each rung's (higher) target.
-        let mut proj = held;
-        for idx in (0..len).rev() {
-            let r = self.rung_prices[idx];
-            if r >= mid.0 || r <= Decimal::ZERO {
+            let (side, size) = if r < mid.0 && idx + 1 < len {
+                // BUY guarding the gap above it: T[idx] − T[idx+1].
+                (Side::Bid, self.rung_units[idx] - self.rung_units[idx + 1])
+            } else if r > mid.0 && idx >= 1 {
+                // SELL guarding the gap below it: T[idx-1] − T[idx].
+                (Side::Ask, self.rung_units[idx - 1] - self.rung_units[idx])
+            } else {
+                continue; // the anchor rung itself, or out of range
+            };
+            let size = size.round_dp(8);
+            if size <= Decimal::ZERO {
                 continue;
             }
-            let target = self.rung_units[idx];
-            if proj >= target {
-                continue; // already hold enough for this rung
+            if min_n > Decimal::ZERO && size * r < min_n {
+                continue;
             }
-            let buy = (target - proj).round_dp(8);
-            if min_n > Decimal::ZERO && buy * r < min_n {
-                continue; // dust — let it roll into a lower rung
-            }
-            out.push(mk(Side::Bid, r, buy));
-            proj = target;
+            out.push(Action::Quote(self.mk(symbol, side, idx, size)));
         }
         out
     }
 
-    /// Current held units = anchor-balanced seed (`T` at the anchor) plus the
-    /// runner-tracked net signed position from this strategy's fills.
-    fn held_units(&self, ctx: &StrategyContext<'_>) -> Decimal {
-        let a0 = self.rung_units.get(self.n()).copied().unwrap_or_default();
-        a0 + ctx.position.size.0
-    }
-
-    /// Diff the desired ladder against the resting orders: cancel anything not
-    /// desired (by side+price), place anything desired but not resting.
-    fn reconcile(&self, ctx: &StrategyContext<'_>, mid: Price) -> Vec<Action> {
-        let held = self.held_units(ctx);
-        let desired = self.desired(ctx.symbol, mid, held);
-        let mut actions = Vec::new();
-
-        // Cancel resting orders that are not in the desired set.
-        for (id, intent) in ctx.open_quotes {
-            let keep = desired
-                .iter()
-                .any(|d| d.side == intent.side && d.price.0 == intent.price.0);
-            if !keep {
-                actions.push(Action::Cancel(*id));
-            }
+    /// Mirror a fill one rung toward where price came from, with the SAME size —
+    /// the offsetting leg that books the round-trip and settles inventory back to
+    /// the balance for the new band. A filled BUY at `r_j` (price dipped) becomes
+    /// a SELL at `r_{j+1}`; a filled SELL at `r_j` (price rose) becomes a BUY at
+    /// `r_{j-1}`. Sizes never drift because each mirror carries the filled
+    /// quantity, so the lattice stays the frozen ladder it was seeded as.
+    fn mirror(
+        &self,
+        symbol: &Symbol,
+        fill_price: Decimal,
+        side: Side,
+        qty: Decimal,
+    ) -> Vec<Action> {
+        let Some(idx) = self.rung_prices.iter().position(|p| *p == fill_price) else {
+            return Vec::new();
+        };
+        let len = self.rung_prices.len();
+        let qty = qty.round_dp(8);
+        if qty <= Decimal::ZERO {
+            return Vec::new();
         }
-        // Place desired orders that are not already resting (matched by
-        // side+price; size drift inside a rung is left alone to avoid churn).
-        for d in desired {
-            let resting = ctx
-                .open_quotes
-                .iter()
-                .any(|(_, q)| q.side == d.side && q.price.0 == d.price.0);
-            if !resting {
-                actions.push(Action::Quote(d));
+        match side {
+            // Buy filled (price came down) → sell back one rung up.
+            Side::Bid if idx + 1 < len => {
+                vec![Action::Quote(self.mk(symbol, Side::Ask, idx + 1, qty))]
             }
+            // Sell filled (price came up) → buy back one rung down.
+            Side::Ask if idx >= 1 => {
+                vec![Action::Quote(self.mk(symbol, Side::Bid, idx - 1, qty))]
+            }
+            _ => Vec::new(),
         }
-        actions
     }
 }
 
@@ -270,41 +247,28 @@ impl Strategy for Rebalance {
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
         match event {
+            // Seed the frozen ladder once, on the first book. Subsequent book
+            // updates do NOTHING — the orders rest where they were placed; only
+            // a fill moves the lattice (via its mirror).
             MarketEvent::BookUpdate { snapshot } => {
+                if self.anchor.is_some() {
+                    return Vec::new();
+                }
                 let Some(mid) = compute_mid_strict(snapshot) else {
                     return Vec::new();
                 };
-                if self.anchor.is_none() {
-                    self.seed(mid);
-                }
-                self.reconcile(ctx, mid)
+                self.seed(mid);
+                self.initial_ladder(ctx.symbol, mid)
             }
-            MarketEvent::Fill(_) => {
+            // A resting order filled → place its offsetting mirror one rung over.
+            MarketEvent::Fill(fill) => {
                 if self.anchor.is_none() {
                     return Vec::new();
                 }
-                let Some(mid) = compute_mid_strict(ctx.latest_book) else {
-                    return Vec::new();
-                };
-                self.reconcile(ctx, mid)
+                self.mirror(ctx.symbol, fill.price.0, fill.side, fill.size.0)
             }
             MarketEvent::Heartbeat { .. } | MarketEvent::Trade { .. } => Vec::new(),
         }
-    }
-
-    fn on_quote_rejected(
-        &mut self,
-        ctx: &StrategyContext<'_>,
-        _intent: &QuoteIntent,
-        _reason: &str,
-    ) -> Vec<Action> {
-        if self.anchor.is_none() {
-            return Vec::new();
-        }
-        let Some(mid) = compute_mid_strict(ctx.latest_book) else {
-            return Vec::new();
-        };
-        self.reconcile(ctx, mid)
     }
 }
 
@@ -436,52 +400,91 @@ mod tests {
     }
 
     #[test]
-    fn runaway_rally_does_not_buy_into_it() {
-        // Regression: when price runs far above the band (exits the top), every
-        // rung sits below mid. A naive mid-vs-rung rule would flip them ALL to
-        // buys and accumulate into the rally (the WLD bug). Inventory-aware
-        // sizing must instead place NO sells (none above mid) and buys ONLY at
-        // rungs below the anchor — never buying above where we already hold the
-        // balanced amount.
+    fn buy_fill_mirrors_to_sell_one_rung_up_same_size() {
+        // A filled BUY at r_j must mirror to a SELL at r_{j+1} carrying the SAME
+        // quantity — the offsetting leg that books the round-trip. Sizes never
+        // drift; the lattice stays frozen.
         let symbol = sym();
         let mut r = Rebalance::new(cfg());
         r.seed(Price(Decimal::from(100)));
         let n = r.n();
-        let held = r.rung_units[n]; // a0, balanced at the anchor
-        let high_mid = Decimal::from(150); // +50%, above all rungs
-        let desired = r.desired(&symbol, Price(high_mid), held);
-
-        assert!(
-            desired.iter().all(|q| q.side == Side::Bid),
-            "no sells when the band is exhausted above"
-        );
-        let anchor_price = r.rung_prices[n];
-        for q in &desired {
-            assert!(
-                q.price.0 < anchor_price,
-                "must not buy at/above the anchor while already at target (rung {})",
-                q.price.0
-            );
+        let j = n - 1; // first rung below anchor
+        let qty = (r.rung_units[j] - r.rung_units[j + 1]).round_dp(8);
+        let out = r.mirror(&symbol, r.rung_prices[j], Side::Bid, qty);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Action::Quote(q) => {
+                assert_eq!(q.side, Side::Ask);
+                assert_eq!(q.price.0, r.rung_prices[j + 1]);
+                assert_eq!(q.size.0, qty);
+            }
+            _ => panic!("expected a mirror quote"),
         }
     }
 
     #[test]
-    fn sells_down_to_target_as_price_rises() {
-        // With balanced holdings at the anchor, rungs above mid are sells sized
-        // to shed toward each (lower) target — the rebalancer sheds into a rally.
+    fn sell_fill_mirrors_to_buy_one_rung_down_same_size() {
         let symbol = sym();
         let mut r = Rebalance::new(cfg());
         r.seed(Price(Decimal::from(100)));
         let n = r.n();
-        let held = r.rung_units[n];
-        let desired = r.desired(&symbol, Price(Decimal::from(100)), held);
-        let first_up = r.rung_prices[n + 1];
-        let sell = desired
-            .iter()
-            .find(|q| q.price.0 == first_up)
-            .expect("sell at first up-rung");
-        assert_eq!(sell.side, Side::Ask);
-        // Sheds exactly a0 − T[first up-rung].
-        assert_eq!(sell.size.0, (held - r.rung_units[n + 1]).round_dp(8));
+        let j = n + 1; // first rung above anchor
+        let qty = (r.rung_units[j - 1] - r.rung_units[j]).round_dp(8);
+        let out = r.mirror(&symbol, r.rung_prices[j], Side::Ask, qty);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            Action::Quote(q) => {
+                assert_eq!(q.side, Side::Bid);
+                assert_eq!(q.price.0, r.rung_prices[j - 1]);
+                assert_eq!(q.size.0, qty);
+            }
+            _ => panic!("expected a mirror quote"),
+        }
+    }
+
+    #[test]
+    fn second_book_update_is_a_noop() {
+        // The ladder is placed once; later book updates must NOT re-quote or
+        // cancel — orders rest in place until filled.
+        let symbol = sym();
+        let snap = book(&symbol, Decimal::from(100), Decimal::from(100));
+        let position = pos(&symbol);
+        let mut r = Rebalance::new(cfg());
+        let ctx1 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(1),
+            position: &position,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let first = r.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        assert!(!first.is_empty(), "first book seeds the ladder");
+        let snap2 = book(&symbol, Decimal::new(1001, 1), Decimal::new(1002, 1));
+        let ctx2 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(2),
+            position: &position,
+            recent_fills: &[],
+            latest_book: &snap2,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let second = r.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap2.clone(),
+            },
+        );
+        assert!(
+            second.is_empty(),
+            "later book updates leave orders in place"
+        );
     }
 }
