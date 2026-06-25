@@ -14,28 +14,31 @@
 //! `initial_balance` split by `target_asset_frac`. Rungs sit at geometric steps
 //! `p0·(1 ± band)^k`, `k = 1..=levels`. We precompute the *balanced* unit holding
 //! `T[j]` at each rung `j` recursively — walking out from the anchor, each rung
-//! rebalances to `target_asset_frac` of the total value *at that rung's price*.
-//! Each rung's order size is then the `T` increment across it:
+//! rebalances to `target_asset_frac` of the total value *at that rung's price*
+//! (`T` decreases with price: hold fewer units when it's expensive).
 //!
-//! ```text
-//!   BUY  at r_j  (r_j < mid):  size = T[j]   − T[j+1]   (add units crossing down)
-//!   SELL at r_j  (r_j > mid):  size = T[j-1] − T[j]     (shed units crossing up)
-//! ```
+//! # Inventory-aware sizing
 //!
-//! Both are positive because `T` decreases with price. A buy at `r_j` and the sell
-//! at `r_{j+1}` that undoes it trade the same gap increment, so an oscillation
-//! within a gap round-trips cleanly and books the rebalancing spread.
+//! Side is fixed by price — **sells above mid, buys below** — and the *size* is
+//! the gap between current holdings and the rung's target `T[j]`, walking outward
+//! from mid (sells shed down to each lower target as price rises; buys add up to
+//! each higher target as price falls). A rung is quoted only when there is
+//! inventory to move toward its target.
+//!
+//! This is what keeps it a *rebalancer*. A naive "buy if rung < mid" rule breaks
+//! when price runs past the band: every rung ends up below mid and flips to a buy,
+//! so the bot accumulates into the rally (observed: WLD +28% → ended 94% asset).
+//! Sizing against the target instead means that once we have shed to the
+//! top-of-band target, no further buys fire above where they belong — the
+//! rebalancer holds (and stays cash-heavy) through a runaway trend.
 //!
 //! # Reconcile
 //!
 //! On every book update / fill the strategy recomputes the desired ladder for the
-//! current mid (buys below, sells above) and diffs it against the resting orders —
-//! emitting only the placements/cancels needed. As price crosses a rung the rung
-//! flips buy↔sell, which is what continuously rebalances toward the target.
+//! current mid + `held` (anchor seed + runner-tracked net position) and diffs it
+//! against the resting orders, emitting only the needed placements/cancels.
 //!
-//! Anchor is fixed (frozen lattice, like [`crate::wave::Wave`]); if price exits the
-//! `±levels·band` band the ladder is exhausted on that side — the rebalancer
-//! deliberately caps how far it follows a trend.
+//! Anchor is fixed (frozen lattice, like [`crate::wave::Wave`]).
 
 use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
 use tikr_venue::QuoteIntent;
@@ -142,56 +145,87 @@ impl Rebalance {
         self.anchor = Some(anchor);
     }
 
-    /// Desired resting orders for the current `mid`: buys at rungs below mid,
-    /// sells at rungs above. Size = the balanced `T` increment across the rung.
-    fn desired(&self, symbol: &Symbol, mid: Price) -> Vec<QuoteIntent> {
+    /// Desired resting orders given the current `mid` and `held` units.
+    ///
+    /// Inventory-aware: each rung drives the holding toward that rung's balanced
+    /// target `T[j]`. Walking the sell side UP from mid, we shed down to each
+    /// (lower) target; walking the buy side DOWN, we add up to each (higher)
+    /// target. A rung is only quoted when there is inventory to move toward its
+    /// target — so once we have sold out to the band top (high price), no buys
+    /// are placed above where they belong, and a runaway rally leaves us holding
+    /// the (small) top-of-band target rather than buying into it.
+    ///
+    /// Side is fixed by price (sells above mid, buys below); the size is the
+    /// signed gap to the target, skipped when already past it. This cannot flip
+    /// a rung to the wrong side the way a pure mid-vs-rung rule did.
+    fn desired(&self, symbol: &Symbol, mid: Price, held: Decimal) -> Vec<QuoteIntent> {
         let len = self.rung_prices.len();
+        let min_n = self.config.min_order_notional;
         let mut out = Vec::with_capacity(len);
+
+        let mk = |side: Side, r: Decimal, size: Decimal| QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price: Price(r),
+            size: Size(size),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        };
+
+        // SELLS — rungs strictly above mid, ascending price. As price rises we
+        // shed holdings down to each rung's (lower) target.
+        let mut proj = held;
         for idx in 0..len {
             let r = self.rung_prices[idx];
-            if r <= Decimal::ZERO {
+            if r <= mid.0 {
                 continue;
             }
-            let (side, size) = if r < mid.0 {
-                // BUY: add T[idx] − T[idx+1] units crossing down into this rung.
-                if idx + 1 >= len {
-                    continue;
-                }
-                (Side::Bid, self.rung_units[idx] - self.rung_units[idx + 1])
-            } else if r > mid.0 {
-                // SELL: shed T[idx-1] − T[idx] units crossing up into this rung.
-                if idx == 0 {
-                    continue;
-                }
-                (Side::Ask, self.rung_units[idx - 1] - self.rung_units[idx])
-            } else {
-                continue; // rung exactly at mid — skip
-            };
-            let size = size.round_dp(8);
-            if size <= Decimal::ZERO {
+            let target = self.rung_units[idx];
+            if proj <= target {
+                continue; // hold too little to sell here
+            }
+            let sell = (proj - target).round_dp(8);
+            if min_n > Decimal::ZERO && sell * r < min_n {
+                continue; // dust — let it roll into a higher rung
+            }
+            out.push(mk(Side::Ask, r, sell));
+            proj = target;
+        }
+
+        // BUYS — rungs strictly below mid, descending price. As price falls we
+        // add holdings up to each rung's (higher) target.
+        let mut proj = held;
+        for idx in (0..len).rev() {
+            let r = self.rung_prices[idx];
+            if r >= mid.0 || r <= Decimal::ZERO {
                 continue;
             }
-            if self.config.min_order_notional > Decimal::ZERO
-                && (size * r) < self.config.min_order_notional
-            {
-                continue;
+            let target = self.rung_units[idx];
+            if proj >= target {
+                continue; // already hold enough for this rung
             }
-            out.push(QuoteIntent {
-                symbol: symbol.clone(),
-                side,
-                price: Price(r),
-                size: Size(size),
-                tif: TimeInForce::PostOnly,
-                kind: QuoteKind::Point,
-            });
+            let buy = (target - proj).round_dp(8);
+            if min_n > Decimal::ZERO && buy * r < min_n {
+                continue; // dust — let it roll into a lower rung
+            }
+            out.push(mk(Side::Bid, r, buy));
+            proj = target;
         }
         out
+    }
+
+    /// Current held units = anchor-balanced seed (`T` at the anchor) plus the
+    /// runner-tracked net signed position from this strategy's fills.
+    fn held_units(&self, ctx: &StrategyContext<'_>) -> Decimal {
+        let a0 = self.rung_units.get(self.n()).copied().unwrap_or_default();
+        a0 + ctx.position.size.0
     }
 
     /// Diff the desired ladder against the resting orders: cancel anything not
     /// desired (by side+price), place anything desired but not resting.
     fn reconcile(&self, ctx: &StrategyContext<'_>, mid: Price) -> Vec<Action> {
-        let desired = self.desired(ctx.symbol, mid);
+        let held = self.held_units(ctx);
+        let desired = self.desired(ctx.symbol, mid, held);
         let mut actions = Vec::new();
 
         // Cancel resting orders that are not in the desired set.
@@ -402,20 +436,52 @@ mod tests {
     }
 
     #[test]
-    fn buy_rung_flips_to_sell_when_price_drops_below_it() {
-        // Anchor at 100; drop mid below the first down-rung. That rung must now
-        // be a SELL (price recovered would rebalance back), proving the round-trip
-        // capture mechanism.
+    fn runaway_rally_does_not_buy_into_it() {
+        // Regression: when price runs far above the band (exits the top), every
+        // rung sits below mid. A naive mid-vs-rung rule would flip them ALL to
+        // buys and accumulate into the rally (the WLD bug). Inventory-aware
+        // sizing must instead place NO sells (none above mid) and buys ONLY at
+        // rungs below the anchor — never buying above where we already hold the
+        // balanced amount.
         let symbol = sym();
         let mut r = Rebalance::new(cfg());
         r.seed(Price(Decimal::from(100)));
         let n = r.n();
-        let first_down = r.rung_prices[n - 1]; // ~99.5
-        // mid below that rung.
-        let low_mid = first_down - Decimal::ONE;
-        let desired = r.desired(&symbol, Price(low_mid));
-        let at_rung: Vec<_> = desired.iter().filter(|q| q.price.0 == first_down).collect();
-        assert_eq!(at_rung.len(), 1);
-        assert_eq!(at_rung[0].side, Side::Ask, "rung above mid must be a sell");
+        let held = r.rung_units[n]; // a0, balanced at the anchor
+        let high_mid = Decimal::from(150); // +50%, above all rungs
+        let desired = r.desired(&symbol, Price(high_mid), held);
+
+        assert!(
+            desired.iter().all(|q| q.side == Side::Bid),
+            "no sells when the band is exhausted above"
+        );
+        let anchor_price = r.rung_prices[n];
+        for q in &desired {
+            assert!(
+                q.price.0 < anchor_price,
+                "must not buy at/above the anchor while already at target (rung {})",
+                q.price.0
+            );
+        }
+    }
+
+    #[test]
+    fn sells_down_to_target_as_price_rises() {
+        // With balanced holdings at the anchor, rungs above mid are sells sized
+        // to shed toward each (lower) target — the rebalancer sheds into a rally.
+        let symbol = sym();
+        let mut r = Rebalance::new(cfg());
+        r.seed(Price(Decimal::from(100)));
+        let n = r.n();
+        let held = r.rung_units[n];
+        let desired = r.desired(&symbol, Price(Decimal::from(100)), held);
+        let first_up = r.rung_prices[n + 1];
+        let sell = desired
+            .iter()
+            .find(|q| q.price.0 == first_up)
+            .expect("sell at first up-rung");
+        assert_eq!(sell.side, Side::Ask);
+        // Sheds exactly a0 − T[first up-rung].
+        assert_eq!(sell.size.0, (held - r.rung_units[n + 1]).round_dp(8));
     }
 }
