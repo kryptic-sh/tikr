@@ -126,6 +126,21 @@ pub struct PaperReport {
     /// reverses and closes at origin; matches an empirical retrace-to-origin
     /// re-run. Equals `net` when the position is flat.
     pub projected_net: Notional,
+    /// SPOT mode: final USD cash held (`fill_sim.spot_cash()`).
+    /// Zero when not in spot mode.
+    pub spot_usd: Notional,
+    /// SPOT mode: final asset units held (`fill_sim.spot_units()`).
+    /// Zero when not in spot mode.
+    pub spot_asset_units: Notional,
+    /// SPOT mode: total account value at the final mark price
+    /// (`spot_usd + spot_asset_units × last_mark`).
+    /// Zero when not in spot mode.
+    pub spot_value_at_market: Notional,
+    /// SPOT mode: P&L of the spot account vs. the seed allocation priced at P0
+    /// (`(spot_usd + spot_asset_units × p0) − (cash0 + units0 × p0)`).
+    /// Positive = trading gained value vs simply holding the seeded assets.
+    /// Zero when not in spot mode.
+    pub spot_harvest_at_start: Notional,
 }
 
 // --- serde wire format ---------------------------------------------------
@@ -185,6 +200,14 @@ struct PaperReportWire {
     rejected_orders: u64,
     #[serde(default)]
     projected_net: String,
+    #[serde(default)]
+    spot_usd: String,
+    #[serde(default)]
+    spot_asset_units: String,
+    #[serde(default)]
+    spot_value_at_market: String,
+    #[serde(default)]
+    spot_harvest_at_start: String,
 }
 
 impl Serialize for PaperReport {
@@ -221,6 +244,10 @@ impl Serialize for PaperReport {
             peak_fills_per_min: self.peak_fills_per_min,
             rejected_orders: self.rejected_orders,
             projected_net: self.projected_net.0.to_string(),
+            spot_usd: self.spot_usd.0.to_string(),
+            spot_asset_units: self.spot_asset_units.0.to_string(),
+            spot_value_at_market: self.spot_value_at_market.0.to_string(),
+            spot_harvest_at_start: self.spot_harvest_at_start.0.to_string(),
         }
         .serialize(serializer)
     }
@@ -316,6 +343,26 @@ impl<'de> Deserialize<'de> for PaperReport {
                 parse(&wire.net)?
             } else {
                 parse(&wire.projected_net)?
+            },
+            spot_usd: if wire.spot_usd.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.spot_usd)?
+            },
+            spot_asset_units: if wire.spot_asset_units.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.spot_asset_units)?
+            },
+            spot_value_at_market: if wire.spot_value_at_market.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.spot_value_at_market)?
+            },
+            spot_harvest_at_start: if wire.spot_harvest_at_start.is_empty() {
+                Notional(Decimal::ZERO)
+            } else {
+                parse(&wire.spot_harvest_at_start)?
             },
         })
     }

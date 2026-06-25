@@ -168,6 +168,20 @@ pub struct RunnerConfig {
     /// strategy + cap + risk gates all reason against the wrong state.
     /// `None` (default) = fresh-flat start.
     pub seed_position: Option<Position>,
+    /// SPOT backtest mode seed: `(cash0, units0, p0)` where
+    /// - `cash0` = initial USD cash (e.g. 50% of total budget)
+    /// - `units0` = initial asset units (e.g. budget/2 / P0)
+    /// - `p0` = price at which the seed was "bought" (used to
+    ///   compute `spot_harvest_at_start = final_value@p0 − seed_value@p0`)
+    ///
+    /// When `Some`, the runner:
+    /// 1. Calls `fill_sim.seed_spot(cash0, units0)`.
+    /// 2. Seeds the PositionTracker with `units0` long at `avg_entry = p0`
+    ///    so unrealized / realized are consistent from the start.
+    /// 3. Disables liquidation and funding (SPOT accounts have neither).
+    ///
+    /// `None` (default) = futures mode.
+    pub spot_seed: Option<(Decimal, Decimal, Decimal)>,
     /// Optional CSV file to append an equity-curve row to on every
     /// snapshot tick. Format: `ts_ns,sim_secs,fills,pos_size,realized,unrealized,fees,funding,net`.
     /// File is created + header-written on the first tick; subsequent
@@ -353,6 +367,7 @@ impl Default for RunnerConfig {
             retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
+            spot_seed: None,
         }
     }
 }
@@ -775,9 +790,44 @@ where
     // Funding accrual state: timestamp of the last event we accrued through.
     // On each subsequent event we apply `position × mark × rate × dt/28800s`
     // continuously, then advance.
-    let funding_cfg = config.funding;
+    // SPOT mode: disable funding entirely (no perp funding in spot).
+    let funding_cfg = if config.spot_seed.is_some() {
+        None
+    } else {
+        config.funding
+    };
     // Isolated-margin liquidation model (paper/backtest only — see field doc).
-    let mut liq_model = config.liquidation.map(LiquidationModel::new);
+    // SPOT mode: disable liquidation entirely (spot accounts can't be liquidated).
+    let mut liq_model = if config.spot_seed.is_some() {
+        None
+    } else {
+        config.liquidation.map(LiquidationModel::new)
+    };
+    // SPOT mode: seed the fill sim and position tracker when configured.
+    let spot_seed = config.spot_seed;
+    if let Some((cash0, units0, p0)) = spot_seed {
+        fill_sim.seed_spot(cash0, units0);
+        // Seed the position tracker with `units0` long at avg_entry = p0 so
+        // unrealized P&L is meaningful from tick 1. Mirrors how seed_position
+        // is used: PositionTracker::from_snapshot with a pre-built Position.
+        // We only do this when no resume + no seed_position are present (a fresh
+        // spot backtest always starts from the seed, not an inherited snapshot).
+        if resume.is_none() && config.seed_position.is_none() && units0 > Decimal::ZERO {
+            let spot_pos = tikr_core::Position {
+                symbol: symbol.clone(),
+                size: tikr_core::SignedSize(units0),
+                avg_entry: tikr_core::Price(p0),
+                realized_pnl: tikr_core::Notional(Decimal::ZERO),
+            };
+            tracker = PositionTracker::from_snapshot(
+                symbol.clone(),
+                spot_pos,
+                tikr_core::Notional(Decimal::ZERO),
+                tikr_core::Notional(Decimal::ZERO),
+                tikr_core::Notional(Decimal::ZERO),
+            );
+        }
+    }
     // Optional recorded mark-price series (backtest). Queried per event by
     // sim-time; `None` → mark falls back to book mid.
     let mut mark_series = config.mark_series;
@@ -938,6 +988,17 @@ where
             report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
             report.sim_duration_secs =
                 resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
+            // SPOT fields (zero on early exit — no fills occurred).
+            if let Some((cash0, units0, p0)) = spot_seed {
+                let spot_usd = fill_sim.spot_cash();
+                let spot_asset = fill_sim.spot_units();
+                report.spot_usd = Notional(spot_usd);
+                report.spot_asset_units = Notional(spot_asset);
+                report.spot_value_at_market =
+                    Notional((spot_usd + spot_asset * last_mark.0).round_dp(8));
+                report.spot_harvest_at_start =
+                    Notional(((spot_usd + spot_asset * p0) - (cash0 + units0 * p0)).round_dp(8));
+            }
             // Non-blocking publish: if a reader (dashboard TUI) is mid-
             // draw and holds the read lock, skip this tick rather than
             // blocking the event loop. The next snapshot interval will
@@ -2859,6 +2920,16 @@ where
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
     report.projected_net = projected;
+    // SPOT fields: populate from fill_sim when a spot seed was provided.
+    if let Some((cash0, units0, p0)) = spot_seed {
+        let spot_usd = fill_sim.spot_cash();
+        let spot_asset = fill_sim.spot_units();
+        report.spot_usd = Notional(spot_usd);
+        report.spot_asset_units = Notional(spot_asset);
+        report.spot_value_at_market = Notional((spot_usd + spot_asset * last_mark.0).round_dp(8));
+        report.spot_harvest_at_start =
+            Notional(((spot_usd + spot_asset * p0) - (cash0 + units0 * p0)).round_dp(8));
+    }
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
     }
@@ -3636,6 +3707,11 @@ fn finalize(
         // step, which `finalize` doesn't have. The caller (which holds the
         // strategy) overwrites this via `project_net_for`. Defaults to `net`.
         projected_net: base.net,
+        // SPOT fields: populated by the runner after finalize() when spot_seed is Some.
+        spot_usd: Notional(Decimal::ZERO),
+        spot_asset_units: Notional(Decimal::ZERO),
+        spot_value_at_market: Notional(Decimal::ZERO),
+        spot_harvest_at_start: Notional(Decimal::ZERO),
     }
 }
 
@@ -4309,6 +4385,7 @@ mod tests {
             latency_jitter_ms: 0,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         })
     }
 
@@ -4337,6 +4414,7 @@ mod tests {
             retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
+            spot_seed: None,
         }
     }
 
@@ -4716,6 +4794,10 @@ mod tests {
             peak_fills_per_min: 0,
             rejected_orders: 0,
             projected_net: Notional(Decimal::ZERO),
+            spot_usd: Notional(Decimal::ZERO),
+            spot_asset_units: Notional(Decimal::ZERO),
+            spot_value_at_market: Notional(Decimal::ZERO),
+            spot_harvest_at_start: Notional(Decimal::ZERO),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -4777,6 +4859,10 @@ mod tests {
             peak_fills_per_min: 0,
             rejected_orders: 0,
             projected_net: Notional(Decimal::ZERO),
+            spot_usd: Notional(Decimal::ZERO),
+            spot_asset_units: Notional(Decimal::ZERO),
+            spot_value_at_market: Notional(Decimal::ZERO),
+            spot_harvest_at_start: Notional(Decimal::ZERO),
         };
         let venue = MockVenue::finite(Vec::new());
         let (_tx, rx) = watch::channel(false);
@@ -4934,6 +5020,7 @@ mod tests {
             latency_jitter_ms: 0,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         });
 
         let temp = TempDir::new().unwrap();
@@ -4961,6 +5048,7 @@ mod tests {
             retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
+            spot_seed: None,
         };
         // External fills channel: empty, never sends — but `Some` activates
         // live_mode.
@@ -5040,6 +5128,7 @@ mod tests {
             latency_jitter_ms: 0,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         });
 
         let temp = TempDir::new().unwrap();
@@ -5067,6 +5156,7 @@ mod tests {
             retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
+            spot_seed: None,
         };
         let (_tx, rx) = watch::channel(false);
 

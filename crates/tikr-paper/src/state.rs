@@ -77,6 +77,10 @@ mod tests {
             peak_fills_per_min: 0,
             rejected_orders: 0,
             projected_net: Notional(Decimal::from(12)),
+            spot_usd: Notional(Decimal::ZERO),
+            spot_asset_units: Notional(Decimal::ZERO),
+            spot_value_at_market: Notional(Decimal::ZERO),
+            spot_harvest_at_start: Notional(Decimal::ZERO),
         }
     }
 

@@ -563,5 +563,6 @@ pub fn live_runner_config(state_dir: PathBuf) -> RunnerConfig {
         retrace_boundary_ts: None,
         inventory_boost: None,
         bagger: crate::bagger::BaggerConfig::default(),
+        spot_seed: None,
     }
 }

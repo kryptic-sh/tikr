@@ -199,6 +199,7 @@ fn fill_sim_with_zero_latency() -> FillSim {
         latency_jitter_ms: 0,
         max_open_orders: None,
         queue_cancel_decay_per_sec: 0.0,
+        spot: false,
     })
 }
 
@@ -388,6 +389,7 @@ async fn risk_resume_alerting_capstone() {
         retrace_boundary_ts: None,
         inventory_boost: None,
         bagger: tikr_paper::bagger::BaggerConfig::default(),
+        spot_seed: None,
     };
     let (_tx1, rx1) = watch::channel(false);
 

@@ -148,6 +148,7 @@ pub fn to_spec(
         liquidation: None,
         mark_series: None,
         retrace_boundary_ts: None,
+        spot_seed: None,
         // Inventory-aware order-size boost — account-level, applied to every
         // strategy by the runner (scales the reducing side up on a curve).
         inventory_boost,
@@ -180,6 +181,7 @@ pub fn to_spec(
         max_open_orders: Some(tikr_backtest::fill_sim::BINANCE_MAX_OPEN_ORDERS_PER_SYMBOL),
         // Live mode discards FillSim; backtest-only queue model stays off here.
         queue_cancel_decay_per_sec: 0.0,
+        spot: false,
     });
 
     Ok(BotSpec {

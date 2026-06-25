@@ -224,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         latency_jitter_ms: 0,
         max_open_orders: None,
         queue_cancel_decay_per_sec: 0.0,
+        spot: false,
     });
 
     let runner_config = RunnerConfig {
@@ -250,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retrace_boundary_ts: None,
         inventory_boost: None,
         bagger: tikr_paper::bagger::BaggerConfig::default(),
+        spot_seed: None,
     };
 
     let report = run_with_resume(

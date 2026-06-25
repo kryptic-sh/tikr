@@ -177,5 +177,10 @@ fn aggregate_sum(reports: &[PaperReport]) -> PaperReport {
         peak_fills_per_min: max_peak_fills_per_min,
         rejected_orders: total_rejected_orders,
         projected_net: Notional(projected_net),
+        // SPOT fields: not meaningful in multi-symbol aggregates; zero-fill.
+        spot_usd: Notional(Decimal::ZERO),
+        spot_asset_units: Notional(Decimal::ZERO),
+        spot_value_at_market: Notional(Decimal::ZERO),
+        spot_harvest_at_start: Notional(Decimal::ZERO),
     }
 }

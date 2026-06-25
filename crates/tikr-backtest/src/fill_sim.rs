@@ -95,6 +95,15 @@ pub struct FillSimConfig {
     /// the trade + level-shrink decrements. `0.0` (default) = no time decay
     /// (prior behaviour). Calibrate to live fill rates.
     pub queue_cancel_decay_per_sec: f64,
+    /// SPOT account mode. When `true`:
+    /// - Gate 1 (margin / buying-power) and Gate 2 (position cap) are replaced
+    ///   by spot cash + asset balance gates (no shorting, no leverage, no
+    ///   liquidation / funding).
+    /// - Every fill updates `spot_cash` and `spot_units` (seeded via
+    ///   [`FillSim::seed_spot`]).
+    ///
+    /// `false` (default) = futures mode (existing behaviour unchanged).
+    pub spot: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +311,24 @@ pub struct FillSim {
     /// [`FillSim::set_wallet`]. With `cfg.leverage` it forms the buying-power
     /// margin gate. `0` = unset (gate falls back to the configured cap).
     current_wallet: Decimal,
+    /// SPOT mode: available USD cash. Bid fills consume it; Ask fills add
+    /// to it. Seeded via [`Self::seed_spot`]. Ignored when
+    /// `cfg.spot == false`.
+    spot_cash: Decimal,
+    /// SPOT mode: held asset units. Ask fills consume them; Bid fills add
+    /// to them. Seeded via [`Self::seed_spot`]. Ignored when
+    /// `cfg.spot == false`. Enforces no-shorting: Ask gate rejects when
+    /// committed + intent would exceed this.
+    spot_units: Decimal,
+    /// Cached per-symbol resting commitment: `(bid_notional, ask_notional,
+    /// ask_size)`. Recomputed lazily (one O(N) pass) only when
+    /// `committed_dirty`. The gate (spot cash/asset + futures Gate 1) reads
+    /// this instead of re-scanning `live_quotes` on every placement — a
+    /// reject storm (cash-pinned grid re-quoting a depleted side) rests no
+    /// orders, so the flag stays clean and each reject is O(1).
+    committed: HashMap<Symbol, (Decimal, Decimal, Decimal)>,
+    /// True when `live_quotes` changed since the last `committed` recompute.
+    committed_dirty: bool,
     /// xorshift64 state for silent-cancellation rolls.
     rng_state: u64,
     /// Separate xorshift64 state for latency-jitter draws. Kept distinct from
@@ -348,6 +375,10 @@ impl FillSim {
             pending_rejections: Vec::new(),
             position_notional: HashMap::new(),
             current_wallet: Decimal::ZERO,
+            spot_cash: Decimal::ZERO,
+            spot_units: Decimal::ZERO,
+            committed: HashMap::new(),
+            committed_dirty: true,
             rng_state,
             latency_rng_state,
             last_event_ts_ns: None,
@@ -363,6 +394,54 @@ impl FillSim {
     /// `cfg.leverage > 0`.
     pub fn set_wallet(&mut self, wallet: Decimal) {
         self.current_wallet = wallet;
+    }
+
+    /// SPOT mode: seed the initial cash + asset balances. Call once at runner
+    /// start, before the first event, when `cfg.spot == true`.
+    pub fn seed_spot(&mut self, cash: Decimal, units: Decimal) {
+        self.spot_cash = cash;
+        self.spot_units = units;
+    }
+
+    /// SPOT mode: current available USD cash (after fills + committed resting bids).
+    pub fn spot_cash(&self) -> Decimal {
+        self.spot_cash
+    }
+
+    /// SPOT mode: current held asset units (after fills).
+    pub fn spot_units(&self) -> Decimal {
+        self.spot_units
+    }
+
+    /// Resting commitment for `symbol`: `(bid_notional, ask_notional,
+    /// ask_size)` summed over `live_quotes`. Recomputes the whole-book cache
+    /// (one O(N) pass over all symbols) only when `committed_dirty`; otherwise
+    /// returns the cached value in O(1). Keeps the placement gate cheap during
+    /// a reject storm, where no order rests so the flag stays clean.
+    fn committed_for(&mut self, symbol: &Symbol) -> (Decimal, Decimal, Decimal) {
+        if self.committed_dirty {
+            self.committed.clear();
+            for q in &self.live_quotes {
+                let e = self.committed.entry(q.symbol.clone()).or_insert((
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                ));
+                let notional = (q.price.0 * q.size_remaining.0).round_dp(8);
+                match q.side {
+                    Side::Bid => e.0 = (e.0 + notional).round_dp(8),
+                    Side::Ask => {
+                        e.1 = (e.1 + notional).round_dp(8);
+                        e.2 += q.size_remaining.0;
+                    }
+                }
+            }
+            self.committed_dirty = false;
+        }
+        self.committed
+            .get(symbol)
+            .copied()
+            .unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))
     }
 
     /// Maker fee in bps (for runner-side synthetic fills, e.g. the bagger).
@@ -787,6 +866,7 @@ impl FillSim {
             r >= p
         });
         self.rng_state = state;
+        self.committed_dirty = true;
     }
 
     fn apply_pending(&mut self, now: Timestamp) -> Vec<Fill> {
@@ -820,7 +900,10 @@ impl FillSim {
                     }
                 }
                 Op::Cancel(id) => self.cancel_id(id),
-                Op::CancelAll => self.live_quotes.clear(),
+                Op::CancelAll => {
+                    self.live_quotes.clear();
+                    self.committed_dirty = true;
+                }
             }
         }
         fills
@@ -867,96 +950,131 @@ impl FillSim {
             ));
             return None;
         }
-        // Two DISTINCT gates, both dynamic vs the running wallet. Conflating
-        // them (one worst-case-all-fill check against the tightest cap) made a
-        // dense frozen-lattice unusable: ~50 resting bids of $5 sum to ~$250, so
-        // a 200%-of-$100 position cap ($200) rejected EVERY bid on every
-        // reconcile even at zero position — stranding the grid one-sided. Split:
-        //
-        //   Gate 1 — MARGIN / buying power (the real Binance `-2019`): total
-        //   EXPOSURE (open position + all resting orders on a side, worst-case
-        //   all-fill) must fit `wallet × leverage`. Resting orders reserve margin
-        //   until they fill/cancel, so the additive worst-case is right HERE — a
-        //   grid genuinely can't rest more notional than its buying power backs.
-        //   At 25× this is loose ($100 → $2,500), biting only over-leveraged
-        //   ladders.
-        //
-        //   Gate 2 — POSITION cap (`max_position_frac` × wallet, and the optional
-        //   fixed `max_position_notional_usdt`): bounds ACTUAL signed position,
-        //   PER-ORDER (projected `pos ± this order`), NOT all-resting-fill —
-        //   resting maker orders aren't position until they fill. `frozen_reconcile`
-        //   re-checks on every fill, so per-order holds |pos| at the cap plus at
-        //   most a few orders of slippage between reconciles, without mass-
-        //   rejecting the adding side.
-        //
-        // Scale note: `position_notional` is pre-rounded to 8 dp, but
-        // `price × size` can independently produce scale 8+ (e.g. DOGE
-        // 0.20123 × 5-dp size). Round both operands before adding so neither the
-        // product nor the sum overflows rust_decimal's 96-bit mantissa.
-        let pos = self
-            .position_notional
-            .get(&intent.symbol)
-            .copied()
-            .unwrap_or(Decimal::ZERO)
-            .round_dp(8);
-        let intent_delta = (intent.price.0 * intent.size.0).round_dp(8);
-
-        // Gate 1 — margin / buying power (worst-case exposure vs wallet × lev).
-        // `current_wallet == 0` (unset) skips this gate (test/back-compat path).
-        if self.cfg.leverage > Decimal::ZERO && self.current_wallet > Decimal::ZERO {
-            let buying_power = (self.current_wallet * self.cfg.leverage).round_dp(8);
-            let mut resting_bids = Decimal::ZERO;
-            let mut resting_asks = Decimal::ZERO;
-            for q in &self.live_quotes {
-                if q.symbol != intent.symbol {
-                    continue;
-                }
-                let n = (q.price.0 * q.size_remaining.0).round_dp(8);
-                match q.side {
-                    Side::Bid => resting_bids = (resting_bids + n).round_dp(8),
-                    Side::Ask => resting_asks = (resting_asks + n).round_dp(8),
-                }
-            }
-            match intent.side {
-                Side::Bid => resting_bids = (resting_bids + intent_delta).round_dp(8),
-                Side::Ask => resting_asks = (resting_asks + intent_delta).round_dp(8),
-            }
-            let worst_long = pos + resting_bids;
-            let worst_short = pos - resting_asks;
-            if worst_long > buying_power || worst_short < -buying_power {
-                self.pending_rejections.push((
-                    intent.clone(),
-                    "margin insufficient (paper -2019)".to_string(),
-                ));
-                return None;
-            }
-        }
-
-        // Gate 2 — strategy position cap (per-order projected |position|). The
-        // tightest of the `%`-of-wallet cap and the explicit fixed cap binds.
-        let pos_cap = {
-            let frac = (self.cfg.max_position_frac > Decimal::ZERO
-                && self.current_wallet > Decimal::ZERO)
-                .then(|| (self.current_wallet * self.cfg.max_position_frac).round_dp(8));
-            match (self.cfg.max_position_notional_usdt, frac) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (Some(a), None) => Some(a),
-                (None, b) => b,
-            }
-        };
-        if let Some(cap) = pos_cap {
-            // Only THIS order's fill moves position; resting siblings aren't
-            // position yet. Reject if filling it would push signed position past
-            // ±cap. At the cap the adding side is rejected while the reducing
-            // side still rests — correct risk behaviour, not stranding.
-            let projected = match intent.side {
-                Side::Bid => pos + intent_delta,
-                Side::Ask => pos - intent_delta,
+        if self.cfg.spot {
+            // SPOT mode: replace the futures Gate 1 + Gate 2 with cash + asset
+            // balance gates. No margin, no leverage, no shorting.
+            //
+            // Bid gate: committed resting-bid notional + this intent's notional
+            // must fit within available spot_cash.
+            // Ask gate: committed resting-ask size + this intent's size must fit
+            // within held spot_units (no shorting — can't sell more than held).
+            //
+            // IOC/FOK bypass the resting-order commitment check (they fill
+            // immediately or are dropped; they never occupy a resting slot) but
+            // still need the balance to be available NOW for the fill.
+            let intent_notional = (intent.price.0 * intent.size.0).round_dp(8);
+            // IOC/FOK never rest, so they reserve no resting commitment. Cached
+            // committed sums (`committed_for`) keep this O(1) during a reject
+            // storm — see `committed` field docs.
+            let is_immediate = matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK);
+            let (committed_bid_notional, _, committed_ask_size) = if is_immediate {
+                (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+            } else {
+                self.committed_for(&intent.symbol)
             };
-            if projected > cap || projected < -cap {
-                self.pending_rejections
-                    .push((intent.clone(), "position cap reached (paper)".to_string()));
-                return None;
+            match intent.side {
+                Side::Bid => {
+                    if (committed_bid_notional + intent_notional).round_dp(8) > self.spot_cash {
+                        self.pending_rejections
+                            .push((intent.clone(), "spot: insufficient cash".to_string()));
+                        return None;
+                    }
+                }
+                Side::Ask => {
+                    if (committed_ask_size + intent.size.0) > self.spot_units {
+                        self.pending_rejections
+                            .push((intent.clone(), "spot: insufficient asset".to_string()));
+                        return None;
+                    }
+                }
+            }
+        } else {
+            // FUTURES mode: Gate 1 + Gate 2 (margin + position cap).
+            //
+            // Two DISTINCT gates, both dynamic vs the running wallet. Conflating
+            // them (one worst-case-all-fill check against the tightest cap) made a
+            // dense frozen-lattice unusable: ~50 resting bids of $5 sum to ~$250, so
+            // a 200%-of-$100 position cap ($200) rejected EVERY bid on every
+            // reconcile even at zero position — stranding the grid one-sided. Split:
+            //
+            //   Gate 1 — MARGIN / buying power (the real Binance `-2019`): total
+            //   EXPOSURE (open position + all resting orders on a side, worst-case
+            //   all-fill) must fit `wallet × leverage`. Resting orders reserve margin
+            //   until they fill/cancel, so the additive worst-case is right HERE — a
+            //   grid genuinely can't rest more notional than its buying power backs.
+            //   At 25× this is loose ($100 → $2,500), biting only over-leveraged
+            //   ladders.
+            //
+            //   Gate 2 — POSITION cap (`max_position_frac` × wallet, and the optional
+            //   fixed `max_position_notional_usdt`): bounds ACTUAL signed position,
+            //   PER-ORDER (projected `pos ± this order`), NOT all-resting-fill —
+            //   resting maker orders aren't position until they fill. `frozen_reconcile`
+            //   re-checks on every fill, so per-order holds |pos| at the cap plus at
+            //   most a few orders of slippage between reconciles, without mass-
+            //   rejecting the adding side.
+            //
+            // Scale note: `position_notional` is pre-rounded to 8 dp, but
+            // `price × size` can independently produce scale 8+ (e.g. DOGE
+            // 0.20123 × 5-dp size). Round both operands before adding so neither the
+            // product nor the sum overflows rust_decimal's 96-bit mantissa.
+            let pos = self
+                .position_notional
+                .get(&intent.symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .round_dp(8);
+            let intent_delta = (intent.price.0 * intent.size.0).round_dp(8);
+
+            // Gate 1 — margin / buying power (worst-case exposure vs wallet × lev).
+            // `current_wallet == 0` (unset) skips this gate (test/back-compat path).
+            if self.cfg.leverage > Decimal::ZERO && self.current_wallet > Decimal::ZERO {
+                let buying_power = (self.current_wallet * self.cfg.leverage).round_dp(8);
+                // Cached resting bid/ask notional (O(1) outside a live_quotes
+                // mutation) — see `committed` field docs.
+                let (mut resting_bids, resting_ask_notional, _) =
+                    self.committed_for(&intent.symbol);
+                let mut resting_asks = resting_ask_notional;
+                match intent.side {
+                    Side::Bid => resting_bids = (resting_bids + intent_delta).round_dp(8),
+                    Side::Ask => resting_asks = (resting_asks + intent_delta).round_dp(8),
+                }
+                let worst_long = pos + resting_bids;
+                let worst_short = pos - resting_asks;
+                if worst_long > buying_power || worst_short < -buying_power {
+                    self.pending_rejections.push((
+                        intent.clone(),
+                        "margin insufficient (paper -2019)".to_string(),
+                    ));
+                    return None;
+                }
+            }
+
+            // Gate 2 — strategy position cap (per-order projected |position|). The
+            // tightest of the `%`-of-wallet cap and the explicit fixed cap binds.
+            let pos_cap = {
+                let frac = (self.cfg.max_position_frac > Decimal::ZERO
+                    && self.current_wallet > Decimal::ZERO)
+                    .then(|| (self.current_wallet * self.cfg.max_position_frac).round_dp(8));
+                match (self.cfg.max_position_notional_usdt, frac) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, b) => b,
+                }
+            };
+            if let Some(cap) = pos_cap {
+                // Only THIS order's fill moves position; resting siblings aren't
+                // position yet. Reject if filling it would push signed position past
+                // ±cap. At the cap the adding side is rejected while the reducing
+                // side still rests — correct risk behaviour, not stranding.
+                let projected = match intent.side {
+                    Side::Bid => pos + intent_delta,
+                    Side::Ask => pos - intent_delta,
+                };
+                if projected > cap || projected < -cap {
+                    self.pending_rejections
+                        .push((intent.clone(), "position cap reached (paper)".to_string()));
+                    return None;
+                }
             }
         }
         // IOC / FOK: if the intent crosses the live touch, fill immediately
@@ -1017,6 +1135,19 @@ impl FillSim {
                 Side::Bid => *entry = (*entry + notional).round_dp(8),
                 Side::Ask => *entry = (*entry - notional).round_dp(8),
             }
+            // SPOT mode: update cash + asset balances on every taker fill.
+            if self.cfg.spot {
+                match intent.side {
+                    Side::Bid => {
+                        self.spot_cash = (self.spot_cash - notional).round_dp(8);
+                        self.spot_units = (self.spot_units + total_qty).round_dp(8);
+                    }
+                    Side::Ask => {
+                        self.spot_cash = (self.spot_cash + notional).round_dp(8);
+                        self.spot_units = (self.spot_units - total_qty).round_dp(8);
+                    }
+                }
+            }
             return Some(Fill {
                 quote_id: QuoteId::new(),
                 price: Price(avg_price),
@@ -1051,6 +1182,7 @@ impl FillSim {
             queue_ahead,
             ts_submitted: ts,
         });
+        self.committed_dirty = true;
         None
     }
 
@@ -1066,6 +1198,7 @@ impl FillSim {
 
     fn cancel_id(&mut self, id: QuoteId) {
         self.live_quotes.retain(|q| q.id != id);
+        self.committed_dirty = true;
         // Also drop any not-yet-applied Place / Replace whose venue id
         // matches — otherwise a pending entry would get promoted into
         // `live_quotes` by the next `apply_pending`, even though the
@@ -1094,6 +1227,7 @@ impl FillSim {
     /// matching live and in-flight quotes from the local mirror immediately.
     pub fn drop_quotes_for(&mut self, symbol: &Symbol) {
         self.live_quotes.retain(|q| &q.symbol != symbol);
+        self.committed_dirty = true;
         self.pending.retain(|p| match &p.op {
             Op::Place { intent, .. } => &intent.symbol != symbol,
             Op::Replace { intent, .. } => &intent.symbol != symbol,
@@ -1173,6 +1307,7 @@ impl FillSim {
             added += 1;
         }
 
+        self.committed_dirty = true;
         (removed, added)
     }
 
@@ -1376,7 +1511,21 @@ impl FillSim {
                 Side::Bid => *entry = (*entry + delta).round_dp(8),
                 Side::Ask => *entry = (*entry - delta).round_dp(8),
             }
+            // SPOT mode: update cash + asset balances on every maker fill.
+            if self.cfg.spot {
+                match q.side {
+                    Side::Bid => {
+                        self.spot_cash = (self.spot_cash - delta).round_dp(8);
+                        self.spot_units = (self.spot_units + fill_amount).round_dp(8);
+                    }
+                    Side::Ask => {
+                        self.spot_cash = (self.spot_cash + delta).round_dp(8);
+                        self.spot_units = (self.spot_units - fill_amount).round_dp(8);
+                    }
+                }
+            }
             q.size_remaining = Size(q.size_remaining.0 - fill_amount);
+            self.committed_dirty = true;
             trade_remaining -= fill_amount;
             if q.size_remaining.0 == Decimal::ZERO {
                 self.live_quotes.remove(i);
@@ -1546,6 +1695,7 @@ mod tests {
             latency_jitter_ms: 0,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         }
     }
 
@@ -2106,6 +2256,7 @@ mod tests {
             latency_jitter_ms: 0,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         };
         let mut sim = FillSim::new(cfg);
 
@@ -2152,6 +2303,7 @@ mod tests {
             latency_jitter_ms: 0,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         };
         let mut sim = FillSim::new(cfg);
         // Seed the book via a snapshot: best_bid=99, best_ask=101.
@@ -2213,6 +2365,7 @@ mod tests {
             latency_jitter_ms: 50,
             max_open_orders: None,
             queue_cancel_decay_per_sec: 0.0,
+            spot: false,
         };
         let base_ns = base_ms * 1_000_000;
         let mut sim = FillSim::new(cfg.clone());

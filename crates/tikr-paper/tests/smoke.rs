@@ -50,6 +50,7 @@ async fn paper_runner_against_testnet_5min() {
         latency_jitter_ms: 0,
         max_open_orders: None,
         queue_cancel_decay_per_sec: 0.0,
+        spot: false,
     });
     let config = RunnerConfig {
         state_dir: temp.path().to_path_buf(),
@@ -75,6 +76,7 @@ async fn paper_runner_against_testnet_5min() {
         retrace_boundary_ts: None,
         inventory_boost: None,
         bagger: tikr_paper::bagger::BaggerConfig::default(),
+        spot_seed: None,
     };
 
     let (tx, rx) = watch::channel(false);

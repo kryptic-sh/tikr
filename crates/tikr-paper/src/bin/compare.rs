@@ -4,6 +4,7 @@
 //! Each preset gets a fresh `ParquetReplay` + `FillSim` + `run_with_resume`
 //! pass, so results are apples-to-apples on identical historical events.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -135,12 +136,37 @@ static EQUITY_CSV_EVERY_N: OnceLock<u32> = OnceLock::new();
 /// runner snapshots the real NET at the boundary and projects the post-retrace
 /// close-out into `projected_net`.
 static RETRACE_BOUNDARY_TS: OnceLock<Option<u64>> = OnceLock::new();
+/// SPOT account mode seed PER SYMBOL: `symbol → (cash0, units0, p0)`. Each
+/// symbol's `run_compare_for_symbol` derives its own P0 from that symbol's
+/// first mid (prices differ wildly across a basket — NEAR ~$2.5 vs ZEC ~$500),
+/// so the seed MUST be keyed by symbol. A single shared P0 (the old `OnceLock`)
+/// seeded every symbol at the first symbol's price → 200×-mispriced phantom
+/// units for high-priced coins. Empty map = futures mode. Read by `run_one` /
+/// `spawn_preset_with_liqs` to wire `RunnerConfig::spot_seed` AND override
+/// `FillSimConfig::spot = true`.
+/// SPOT seed triple: `(cash0, units0, p0)`.
+type SpotSeed = (Decimal, Decimal, Decimal);
+static SPOT_SEED: OnceLock<Mutex<HashMap<Symbol, SpotSeed>>> = OnceLock::new();
+
+fn spot_seed_map() -> &'static Mutex<HashMap<Symbol, SpotSeed>> {
+    SPOT_SEED.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn balance_compounding() -> (Decimal, Decimal, Decimal) {
     BALANCE_COMPOUNDING
         .get()
         .copied()
         .unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))
+}
+
+/// SPOT seed for `symbol`, or `None` if that symbol runs in futures mode.
+fn spot_seed_for(symbol: &Symbol) -> Option<SpotSeed> {
+    spot_seed_map().lock().unwrap().get(symbol).copied()
+}
+
+/// `true` when `--spot` armed the spot-account mode (any symbol seeded).
+fn spot_mode_active() -> bool {
+    !spot_seed_map().lock().unwrap().is_empty()
 }
 
 fn runner_min_notional() -> Decimal {
@@ -1415,6 +1441,20 @@ struct Args {
     /// mmr, ss, ss-old, sg).
     #[arg(long, default_value = "")]
     strategies: String,
+
+    /// SPOT account mode. When set, the backtest models a spot account (USD
+    /// cash + asset units) instead of a leveraged futures position. Disables
+    /// funding accrual and liquidation. Seed allocation split by
+    /// `--spot-asset-pct`. P0 is derived from the first observed mid of the
+    /// dataset.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    spot: bool,
+
+    /// SPOT mode: percent of the initial balance allocated to asset units at
+    /// the start (the rest is USD cash). Default `50` = 50/50 split. Only
+    /// meaningful when `--spot` is set.
+    #[arg(long, default_value = "50")]
+    spot_asset_pct: String,
 }
 
 /// Parse `--strategies` into a normalised set. Empty input ⇒ `None`
@@ -1893,7 +1933,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Isolated-margin liquidation model. Leverage drives the liq distance
     // (1/lev below entry for longs); off unless explicitly armed so the
     // default backtest keeps its no-liquidation behaviour.
-    let liq_cfg = if args.liquidation {
+    // SPOT mode: never liquidate (no margin account).
+    let liq_cfg = if args.liquidation && !args.spot {
         let leverage = Decimal::from_str(&args.leverage)?;
         Some(LiquidationConfig {
             leverage,
@@ -2417,7 +2458,8 @@ async fn run_sweep_collect(
     };
     // Perp funding model. Disabled when rate == 0. CLI takes integer bps per
     // 8h; convert to the per-interval fraction the runner expects.
-    let funding_cfg: Option<FundingConfig> = if args.funding_bps_per_8h != 0 {
+    // SPOT mode: no funding (no margin account).
+    let funding_cfg: Option<FundingConfig> = if args.funding_bps_per_8h != 0 && !args.spot {
         Some(FundingConfig {
             interval_secs: 28_800,
             rate_per_interval: Decimal::from(args.funding_bps_per_8h) / Decimal::from(10_000),
@@ -2474,6 +2516,10 @@ async fn run_sweep_collect(
             None
         },
         queue_cancel_decay_per_sec: args.sim_queue_cancel_decay_per_sec,
+        // SPOT mode flag: set later via the SPOT_SEED global when --spot is active.
+        // `run_one` / `spawn_preset_with_liqs` read SPOT_SEED and set this to `true`
+        // when a seed is present.
+        spot: false,
     };
     // All flat-notional strategies size from the single `--notional` knob —
     // EXCEPT when balance-compounding is on (the default), where the per-order
@@ -2591,8 +2637,58 @@ async fn run_sweep_collect(
     // a held bag round-trips out → `projected_net`. Boundary ts is published for
     // the RunnerConfig builders.
     // Retrace granularity is data-derived (median observed mid-move).
-    let (shared_data, retrace_boundary_ts) = shared_data.with_retrace_tail();
+    //
+    // SPOT mode SKIPS the tail entirely: projNET is a futures bag-round-trip
+    // device, but the synthetic walk-back to origin makes the spot grid TRADE
+    // against a price move that never happened (e.g. WLD really ended +28%, but
+    // the tail dragged the synthetic price back down, draining cash buying the
+    // fake crash and marking val@mkt at the reverted price). Spot must evaluate
+    // on the REAL data end only.
+    let (shared_data, retrace_boundary_ts) = if args.spot {
+        (shared_data, None)
+    } else {
+        shared_data.with_retrace_tail()
+    };
     let _ = RETRACE_BOUNDARY_TS.set(retrace_boundary_ts);
+
+    // SPOT account mode: derive THIS symbol's P0 from its own first mid, then
+    // compute the (cash0, units0, p0) triple that splits the initial balance
+    // according to --spot-asset-pct. This function runs once per symbol;
+    // `shared_data` holds only `symbol`, so `closes` is that symbol's series.
+    // The seed is keyed by symbol — a basket of mixed-price coins each gets its
+    // own P0 (see SPOT_SEED docs).
+    if args.spot {
+        let closes = shared_data.minute_close_mids(1);
+        let p0_opt: Option<Decimal> = closes
+            .iter()
+            .flat_map(|sym_closes| sym_closes.iter())
+            .copied()
+            .find(|&p| p > Decimal::ZERO);
+        if let Some(p0) = p0_opt {
+            let initial = balance_compounding().0;
+            let asset_pct = Decimal::from_str(&args.spot_asset_pct).unwrap_or(Decimal::from(50));
+            let cash_seed =
+                (initial * (Decimal::from(100) - asset_pct) / Decimal::from(100)).round_dp(8);
+            let units_seed = (initial * asset_pct / Decimal::from(100) / p0).round_dp(8);
+            info!(
+                symbol = %symbol.base.0,
+                p0 = %p0,
+                cash_seed = %cash_seed,
+                units_seed = %units_seed,
+                asset_pct = %asset_pct,
+                "SPOT mode: seeding account"
+            );
+            spot_seed_map()
+                .lock()
+                .unwrap()
+                .insert(symbol.clone(), (cash_seed, units_seed, p0));
+        } else {
+            eprintln!(
+                "WARN: --spot active but no mid price found for {}; running it in futures mode",
+                symbol.base.0
+            );
+        }
+    }
 
     // Build all preset handles up front; each runs as a tokio task. The
     // multi-thread runtime fans them across cores. State dirs are unique
@@ -3940,7 +4036,13 @@ async fn run_one<S: Strategy>(
 ) -> PaperReport {
     let replay = ParquetReplay::from_shared(shared_data);
     let venue = BacktestVenue::new(replay);
-    let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
+    // SPOT mode: override FillSimConfig::spot when THIS symbol has a seed.
+    let symbol_spot_seed = spot_seed_for(&symbol);
+    let fill_sim = FillSim::new(FillSimConfig {
+        fees,
+        spot: symbol_spot_seed.is_some(),
+        ..sim_cfg
+    });
     let runner_config = RunnerConfig {
         state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
         wallet_rx: None,
@@ -3972,6 +4074,7 @@ async fn run_one<S: Strategy>(
         retrace_boundary_ts: RETRACE_BOUNDARY_TS.get().copied().flatten(),
         inventory_boost: inventory_boost(),
         bagger: bagger(),
+        spot_seed: symbol_spot_seed,
     };
     let (_tx, rx) = watch::channel(false);
     let external_fills: Option<tokio::sync::mpsc::UnboundedReceiver<Fill>> = None;
@@ -4021,6 +4124,8 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
     let sd = Arc::clone(shared_data);
     // Per-preset deep copy — see note in `spawn_preset`.
     let sym = deep_clone_symbol(symbol);
+    // SPOT seed is keyed by symbol; capture before the async move.
+    let symbol_spot_seed = spot_seed_for(symbol);
     let display = name.to_string();
     let state_id = name
         .chars()
@@ -4041,7 +4146,12 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
         drop(liq_tx);
         let replay = ParquetReplay::from_shared(sd);
         let venue = BacktestVenue::new(replay);
-        let fill_sim = FillSim::new(FillSimConfig { fees, ..sim_cfg });
+        // SPOT mode: override FillSimConfig::spot when THIS symbol has a seed.
+        let fill_sim = FillSim::new(FillSimConfig {
+            fees,
+            spot: symbol_spot_seed.is_some(),
+            ..sim_cfg
+        });
         let runner_config = RunnerConfig {
             state_dir: PathBuf::from(format!("./state/backtest_compare/{}", state_id)),
             wallet_rx: None,
@@ -4070,6 +4180,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             retrace_boundary_ts: RETRACE_BOUNDARY_TS.get().copied().flatten(),
             inventory_boost: inventory_boost(),
             bagger: bagger(),
+            spot_seed: symbol_spot_seed,
         };
         let (_tx, rx) = watch::channel(false);
         info!(strategy = strategy.name(), preset = %state_id, "preset start (liq-gated)");
@@ -4187,8 +4298,13 @@ fn format_eta(secs: f64) -> String {
 /// stripping currency symbols. `symbol` is repeated on every row so
 /// basket-mode CSV streams stay row-addressable when concatenated.
 fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
+    let spot_suffix = if spot_mode_active() {
+        ",spot_usd,spot_asset_units,spot_value_at_market,spot_harvest_at_start"
+    } else {
+        ""
+    };
     println!(
-        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,mean_pos_usdt,realized,unrealized,fees,net,projected_net,dollars_per_fill,roi_pct"
+        "symbol,preset,fills,fills_per_min,peak_fills_per_min,rejected_orders,liquidations,volume_usdt,peak_pos_usdt,mean_pos_usdt,realized,unrealized,fees,net,projected_net,dollars_per_fill,roi_pct{spot_suffix}"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -4216,8 +4332,19 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
         } else {
             name.clone()
         };
+        let spot_cols = if spot_mode_active() {
+            format!(
+                ",{:.4},{:.6},{:.4},{:.4}",
+                decimal_to_f64(&r.spot_usd.0),
+                decimal_to_f64(&r.spot_asset_units.0),
+                decimal_to_f64(&r.spot_value_at_market.0),
+                decimal_to_f64(&r.spot_harvest_at_start.0),
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            "{symbol},{safe_name},{},{:.4},{},{},{},{:.4},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4}{spot_cols}",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
@@ -4243,11 +4370,21 @@ fn print_csv(symbol: &str, results: &[(String, PaperReport)]) {
 fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
     println!("### {symbol}");
     println!();
+    let spot_header_cols = if spot_mode_active() {
+        " usd | asset | val@mkt | harvest@P0 |"
+    } else {
+        ""
+    };
+    let spot_align_cols = if spot_mode_active() {
+        "----:|------:|--------:|-----------:|"
+    } else {
+        ""
+    };
     println!(
-        "| preset | fills | fills/min | peak/min | rej | liq | volume | peak_pos | realized | unrealized | fees | NET | projNET | $/fill | ROI% |"
+        "| preset | fills | fills/min | peak/min | rej | liq | volume | peak_pos | realized | unrealized | fees | NET | projNET | $/fill | ROI% |{spot_header_cols}"
     );
     println!(
-        "|--------|------:|----------:|---------:|----:|----:|-------:|---------:|---------:|-----------:|-----:|----:|--------:|-------:|-----:|"
+        "|--------|------:|----------:|---------:|----:|----:|-------:|---------:|---------:|-----------:|-----:|----:|--------:|-------:|-----:|{spot_align_cols}"
     );
     for (name, r) in results {
         let sim_min = (r.sim_duration_secs as f64) / 60.0;
@@ -4274,8 +4411,19 @@ fn print_markdown(symbol: &str, results: &[(String, PaperReport)]) {
         };
         // Markdown escape: pipes inside cell text break the row.
         let safe_name = name.replace('|', "\\|");
+        let spot_data_cols = if spot_mode_active() {
+            format!(
+                " {:.4} | {:.6} | {:.4} | {:.4} |",
+                decimal_to_f64(&r.spot_usd.0),
+                decimal_to_f64(&r.spot_asset_units.0),
+                decimal_to_f64(&r.spot_value_at_market.0),
+                decimal_to_f64(&r.spot_harvest_at_start.0),
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "| {safe_name} | {} | {:.2} | {} | {} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |",
+            "| {safe_name} | {} | {:.2} | {} | {} | {} | {volume:.0} | {peak:.0} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.5} | {roi} |{spot_data_cols}",
             r.fills_emitted,
             fpm,
             r.peak_fills_per_min,
@@ -4424,6 +4572,9 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             "$/fill",
             "ROI%",
         ]);
+        if spot_mode_active() {
+            headers.extend(["usd", "asset", "val@mkt", "harvest@P0"]);
+        }
         if baseline_net.is_some() {
             headers.push("ΔNET");
         }
@@ -4470,6 +4621,12 @@ fn print_table(results: &[(String, PaperReport)], baseline_net: Option<f64>) {
             // `liq` slots right after `rej` (index 5) to match the header.
             if liquidation_modeled() {
                 row.insert(5, r.liquidations.to_string());
+            }
+            if spot_mode_active() {
+                row.push(format!("{:.4}", decimal_to_f64(&r.spot_usd.0)));
+                row.push(format!("{:.6}", decimal_to_f64(&r.spot_asset_units.0)));
+                row.push(format!("{:.4}", decimal_to_f64(&r.spot_value_at_market.0)));
+                row.push(format!("{:.4}", decimal_to_f64(&r.spot_harvest_at_start.0)));
             }
             if let Some(bn) = baseline_net {
                 let delta = net - bn;
