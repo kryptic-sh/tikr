@@ -34,9 +34,10 @@ use tikr_strategy::{
     AvellanedaStoikov, AvellanedaStoikovConfig, EwmaConfig, FlatMm, FlatMmConfig, Glft, GlftConfig,
     Hawk, HawkConfig, Hydra, HydraConfig, Keel, KeelConfig, KeelMode, LadderReentry,
     LadderReentryConfig, LayeredGrid, LayeredGridConfig, LiqFade, LiqFadeConfig,
-    MicroMeanReversion, MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, SimpleGap,
-    SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid, StaticGridConfig, Strategy, Tidal,
-    TidalConfig, Tide, TideConfig, TopOfBook, TopOfBookConfig, Wave, WaveConfig,
+    MicroMeanReversion, MicroMeanReversionConfig, MicroPrice, MicroPriceConfig, Rebalance,
+    RebalanceConfig, SimpleGap, SimpleGapConfig, SpreadScalp, SpreadScalpConfig, StaticGrid,
+    StaticGridConfig, Strategy, Tidal, TidalConfig, Tide, TideConfig, TopOfBook, TopOfBookConfig,
+    Wave, WaveConfig,
 };
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tokio::sync::watch;
@@ -186,7 +187,7 @@ fn equity_csv_every_n() -> u32 {
 fn max_expected_open_for(name: &str) -> usize {
     match name {
         "tide" | "joker" | "rsi-mr" | "wave" | "flat-mm" | "volley" | "strangler"
-        | "static-grid" | "layered-grid" | "spread-scalp" => 0,
+        | "static-grid" | "layered-grid" | "spread-scalp" | "rebalance" => 0,
         _ => 2,
     }
 }
@@ -999,6 +1000,15 @@ struct Args {
     /// below cost. Default off.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     tide_chase_to_avg: bool,
+
+    /// Rebalance sweep: comma-separated rung spacing in bps (geometric).
+    /// Constant-mix MM; target ratio comes from `--spot-asset-pct`.
+    #[arg(long, default_value = "50")]
+    rebalance_band_bps_list: String,
+
+    /// Rebalance sweep: comma-separated rungs per side.
+    #[arg(long, default_value = "10")]
+    rebalance_levels_list: String,
 
     /// Wave sweep: comma-separated lattice geometry in bps. Live USDC
     /// config uses 2.
@@ -3429,6 +3439,42 @@ async fn run_sweep_collect(
                         );
                     }
                 }
+            }
+        }
+    }
+
+    // Rebalance — constant-mix MM. Holds a target asset fraction (from
+    // --spot-asset-pct) and trades back toward it at each rung; inventory-
+    // bounded (never drains cash). Rungs at ±band_bps, sized to rebalance.
+    if included("rebalance", &allow) {
+        let rb_bands = parse_u32_list(&args.rebalance_band_bps_list)?;
+        let rb_levels = parse_u32_list(&args.rebalance_levels_list)?;
+        let target_frac = (Decimal::from_str(&args.spot_asset_pct)
+            .unwrap_or_else(|_| Decimal::from(50))
+            / Decimal::from(100))
+        .round_dp(6);
+        let initial_balance = balance_compounding().0;
+        for &levels in &rb_levels {
+            for &band in &rb_bands {
+                let label = format!("Rebalance band={band}bps lv={levels} tgt={target_frac}");
+                spawn_preset(
+                    &mut handles,
+                    &shared_data,
+                    &symbol,
+                    &label,
+                    Rebalance::new(RebalanceConfig {
+                        band_bps: band,
+                        levels,
+                        target_asset_frac: target_frac,
+                        initial_balance,
+                        min_order_notional: min_notional,
+                    }),
+                    fees,
+                    skim_cfg,
+                    funding_cfg,
+                    sim_cfg_template.clone(),
+                    equity_csv_dir.clone(),
+                );
             }
         }
     }
