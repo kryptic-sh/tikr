@@ -774,10 +774,6 @@ impl Strategy for FlatMm {
             ("flush_bps", self.config.flush_bps.normalize().to_string()),
         ]
     }
-
-    fn grid_step_bps(&self) -> Option<Decimal> {
-        (self.config.step_bps > Decimal::ZERO).then_some(self.config.step_bps)
-    }
 }
 
 #[cfg(test)]

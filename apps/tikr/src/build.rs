@@ -147,6 +147,7 @@ pub fn to_spec(
         max_expected_open_orders: max_open_orders_for(cfg),
         liquidation: None,
         mark_series: None,
+        retrace_boundary_ts: None,
         // Inventory-aware order-size boost — account-level, applied to every
         // strategy by the runner (scales the reducing side up on a curve).
         inventory_boost,

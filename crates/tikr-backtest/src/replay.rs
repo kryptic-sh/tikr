@@ -79,7 +79,7 @@ struct BookState {
 }
 
 /// In-memory representation of one historical event.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LoadedEvent {
     ts_ns: u64,
     symbol_idx: usize,
@@ -94,7 +94,7 @@ struct LoadedEvent {
     src: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum EventPayload {
     BookDelta {
         side: u8,
@@ -293,6 +293,189 @@ impl LoadedReplayData {
             (Some(f), Some(l)) => Some((f.ts_ns, l.ts_ns)),
             _ => None,
         }
+    }
+
+    /// Append a synthetic "retrace to origin" tail. After the real data ends,
+    /// the mid is walked from the LAST observed mid back to the FIRST observed
+    /// mid (the pre-excursion / lattice-anchor price) in `~steps` tick-aligned
+    /// increments, emitting a book snapshot + a fat trade per step. Replaying
+    /// it lets any held bag round-trip out through the strategy's REAL order
+    /// logic — the basis for the projected-NET-on-full-retrace metric.
+    ///
+    /// Returns `(data, Some(boundary_ts))` where `boundary_ts` is the last real
+    /// event's timestamp (the runner snapshots NET there, then continues into
+    /// the tail for `projected_net`). Returns `(self, None)` when there's no
+    /// meaningful retrace (flat data, <2 distinct mids, degenerate tick).
+    /// Single-symbol (`symbol_idx 0`).
+    ///
+    /// The retrace granularity (price move per book update) is derived from the
+    /// DATA's own median consecutive-mid move, so the rebound advances at the
+    /// same speed the market actually moved — the strategy re-quotes at the same
+    /// cadence it saw live (too coarse holds the bag too long → over-states; too
+    /// fine sells it off too incrementally → under-states). Total steps are
+    /// capped so a huge span can't explode the event count.
+    pub fn with_retrace_tail(self: &Arc<Self>) -> (Arc<Self>, Option<u64>) {
+        use rust_decimal::prelude::ToPrimitive;
+        const MAX_STEPS: i64 = 20_000;
+        let tick = self.cfg.tick_size;
+        if tick <= Decimal::ZERO || self.events.is_empty() {
+            return (self.clone(), None);
+        }
+        let mid_of = |b: &BookState| -> Option<Decimal> {
+            if let (Some((bt, _)), Some((at, _))) =
+                (b.bids.iter().next_back(), b.asks.iter().next())
+            {
+                let bp = Decimal::from(*bt) * tick;
+                let ap = Decimal::from(*at) * tick;
+                if bp > Decimal::ZERO && ap > bp {
+                    return Some((bp + ap) / Decimal::from(2));
+                }
+            }
+            None
+        };
+        let to_ticks = |p: Decimal| -> i64 { (p / tick).round().to_i64().unwrap_or(0) };
+        // Reconstruct first + last complete-snapshot mid for symbol 0, the last
+        // ts / max seq to continue from, and the per-snapshot mid moves (in
+        // ticks) whose median sets the retrace granularity.
+        let mut book = BookState::default();
+        let (mut first_mid, mut last_mid): (Option<Decimal>, Option<Decimal>) = (None, None);
+        let mut prev_mid_t: Option<i64> = None;
+        let mut mid_diffs: Vec<i64> = Vec::new();
+        let mut last_ts = 0u64;
+        let mut max_seq = 0u64;
+        for ev in &self.events {
+            last_ts = last_ts.max(ev.ts_ns);
+            if ev.symbol_idx != 0 {
+                continue;
+            }
+            if let EventPayload::BookDelta {
+                side,
+                price_ticks,
+                size,
+                seq,
+            } = &ev.payload
+            {
+                if ev.ts_ns != book.last_applied_ts {
+                    if let Some(m) = mid_of(&book) {
+                        first_mid.get_or_insert(m);
+                        last_mid = Some(m);
+                        let mt = to_ticks(m);
+                        if let Some(p) = prev_mid_t {
+                            let d = (mt - p).abs();
+                            if d > 0 {
+                                mid_diffs.push(d);
+                            }
+                        }
+                        prev_mid_t = Some(mt);
+                    }
+                    book.bids.clear();
+                    book.asks.clear();
+                    book.last_applied_ts = ev.ts_ns;
+                }
+                let levels = if *side == 0 {
+                    &mut book.bids
+                } else {
+                    &mut book.asks
+                };
+                if size.is_zero() {
+                    levels.remove(price_ticks);
+                } else {
+                    levels.insert(
+                        *price_ticks,
+                        Level {
+                            price: Price(Decimal::from(*price_ticks) * tick),
+                            size: Size(*size),
+                        },
+                    );
+                }
+                max_seq = max_seq.max(*seq);
+            }
+        }
+        if let Some(m) = mid_of(&book) {
+            first_mid.get_or_insert(m);
+            last_mid = Some(m);
+        }
+        let (Some(origin), Some(end)) = (first_mid, last_mid) else {
+            return (self.clone(), None);
+        };
+        if origin == end {
+            return (self.clone(), None);
+        }
+
+        // Walk `end` → `origin` in tick-aligned steps. `dir` is +1 when the
+        // origin is above (price rebounds up, lifting asks → a long bag sells),
+        // −1 when below (price falls back, hitting bids → a short bag covers).
+        let end_t = to_ticks(end);
+        let origin_t = to_ticks(origin);
+        let span = (origin_t - end_t).abs();
+        if span == 0 {
+            return (self.clone(), None);
+        }
+        let dir: i64 = if origin_t > end_t { 1 } else { -1 };
+        // Step = median observed mid-move (data cadence), ≥1 tick, and coarse
+        // enough that the total step count never exceeds MAX_STEPS.
+        let median_move = if mid_diffs.is_empty() {
+            1
+        } else {
+            mid_diffs.sort_unstable();
+            mid_diffs[mid_diffs.len() / 2]
+        };
+        let step_ticks = median_move.max(1).max(span / MAX_STEPS + 1);
+        let step_ns = 1_000_000_000u64; // 1s/step — well past any latency model
+
+        let mut events = self.events.clone();
+        let mut ts = last_ts + step_ns;
+        let mut seq = max_seq + 1;
+        let mut src_row: u64 = 0;
+        let src_base: u64 = u64::from(u32::MAX) << 32; // sort strictly after real rows
+        let mut cur = end_t;
+        let big = Decimal::from(1_000_000_000i64); // fat trade — fills any resting level
+        let trade_taker: u8 = if dir > 0 { 0 } else { 1 }; // up=buy lifts asks, down=sell hits bids
+        while cur != origin_t {
+            cur += dir * step_ticks;
+            // Clamp the final step exactly onto the origin.
+            if (dir > 0 && cur > origin_t) || (dir < 0 && cur < origin_t) {
+                cur = origin_t;
+            }
+            // Book snapshot straddling the price by one tick (off the lattice).
+            for (side, off) in [(0u8, -1i64), (1u8, 1i64)] {
+                events.push(LoadedEvent {
+                    ts_ns: ts,
+                    symbol_idx: 0,
+                    payload: EventPayload::BookDelta {
+                        side,
+                        price_ticks: cur + off,
+                        size: Decimal::ONE,
+                        seq,
+                    },
+                    src: src_base | src_row,
+                });
+                seq += 1;
+                src_row += 1;
+            }
+            ts += step_ns;
+            // Trade AT the price to fill the strategy's resting reduce orders.
+            events.push(LoadedEvent {
+                ts_ns: ts,
+                symbol_idx: 0,
+                payload: EventPayload::Trade {
+                    price: Decimal::from(cur) * tick,
+                    size: big,
+                    taker_side: trade_taker,
+                },
+                src: src_base | src_row,
+            });
+            src_row += 1;
+            ts += step_ns;
+        }
+
+        (
+            Arc::new(Self {
+                cfg: self.cfg.clone(),
+                events,
+            }),
+            Some(last_ts),
+        )
     }
 
     /// True if no events were loaded.

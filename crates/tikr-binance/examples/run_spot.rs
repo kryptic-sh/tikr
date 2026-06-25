@@ -268,6 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_expected_open_orders: 2,
         liquidation: None,
         mark_series: None,
+        retrace_boundary_ts: None,
         inventory_boost: None,
         bagger: tikr_paper::bagger::BaggerConfig::default(),
     };

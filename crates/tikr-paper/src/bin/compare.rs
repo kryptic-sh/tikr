@@ -130,6 +130,11 @@ static RUNNER_MIN_NOTIONAL: Mutex<Decimal> = Mutex::new(Decimal::ZERO);
 /// `--equity-csv-every-n-events`. Read by the `run_one` /
 /// `spawn_preset_with_liqs` RunnerConfig builders when a CSV path is set.
 static EQUITY_CSV_EVERY_N: OnceLock<u32> = OnceLock::new();
+/// Boundary ts of the appended retrace-to-origin tail (last real event), or
+/// `None` when no tail was appended. Read by the RunnerConfig builders so the
+/// runner snapshots the real NET at the boundary and projects the post-retrace
+/// close-out into `projected_net`.
+static RETRACE_BOUNDARY_TS: OnceLock<Option<u64>> = OnceLock::new();
 
 fn balance_compounding() -> (Decimal, Decimal, Decimal) {
     BALANCE_COMPOUNDING
@@ -2580,6 +2585,15 @@ async fn run_sweep_collect(
         }
     };
 
+    // Append a synthetic retrace-to-origin tail to the shared data (after the
+    // span/spread pre-checks, which must see the real data). Each preset's
+    // runner snapshots the REAL report at the boundary, then replays the tail so
+    // a held bag round-trips out → `projected_net`. Boundary ts is published for
+    // the RunnerConfig builders.
+    // Retrace granularity is data-derived (median observed mid-move).
+    let (shared_data, retrace_boundary_ts) = shared_data.with_retrace_tail();
+    let _ = RETRACE_BOUNDARY_TS.set(retrace_boundary_ts);
+
     // Build all preset handles up front; each runs as a tokio task. The
     // multi-thread runtime fans them across cores. State dirs are unique
     // per preset (derived from the preset name) so concurrent snapshot /
@@ -3955,6 +3969,7 @@ async fn run_one<S: Strategy>(
         max_expected_open_orders: max_expected_open_for(strategy.name()),
         liquidation: liquidation(),
         mark_series: None,
+        retrace_boundary_ts: RETRACE_BOUNDARY_TS.get().copied().flatten(),
         inventory_boost: inventory_boost(),
         bagger: bagger(),
     };
@@ -4052,6 +4067,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             max_expected_open_orders: max_expected_open_for(strategy.name()),
             liquidation: liquidation(),
             mark_series: None,
+            retrace_boundary_ts: RETRACE_BOUNDARY_TS.get().copied().flatten(),
             inventory_boost: inventory_boost(),
             bagger: bagger(),
         };

@@ -45,6 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 100, // return to origin
             ],
         ),
+        // Retrace variants: the s2 / s4 paths with a full rebound to the origin
+        // appended — to empirically measure what NET becomes once the held bag
+        // actually round-trips out (ground truth for the projected-NET metric).
+        ("s2_retrace", &[70, 80, 70, 80, 70, 80, 100]),
+        ("s4_retrace", &[70, 80, 70, 80, 70, 60, 100]),
     ];
 
     // (rung size in dollars, name suffix). Same dollar path at two resolutions.

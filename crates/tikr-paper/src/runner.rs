@@ -222,6 +222,14 @@ pub struct RunnerConfig {
     /// behaviour). Loaded from `mark_<BASE>_*.parquet` via
     /// [`tikr_backtest::mark::MarkSeries`].
     pub mark_series: Option<tikr_backtest::mark::MarkSeries>,
+    /// Backtest only — timestamp (ns) of the last REAL event when a synthetic
+    /// retrace-to-origin tail has been appended to the replay
+    /// ([`tikr_backtest::replay::LoadedReplayData::with_retrace_tail`]). The
+    /// runner snapshots the real NET when the stream crosses this ts, then
+    /// keeps replaying the tail; `PaperReport::projected_net` reflects the
+    /// post-retrace close-out (a held bag round-tripping out). `None` (default)
+    /// → `projected_net == net`.
+    pub retrace_boundary_ts: Option<u64>,
     /// Optional inventory-aware order-size boost (runner-side, applies to
     /// every strategy). When `Some`, the reducing side's order size is scaled
     /// up on a curve as inventory approaches the per-bot cap. `None` (default)
@@ -342,6 +350,7 @@ impl Default for RunnerConfig {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
         }
@@ -723,6 +732,11 @@ where
     // from `config.mark_series` when present; otherwise falls back to
     // `last_mid` so behaviour is unchanged when no mark stream is supplied.
     let mut last_mark = Price(Decimal::ZERO);
+    // Projected-NET-on-full-retrace: when a synthetic retrace tail has been
+    // appended (`retrace_boundary_ts`), snapshot the REAL report the moment the
+    // stream crosses the boundary into the tail. `projected_net` then comes from
+    // the post-tail finalize (the held bag round-tripping out).
+    let mut boundary_report: Option<PaperReport> = None;
     let mut last_fill: Option<Fill> = None;
     // Per-symbol side-failure tracker. When one side's venue.quote() fails
     // MAX_FAILS_PER_SIDE times consecutively, that side is skipped until the
@@ -1119,6 +1133,44 @@ where
                 let ts = event_ts(&event);
                 if first_event_ts.is_none() {
                     first_event_ts = Some(ts);
+                }
+                // First event past the real/tail boundary → freeze the REAL
+                // report HERE, before any state for this (synthetic) event is
+                // applied, so it reflects the exact last-real-event state (mark
+                // + position). Everything after is the appended retrace, used
+                // only for `projected_net`.
+                if boundary_report.is_none()
+                    && config.retrace_boundary_ts.is_some_and(|b| ts.0 > b)
+                {
+                    boundary_report = Some(finalize(
+                        &tracker,
+                        last_mark,
+                        started,
+                        events_processed,
+                        fills_emitted,
+                        &risk_gate,
+                        first_event_ts,
+                        last_event_ts,
+                        skim_cfg,
+                        skim_count,
+                        skim_total_usdt,
+                        base_stacked,
+                        &symbol,
+                        buy_volume,
+                        sell_volume,
+                        buy_fills,
+                        sell_fills,
+                        peak_position_usdt,
+                        peak_long_usdt,
+                        peak_short_usdt,
+                        position_usdt_sum,
+                        position_samples,
+                        full_fills,
+                        partial_fills,
+                        liq_model.as_ref().map(|m| m.count()).unwrap_or(0),
+                        fill_rate.peak_per_min,
+                        rejected_orders,
+                    ));
                 }
                 last_event_ts = Some(ts);
 
@@ -2769,7 +2821,11 @@ where
         fill_sim.on_action(action, now_ts);
     }
 
-    let mut report = finalize(
+    // Final finalize. With a retrace tail this is the POST-retrace state (the
+    // held bag rounded out); its NET becomes `projected_net`. The REAL report is
+    // the boundary snapshot taken when the tail began. Without a tail there's no
+    // boundary → this IS the real report and projected_net == net.
+    let post = finalize(
         &tracker,
         last_mark,
         started,
@@ -2798,17 +2854,11 @@ where
         fill_rate.peak_per_min,
         rejected_orders,
     );
+    let projected = post.net;
+    let mut report = boundary_report.take().unwrap_or(post);
     report.runtime_secs = resumed_runtime_secs.saturating_add(report.runtime_secs);
     report.sim_duration_secs = resumed_sim_duration_secs.saturating_add(report.sim_duration_secs);
-    // Project the close-out of any open bag: each open unit recaptures one grid
-    // step if it round-trips out of the lattice. Needs the strategy's grid step,
-    // so it's computed here (not in `finalize`).
-    report.projected_net = project_net_for(
-        &report,
-        tracker.snapshot().size.0,
-        last_mark,
-        strategy.grid_step_bps(),
-    );
+    report.projected_net = projected;
     if let Err(e) = state::write_snapshot(&report, &config.state_dir, &run_id) {
         warn!("final snapshot write failed: {}", e);
     }
@@ -3589,27 +3639,6 @@ fn finalize(
     }
 }
 
-/// Project NET assuming the open bag round-trips out of the lattice: each open
-/// unit recaptures one grid step on close. `net − unrealized + |final notional|
-/// × step_bps/10000`. Returns `net` unchanged when the strategy has no fixed
-/// grid step or the position is flat. `mark` is the final mark price; `size` the
-/// signed final position in base units.
-fn project_net_for(
-    report: &PaperReport,
-    size: Decimal,
-    mark: Price,
-    grid_step_bps: Option<Decimal>,
-) -> Notional {
-    match grid_step_bps {
-        Some(step_bps) if step_bps > Decimal::ZERO && !size.is_zero() => {
-            let final_notional = (size.abs() * mark.0).abs();
-            let recapture = final_notional * step_bps / Decimal::from(10_000);
-            Notional((report.net.0 - report.unrealized.0 + recapture).round_dp(8))
-        }
-        _ => report.net,
-    }
-}
-
 fn empty_snapshot(symbol: &Symbol) -> Snapshot {
     Snapshot {
         symbol: symbol.clone(),
@@ -4305,6 +4334,7 @@ mod tests {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
         }
@@ -4928,6 +4958,7 @@ mod tests {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
         };
@@ -5033,6 +5064,7 @@ mod tests {
             max_expected_open_orders: 2,
             liquidation: None,
             mark_series: None,
+            retrace_boundary_ts: None,
             inventory_boost: None,
             bagger: crate::bagger::BaggerConfig::default(),
         };
