@@ -1136,6 +1136,9 @@ impl FillSim {
                 Side::Ask => *entry = (*entry - notional).round_dp(8),
             }
             // SPOT mode: update cash + asset balances on every taker fill.
+            // The fee is quote-denominated (USDC) and always paid, so it
+            // reduces cash on both buys and sells (a negative maker rebate
+            // would add). Modelled in quote for both sides for simplicity.
             if self.cfg.spot {
                 match intent.side {
                     Side::Bid => {
@@ -1147,6 +1150,7 @@ impl FillSim {
                         self.spot_units = (self.spot_units - total_qty).round_dp(8);
                     }
                 }
+                self.spot_cash = (self.spot_cash - fee_amount).round_dp(8);
             }
             return Some(Fill {
                 quote_id: QuoteId::new(),
@@ -1512,6 +1516,8 @@ impl FillSim {
                 Side::Ask => *entry = (*entry - delta).round_dp(8),
             }
             // SPOT mode: update cash + asset balances on every maker fill.
+            // `fee_amount` is quote-denominated and signed (positive = paid,
+            // negative = maker rebate); subtract it from cash on both sides.
             if self.cfg.spot {
                 match q.side {
                     Side::Bid => {
@@ -1523,6 +1529,7 @@ impl FillSim {
                         self.spot_units = (self.spot_units - fill_amount).round_dp(8);
                     }
                 }
+                self.spot_cash = (self.spot_cash - fee_amount).round_dp(8);
             }
             q.size_remaining = Size(q.size_remaining.0 - fill_amount);
             self.committed_dirty = true;
