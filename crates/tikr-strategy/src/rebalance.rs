@@ -84,6 +84,11 @@ pub struct Rebalance {
     rung_prices: Vec<Decimal>,
     /// Balanced unit holding at each rung, same indexing as `rung_prices`.
     rung_units: Vec<Decimal>,
+    /// Whether the frozen ladder has been placed. The ladder waits until the
+    /// anchor long (`a0` units) is fully open — on spot the runner pre-seeds it
+    /// so this is immediate; on futures the strategy opens it with a taker buy
+    /// first (see `on_event`).
+    ladder_placed: bool,
 }
 
 impl Rebalance {
@@ -238,6 +243,7 @@ impl Strategy for Rebalance {
             anchor: None,
             rung_prices: Vec::new(),
             rung_units: Vec::new(),
+            ladder_placed: false,
         }
     }
 
@@ -247,22 +253,52 @@ impl Strategy for Rebalance {
 
     fn on_event(&mut self, ctx: &StrategyContext<'_>, event: &MarketEvent) -> Vec<Action> {
         match event {
-            // Seed the frozen ladder once, on the first book. Subsequent book
-            // updates do NOTHING — the orders rest where they were placed; only
-            // a fill moves the lattice (via its mirror).
             MarketEvent::BookUpdate { snapshot } => {
-                if self.anchor.is_some() {
-                    return Vec::new();
-                }
                 let Some(mid) = compute_mid_strict(snapshot) else {
                     return Vec::new();
                 };
-                self.seed(mid);
+                if self.anchor.is_none() {
+                    self.seed(mid);
+                }
+                if self.ladder_placed {
+                    return Vec::new(); // orders rest; only fills move the lattice
+                }
+                // Open (or top up) the anchor long `a0` before placing the ladder.
+                // Spot pre-seeds the position so `a0` is already held → this is a
+                // no-op and the ladder goes down immediately. Futures starts flat,
+                // so we open the long with a marketable IOC buy first — that is the
+                // "open a long at the asset allocation" step that lets the grid then
+                // trade it exactly like a spot inventory.
+                let a0 = self.rung_units.get(self.n()).copied().unwrap_or_default();
+                let to_open = (a0 - ctx.position.size.0).round_dp(8);
+                let open_floor = self.config.min_order_notional.max(Decimal::ONE);
+                if to_open > Decimal::ZERO && to_open * mid.0 >= open_floor {
+                    let ask = ctx
+                        .latest_book
+                        .asks
+                        .first()
+                        .map(|l| l.price.0)
+                        .unwrap_or(mid.0);
+                    // Cross generously so the IOC clears available depth; it tops
+                    // up over successive books until the full long is open.
+                    let limit = (ask * Decimal::new(101, 2)).round_dp(8);
+                    return vec![Action::Quote(QuoteIntent {
+                        symbol: ctx.symbol.clone(),
+                        side: Side::Bid,
+                        price: Price(limit),
+                        size: Size(to_open),
+                        tif: TimeInForce::IOC,
+                        kind: QuoteKind::Point,
+                    })];
+                }
+                self.ladder_placed = true;
                 self.initial_ladder(ctx.symbol, mid)
             }
-            // A resting order filled → place its offsetting mirror one rung over.
+            // A resting ladder order filled → place its offsetting mirror. Opening
+            // (taker) fills happen before the ladder and never match a rung price,
+            // so they don't trigger a mirror.
             MarketEvent::Fill(fill) => {
-                if self.anchor.is_none() {
+                if !self.ladder_placed {
                     return Vec::new();
                 }
                 self.mirror(ctx.symbol, fill.price.0, fill.side, fill.size.0)
@@ -303,10 +339,11 @@ mod tests {
         }
     }
 
-    fn pos(symbol: &Symbol) -> Position {
+    /// Position holding `units` long (spot pre-seeds the anchor `a0`).
+    fn pos_long(symbol: &Symbol, units: Decimal) -> Position {
         Position {
             symbol: symbol.clone(),
-            size: SignedSize(Decimal::ZERO),
+            size: SignedSize(units),
             avg_entry: Price(Decimal::ZERO),
             realized_pnl: Notional(Decimal::ZERO),
         }
@@ -369,7 +406,8 @@ mod tests {
     fn first_book_seeds_and_places_ladder() {
         let symbol = sym();
         let snap = book(&symbol, Decimal::from(100), Decimal::from(100));
-        let position = pos(&symbol);
+        // Spot pre-seeds a0 = 50% × $10k / $100 = 50 units long.
+        let position = pos_long(&symbol, Decimal::from(50));
         let mut r = Rebalance::new(cfg());
         let ctx = StrategyContext {
             symbol: &symbol,
@@ -448,7 +486,7 @@ mod tests {
         // cancel — orders rest in place until filled.
         let symbol = sym();
         let snap = book(&symbol, Decimal::from(100), Decimal::from(100));
-        let position = pos(&symbol);
+        let position = pos_long(&symbol, Decimal::from(50)); // spot pre-seed
         let mut r = Rebalance::new(cfg());
         let ctx1 = StrategyContext {
             symbol: &symbol,
@@ -486,5 +524,66 @@ mod tests {
             second.is_empty(),
             "later book updates leave orders in place"
         );
+    }
+
+    #[test]
+    fn futures_opens_long_before_placing_ladder() {
+        // Starting flat (futures), the first book must emit a marketable IOC BUY
+        // to open the anchor long a0 — NOT the ladder yet. Only once the long is
+        // held does the ladder go down (proven by feeding the position back).
+        let symbol = sym();
+        let snap = book(&symbol, Decimal::from(100), Decimal::from(100));
+        let flat = pos_long(&symbol, Decimal::ZERO);
+        let mut r = Rebalance::new(cfg());
+        let ctx_flat = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(1),
+            position: &flat,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let open = r.on_event(
+            &ctx_flat,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        assert_eq!(open.len(), 1, "exactly one opening order");
+        match &open[0] {
+            Action::Quote(q) => {
+                assert_eq!(q.side, Side::Bid);
+                assert_eq!(q.tif, TimeInForce::IOC);
+                assert_eq!(q.size.0, Decimal::from(50)); // a0 = 50 units
+            }
+            _ => panic!("expected an IOC open"),
+        }
+        // Now hold a0; the ladder should be placed.
+        let held = pos_long(&symbol, Decimal::from(50));
+        let ctx_held = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(2),
+            position: &held,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let ladder = r.on_event(
+            &ctx_held,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let buys = ladder
+            .iter()
+            .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Bid))
+            .count();
+        let sells = ladder
+            .iter()
+            .filter(|a| matches!(a, Action::Quote(q) if q.side == Side::Ask))
+            .count();
+        assert_eq!((buys, sells), (3, 3), "ladder placed once long is open");
     }
 }

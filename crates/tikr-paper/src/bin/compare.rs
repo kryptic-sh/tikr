@@ -3453,7 +3453,16 @@ async fn run_sweep_collect(
             .unwrap_or_else(|_| Decimal::from(50))
             / Decimal::from(100))
         .round_dp(6);
-        let initial_balance = balance_compounding().0;
+        // SPOT: V0 = wallet; the runner pre-seeds the asset half, cash is the
+        // rest. FUTURES: the bot opens a long = 1× wallet (the "asset") on start
+        // and holds the wallet as cash, so the rebalanced book is 2× wallet at
+        // the 50/50 point — pass V0 = wallet / target_frac so a0 = 1× wallet.
+        let wallet = balance_compounding().0;
+        let initial_balance = if spot_mode_active() || target_frac <= Decimal::ZERO {
+            wallet
+        } else {
+            (wallet / target_frac).round_dp(8)
+        };
         for &levels in &rb_levels {
             for &band in &rb_bands {
                 let label = format!("Rebalance band={band}bps lv={levels} tgt={target_frac}");
