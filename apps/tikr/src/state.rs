@@ -819,19 +819,41 @@ pub struct SessionState {
 pub const SESSION_FILE: &str = "session.json";
 
 /// Load the session manifest from `<dir>/session.json`, or `None` if absent /
-/// unreadable / malformed (treated as a cold start — never fatal).
+/// unreadable / malformed (treated as a cold start — never fatal). A missing
+/// file is the normal cold-start case and stays silent; a file that EXISTS
+/// but fails to parse (e.g. a torn write) is logged at `warn` so silent
+/// session-state loss is visible instead of masquerading as a fresh start.
 pub fn load_session(dir: &std::path::Path) -> Option<SessionState> {
     let path = dir.join(SESSION_FILE);
-    let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return None, // absent (or unreadable) — treat as cold start
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(state) => Some(state),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "session.json exists but failed to parse — starting cold (prior session state lost)"
+            );
+            None
+        }
+    }
 }
 
-/// Write the session manifest to `<dir>/session.json`, creating `dir` if needed.
+/// Write the session manifest to `<dir>/session.json`, creating `dir` if
+/// needed. Writes to a sibling temp file first and `rename`s it into place —
+/// `rename` is atomic on the same filesystem, so a crash mid-write leaves
+/// either the old complete file or the new complete file, never a torn one.
 pub fn save_session(dir: &std::path::Path, state: &SessionState) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let json =
         serde_json::to_string_pretty(state).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(dir.join(SESSION_FILE), json)
+    let final_path = dir.join(SESSION_FILE);
+    let tmp_path = dir.join(format!("{SESSION_FILE}.tmp"));
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, &final_path)
 }
 
 #[derive(Default)]

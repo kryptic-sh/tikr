@@ -95,6 +95,11 @@ pub fn spawn_bagboy(
         let mut total_base_acquired = Decimal::ZERO;
         let mut last_seen_base = Decimal::ZERO;
         let mut last_known_bid = Decimal::ZERO;
+        // Set once cancel_all has fired for a reached cap, so we don't re-fire
+        // it every poll tick (500ms) forever — cancel once, then just monitor.
+        // Reset if the cap ever re-opens (e.g. a live config change raises the
+        // budget) so a later breach cancels again.
+        let mut cap_cancel_done = false;
         if let Ok(b) = client.balance(&base_asset).await {
             last_seen_base = b.free + b.locked;
             info!(
@@ -131,9 +136,17 @@ pub fn spawn_bagboy(
             if cur_base > last_seen_base {
                 let delta = cur_base - last_seen_base;
                 total_base_acquired += delta;
+                // Accumulate actual spend at fill-detection time (delta ×
+                // price observed at detection) into a total that only ever
+                // grows. NOT recomputed from current mark price elsewhere —
+                // a falling price would otherwise lower "spent" after the
+                // fact and let the ladder buy straight through
+                // `max_total_usdt`.
+                total_spent_usdt += delta * last_known_bid;
                 info!(
                     symbol = %symbol, fill_base = %delta,
                     total_base = %total_base_acquired,
+                    total_spent = %total_spent_usdt,
                     "bagboy: fill detected"
                 );
                 // Record fill on LiveSnapshot so the watcher task picks
@@ -161,8 +174,11 @@ pub fn spawn_bagboy(
                 .max_total_base
                 .is_some_and(|cap| total_base_acquired >= cap);
             if capped_usdt || capped_base {
-                info!(symbol = %symbol, "bagboy: cap reached — canceling all + monitoring");
-                let _ = client.cancel_all(&symbol).await;
+                if !cap_cancel_done {
+                    info!(symbol = %symbol, "bagboy: cap reached — canceling all + monitoring");
+                    let _ = client.cancel_all(&symbol).await;
+                    cap_cancel_done = true;
+                }
                 publish(
                     &live,
                     Decimal::ZERO,
@@ -172,6 +188,7 @@ pub fn spawn_bagboy(
                 );
                 continue;
             }
+            cap_cancel_done = false; // cap not (or no longer) active
 
             // 3. Get book.
             let book = match client.book_ticker(&symbol).await {
@@ -206,10 +223,6 @@ pub fn spawn_bagboy(
             let quote_free = bal_quote.free;
             let min_order_cost = cfg.usdt_per_order.max(filters.min_notional);
             if quote_free < min_order_cost {
-                // Update spent total from accumulated base × current price.
-                if total_base_acquired > Decimal::ZERO {
-                    total_spent_usdt = total_base_acquired * book.bid_price;
-                }
                 // Reconcile open count for display.
                 let open_count = match client.open_orders(&symbol).await {
                     Ok(orders) => orders.len() as u32,
@@ -325,10 +338,10 @@ pub fn spawn_bagboy(
                 }
             }
 
-            // Update displayed metrics.
-            if total_base_acquired > Decimal::ZERO {
-                total_spent_usdt = total_base_acquired * book.bid_price;
-            }
+            // Displayed metrics. `total_spent_usdt` is NOT recomputed here —
+            // it only advances at fill-detection time (see above), so it
+            // reflects actual spend against `max_total_usdt` rather than the
+            // current mark value of the position.
             let open_count_after = match client.open_orders(&symbol).await {
                 Ok(o) => o.len() as u32,
                 Err(_) => 0,

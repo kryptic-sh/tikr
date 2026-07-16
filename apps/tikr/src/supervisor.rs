@@ -129,7 +129,13 @@ pub fn spawn_supervisor(
                 let handle_result = run_once(&ctx).await;
                 match handle_result {
                     Ok(spawned) => {
-                        attempt = 0; // reset backoff on successful spawn
+                        // Backoff is reset only after the bot proves it's
+                        // actually healthy (see below) — NOT just because it
+                        // spawned. A bot that spawns and crashes within
+                        // MIN_HEALTHY_UPTIME must keep growing the backoff,
+                        // or a crash-loop hammers the venue at a constant
+                        // ~1s cadence forever.
+                        let spawn_time = std::time::Instant::now();
                         if let Some(d) = spawned.price_decimals {
                             shared_state.set_price_decimals(&symbol_str, d);
                         }
@@ -170,12 +176,37 @@ pub fn spawn_supervisor(
                                     if *global_shutdown.borrow() {
                                         info!("global shutdown — stopping bot");
                                         let _ = shutdown_tx.send(true);
-                                        let _ = tokio::time::timeout(Duration::from_secs(5), &mut join).await;
+                                        // A bare timeout that elapses merely drops
+                                        // the JoinHandle, which DETACHES the task —
+                                        // it keeps running and can re-quote /
+                                        // re-open a position after rampage flattens
+                                        // it. Abort + reap on timeout so the task
+                                        // cannot outlive the supervisor.
+                                        if tokio::time::timeout(Duration::from_secs(5), &mut join)
+                                            .await
+                                            .is_err()
+                                        {
+                                            warn!(
+                                                "bot did not stop within 5s — aborting task to prevent a zombie re-quoting after shutdown"
+                                            );
+                                            join.abort();
+                                            let _ = join.await;
+                                        }
                                         let _ = us_shutdown_tx.send(true);
                                         return;
                                     }
                                 }
                             }
+                        }
+                        // Only forgive prior crash-loop backoff once the bot has
+                        // proven itself healthy for a minimum uptime — otherwise
+                        // a spawn-then-immediately-crash cycle would reset to a
+                        // ~1s backoff every time and hammer the venue REST API.
+                        // Below the threshold, `attempt` is left untouched so the
+                        // saturating_add below keeps growing it.
+                        const MIN_HEALTHY_UPTIME: Duration = Duration::from_secs(60);
+                        if spawn_time.elapsed() >= MIN_HEALTHY_UPTIME {
+                            attempt = 0;
                         }
                     }
                     Err(e) => {
@@ -428,13 +459,20 @@ async fn default_order_notional(venue: &BinanceClient, ctx: &SupervisorCtx) -> R
     Ok(balance.wallet_balance * ctx.order_balance_pct / Decimal::from(100))
 }
 
-pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) {
+/// Cancel resting orders and close any open position for `symbol`. Returns
+/// `true` only when the position is confirmed flat (or was already flat)
+/// afterward; `false` if a cancel/close step failed and the position may
+/// still be open — callers MUST NOT treat the symbol as safely retired when
+/// this returns `false` (see `flatten_symbols` in rampage.rs).
+pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core::Symbol) -> bool {
     use rust_decimal::Decimal;
     use tikr_core::{Side, Size};
     use tracing::info;
 
+    let mut ok = true;
     if let Err(e) = venue.cancel_all(symbol).await {
         warn!(error = ?e, "cancel_all failed (continuing)");
+        ok = false;
     }
     match venue.position(symbol).await {
         Ok(pos) if pos.size.0 != Decimal::ZERO => {
@@ -465,23 +503,33 @@ pub(crate) async fn reset_symbol_state(venue: &BinanceClient, symbol: &tikr_core
                 );
                 if let Err(e) = venue.market_close(symbol, close_side, Size(qty)).await {
                     warn!(error = ?e, qty = %qty, "dust reduce-only market close FAILED — position left open");
+                    return false;
                 }
-                return;
+                return ok;
             }
-            flatten_with_limit_fallback(venue, symbol, close_side, Size(qty)).await;
+            if !flatten_with_limit_fallback(venue, symbol, close_side, Size(qty)).await {
+                ok = false;
+            }
         }
         Ok(_) => {}
-        Err(e) => warn!(error = ?e, "venue.position failed"),
+        Err(e) => {
+            warn!(error = ?e, "venue.position failed");
+            ok = false;
+        }
     }
+    ok
 }
 
 /// Try to close with a limit order at mid; fall back to market after 10s.
+/// Returns `true` only if the position is confirmed closed (or the close
+/// order was accepted without a follow-up failure); `false` if any close
+/// attempt errored and the position may still be open.
 async fn flatten_with_limit_fallback(
     venue: &BinanceClient,
     symbol: &tikr_core::Symbol,
     side: tikr_core::Side,
     qty: tikr_core::Size,
-) {
+) -> bool {
     use std::time::Duration;
     use tikr_core::{Price, QuoteKind, Size, TimeInForce};
     use tikr_venue::QuoteIntent;
@@ -502,16 +550,14 @@ async fn flatten_with_limit_fallback(
                 .unwrap_or(Decimal::ZERO);
             if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
                 info!("invalid book for limit close, using market order");
-                let _ = venue.market_close(symbol, side, qty).await;
-                return;
+                return venue.market_close(symbol, side, qty).await.is_ok();
             }
             // Use mid price — aggressive enough to likely fill within 10s
             Price((bid + ask) / Decimal::from(2))
         }
         Err(e) => {
             warn!(error = ?e, "snapshot failed for limit close, using market order");
-            let _ = venue.market_close(symbol, side, qty).await;
-            return;
+            return venue.market_close(symbol, side, qty).await.is_ok();
         }
     };
 
@@ -547,13 +593,17 @@ async fn flatten_with_limit_fallback(
                     if let Err(e) = venue.market_close(symbol, side, Size(remaining)).await {
                         warn!(error = ?e, remaining = %remaining,
                             "market close of flatten remainder FAILED — position left open (will be re-adopted next wave_auto cycle)");
+                        return false;
                     }
+                    true
                 }
                 Ok(_) => {
                     info!("limit close fully filled");
+                    true
                 }
                 Err(e) => {
                     warn!(error = ?e, "position check after limit close failed");
+                    false
                 }
             }
         }
@@ -562,7 +612,9 @@ async fn flatten_with_limit_fallback(
             if let Err(e) = venue.market_close(symbol, side, qty).await {
                 warn!(error = ?e, qty = %qty.0,
                     "market close fallback FAILED — position left open (will be re-adopted next wave_auto cycle)");
+                return false;
             }
+            true
         }
     }
 }

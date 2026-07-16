@@ -742,7 +742,9 @@ async fn stop_bot(bot: ActiveBot) {
 /// symbol flattened cleanly. A venue-build failure (e.g. a rate-limited
 /// `exchangeInfo`) is published to the account-wide gate so callers can defer,
 /// and makes this return `false` — the caller must NOT treat the position as
-/// closed.
+/// closed. Same for a cancel/close failure inside `reset_symbol_state` itself
+/// (e.g. the market-close fallback rejects) — that also returns `false` here
+/// so a position that's still open is never banked as retired.
 async fn flatten_symbols(
     symbols: &[String],
     account: &RampageAccountCtx,
@@ -762,7 +764,16 @@ async fn flatten_symbols(
         {
             Ok(v) => {
                 info!(symbol = symbol_str, "rampage: cancel + flatten");
-                reset_symbol_state(&v, &symbol).await;
+                // Propagate an actual close failure (cancel_all / market /
+                // limit close all failed silently before this) — the caller
+                // must NOT bank a bot whose position may still be open.
+                if !reset_symbol_state(&v, &symbol).await {
+                    warn!(
+                        symbol = symbol_str,
+                        "rampage: cancel/close failed during flatten — position may still be open"
+                    );
+                    all_ok = false;
+                }
             }
             Err(e) => {
                 // Preserve the gate so the rotation defers instead of stranding.

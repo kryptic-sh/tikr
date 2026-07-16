@@ -129,14 +129,27 @@ fn resolve_config_path(cli: Option<&std::path::Path>) -> anyhow::Result<PathBuf>
 /// dir, and two different configs never share state. Per-bot subdirs (keyed by
 /// symbol) are created under this base by `per_bot_state_dir`.
 fn session_state_dir(config_path: &std::path::Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
     // Canonicalize so cwd-relative and absolute spellings of the same file
     // collapse to one session dir; fall back to the raw path if the file can't
     // be canonicalized (shouldn't happen — it was just opened).
     let full = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    full.hash(&mut hasher);
-    let hash = hasher.finish();
+
+    // FNV-1a over the canonical path's bytes, implemented inline (no new
+    // dependency needed for a few lines of arithmetic). Deliberately NOT
+    // `std::hash::DefaultHasher` / `RandomState` — their algorithm is
+    // explicitly unspecified and CAN change between Rust releases, which
+    // would silently remap every existing session dir to a new hash on a
+    // toolchain upgrade and orphan all prior session state. FNV-1a is a
+    // fixed, tiny, well-known algorithm, so the mapping is stable forever
+    // (barring a deliberate, one-time change to this function itself, which
+    // has the same one-time migration cost as the bug this replaces).
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut hash: u64 = FNV_OFFSET_BASIS;
+    for byte in full.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
 
     let mut base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
