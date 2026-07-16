@@ -587,6 +587,13 @@ where
 
     // Live mode: real venue fills feed the tracker (vs FillSim driving backtest).
     let live_mode = external_fills.is_some();
+    if live_mode {
+        // The sim becomes a resting-order mirror only: public Trade prints
+        // must not consume mirrored quotes (the real order still rests — a
+        // simulated fill would empty the slot and the strategy would place
+        // a duplicate at the same price until reconciliation catches it).
+        fill_sim.set_live_mirror(true);
+    }
 
     // Live restart resume: if the caller passed no explicit resume, reload this
     // bot's latest persisted snapshot from its state dir so realized / fees /
@@ -727,11 +734,17 @@ where
         skim_ratio = sc.skim_ratio;
     }
     let mut profit_since_skim = Decimal::ZERO;
-    let mut last_net_seen = Decimal::ZERO;
     let mut skim_count: u64 = resume.as_ref().map(|r| r.skim_count).unwrap_or(0);
     let mut skim_total_usdt: Decimal = resume
         .as_ref()
         .map(|r| r.skim_total_usdt.0)
+        .unwrap_or(Decimal::ZERO);
+    // Seed the skim baseline from the resumed report. Starting at 0 makes the
+    // first tick see the entire prior session's net as fresh "gain" and fire
+    // catch-up skims for profit that was already skimmed/accounted last run.
+    let mut last_net_seen = resume
+        .as_ref()
+        .map(|r| r.realized.0 + r.funding.0 - r.fees.0 - skim_total_usdt)
         .unwrap_or(Decimal::ZERO);
     let mut base_stacked: Decimal = resume
         .as_ref()
@@ -1103,6 +1116,12 @@ where
                     None => std::future::pending().await,
                 }
             } => {
+                if !changed {
+                    // Sender dropped: `changed()` returns Err immediately and
+                    // forever — leaving the receiver in place turns this arm
+                    // permanently ready and livelocks the loop at 100% CPU.
+                    notional_rx = None;
+                }
                 if changed
                     && let Some(rx) = notional_rx.as_ref()
                 {
@@ -1147,6 +1166,10 @@ where
                     None => std::future::pending().await,
                 }
             } => {
+                if !changed {
+                    // Same livelock guard as the notional arm above.
+                    max_position_rx = None;
+                }
                 if changed
                     && let Some(rx) = max_position_rx.as_ref()
                 {
@@ -1504,6 +1527,9 @@ where
                                         &symbol,
                                     )
                                     .await;
+                                    // Ratchet/timer state commits only on
+                                    // actual execution — see FlattenCommit.
+                                    bagger_state.commit(d.commit);
                                 } else {
                                     // Live: real reduce. Taker = market_close;
                                     // maker = reduce-only limit (GTX post-only) at
@@ -1531,6 +1557,7 @@ where
                                     match send {
                                         Ok(()) => {
                                             bagger_flattens = bagger_flattens.saturating_add(1);
+                                            bagger_state.commit(d.commit);
                                             info!(
                                                 reason = d.reason,
                                                 side = ?d.side,
@@ -1983,9 +2010,9 @@ where
                             &last_fill,
                             peak_long_usdt,
                             peak_short_usdt,
-                            live_metrics(&strategy),
+                            || live_metrics(&strategy),
                             bagger_flattens,
-                            bagger_target.clone(),
+                            &bagger_target,
                         );
                         // Partial: the LiveQuote is still on the book (FillSim
                         // keeps it around with reduced size_remaining). Don't
@@ -2138,9 +2165,9 @@ where
                     &last_fill,
                     peak_long_usdt,
                     peak_short_usdt,
-                    live_metrics(&strategy),
+                    || live_metrics(&strategy),
                     bagger_flattens,
-                    bagger_target.clone(),
+                    &bagger_target,
                 );
 
                 // PaperReport snapshot: fire on the very FIRST event so
@@ -2363,9 +2390,9 @@ where
                     &last_fill,
                     peak_long_usdt,
                     peak_short_usdt,
-                    live_metrics(&strategy),
+                    || live_metrics(&strategy),
                     bagger_flattens,
-                    bagger_target.clone(),
+                    &bagger_target,
                 );
                     continue;
                 }
@@ -2426,9 +2453,9 @@ where
                     &last_fill,
                     peak_long_usdt,
                     peak_short_usdt,
-                    live_metrics(&strategy),
+                    || live_metrics(&strategy),
                     bagger_flattens,
-                    bagger_target.clone(),
+                    &bagger_target,
                 );
             }
             _ = status_tick.tick() => {
@@ -2459,9 +2486,9 @@ where
                     &last_fill,
                     peak_long_usdt,
                     peak_short_usdt,
-                    live_metrics(&strategy),
+                    || live_metrics(&strategy),
                     bagger_flattens,
-                    bagger_target.clone(),
+                    &bagger_target,
                 );
                 if let Some(ref tap) = config.snapshot_tap {
                     let mut heartbeat = finalize(
@@ -2562,11 +2589,11 @@ where
                     // Detect a TP fill against the UNFILTERED quote list — the
                     // strategy-facing `quotes` excludes manager orders, so it
                     // would always look "gone" and false-detect a fill.
+                    // `is_tracked` also sees the pending (in-flight) queue —
+                    // an enqueued place not yet promoted must not read as a
+                    // fill on a quiet symbol.
                     if let Some(id) = tp_quote_id
-                        && !fill_sim
-                            .all_live_quotes_for(&symbol)
-                            .iter()
-                            .any(|(qid, _)| *qid == id)
+                        && !fill_sim.is_tracked(id)
                     {
                         fill_sim.unmark_manager(id);
                         tp_quote_id = None;
@@ -2812,12 +2839,19 @@ where
                         // let strategy re-emit on next event. Disabled
                         // (max=0) for grid strategies that deliberately
                         // keep many resting orders.
+                        // `max_expected_open_orders` bounds the STRATEGY's
+                        // orders; the runner's own resting take-profit is on
+                        // the venue too. Without headroom for it, a 2-order
+                        // strategy + TP = 3 > 2 → this sweep would nuke the
+                        // whole book (TP included) every 30s.
+                        let manager_orders = usize::from(tp_quote_id.is_some());
                         if config.max_expected_open_orders > 0
-                            && venue_open > config.max_expected_open_orders
+                            && venue_open > config.max_expected_open_orders + manager_orders
                         {
                             warn!(
                                 venue_open,
                                 max_expected = config.max_expected_open_orders,
+                                manager_orders,
                                 "order reconciliation: open count > max_expected, cancelling all"
                             );
                             if let Err(e) = venue.cancel_all(&symbol).await {
@@ -2848,9 +2882,9 @@ where
                     &last_fill,
                     peak_long_usdt,
                     peak_short_usdt,
-                    live_metrics(&strategy),
+                    || live_metrics(&strategy),
                     bagger_flattens,
-                    bagger_target.clone(),
+                    &bagger_target,
                 );
                         }
                     }
@@ -3187,8 +3221,12 @@ async fn dispatch_post_fill_actions<V, S>(
     );
     let actions: Vec<tikr_strategy::Action> = match snapshot_mid(current_book) {
         Some(mid) if max_position > Decimal::ZERO || profit_gated_boost => {
-            let signed_pos_notional = post_fill_pos.size.0 * mid;
+            // Value the cap at COST BASIS like the main loop (see the
+            // comment there): marking a losing long down releases the cap
+            // and the post-fill refill path would buy deeper into the drop.
             let avg = post_fill_pos.avg_entry.0;
+            let cap_price = if avg > Decimal::ZERO { avg } else { mid };
+            let signed_pos_notional = post_fill_pos.size.0 * cap_price;
             let actions = match inventory_boost {
                 Some(boost) => apply_inventory_size_boost(
                     actions,
@@ -3753,13 +3791,18 @@ fn publish_live(
     last_fill: &Option<Fill>,
     peak_long_usdt: Decimal,
     peak_short_usdt: Decimal,
-    metrics: Vec<(String, String)>,
+    // Lazy: strategy metrics format several Strings per call, and this runs
+    // on EVERY market event — in backtests the tap is always None, so the
+    // work must not happen before the guard below.
+    metrics: impl FnOnce() -> Vec<(String, String)>,
     bagger_flattens: u64,
-    bagger_target: Option<String>,
+    bagger_target: &Option<String>,
 ) {
     let Some(tap) = tap.as_ref() else {
         return;
     };
+    let metrics = metrics();
+    let bagger_target = bagger_target.clone();
     let pos = tracker.snapshot();
     let quotes = fill_sim.live_quotes_for(symbol);
     let mut open_buys: u32 = 0;

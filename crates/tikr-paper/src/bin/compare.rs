@@ -135,8 +135,13 @@ static EQUITY_CSV_EVERY_N: OnceLock<u32> = OnceLock::new();
 /// Boundary ts of the appended retrace-to-origin tail (last real event), or
 /// `None` when no tail was appended. Read by the RunnerConfig builders so the
 /// runner snapshots the real NET at the boundary and projects the post-retrace
-/// close-out into `projected_net`.
-static RETRACE_BOUNDARY_TS: OnceLock<Option<u64>> = OnceLock::new();
+/// close-out into `projected_net`. Settable (not a `OnceLock`) because basket
+/// mode derives a different boundary per symbol — with a write-once cell,
+/// every symbol after the first ran with symbol 1's boundary, freezing
+/// `boundary_report` mid-real-data (or counting synthetic tail as real NET)
+/// and corrupting the headline NET/ROI for the rest of the basket. Same
+/// sequential-per-symbol safety argument as `RUNNER_MIN_NOTIONAL`.
+static RETRACE_BOUNDARY_TS: Mutex<Option<u64>> = Mutex::new(None);
 /// SPOT account mode seed PER SYMBOL: `symbol → (cash0, units0, p0)`. Each
 /// symbol's `run_compare_for_symbol` derives its own P0 from that symbol's
 /// first mid (prices differ wildly across a basket — NEAR ~$2.5 vs ZEC ~$500),
@@ -2189,20 +2194,29 @@ fn run_score_dump(
             Decimal::ZERO
         };
         print!("{:<10} {:>8} {:>8.2}", sym, series.len(), range_pct);
-        let n_windows = series.len() - window + 1;
         for k in &penalties {
             let mut sum = Decimal::ZERO;
             let mut passed = 0usize;
+            let mut scored = 0usize;
             for w in series.windows(window) {
                 if let Some(s) = grid_vol_window(w, *k) {
                     sum += s;
+                    scored += 1;
                     if s > Decimal::ZERO {
                         passed += 1;
                     }
                 }
             }
-            let mean = sum / Decimal::from(n_windows);
-            let pass_pct = (passed as f64 / n_windows as f64) * 100.0;
+            // Divide by windows that actually produced a score — skipped
+            // windows (leading zero-mids) would deflate the mean and %>0.
+            let (mean, pass_pct) = if scored > 0 {
+                (
+                    sum / Decimal::from(scored as u64),
+                    (passed as f64 / scored as f64) * 100.0,
+                )
+            } else {
+                (Decimal::ZERO, 0.0)
+            };
             print!("  {:>9.1}|{:>3.0}%", mean, pass_pct);
         }
         println!();
@@ -2659,7 +2673,7 @@ async fn run_sweep_collect(
     } else {
         shared_data.with_retrace_tail()
     };
-    let _ = RETRACE_BOUNDARY_TS.set(retrace_boundary_ts);
+    *RETRACE_BOUNDARY_TS.lock().unwrap() = retrace_boundary_ts;
 
     // SPOT account mode: derive THIS symbol's P0 from its own first mid, then
     // compute the (cash0, units0, p0) triple that splits the initial balance
@@ -4126,7 +4140,7 @@ async fn run_one<S: Strategy>(
         max_expected_open_orders: max_expected_open_for(strategy.name()),
         liquidation: liquidation(),
         mark_series: None,
-        retrace_boundary_ts: RETRACE_BOUNDARY_TS.get().copied().flatten(),
+        retrace_boundary_ts: *RETRACE_BOUNDARY_TS.lock().unwrap(),
         inventory_boost: inventory_boost(),
         bagger: bagger(),
         spot_seed: symbol_spot_seed,
@@ -4232,7 +4246,7 @@ fn spawn_preset_with_liqs<S: Strategy + Send + 'static>(
             max_expected_open_orders: max_expected_open_for(strategy.name()),
             liquidation: liquidation(),
             mark_series: None,
-            retrace_boundary_ts: RETRACE_BOUNDARY_TS.get().copied().flatten(),
+            retrace_boundary_ts: *RETRACE_BOUNDARY_TS.lock().unwrap(),
             inventory_boost: inventory_boost(),
             bagger: bagger(),
             spot_seed: symbol_spot_seed,

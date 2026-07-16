@@ -338,6 +338,30 @@ pub struct FlattenDecision {
     pub taker: bool,
     /// Human-readable trigger, for logs.
     pub reason: &'static str,
+    /// State to stamp via [`BaggerState::commit`] once the runner has
+    /// actually executed this decision.
+    pub commit: FlattenCommit,
+}
+
+/// Deferred state mutation for a [`FlattenDecision`]. `evaluate()` must not
+/// mutate ratchet/timer state at decision time: the runner can still discard
+/// the decision (10s cooldown, empty book side, live send failure), and a
+/// pre-committed snapshot/timer would silently swallow that trigger — a
+/// profit-lock leg never banked, a loss never cut, a periodic interval
+/// skipped. The runner calls [`BaggerState::commit`] after execution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlattenCommit {
+    /// Nothing to stamp.
+    None,
+    /// Stamp the periodic-flatten timer at this event time.
+    PeriodicTimer(u64),
+    /// Re-base the shared lock-ratchet snapshot to this equity.
+    LockSnapshot(Decimal),
+    /// Re-base the equity high-water to this equity (giveback fired).
+    /// Without this the post-flatten equity stays below `hwm × (1 − pct)`
+    /// and every subsequent bag immediately re-triggers the giveback,
+    /// taker-flattening forever instead of acting as a one-shot de-risk.
+    GivebackRebase(Decimal),
 }
 
 /// Mutable per-bag state carried across ticks by the runner.
@@ -367,6 +391,23 @@ impl BaggerState {
             Side::Ask
         } else {
             Side::Bid
+        }
+    }
+
+    /// Apply a decision's deferred state mutation. Call ONLY after the
+    /// flatten actually executed (backtest fill synthesized / live send Ok).
+    pub fn commit(&mut self, commit: FlattenCommit) {
+        match commit {
+            FlattenCommit::None => {}
+            FlattenCommit::PeriodicTimer(now_ns) => {
+                self.last_periodic_flatten_ns = now_ns;
+            }
+            FlattenCommit::LockSnapshot(equity) => {
+                self.lock_snapshot = equity;
+            }
+            FlattenCommit::GivebackRebase(equity) => {
+                self.equity_high_water = equity;
+            }
         }
     }
 
@@ -433,7 +474,9 @@ impl BaggerState {
             if self.last_periodic_flatten_ns == 0 {
                 self.last_periodic_flatten_ns = now_ns;
             } else if now_ns.saturating_sub(self.last_periodic_flatten_ns) >= interval_ns {
-                self.last_periodic_flatten_ns = now_ns;
+                // Timer stamped via commit() only when the runner executes —
+                // stamping here would silently consume the interval when the
+                // decision is discarded (cooldown / empty book / send failure).
                 let qty = (full * cfg.periodic_flatten_frac).min(full);
                 if qty > Decimal::ZERO {
                     return Some(FlattenDecision {
@@ -441,6 +484,7 @@ impl BaggerState {
                         side,
                         taker: cfg.exit_taker,
                         reason: "periodic flatten",
+                        commit: FlattenCommit::PeriodicTimer(now_ns),
                     });
                 }
             }
@@ -475,6 +519,7 @@ impl BaggerState {
                     } else {
                         "inventory ≥ wallet cap"
                     },
+                    commit: FlattenCommit::None,
                 });
             }
         }
@@ -494,6 +539,7 @@ impl BaggerState {
                         side,
                         taker: cfg.exit_taker,
                         reason: "buying-power cut",
+                        commit: FlattenCommit::None,
                     });
                 }
             }
@@ -521,6 +567,7 @@ impl BaggerState {
                         side,
                         taker: false,
                         reason: "avg TP",
+                        commit: FlattenCommit::None,
                     });
                 }
             }
@@ -537,6 +584,7 @@ impl BaggerState {
                     side,
                     taker: false,
                     reason: "pnl flat",
+                    commit: FlattenCommit::None,
                 });
             }
         }
@@ -555,6 +603,7 @@ impl BaggerState {
                         side,
                         taker: cfg.exit_taker,
                         reason: "wallet bracket TP",
+                        commit: FlattenCommit::None,
                     });
                 }
                 if cfg.wallet_sl_pct > Decimal::ZERO
@@ -565,6 +614,7 @@ impl BaggerState {
                         side,
                         taker: cfg.exit_taker,
                         reason: "wallet bracket SL",
+                        commit: FlattenCommit::None,
                     });
                 }
             }
@@ -582,6 +632,10 @@ impl BaggerState {
                 side,
                 taker: cfg.exit_taker,
                 reason: "equity giveback",
+                // Re-base the high-water once executed — post-flatten equity
+                // stays below the old `hwm × (1 − pct)` forever, so without
+                // the re-base every subsequent bag re-triggers immediately.
+                commit: FlattenCommit::GivebackRebase(mtm_equity),
             });
         }
 
@@ -594,12 +648,12 @@ impl BaggerState {
             && mtm_equity
                 <= self.lock_snapshot * (Decimal::ONE - cfg.loss_lock_pct / Decimal::from(100))
         {
-            self.lock_snapshot = mtm_equity;
             return Some(FlattenDecision {
                 qty: full,
                 side,
                 taker: cfg.exit_taker,
                 reason: "loss lock",
+                commit: FlattenCommit::LockSnapshot(mtm_equity),
             });
         }
 
@@ -613,12 +667,12 @@ impl BaggerState {
             && mtm_equity
                 >= self.lock_snapshot * (Decimal::ONE + cfg.profit_lock_pct / Decimal::from(100))
         {
-            self.lock_snapshot = mtm_equity;
             return Some(FlattenDecision {
                 qty: full,
                 side,
                 taker: cfg.exit_taker,
                 reason: "profit lock",
+                commit: FlattenCommit::LockSnapshot(mtm_equity),
             });
         }
 
@@ -640,6 +694,7 @@ impl BaggerState {
                         side,
                         taker: cfg.exit_taker,
                         reason: "size cap trim",
+                        commit: FlattenCommit::None,
                     });
                 }
             }
@@ -665,6 +720,7 @@ impl BaggerState {
                         } else {
                             "hard SL"
                         },
+                        commit: FlattenCommit::None,
                     });
                 }
             }
@@ -687,6 +743,7 @@ impl BaggerState {
                     side,
                     taker: cfg.exit_taker,
                     reason: "trailing TP",
+                    commit: FlattenCommit::None,
                 });
             }
         }
@@ -700,6 +757,7 @@ impl BaggerState {
                     side,
                     taker: cfg.exit_taker,
                     reason: "fixed TP",
+                    commit: FlattenCommit::None,
                 });
             }
         }
@@ -797,6 +855,10 @@ mod tests {
         let d = st.evaluate(&cfg, long_input("20", 1)).unwrap();
         assert_eq!(d.reason, "profit lock");
         assert_eq!(d.qty, dec("2"), "flattens full bag");
+        // Re-base happens via commit() once the runner executes — evaluate()
+        // itself is side-effect free so a discarded decision keeps the
+        // trigger armed.
+        st.commit(d.commit);
         // Snapshot re-based to 1020: another +20 (equity 1020) is NOT enough.
         assert!(st.evaluate(&cfg, long_input("20", 2)).is_none());
         // Equity 1041 ≥ 1020 × 1.02 = 1040.4 → bank again.
@@ -819,6 +881,8 @@ mod tests {
         let d = st.evaluate(&cfg, long_input("-20", 1)).unwrap();
         assert_eq!(d.reason, "loss lock");
         assert_eq!(d.qty, dec("2"), "flattens full bag");
+        // Re-base via commit() (execution-time), matching the runner contract.
+        st.commit(d.commit);
         // Snapshot re-based DOWN to 980: another −20 (equity 980) is not enough.
         assert!(st.evaluate(&cfg, long_input("-20", 2)).is_none());
         // Equity 959.6 ≤ 980 × 0.98 = 960.4 → cut again.
@@ -838,11 +902,10 @@ mod tests {
         };
         let mut st = BaggerState::default();
         assert!(st.evaluate(&cfg, long_input("0", 0)).is_none()); // seed @1000
-        // +2% banks (snapshot → 1020).
-        assert_eq!(
-            st.evaluate(&cfg, long_input("20", 1)).unwrap().reason,
-            "profit lock"
-        );
+        // +2% banks (snapshot → 1020 via commit).
+        let d = st.evaluate(&cfg, long_input("20", 1)).unwrap();
+        assert_eq!(d.reason, "profit lock");
+        st.commit(d.commit);
         // From snapshot 1020, equity 979.6 ≤ 1020 × 0.98 = 999.6 → loss lock.
         assert_eq!(
             st.evaluate(&cfg, long_input("-20.4", 2)).unwrap().reason,
@@ -1082,8 +1145,12 @@ mod tests {
         let d = st.evaluate(&cfg, long_input("0", 400 * ns)).unwrap();
         assert_eq!(d.reason, "periodic flatten");
         assert_eq!(d.qty, dec("1"), "half of 2 units");
-        // Immediately after: timer reset, no re-fire.
-        assert!(st.evaluate(&cfg, long_input("0", 401 * ns)).is_none());
+        // Timer stamps on commit() (execution-time). Until then the trigger
+        // stays armed — a discarded decision must not consume the interval.
+        assert!(st.evaluate(&cfg, long_input("0", 401 * ns)).is_some());
+        st.commit(d.commit);
+        // Committed: no re-fire inside the next interval.
+        assert!(st.evaluate(&cfg, long_input("0", 402 * ns)).is_none());
     }
 
     #[test]

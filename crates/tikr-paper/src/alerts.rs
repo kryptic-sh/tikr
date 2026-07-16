@@ -191,15 +191,26 @@ pub struct WebhookSink {
     pub format: WebhookFormat,
     /// Internal dedup state: (discriminant, severity) -> last-sent time.
     dedup: Mutex<HashMap<(&'static str, Severity), Instant>>,
+    /// Reused HTTP client with explicit timeouts. `send` is awaited inline on
+    /// the trading-event path — reqwest's default has NO request timeout, so a
+    /// hung webhook endpoint (accepted TCP, no response) would block the
+    /// runner's whole event loop indefinitely.
+    client: reqwest::Client,
 }
 
 impl WebhookSink {
     /// Construct a new webhook sink.
     pub fn new(url: String, format: WebhookFormat) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client build");
         Self {
             url,
             format,
             dedup: Mutex::new(HashMap::new()),
+            client,
         }
     }
 
@@ -233,8 +244,8 @@ impl AlertSink for WebhookSink {
                 "message": alert.message(),
             }),
         };
-        let client = reqwest::Client::new();
-        let resp = client
+        let resp = self
+            .client
             .post(&self.url)
             .json(&body)
             .send()
