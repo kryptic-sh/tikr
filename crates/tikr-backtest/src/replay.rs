@@ -78,6 +78,47 @@ struct BookState {
     last_applied_ts: u64,
 }
 
+impl BookState {
+    /// Apply one raw book-delta row: a new `ts_ns` from the recorder means a
+    /// fresh full snapshot (see the struct docs), so both sides are cleared
+    /// before the row's level is inserted/removed. Takes `&mut self`
+    /// directly (rather than being a method on `ParquetReplay`) so callers
+    /// can hold it alongside a live borrow of `ParquetReplay::data` — the
+    /// two are disjoint fields, but a `&mut ParquetReplay` method would
+    /// require exclusive access to the whole struct.
+    fn apply_delta_row(
+        &mut self,
+        tick_size: Decimal,
+        ts_ns: u64,
+        side: u8,
+        price_ticks: i64,
+        size: Decimal,
+    ) {
+        if ts_ns != self.last_applied_ts {
+            self.bids.clear();
+            self.asks.clear();
+            self.last_applied_ts = ts_ns;
+        }
+        let levels = if side == 0 {
+            &mut self.bids
+        } else {
+            &mut self.asks
+        };
+        if size.is_zero() {
+            levels.remove(&price_ticks);
+        } else {
+            let price = Price(Decimal::from(price_ticks) * tick_size);
+            levels.insert(
+                price_ticks,
+                Level {
+                    price,
+                    size: Size(size),
+                },
+            );
+        }
+    }
+}
+
 /// In-memory representation of one historical event.
 #[derive(Debug, Clone)]
 struct LoadedEvent {
@@ -986,34 +1027,54 @@ impl Replay for ParquetReplay {
                 size,
                 seq: _,
             } => {
-                let book = &mut self.books[ev.symbol_idx];
+                let symbol_idx = ev.symbol_idx;
+                let ts_ns = ev.ts_ns;
+                let tick_size = self.data.cfg.tick_size;
                 // ts boundary → new full snapshot from the recorder (Binance
-                // @depth20@100ms semantics). Clear both sides before applying
-                // the first row of the new snapshot so stale levels from the
-                // prior snapshot don't linger.
-                if ev.ts_ns != book.last_applied_ts {
-                    book.bids.clear();
-                    book.asks.clear();
-                    book.last_applied_ts = ev.ts_ns;
-                }
-                let levels = if *side == 0 {
-                    &mut book.bids
-                } else {
-                    &mut book.asks
-                };
-                if size.is_zero() {
-                    levels.remove(price_ticks);
-                } else {
-                    let tick = self.data.cfg.tick_size;
-                    let price = Price(Decimal::from(*price_ticks) * tick);
-                    levels.insert(
+                // @depth20@100ms semantics); `apply_delta_row` clears both
+                // sides before applying the first row of a new snapshot so
+                // stale levels from the prior one don't linger.
+                self.books[symbol_idx].apply_delta_row(
+                    tick_size,
+                    ts_ns,
+                    *side,
+                    *price_ticks,
+                    *size,
+                );
+
+                // Coalesce: the recorder spreads ONE full snapshot across
+                // many single-level delta rows sharing `(ts_ns, symbol)`.
+                // Applying each row and emitting a `BookUpdate` per row (the
+                // old behaviour) makes every row but the last a torn,
+                // one-sided book — only that row's side reflects the new
+                // snapshot, the other side is still the PRIOR snapshot's —
+                // and clones the whole book (O(depth)) on every row, O(depth²)
+                // per snapshot. Consume the rest of the group here instead
+                // and emit exactly ONE `BookUpdate`, after the last row.
+                while let Some(next) = self.data.events.get(self.cursor) {
+                    if next.ts_ns != ts_ns || next.symbol_idx != symbol_idx {
+                        break;
+                    }
+                    let EventPayload::BookDelta {
+                        side,
+                        price_ticks,
+                        size,
+                        seq: _,
+                    } = &next.payload
+                    else {
+                        break;
+                    };
+                    self.books[symbol_idx].apply_delta_row(
+                        tick_size,
+                        ts_ns,
+                        *side,
                         *price_ticks,
-                        Level {
-                            price,
-                            size: Size(*size),
-                        },
+                        *size,
                     );
+                    self.cursor += 1;
                 }
+
+                let book = &self.books[symbol_idx];
                 let bids = book.bids.values().rev().cloned().collect();
                 let asks = book.asks.values().cloned().collect();
                 Some(MarketEvent::BookUpdate {
@@ -1178,30 +1239,24 @@ mod tests {
         };
         let mut r = ParquetReplay::new(cfg).unwrap();
 
+        // The two ts=1_000 rows (bid + ask) coalesce into ONE BookUpdate:
+        // `ParquetReplay::next` applies every row sharing (ts_ns, symbol)
+        // before emitting a snapshot, so callers never see a torn,
+        // one-sided book mid-snapshot the way one-BookUpdate-per-row did.
         let e1 = r.next().await.expect("first event");
         match e1 {
             MarketEvent::BookUpdate { snapshot } => {
                 assert_eq!(snapshot.ts, Timestamp(1_000));
                 assert_eq!(snapshot.bids.len(), 1);
-                assert_eq!(snapshot.asks.len(), 0); // ask not seen yet
+                assert_eq!(snapshot.asks.len(), 1);
                 assert_eq!(snapshot.bids[0].price.0, Decimal::try_from(100.0).unwrap());
+                assert_eq!(snapshot.asks[0].price.0, Decimal::try_from(101.0).unwrap());
             }
             other => panic!("expected BookUpdate, got {other:?}"),
         }
 
         let e2 = r.next().await.expect("second event");
         match e2 {
-            MarketEvent::BookUpdate { snapshot } => {
-                assert_eq!(snapshot.ts, Timestamp(1_000));
-                assert_eq!(snapshot.bids.len(), 1);
-                assert_eq!(snapshot.asks.len(), 1);
-                assert_eq!(snapshot.asks[0].price.0, Decimal::try_from(101.0).unwrap());
-            }
-            other => panic!("expected BookUpdate, got {other:?}"),
-        }
-
-        let e3 = r.next().await.expect("third event");
-        match e3 {
             MarketEvent::BookUpdate { snapshot } => {
                 // New ts → fresh snapshot. Prior asks cleared.
                 assert_eq!(snapshot.ts, Timestamp(2_000));

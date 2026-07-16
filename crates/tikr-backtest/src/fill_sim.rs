@@ -303,10 +303,16 @@ pub struct FillSim {
     /// `strategy.on_quote_rejected` so backtests exercise the same
     /// recovery path live mode uses.
     pending_rejections: Vec<(QuoteIntent, String)>,
-    /// Signed position notional in USDT per symbol. Positive = long.
-    /// Maintained by maker fills (`match_trade`) and taker fills
-    /// (`place_or_reject` IOC arm). Used for synthetic margin rejects.
-    position_notional: HashMap<Symbol, Decimal>,
+    /// Signed position size in BASE UNITS per symbol (NOT notional).
+    /// Positive = long. Maintained by maker fills (`match_trade`) and taker
+    /// fills (`place_or_reject` IOC arm). Gates convert this to notional at
+    /// check time via the `position_notional` method (mark price × units) —
+    /// accumulating notional directly here would track signed CASH FLOW
+    /// instead of position size, drifting by the gross realized PnL of
+    /// every round trip (buy 1 @ 100 / sell 1 @ 110 nets a flat position
+    /// but a −10 "notional" under the old cash-flow scheme) and eventually
+    /// mis-gating one side of the margin/position caps.
+    position_units: HashMap<Symbol, Decimal>,
     /// Running account wallet (margin balance), pushed by the runner via
     /// [`FillSim::set_wallet`]. With `cfg.leverage` it forms the buying-power
     /// margin gate. `0` = unset (gate falls back to the configured cap).
@@ -352,6 +358,12 @@ pub struct FillSim {
     /// Symbol the cache was built for; a mismatch forces a rebuild (defends
     /// the cache against multi-symbol callers).
     open_quotes_cache_symbol: Option<Symbol>,
+    /// Live-mode mirror: the sim only REGISTERS resting orders (so the
+    /// runner/strategy can see them); fills, silent cancels, and queue decay
+    /// come from the real venue. When set, public trades must NOT consume
+    /// mirrored quotes — the real order still rests on the venue, and a
+    /// simulated fill here would make the strategy re-quote a duplicate.
+    live_mirror: bool,
 }
 
 impl FillSim {
@@ -373,7 +385,7 @@ impl FillSim {
             manager_ids: HashSet::new(),
             book_state: HashMap::new(),
             pending_rejections: Vec::new(),
-            position_notional: HashMap::new(),
+            position_units: HashMap::new(),
             current_wallet: Decimal::ZERO,
             spot_cash: Decimal::ZERO,
             spot_units: Decimal::ZERO,
@@ -385,6 +397,7 @@ impl FillSim {
             open_quotes_cache: Vec::new(),
             open_quotes_cache_sig: None,
             open_quotes_cache_symbol: None,
+            live_mirror: false,
         }
     }
 
@@ -442,6 +455,32 @@ impl FillSim {
             .get(symbol)
             .copied()
             .unwrap_or((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO))
+    }
+
+    /// Signed position notional for `symbol`: `position_units × mark price`.
+    /// Mark price prefers the live book mid (`(best_bid + best_ask) / 2`)
+    /// when both sides are known, falls back to whichever touch is known,
+    /// and finally to `fallback_price` (the placing intent's own price)
+    /// when the book hasn't been seeded yet. Computing notional from units
+    /// at gate-check time — rather than accumulating signed cash flow —
+    /// keeps the margin gates immune to realized PnL: a flat position after
+    /// a profitable round trip must read as zero exposure, not the trade's
+    /// profit (see `position_units` field docs).
+    fn position_notional(&self, symbol: &Symbol, fallback_price: Price) -> Decimal {
+        let units = self
+            .position_units
+            .get(symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let mark = match self.book_state.get(symbol) {
+            Some(b) => match (b.best_bid(), b.best_ask()) {
+                (Some(bid), Some(ask)) => (bid.0 + ask.0) / Decimal::from(2),
+                (Some(p), None) | (None, Some(p)) => p.0,
+                (None, None) => fallback_price.0,
+            },
+            None => fallback_price.0,
+        };
+        (units * mark).round_dp(8)
     }
 
     /// Maker fee in bps (for runner-side synthetic fills, e.g. the bagger).
@@ -685,6 +724,7 @@ impl FillSim {
                 mix(&mut h1, intent.price.0.mantissa() as u64);
                 mix(&mut h2, (intent.price.0.scale() as u64) << 1 | side_bit);
                 mix(&mut h1, intent.size.0.mantissa() as u64);
+                mix(&mut h2, intent.size.0.scale() as u64);
             }
         }
         mix(&mut h1, count);
@@ -723,14 +763,25 @@ impl FillSim {
         let cancel_base = self.cfg.cancel_latency_ms;
         let (scheduled, op) = match action {
             Action::Quote(intent) => (
-                now.0.saturating_add(self.sample_latency_ns(submit_base)),
+                // `.max(1)`: with `submit_latency_ms == 0` and no jitter,
+                // `sample_latency_ns` returns exactly 0, which would let
+                // `apply_pending`'s `<=` promotion make the order live in
+                // THIS SAME `on_market_event` call — before a Trade event
+                // that triggered it (e.g. a strategy quoting in reaction to
+                // a print) has been matched. No real venue acks an order
+                // before the event that caused it; forcing at least 1ns of
+                // delay guarantees the op only becomes live strictly after
+                // the current event.
+                now.0
+                    .saturating_add(self.sample_latency_ns(submit_base).max(1)),
                 Op::Place {
                     intent,
                     override_id: None,
                 },
             ),
             Action::Requote { id, intent } => (
-                now.0.saturating_add(self.sample_latency_ns(submit_base)),
+                now.0
+                    .saturating_add(self.sample_latency_ns(submit_base).max(1)),
                 Op::Replace { id, intent },
             ),
             Action::Cancel(id) => (
@@ -763,7 +814,9 @@ impl FillSim {
         venue_id: QuoteId,
     ) {
         let submit_base = self.cfg.submit_latency_ms;
-        let submit_ns = self.sample_latency_ns(submit_base);
+        // `.max(1)`: same same-tick look-ahead guard as `on_action` — see
+        // its comment on the `Action::Quote` arm.
+        let submit_ns = self.sample_latency_ns(submit_base).max(1);
         self.pending.push(PendingOp {
             scheduled_ts_ns: now.0.saturating_add(submit_ns),
             op: Op::Place {
@@ -774,10 +827,27 @@ impl FillSim {
         self.pending.sort_by_key(|p| p.scheduled_ts_ns);
     }
 
+    /// Switch the sim into live-mirror mode (see the `live_mirror` field):
+    /// resting-order registry + book tracking only; no simulated fills,
+    /// silent cancels, or queue decay.
+    pub fn set_live_mirror(&mut self, on: bool) {
+        self.live_mirror = on;
+    }
+
     /// Match queued open quotes against `ev`; emit fills for any quotes
     /// taken out by the trade-through model. Also emits taker fills for any
     /// pending IOC/FOK ops that became eligible this tick.
     pub fn on_market_event(&mut self, ev: &MarketEvent, now: Timestamp) -> Vec<Fill> {
+        if self.live_mirror {
+            // Real venue owns fills/cancels; only advance the book mirror
+            // and promote pending ops so resting orders become visible.
+            self.last_event_ts_ns = Some(now.0);
+            let fills = self.apply_pending(now);
+            if let MarketEvent::BookUpdate { snapshot } = ev {
+                self.update_book_state(snapshot);
+            }
+            return fills;
+        }
         // Front-cancel queue decay must read the prior event ts BEFORE
         // silent_cancel_tick advances `last_event_ts_ns`.
         self.decay_queue_ahead(now);
@@ -886,22 +956,66 @@ impl FillSim {
                     }
                 }
                 Op::Replace { id, intent } => {
-                    self.cancel_id(id);
                     // PRESERVE the id across a replace. A requote amends in place
                     // (WS/REST `order.modify` keeps the venue `orderId`), so the
                     // tracked id must stay equal to the venue id — otherwise the
                     // replaced quote gets a fresh random `QuoteId::default()`,
                     // which the next requote recovers as a garbage orderId and
                     // the venue rejects with `-1102`.
-                    if let Some(f) =
-                        self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns), Some(id))
-                    {
-                        fills.push(f);
+                    //
+                    // Snapshot + evict the order being replaced BEFORE gating
+                    // the new intent, so the gates/cross checks run net of the
+                    // slot it's replacing (a real `order.modify` doesn't
+                    // double-reserve margin/cash for the same order) — and so
+                    // a REJECT can restore it, matching live Binance modify
+                    // semantics where a rejected modify leaves the original
+                    // order resting untouched. Any stale in-flight op still
+                    // referencing `id` is purged either way.
+                    let restore = self
+                        .live_quotes
+                        .iter()
+                        .position(|q| q.id == id)
+                        .map(|idx| self.live_quotes.remove(idx));
+                    if restore.is_some() {
+                        self.committed_dirty = true;
+                    }
+                    self.purge_pending_id(id);
+                    let rejections_before = self.pending_rejections.len();
+                    match self.place_or_reject(intent, Timestamp(p.scheduled_ts_ns), Some(id)) {
+                        Some(f) => fills.push(f),
+                        None if self.pending_rejections.len() > rejections_before => {
+                            // Rejected — restore the original resting order
+                            // verbatim rather than leaving the strategy
+                            // blind to a quote it thinks is still live.
+                            if let Some(orig) = restore {
+                                self.live_quotes.push(orig);
+                                self.committed_dirty = true;
+                            }
+                        }
+                        None => {
+                            // Accepted (now resting under `id`), or a
+                            // non-crossing IOC/FOK Requote that legitimately
+                            // drops with no fill and no rejection — either
+                            // way the replace deliberately consumed the old
+                            // order.
+                        }
                     }
                 }
                 Op::Cancel(id) => self.cancel_id(id),
                 Op::CancelAll => {
-                    self.live_quotes.clear();
+                    // Strategy-issued CancelAll must not remove MANAGER-owned
+                    // resting orders (take-profit / bagger) — same invariant
+                    // as `drop_quotes_for`: dropping a manager id here would
+                    // false-latch the runner's fill detection (id-absence ==
+                    // "the TP filled"). `Action::CancelAll` carries no symbol
+                    // to scope by, but every `FillSim` instance is
+                    // single-symbol in practice (`tikr_backtest::runner::run`
+                    // and `tikr_paper::runner::run` both take one fixed
+                    // `symbol` for the whole run — see their doc comments),
+                    // so the real bug here was manager exposure, not
+                    // cross-symbol leakage.
+                    self.live_quotes
+                        .retain(|q| self.manager_ids.contains(&q.id));
                     self.committed_dirty = true;
                 }
             }
@@ -974,7 +1088,13 @@ impl FillSim {
             };
             match intent.side {
                 Side::Bid => {
-                    if (committed_bid_notional + intent_notional).round_dp(8) > self.spot_cash {
+                    // Reserve the maker fee alongside the notional: a fill
+                    // deducts BOTH from spot_cash (see `match_trade`'s SPOT
+                    // block), so gating on notional alone under-reserves and
+                    // lets a dense bid ladder fill its cash balance negative.
+                    let fee_frac = Decimal::from(self.cfg.fees.maker_bps) / Decimal::from(10_000);
+                    let reserved = (intent_notional * (Decimal::ONE + fee_frac)).round_dp(8);
+                    if (committed_bid_notional + reserved).round_dp(8) > self.spot_cash {
                         self.pending_rejections
                             .push((intent.clone(), "spot: insufficient cash".to_string()));
                         return None;
@@ -1013,16 +1133,16 @@ impl FillSim {
             //   most a few orders of slippage between reconciles, without mass-
             //   rejecting the adding side.
             //
-            // Scale note: `position_notional` is pre-rounded to 8 dp, but
+            // `pos` is `position_units × mark price` (see the
+            // `position_notional` method) — computed fresh at gate time
+            // rather than accumulated as cash flow, so realized PnL from
+            // round trips never leaks into the margin check.
+            //
+            // Scale note: `position_notional` pre-rounds to 8 dp, but
             // `price × size` can independently produce scale 8+ (e.g. DOGE
             // 0.20123 × 5-dp size). Round both operands before adding so neither the
             // product nor the sum overflows rust_decimal's 96-bit mantissa.
-            let pos = self
-                .position_notional
-                .get(&intent.symbol)
-                .copied()
-                .unwrap_or(Decimal::ZERO)
-                .round_dp(8);
+            let pos = self.position_notional(&intent.symbol, intent.price);
             let intent_delta = (intent.price.0 * intent.size.0).round_dp(8);
 
             // Gate 1 — margin / buying power (worst-case exposure vs wallet × lev).
@@ -1080,7 +1200,9 @@ impl FillSim {
         // IOC / FOK: if the intent crosses the live touch, fill immediately
         // at the touch price as a taker. If it doesn't cross, drop silently
         // (IOC = unfilled remainder gets cancelled; we treat 0 fill as full
-        // cancel). Partial-fill modeling for IOC is a future refinement.
+        // cancel). FOK additionally requires the FULL size to be fillable
+        // right now — see the all-or-nothing check below. Partial-fill
+        // modeling for IOC is a future refinement.
         if matches!(intent.tif, TimeInForce::IOC | TimeInForce::FOK) {
             if !self.book_state.contains_key(&intent.symbol) {
                 self.book_state
@@ -1102,6 +1224,13 @@ impl FillSim {
                 return None;
             }
             let total_qty: Decimal = consumed.iter().map(|(_, q)| *q).sum();
+            if matches!(intent.tif, TimeInForce::FOK) && total_qty < intent.size.0 {
+                // FOK is all-or-nothing: the book can't fill the whole size
+                // right now, so the order dies untouched — no partial fill,
+                // no book mutation (unlike IOC, which takes what it can get
+                // and cancels the remainder).
+                return None;
+            }
             // Weighted-average price = Σ(p × q) / Σq. Round at each
             // multiplication to bound Decimal scale (same scale-overflow
             // story as the original at-touch fill below).
@@ -1120,20 +1249,19 @@ impl FillSim {
             for (lvl_price, lvl_qty) in &consumed {
                 st.decrement_level(touched_side, *lvl_price, *lvl_qty);
             }
-            // Position notional uses the same Σ(p×q) we just computed —
-            // it's the actual cash flow of the trade, not the touch
-            // approximation.
-            if !self.position_notional.contains_key(&intent.symbol) {
-                self.position_notional
+            // Position tracked in signed BASE UNITS, not cash flow — see
+            // `position_units` field docs.
+            if !self.position_units.contains_key(&intent.symbol) {
+                self.position_units
                     .insert(intent.symbol.clone(), Decimal::ZERO);
             }
             let entry = self
-                .position_notional
+                .position_units
                 .get_mut(&intent.symbol)
                 .expect("inserted above");
             match intent.side {
-                Side::Bid => *entry = (*entry + notional).round_dp(8),
-                Side::Ask => *entry = (*entry - notional).round_dp(8),
+                Side::Bid => *entry += total_qty,
+                Side::Ask => *entry -= total_qty,
             }
             // SPOT mode: update cash + asset balances on every taker fill.
             // The fee is quote-denominated (USDC) and always paid, so it
@@ -1161,9 +1289,11 @@ impl FillSim {
                 fee_quote: Notional(fee_amount),
                 side: intent.side,
                 ts,
-                // IOC may now PARTIALLY fill if the book runs out of
-                // depth (or the limit price is breached) before the
-                // intent size is consumed. `is_full = (consumed == intent.size)`.
+                // FOK reaching here always fills the full size (checked
+                // above — otherwise it already returned `None`). IOC may
+                // PARTIALLY fill if the book runs out of depth (or the
+                // limit price is breached) before the intent size is
+                // consumed. `is_full = (consumed == intent.size)`.
                 is_full: total_qty >= intent.size.0,
                 trade_id: None,
             });
@@ -1203,11 +1333,15 @@ impl FillSim {
     fn cancel_id(&mut self, id: QuoteId) {
         self.live_quotes.retain(|q| q.id != id);
         self.committed_dirty = true;
-        // Also drop any not-yet-applied Place / Replace whose venue id
-        // matches — otherwise a pending entry would get promoted into
-        // `live_quotes` by the next `apply_pending`, even though the
-        // strategy already cancelled (or the venue already filled) the
-        // underlying order.
+        self.purge_pending_id(id);
+    }
+
+    /// Drop any not-yet-applied Place / Replace whose venue id matches `id`
+    /// — otherwise a pending entry would get promoted into `live_quotes` by
+    /// the next `apply_pending`, even though the strategy already cancelled
+    /// (or the venue already filled) the underlying order. Shared by
+    /// `cancel_id` and the `Op::Replace` handler in `apply_pending`.
+    fn purge_pending_id(&mut self, id: QuoteId) {
         self.pending.retain(|p| match &p.op {
             Op::Place {
                 override_id: Some(oid),
@@ -1229,14 +1363,39 @@ impl FillSim {
 
     /// Live mode: venue confirmed all symbol orders were cancelled. Drop all
     /// matching live and in-flight quotes from the local mirror immediately.
+    /// MANAGER-owned entries (runner take-profit / bagger) survive: a
+    /// strategy-triggered cancel-all must not make the runner's TP id vanish
+    /// from the mirror — id-absence is how the runner detects a TP *fill*,
+    /// so dropping it here would false-latch `tp_taken`. The runner cancels
+    /// its own orders explicitly via [`Self::drop_quote`].
     pub fn drop_quotes_for(&mut self, symbol: &Symbol) {
-        self.live_quotes.retain(|q| &q.symbol != symbol);
+        self.live_quotes
+            .retain(|q| &q.symbol != symbol || self.manager_ids.contains(&q.id));
         self.committed_dirty = true;
         self.pending.retain(|p| match &p.op {
-            Op::Place { intent, .. } => &intent.symbol != symbol,
+            Op::Place {
+                intent,
+                override_id,
+            } => {
+                &intent.symbol != symbol
+                    || override_id.is_some_and(|id| self.manager_ids.contains(&id))
+            }
             Op::Replace { intent, .. } => &intent.symbol != symbol,
             Op::Cancel(_) | Op::CancelAll => true,
         });
+    }
+
+    /// True if `id` rests in the mirror OR is still in-flight in the pending
+    /// queue (submit latency not yet elapsed). Live mode distinguishes a
+    /// FILLED order (gone from both) from one merely not yet promoted — on a
+    /// quiet symbol an enqueued place can sit pending for seconds.
+    pub fn is_tracked(&self, id: QuoteId) -> bool {
+        self.live_quotes.iter().any(|q| q.id == id)
+            || self.pending.iter().any(|p| match &p.op {
+                Op::Place { override_id, .. } => *override_id == Some(id),
+                Op::Replace { id: rid, .. } => *rid == id,
+                Op::Cancel(_) | Op::CancelAll => false,
+            })
     }
 
     /// Reconcile in-memory `live_quotes` against the venue's authoritative
@@ -1255,7 +1414,13 @@ impl FillSim {
         let before = self.live_quotes.len();
         self.live_quotes
             .retain(|q| &q.symbol != symbol || valid_ids.contains(&q.id));
-        before - self.live_quotes.len()
+        let removed = before - self.live_quotes.len();
+        if removed > 0 {
+            // The spot-cash / margin gates read the cached commitment; a
+            // stale cache keeps counting the dropped ghosts as resting.
+            self.committed_dirty = true;
+        }
+        removed
     }
 
     /// Reconcile in-memory live quote state to the venue's authoritative open
@@ -1424,48 +1589,88 @@ impl FillSim {
         let mut out = Vec::new();
         let mut trade_remaining = trade_size.0;
 
-        let mut i = 0;
-        while i < self.live_quotes.len() && trade_remaining > Decimal::ZERO {
-            let q = &mut self.live_quotes[i];
-            let eligible =
-                q.symbol == *symbol && quote_takes_trade(q.side, q.price, taker_side, trade_price);
-            if !eligible {
-                i += 1;
-                continue;
+        // Price priority: gather every quote this trade is eligible to
+        // take, sorted best-price-first, so a worse-priced quote can never
+        // steal the trade ahead of a better one purely because it sits
+        // earlier in `live_quotes` (insertion order). Eligibility is
+        // one-sided per event — `quote_takes_trade` only matches our Bids
+        // against an Ask taker or our Asks against a Bid taker — so this is
+        // a single sort, never a merge of both sides.
+        let mut eligible: Vec<usize> = self
+            .live_quotes
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| {
+                q.symbol == *symbol && quote_takes_trade(q.side, q.price, taker_side, trade_price)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match taker_side {
+            // Taker sold — hits our Bids. Highest (best) bid first.
+            Side::Ask => eligible.sort_by(|&a, &b| {
+                self.live_quotes[b]
+                    .price
+                    .0
+                    .cmp(&self.live_quotes[a].price.0)
+            }),
+            // Taker bought — hits our Asks. Lowest (best) ask first.
+            Side::Bid => eligible.sort_by(|&a, &b| {
+                self.live_quotes[a]
+                    .price
+                    .0
+                    .cmp(&self.live_quotes[b].price.0)
+            }),
+        }
+
+        let mut drained: Vec<usize> = Vec::new();
+        for i in eligible {
+            if trade_remaining <= Decimal::ZERO {
+                break;
             }
+            let q = &mut self.live_quotes[i];
             match q.side {
                 Side::Bid => self.diag.bid_eligible += 1,
                 Side::Ask => self.diag.ask_eligible += 1,
             }
 
-            // Queue priority: trade consumes the orders RESTING AHEAD of us
-            // at our level before reaching our quote. queue_ahead drops to
-            // zero before we can fill. Trades at deeper prices (sweeps that
-            // walk through our level) implicitly cleared queue ahead by the
-            // time they reach us, but we model this conservatively: ONLY
-            // trades AT our exact price level decrement our queue_ahead.
-            // (Sweeping trades will print at multiple prices including ours
-            // if size is sufficient; the prints AT our level decrement the
-            // queue and fill us together.)
+            // Queue priority: a trade printed AT our exact price consumes
+            // the orders resting ahead of us before reaching our quote —
+            // decrement queue_ahead 1:1, and the book aggregate at our
+            // level (so the next BookUpdate doesn't mis-attribute this as a
+            // cancel). A trade printed STRICTLY THROUGH our price (a sell
+            // below our bid / a buy above our ask) means the market already
+            // walked past our level to get here, so whatever was ahead of
+            // us is necessarily gone — the queue is swept to zero. That
+            // sweep happened at OTHER price levels, not ours, so it must
+            // NOT decrement our book aggregate: that volume was never at
+            // our price to begin with.
             let q_side = q.side;
             let q_price = q.price;
-            let ate = q.queue_ahead.min(trade_remaining);
-            if ate > Decimal::ZERO {
+            if trade_price.0 == q_price.0 {
+                let ate = q.queue_ahead.min(trade_remaining);
+                if ate > Decimal::ZERO {
+                    match q_side {
+                        Side::Bid => self.diag.bid_queue_eaten += ate,
+                        Side::Ask => self.diag.ask_queue_eaten += ate,
+                    }
+                    q.queue_ahead -= ate;
+                    trade_remaining -= ate;
+                    // Decrement book aggregate at our level so the next
+                    // BookUpdate doesn't mis-attribute this trade-shrinkage as
+                    // cancels.
+                    if let Some(b) = self.book_state.get_mut(symbol) {
+                        b.decrement_level(q_side, q_price, ate);
+                    }
+                    if trade_remaining == Decimal::ZERO {
+                        break;
+                    }
+                }
+            } else if q.queue_ahead > Decimal::ZERO {
                 match q_side {
-                    Side::Bid => self.diag.bid_queue_eaten += ate,
-                    Side::Ask => self.diag.ask_queue_eaten += ate,
+                    Side::Bid => self.diag.bid_queue_eaten += q.queue_ahead,
+                    Side::Ask => self.diag.ask_queue_eaten += q.queue_ahead,
                 }
-                q.queue_ahead -= ate;
-                trade_remaining -= ate;
-                // Decrement book aggregate at our level so the next
-                // BookUpdate doesn't mis-attribute this trade-shrinkage as
-                // cancels.
-                if let Some(b) = self.book_state.get_mut(symbol) {
-                    b.decrement_level(q_side, q_price, ate);
-                }
-                if trade_remaining == Decimal::ZERO {
-                    break;
-                }
+                q.queue_ahead = Decimal::ZERO;
             }
             let q = &mut self.live_quotes[i];
 
@@ -1502,19 +1707,18 @@ impl FillSim {
                 is_full,
                 trade_id: None,
             });
+            // Position tracked in signed BASE UNITS, not cash flow — see
+            // `position_units` field docs.
+            if !self.position_units.contains_key(symbol) {
+                self.position_units.insert(symbol.clone(), Decimal::ZERO);
+            }
+            let entry = self.position_units.get_mut(symbol).expect("inserted above");
+            match q.side {
+                Side::Bid => *entry += fill_amount,
+                Side::Ask => *entry -= fill_amount,
+            }
             // Same scale-bound treatment as the IOC arm; see comment above.
             let delta = (fill_price.0 * fill_amount).round_dp(8);
-            if !self.position_notional.contains_key(symbol) {
-                self.position_notional.insert(symbol.clone(), Decimal::ZERO);
-            }
-            let entry = self
-                .position_notional
-                .get_mut(symbol)
-                .expect("inserted above");
-            match q.side {
-                Side::Bid => *entry = (*entry + delta).round_dp(8),
-                Side::Ask => *entry = (*entry - delta).round_dp(8),
-            }
             // SPOT mode: update cash + asset balances on every maker fill.
             // `fee_amount` is quote-denominated and signed (positive = paid,
             // negative = maker rebate); subtract it from cash on both sides.
@@ -1535,10 +1739,15 @@ impl FillSim {
             self.committed_dirty = true;
             trade_remaining -= fill_amount;
             if q.size_remaining.0 == Decimal::ZERO {
-                self.live_quotes.remove(i);
-            } else {
-                i += 1;
+                drained.push(i);
             }
+        }
+
+        // Remove fully-filled quotes highest-index-first so earlier indices
+        // still queued for removal stay valid.
+        drained.sort_unstable_by(|a, b| b.cmp(a));
+        for i in drained {
+            self.live_quotes.remove(i);
         }
 
         out
