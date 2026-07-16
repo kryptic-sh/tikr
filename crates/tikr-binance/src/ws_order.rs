@@ -302,8 +302,26 @@ async fn ws_connect_and_logon(
 }
 
 /// Wait for a response frame with a string `id` matching `expected_id` and
-/// `status == 200`. Ignores unrelated frames.
+/// `status == 200`. Ignores unrelated frames. Bounded by a 10s timeout so a
+/// connected-but-silent server can't hang connect/reconnect forever.
 async fn wait_for_string_id_ack(
+    stream: &mut WsStream,
+    expected_id: &str,
+    method: &str,
+) -> Result<(), VenueError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_string_id_ack_inner(stream, expected_id, method),
+    )
+    .await
+    .map_err(|_| {
+        VenueError::Network(std::io::Error::other(format!(
+            "ws order: timed out waiting for {method} ack"
+        )))
+    })?
+}
+
+async fn wait_for_string_id_ack_inner(
     stream: &mut WsStream,
     expected_id: &str,
     method: &str,
@@ -497,11 +515,14 @@ fn interpret_response(v: serde_json::Value) -> Result<serde_json::Value, VenueEr
     if status == 200 {
         return Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null));
     }
+    // Default to 0 (generic rejection) when the error frame lacks a numeric
+    // code — a benign default like -5027 ("no need to modify") would make
+    // malformed error replies read as successful no-op requotes.
     let code = v
         .get("error")
         .and_then(|e| e.get("code"))
         .and_then(serde_json::Value::as_i64)
-        .unwrap_or(-5027) as i32;
+        .unwrap_or(0) as i32;
     let msg = v
         .get("error")
         .and_then(|e| e.get("msg"))

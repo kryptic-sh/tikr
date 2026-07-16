@@ -83,17 +83,10 @@ pub async fn mint_listen_key(
         .await
         .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| VenueError::Internal(Box::new(e)))?;
+    // `read_json` maps 429/418/403 to RateLimited (honoring Retry-After) and
+    // other non-2xx to typed errors, so an HTML error body never reaches the
+    // JSON parser as an opaque Internal error.
+    let body: serde_json::Value = crate::http::read_json(resp).await?;
 
     let key = body
         .get("listenKey")
@@ -122,12 +115,10 @@ pub async fn keepalive_listen_key(
         .await
         .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
+    // A keepalive failure (e.g. 400 "listenKey does not exist") must surface
+    // as an error — swallowing it leaves the stream silently dead until the
+    // 60-min expiry forces a reconnect.
+    crate::http::read_body(resp).await?;
     Ok(())
 }
 
@@ -258,7 +249,26 @@ pub async fn open_spot_user_data_ws(
 
 /// Wait for a JSON response frame with `"id"` matching `expected_id` and
 /// `"status"` == 200. Ignores unrelated frames (ping, other events).
+/// Bounded by a 10s timeout so a connected-but-silent server can't hang the
+/// open/reconnect path forever.
 async fn wait_for_ack(
+    stream: &mut WsStream,
+    expected_id: &str,
+    method: &str,
+) -> Result<(), VenueError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_ack_inner(stream, expected_id, method),
+    )
+    .await
+    .map_err(|_| {
+        VenueError::Network(std::io::Error::other(format!(
+            "WS-API timed out waiting for {method} ack"
+        )))
+    })?
+}
+
+async fn wait_for_ack_inner(
     stream: &mut WsStream,
     expected_id: &str,
     method: &str,
@@ -955,7 +965,7 @@ pub struct ExecutionReport {
     /// Commission asset.
     #[serde(rename = "N")]
     pub commission_asset: Option<String>,
-    /// Execution type (`"FILL"`, `"NEW"`, `"CANCELED"`, etc.).
+    /// Execution type (`"TRADE"` for fills, `"NEW"`, `"CANCELED"`, etc.).
     #[serde(rename = "x")]
     pub execution_type: String,
     /// Transaction time (ms).
@@ -977,8 +987,10 @@ fn parse_execution_report(
     if frame_symbol != symbol_filter {
         return None;
     }
+    // Binance spot reports fills as execution type `TRADE` (there is no
+    // `FILL` value in the spot executionReport spec); accept both defensively.
     let exec_type = v.get("x").and_then(serde_json::Value::as_str)?;
-    if exec_type != "FILL" {
+    if exec_type != "TRADE" && exec_type != "FILL" {
         return None;
     }
     // Spot order status field. Treat anything other than FILLED as partial
@@ -1152,7 +1164,7 @@ mod tests {
             "F": "0.00000000",
             "g": -1,
             "C": "",
-            "x": "FILL",
+            "x": "TRADE",
             "X": "FILLED",
             "r": "NONE",
             "i": 12345678,
@@ -1389,7 +1401,7 @@ mod tests {
             "s": "BTCUSDT",
             "c": "tikr_00000000000000000000000000000001",
             "S": "BUY",
-            "x": "FILL",
+            "x": "TRADE",
             "X": "FILLED",
             "i": 12345678,
             "l": "0.001",

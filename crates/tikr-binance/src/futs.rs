@@ -1641,21 +1641,50 @@ pub async fn get_user_trades(
     symbol: &str,
     start_ms: u64,
 ) -> Result<Vec<tikr_core::Fill>, VenueError> {
-    let params = format!("symbol={symbol}&startTime={start_ms}&limit=1000");
-    let signed = append_auth_dispatch(&params, key_material);
-    let url = format!("{base_url}/fapi/v1/userTrades?{signed}");
-    let resp = http
-        .get(&url)
-        .header("X-MBX-APIKEY", api_key)
-        .send()
-        .await
-        .map_err(network_err)?;
+    // Paginate: a single page caps at 1000 rows, and a busy outage window can
+    // exceed that — silently dropping the overflow would lose exactly the
+    // fills this reconciliation path exists to replay. Follow-up pages use
+    // `fromId` (last seen id + 1); Binance returns rows ascending by id.
+    const PAGE_LIMIT: usize = 1000;
+    const MAX_PAGES: usize = 50; // runaway backstop: 50k trades per gap-fill
+    let mut out: Vec<tikr_core::Fill> = Vec::new();
+    let mut from_id: Option<u64> = None;
+    for _ in 0..MAX_PAGES {
+        let params = match from_id {
+            Some(id) => format!("symbol={symbol}&fromId={id}&limit={PAGE_LIMIT}"),
+            None => format!("symbol={symbol}&startTime={start_ms}&limit={PAGE_LIMIT}"),
+        };
+        let signed = append_auth_dispatch(&params, key_material);
+        let url = format!("{base_url}/fapi/v1/userTrades?{signed}");
+        let resp = http
+            .get(&url)
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(network_err)?;
 
-    let body: Value = read_json(resp).await?;
-    if let Some(err) = try_parse_error(&body) {
-        return Err(err);
+        let body: Value = read_json(resp).await?;
+        if let Some(err) = try_parse_error(&body) {
+            return Err(err);
+        }
+        // Raw row count decides whether another page may exist (parsed fills
+        // can be fewer if malformed rows are skipped).
+        let raw_len = body.as_array().map_or(0, Vec::len);
+        let last_id = body
+            .as_array()
+            .and_then(|a| a.last())
+            .and_then(|r| r.get("id"))
+            .and_then(Value::as_u64);
+        out.extend(parse_user_trades(&body)?);
+        if raw_len < PAGE_LIMIT {
+            break;
+        }
+        match last_id {
+            Some(id) => from_id = Some(id + 1),
+            None => break,
+        }
     }
-    parse_user_trades(&body)
+    Ok(out)
 }
 
 /// Pure parser for a `GET /fapi/v1/userTrades` response body — split out from
@@ -1697,10 +1726,15 @@ pub(crate) fn parse_user_trades(body: &Value) -> Result<Vec<tikr_core::Fill>, Ve
         let qty = parse_dec("qty", qty_s)?;
         let commission = Decimal::from_str(comm_s).unwrap_or(Decimal::ZERO);
 
-        let side = if side_str == "BUY" {
-            Side::Bid
-        } else {
-            Side::Ask
+        // Skip rows with a malformed/missing side instead of silently booking
+        // them as sells — a wrong-side fill flips position accounting.
+        let side = match side_str {
+            "BUY" => Side::Bid,
+            "SELL" => Side::Ask,
+            other => {
+                tracing::warn!("userTrades: skipping row with unknown side '{other}'");
+                continue;
+            }
         };
         let quote_id = QuoteId::from_uuid(Uuid::from_u128(order_id as u128));
 

@@ -184,6 +184,17 @@ impl BinanceEnv {
     }
 }
 
+/// Build the REST client with explicit timeouts. reqwest's default has NO
+/// request timeout, so a black-holed connection would hang order placement /
+/// cancels indefinitely and freeze the runner's tick loop.
+fn new_http_client() -> HttpClient {
+    HttpClient::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .expect("reqwest client build")
+}
+
 /// Fetch `exchangeInfo` for `env` and return the subset of `symbols` that are
 /// NOT listed on the exchange (case-insensitive). An empty result means every
 /// symbol is valid. Use this to fail fast before subscribing to streams /
@@ -193,7 +204,7 @@ pub async fn invalid_symbols(
     env: BinanceEnv,
     symbols: &[String],
 ) -> Result<Vec<String>, VenueError> {
-    let http = HttpClient::new();
+    let http = new_http_client();
     let base_url = env.rest_base_url();
     let resp = if env.is_futures() {
         crate::futs::get_exchange_info(&http, base_url).await?
@@ -216,7 +227,7 @@ pub async fn symbol_filters(
     env: BinanceEnv,
     symbol: &str,
 ) -> Result<Option<exchange_info::SymbolFilters>, VenueError> {
-    let http = HttpClient::new();
+    let http = new_http_client();
     let base_url = env.rest_base_url();
     let resp = if env.is_futures() {
         crate::futs::get_exchange_info(&http, base_url).await?
@@ -331,7 +342,7 @@ impl BinanceClient {
         symbol: Option<&Symbol>,
         leverage: u32,
     ) -> Result<Self, VenueError> {
-        let http = HttpClient::new();
+        let http = new_http_client();
         let base_url = env.rest_base_url();
 
         // Check mainnet gate.
@@ -708,10 +719,9 @@ impl Venue for BinanceClient {
             .send()
             .await
             .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| VenueError::Internal(Box::new(e)))?;
+        // `read_json` maps 429/418/403 to RateLimited so callers back off
+        // instead of seeing an opaque serde error on an HTML error body.
+        let body: serde_json::Value = crate::http::read_json(resp).await?;
 
         fn parse_levels(arr: Option<&Vec<serde_json::Value>>) -> Vec<tikr_core::Level> {
             arr.map(|rows| {
@@ -1039,8 +1049,17 @@ impl Venue for BinanceClient {
                 &coid,
             )
             .await;
-            if let Err(e) = cancel_result {
-                warn!(error = ?e, "requote (spot): cancel failed; proceeding with new quote");
+            match cancel_result {
+                Ok(()) => {
+                    // Old order is gone — drop its tracking entry (this path
+                    // bypasses `self.cancel`, which normally does the prune).
+                    if let Ok(mut map) = self.quote_symbols.lock() {
+                        map.remove(&id);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = ?e, "requote (spot): cancel failed; proceeding with new quote");
+                }
             }
             self.quote(intent).await.map(|_| ())
         }
@@ -1140,13 +1159,17 @@ impl Venue for BinanceClient {
                     continue;
                 }
             };
-            let size = match round_size(&self.exchange_info_cache, &sym_str, intent.size) {
+            let rounded = match round_size(&self.exchange_info_cache, &sym_str, intent.size) {
                 Ok(s) => s,
                 Err(e) => {
                     results[idx] = Some(Err(e));
                     continue;
                 }
             };
+            // Same min-notional safety net as the single-order `quote` path;
+            // without it the batch path rejects orders a hair under the floor.
+            let size =
+                bump_size_for_min_notional(&self.exchange_info_cache, &sym_str, rounded, price);
             if let Err(e) = validate_qty(&self.exchange_info_cache, &sym_str, size, price) {
                 results[idx] = Some(Err(e));
                 continue;
@@ -1457,6 +1480,14 @@ impl Venue for BinanceClient {
             // the runner's reconciliation simply does nothing on spot.
             return Ok(Vec::new());
         }
+        // Snapshot tracked ids BEFORE the fetch: anything placed while the
+        // REST call is in flight won't be in the response and must survive
+        // the prune below.
+        let before: std::collections::HashSet<QuoteId> = self
+            .quote_symbols
+            .lock()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
         let rows = crate::futs::get_open_orders(
             &self.http,
             base_url,
@@ -1465,6 +1496,19 @@ impl Venue for BinanceClient {
             &sym_str,
         )
         .await?;
+        // Prune `quote_symbols`: most orders end by FILLING (never cancelled),
+        // so without this the map grows one entry per placed order forever.
+        // An entry for this symbol that was tracked before the fetch but is
+        // no longer open on the venue is dead — drop it.
+        let live: std::collections::HashSet<QuoteId> = rows
+            .iter()
+            .map(|&(id, ..)| QuoteId::from_uuid(uuid::Uuid::from_u128(id as u128)))
+            .collect();
+        if let Ok(mut map) = self.quote_symbols.lock() {
+            map.retain(|qid, (sym, _)| {
+                *sym != sym_str || live.contains(qid) || !before.contains(qid)
+            });
+        }
         // Map each Binance row to a venue-agnostic OpenOrder. The QuoteId
         // is derived the same way as in the user_stream parser
         // (`QuoteId::from_uuid(Uuid::from_u128(order_id as u128))`) so
