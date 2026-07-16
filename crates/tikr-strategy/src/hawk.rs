@@ -50,11 +50,25 @@
 //! Each of these can be added iteratively as backtests prove the
 //! v0 baseline is profitable enough to warrant more complexity.
 
-use tikr_core::{Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce};
+use tikr_core::{
+    Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp,
+};
 use tikr_venue::QuoteIntent;
 
 use crate::risk::{self, RiskConfig, RiskDecision};
-use crate::{Action, Strategy, StrategyContext};
+use crate::{Action, Strategy, StrategyContext, should_requote_on_tick_drift};
+
+/// Min elapsed time between risk-gate flatten IOC emissions. Mirrors
+/// `ratchet.rs::SL_CLOSE_RETRY_NS` — while the IOC is in flight the
+/// position report still shows the old size, so without this latch the
+/// gate would re-fire a full-size close every event until the fill
+/// lands.
+const RISK_CLOSE_RETRY_NS: u64 = 5_000_000_000;
+
+/// Min elapsed time between hot-mode ladder rebuilds when the anchor
+/// (best bid/ask) hasn't drifted a full tick. Bounds the worst-case
+/// staleness of the ladder even in a dead-quiet book.
+const LADDER_REQUOTE_MIN_INTERVAL_MS: u64 = 2_000;
 
 /// Configuration for [`Hawk`].
 #[derive(Debug, Clone)]
@@ -105,10 +119,28 @@ pub struct Hawk {
     /// Heartbeat handlers can re-anchor without a fresh snapshot.
     last_bid: Option<Price>,
     last_ask: Option<Price>,
-    /// `true` once we've ever placed the hot-mode ladder. Lets the
-    /// first BookUpdate after going cold→hot do an unconditional
-    /// placement vs a diff.
+    /// `true` once we've ever placed the hot-mode ladder. Gates the
+    /// requote below: `!placed` forces an unconditional rebuild (cold→hot
+    /// transition or cold start) even when the anchor hasn't drifted.
     placed: bool,
+    /// Anchor (best bid/ask) + timestamp of the last hot-mode ladder
+    /// placement. Requote gate: rebuild only when the anchor drifts ≥ 1
+    /// tick or `LADDER_REQUOTE_MIN_INTERVAL_MS` elapses — without this,
+    /// hot mode did CancelAll + full rebuild on every single event
+    /// (order storm, zero queue priority).
+    last_ladder_bid: Option<Price>,
+    last_ladder_ask: Option<Price>,
+    last_ladder_ts: Option<Timestamp>,
+    /// Price of the close-side quote most recently posted in cold mode.
+    /// `None` whenever hot mode is active (or nothing has posted yet) so
+    /// the first cold event after a hot ladder always re-posts (clearing
+    /// the outgoing ladder). While cold, re-posting is skipped unless the
+    /// target price actually changed — the close is anchored to the
+    /// static `avg_entry`, so most events recompute an identical price.
+    last_cold_close_price: Option<Price>,
+    /// Timestamp of the last risk-gate flatten IOC emission — the
+    /// pending-close latch. See `RISK_CLOSE_RETRY_NS`.
+    last_risk_close_ts_ns: u64,
 }
 
 impl Hawk {
@@ -265,10 +297,12 @@ impl Hawk {
     ) -> Vec<Action> {
         let Some(close) = Self::close_side(ctx.position.size.0) else {
             // Flat — nothing to keep alive. Drop all add-side quotes.
+            self.last_cold_close_price = None;
             return vec![Action::CancelAll];
         };
         let entry = ctx.position.avg_entry.0;
         if entry <= Decimal::ZERO {
+            self.last_cold_close_price = None;
             return vec![Action::CancelAll];
         }
         let target_bps = if self.config.close_target_bps > 0 {
@@ -316,6 +350,15 @@ impl Hawk {
             // would CancelAll here.
             return Vec::new();
         }
+        // Requote gate: re-post only when the target actually moved.
+        // `last_cold_close_price` is reset to `None` whenever hot mode
+        // is active, so the first cold event after a hot ladder always
+        // falls through here (clearing the outgoing ladder via the
+        // bundled CancelAll).
+        if self.last_cold_close_price == Some(price) {
+            return Vec::new();
+        }
+        self.last_cold_close_price = Some(price);
         vec![Action::CancelAll, self.make_quote(ctx.symbol, close, price)]
     }
 }
@@ -329,6 +372,11 @@ impl Strategy for Hawk {
             last_bid: None,
             last_ask: None,
             placed: false,
+            last_ladder_bid: None,
+            last_ladder_ask: None,
+            last_ladder_ts: None,
+            last_cold_close_price: None,
+            last_risk_close_ts_ns: 0,
         }
     }
 
@@ -357,6 +405,13 @@ impl Strategy for Hawk {
             MarketEvent::Trade { .. } => return Vec::new(),
         };
 
+        // Venue reports flat → any in-flight flatten IOC has landed (or
+        // was never needed). Reset the latch so a future risk trip can
+        // fire immediately instead of waiting out a stale retry window.
+        if ctx.position.size.0 == Decimal::ZERO {
+            self.last_risk_close_ts_ns = 0;
+        }
+
         // Risk gate runs FIRST so an adverse spike still trips TP/SL
         // even when the rest of the handler short-circuits.
         if self.config.take_profit_bps > 0 || self.config.stop_loss_bps > 0 {
@@ -364,7 +419,23 @@ impl Strategy for Hawk {
             if let RiskDecision::Close { side, qty, .. } =
                 risk::evaluate(ctx.position, mid, self.risk_cfg())
             {
+                // Pending-close latch: an IOC flatten may already be in
+                // flight — the position report won't reflect it for a
+                // few events. Re-firing a full-size close every event
+                // can double-fill and flip the position, so hold off;
+                // if the IOC missed, this retries once the window
+                // elapses (mirrors ratchet.rs::last_sl_close_ts_ns).
+                if self.last_risk_close_ts_ns > 0
+                    && ctx.now.0.saturating_sub(self.last_risk_close_ts_ns) < RISK_CLOSE_RETRY_NS
+                {
+                    return Vec::new();
+                }
+                self.last_risk_close_ts_ns = ctx.now.0;
                 self.placed = false;
+                self.last_ladder_bid = None;
+                self.last_ladder_ask = None;
+                self.last_ladder_ts = None;
+                self.last_cold_close_price = None;
                 return vec![
                     Action::CancelAll,
                     risk::build_close(ctx.symbol, side, qty, best_bid, best_ask),
@@ -376,16 +447,47 @@ impl Strategy for Hawk {
         let targets = self.compute_top_targets(best_bid, best_ask);
         match targets {
             Some(_) => {
-                // Hot mode — refresh the ladder.
+                // Hot mode. `last_cold_close_price` is only meaningful
+                // while cold; clear it so the next cold event always
+                // re-posts (clearing this ladder) instead of matching a
+                // stale price.
+                self.last_cold_close_price = None;
+                // Requote gate: rebuild only when the anchor (best
+                // bid/ask) has drifted ≥ 1 tick since the last placed
+                // ladder, `LADDER_REQUOTE_MIN_INTERVAL_MS` elapsed, or
+                // this is the first placement (cold start / cold→hot
+                // transition, `!self.placed`). Without this, every
+                // single event did CancelAll + full ladder rebuild —
+                // an order storm with zero queue priority.
+                let should_requote = !self.placed
+                    || should_requote_on_tick_drift(
+                        self.last_ladder_bid,
+                        self.last_ladder_ask,
+                        self.last_ladder_ts,
+                        best_bid,
+                        best_ask,
+                        ctx.now,
+                        LADDER_REQUOTE_MIN_INTERVAL_MS,
+                        self.config.tick_size,
+                    );
+                self.placed = true;
+                if !should_requote {
+                    return vec![Action::NoOp];
+                }
                 let mid = (best_bid.0 + best_ask.0) / Decimal::from(2);
                 let pos_usdt = ctx.position.size.0 * mid;
                 let actions = self.build_ladder(ctx, best_bid, best_ask, pos_usdt);
-                self.placed = true;
+                self.last_ladder_bid = Some(best_bid);
+                self.last_ladder_ask = Some(best_ask);
+                self.last_ladder_ts = Some(ctx.now);
                 actions
             }
             None => {
                 // Cold mode — keep close-side alive, cancel add-side.
                 self.placed = false;
+                self.last_ladder_bid = None;
+                self.last_ladder_ask = None;
+                self.last_ladder_ts = None;
                 self.cold_quote(ctx, best_bid, best_ask)
             }
         }
@@ -604,5 +706,141 @@ mod tests {
             .collect();
         assert!(!quote_sides.is_empty());
         assert!(quote_sides.iter().all(|s| *s == Side::Ask));
+    }
+
+    /// Requote gate: a second hot BookUpdate at the SAME best bid/ask
+    /// (no tick drift) inside the min requote interval must NOT rebuild
+    /// the ladder — before the fix, hot mode did CancelAll + full
+    /// rebuild on every single event regardless of drift.
+    #[test]
+    fn hot_mode_gates_redundant_rebuild_on_unchanged_book() {
+        let mut h = Hawk::new(cfg());
+        let s = sym();
+        let p = flat();
+        let snap0 = snap(99_950, 100_050, 1_000_000_000);
+        let c0 = ctx(&s, &p, &snap0);
+        let first = h.on_event(
+            &c0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap0.clone(),
+            },
+        );
+        assert!(!first.is_empty(), "first hot event must place the ladder");
+
+        // Same book, 1ms later — well within any sane requote interval,
+        // no tick drift.
+        let snap1 = snap(99_950, 100_050, 1_001_000_000);
+        let c1 = ctx(&s, &p, &snap1);
+        let second = h.on_event(
+            &c1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+        assert!(
+            matches!(second.as_slice(), [Action::NoOp]),
+            "unchanged anchor within the interval must not rebuild, got {second:?}"
+        );
+
+        // Book moves ≥ 1 tick → gate reopens, ladder rebuilds.
+        let snap2 = snap(99_951, 100_051, 1_002_000_000);
+        let c2 = ctx(&s, &p, &snap2);
+        let third = h.on_event(
+            &c2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap2.clone(),
+            },
+        );
+        assert!(
+            third.iter().any(|a| matches!(a, Action::CancelAll)),
+            "tick drift must trigger a rebuild, got {third:?}"
+        );
+    }
+
+    /// Cold mode: while holding, an unchanged close target must not
+    /// re-post every event — only when the target price actually moves.
+    #[test]
+    fn cold_mode_gates_redundant_repost_on_unchanged_target() {
+        let mut h = Hawk::new(cfg());
+        let s = sym();
+        let p = Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::from_str_exact("0.001").unwrap()),
+            avg_entry: Price(Decimal::from(100_000)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let snap0 = snap(99_990, 100_010, 1_000_000_000); // 2bps, cold
+        let c0 = ctx(&s, &p, &snap0);
+        let first = h.on_event(
+            &c0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap0.clone(),
+            },
+        );
+        assert!(
+            first.iter().any(|a| matches!(a, Action::CancelAll)),
+            "first cold post must place the close leg"
+        );
+
+        // Same cold book, same avg_entry → identical target → no repost.
+        let snap1 = snap(99_990, 100_010, 1_001_000_000);
+        let c1 = ctx(&s, &p, &snap1);
+        let second = h.on_event(
+            &c1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+        assert!(
+            second.is_empty(),
+            "unchanged cold close target must not repost, got {second:?}"
+        );
+    }
+
+    /// Pending-close latch: a risk-trip must not re-fire the flatten IOC
+    /// every event while it's presumably still in flight — the position
+    /// report lags the fill.
+    #[test]
+    fn risk_gate_latches_pending_close() {
+        let mut c = cfg();
+        c.take_profit_bps = 10;
+        let mut h = Hawk::new(c);
+        let s = sym();
+        // Long, deep in profit → TP trips every event until the venue
+        // reports flat.
+        let p = Position {
+            symbol: sym(),
+            size: SignedSize(Decimal::from_str_exact("0.001").unwrap()),
+            avg_entry: Price(Decimal::from(90_000)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let snap0 = snap(99_950, 100_050, 1_000_000_000);
+        let c0 = ctx(&s, &p, &snap0);
+        let first = h.on_event(
+            &c0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap0.clone(),
+            },
+        );
+        assert!(
+            first.iter().any(|a| matches!(a, Action::CancelAll)),
+            "first risk trip must flatten, got {first:?}"
+        );
+
+        // Position report hasn't updated yet (still shows the same long)
+        // — a re-evaluation immediately after must be suppressed by the
+        // latch instead of re-firing another full-size close.
+        let snap1 = snap(99_950, 100_050, 1_001_000_000);
+        let c1 = ctx(&s, &p, &snap1);
+        let second = h.on_event(
+            &c1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+        assert!(
+            second.is_empty(),
+            "latched retry window must suppress re-fire, got {second:?}"
+        );
     }
 }

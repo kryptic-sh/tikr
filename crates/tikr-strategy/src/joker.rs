@@ -29,6 +29,13 @@ use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
 
+/// Grace window during which a just-emitted (side, price) placement counts
+/// as coverage even though it hasn't shown up in `ctx.open_quotes` yet
+/// (venue ack / runner reconciliation lags the emit by at least one
+/// event). Used by both the dedupe check (`already_at`) and the age
+/// sweep's `placement_ts` pruning — see their doc comments.
+const IN_FLIGHT_GRACE_NS: u64 = 10_000_000_000; // 10s
+
 /// Configuration for [`Joker`].
 #[derive(Debug, Clone)]
 pub struct JokerConfig {
@@ -101,13 +108,33 @@ impl Joker {
         })
     }
 
+    /// True if `side` already has coverage near `price` — either a
+    /// resting order in `ctx.open_quotes`, or a just-emitted placement
+    /// (tracked in `placement_ts`) that hasn't shown up there yet.
+    /// `open_quotes` lags in-flight placements by at least one event;
+    /// checking it alone let the same touch get re-emitted every event
+    /// until the venue ack landed — duplicate resting orders. A
+    /// `placement_ts` entry counts as coverage until it either appears in
+    /// `open_quotes` or `IN_FLIGHT_GRACE_NS` elapses (safety valve: if the
+    /// order never lands — rejected, lost — don't suppress emits at that
+    /// price forever).
     fn already_at(&self, ctx: &StrategyContext<'_>, side: Side, price: Price) -> bool {
         let tol = Decimal::from(self.config.order_tick_tolerance) * self.config.tick_size;
         let lo = price.0 - tol;
         let hi = price.0 + tol;
-        ctx.open_quotes
+        let resting = ctx
+            .open_quotes
             .iter()
-            .any(|(_, q)| q.side == side && q.price.0 >= lo && q.price.0 <= hi)
+            .any(|(_, q)| q.side == side && q.price.0 >= lo && q.price.0 <= hi);
+        if resting {
+            return true;
+        }
+        self.placement_ts.iter().any(|((s, p), ts)| {
+            *s == side
+                && *p >= lo
+                && *p <= hi
+                && ctx.now.0.saturating_sub(ts.0) < IN_FLIGHT_GRACE_NS
+        })
     }
 }
 
@@ -145,8 +172,16 @@ impl Strategy for Joker {
                 .map(|(_, q)| (q.side, q.price.0))
                 .collect();
             // Drop tracker entries that no longer have a matching open
-            // quote (filled, externally cancelled).
-            self.placement_ts.retain(|k, _| open_keys.contains(k));
+            // quote (filled, externally cancelled) — EXCEPT ones still
+            // inside the in-flight grace window: those are placements
+            // just emitted this session that haven't shown up in
+            // `open_quotes` yet. Dropping them unconditionally (as
+            // before) permanently exempted them from this very age sweep
+            // once they did land, since the sweep only checks quotes with
+            // a `placement_ts` record.
+            self.placement_ts.retain(|k, ts| {
+                open_keys.contains(k) || now_ns.saturating_sub(ts.0) < IN_FLIGHT_GRACE_NS
+            });
             for (id, q) in ctx.open_quotes {
                 let key = (q.side, q.price.0);
                 if let Some(ts) = self.placement_ts.get(&key)
@@ -344,5 +379,183 @@ mod tests {
             Action::Quote(q) => assert_eq!(q.side, Side::Ask),
             _ => panic!("expected Quote"),
         }
+    }
+
+    /// Regression: dedupe must cover in-flight placements the runner
+    /// hasn't reconciled into `open_quotes` yet — checking `open_quotes`
+    /// alone let the same touch get re-emitted every event.
+    #[test]
+    fn in_flight_placement_suppresses_duplicate_emit_before_open_quotes_catch_up() {
+        let mut s = Joker::new(cfg());
+        let snap = book(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos();
+        let symbol = sym();
+
+        let c0 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(1_000_000_000),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let first = s.on_event(
+            &c0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        assert_eq!(first.len(), 2, "first event emits both touches");
+
+        // Same book, `open_quotes` still empty (runner hasn't reconciled
+        // the in-flight placements yet), 1s later — well inside the
+        // grace window. Before the fix this re-emitted duplicates.
+        let c1 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(2_000_000_000),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let second = s.on_event(
+            &c1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        assert!(
+            second.is_empty(),
+            "in-flight grace must suppress duplicate emit, got {second:?}"
+        );
+
+        // Well past the grace window, still no open_quotes (order truly
+        // lost — rejected, dropped) → safety-valve retry re-emits.
+        let c2 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(1_000_000_000 + 11_000_000_000),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let third = s.on_event(
+            &c2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        assert_eq!(
+            third.len(),
+            2,
+            "past the grace window, emit must retry, got {third:?}"
+        );
+    }
+
+    /// Regression: the age sweep's `placement_ts.retain` used to drop
+    /// entries for just-emitted, not-yet-reconciled orders unconditionally
+    /// — permanently exempting them from the age sweep once they DID land
+    /// in `open_quotes`, since the sweep only acts on quotes with a
+    /// `placement_ts` record.
+    #[test]
+    fn placement_ts_survives_in_flight_gap_so_age_sweep_still_reaps_it() {
+        let mut c = cfg();
+        c.max_order_age_secs = 5;
+        let mut s = Joker::new(c);
+        let snap = book(Decimal::from(100), Decimal::new(1001, 1));
+        let p = pos();
+        let symbol = sym();
+
+        let c0 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(0),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let first = s.on_event(
+            &c0,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        assert_eq!(first.len(), 2, "first event emits both touches");
+
+        // 1s later, still not reconciled into open_quotes (runner lag).
+        // Before the fix, this call's retain() unconditionally wiped the
+        // placement_ts entries since open_keys was still empty.
+        let c1 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(1_000_000_000),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let _ = s.on_event(
+            &c1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+
+        // 6s after the ORIGINAL emit (past max_order_age_secs=5), the
+        // orders finally show up in open_quotes at their emitted prices.
+        // The age sweep must reap them using the ORIGINAL emit
+        // timestamp — which only survives if placement_ts wasn't wiped
+        // at t=1s.
+        let open = vec![
+            (
+                QuoteId::new(),
+                QuoteIntent {
+                    symbol: symbol.clone(),
+                    side: Side::Bid,
+                    price: Price(Decimal::from(100)),
+                    size: Size(Decimal::ONE),
+                    tif: TimeInForce::PostOnly,
+                    kind: QuoteKind::Point,
+                },
+            ),
+            (
+                QuoteId::new(),
+                QuoteIntent {
+                    symbol: symbol.clone(),
+                    side: Side::Ask,
+                    price: Price(Decimal::new(1001, 1)),
+                    size: Size(Decimal::ONE),
+                    tif: TimeInForce::PostOnly,
+                    kind: QuoteKind::Point,
+                },
+            ),
+        ];
+        let c2 = StrategyContext {
+            symbol: &symbol,
+            now: Timestamp(6_000_000_000),
+            position: &p,
+            recent_fills: &[],
+            latest_book: &snap,
+            open_quotes: &open,
+            recent_liqs: &[],
+        };
+        let third = s.on_event(
+            &c2,
+            &MarketEvent::BookUpdate {
+                snapshot: snap.clone(),
+            },
+        );
+        let cancels = third
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel(_)))
+            .count();
+        assert_eq!(
+            cancels, 2,
+            "age sweep must reap both orders using the original emit ts, got {third:?}"
+        );
     }
 }

@@ -89,6 +89,10 @@ pub struct Rebalance {
     /// so this is immediate; on futures the strategy opens it with a taker buy
     /// first (see `on_event`).
     ladder_placed: bool,
+    /// Rungs rejected at placement (post-only would-cross while price sat on
+    /// them). Without recovery a reject is a permanent hole in the frozen
+    /// ladder. Re-placed on later BookUpdates once no longer crossing.
+    rejected: Vec<QuoteIntent>,
 }
 
 impl Rebalance {
@@ -169,23 +173,30 @@ impl Rebalance {
     /// folds in every inner rung's fill, so a level "knows about" the orders
     /// closer to the anchor). Orders then rest untouched; fills are mirrored one
     /// rung over by [`Self::mirror`].
-    fn initial_ladder(&self, symbol: &Symbol, mid: Price) -> Vec<Action> {
+    fn initial_ladder(&self, symbol: &Symbol) -> Vec<Action> {
         let len = self.rung_prices.len();
         let min_n = self.config.min_order_notional;
+        let anchor_idx = self.n();
         let mut out = Vec::with_capacity(len);
         for idx in 0..len {
             let r = self.rung_prices[idx];
             if r <= Decimal::ZERO {
                 continue;
             }
-            let (side, size) = if r < mid.0 && idx + 1 < len {
+            // Classify by rung position relative to the FROZEN anchor, not
+            // the live mid: the futures open path takes several books, and
+            // if mid drifted a band in that window, a mid-based split would
+            // give rungs between the anchor and the new mid the wrong role —
+            // breaking the constant-mix invariant from the very first fill
+            // (holdings would exceed the balanced `T` for that price).
+            let (side, size) = if idx < anchor_idx && idx + 1 < len {
                 // BUY guarding the gap above it: T[idx] − T[idx+1].
                 (Side::Bid, self.rung_units[idx] - self.rung_units[idx + 1])
-            } else if r > mid.0 && idx >= 1 {
+            } else if idx > anchor_idx && idx >= 1 {
                 // SELL guarding the gap below it: T[idx-1] − T[idx].
                 (Side::Ask, self.rung_units[idx - 1] - self.rung_units[idx])
             } else {
-                continue; // the anchor rung itself, or out of range
+                continue; // the anchor rung itself
             };
             let size = size.round_dp(8);
             if size <= Decimal::ZERO {
@@ -220,16 +231,26 @@ impl Rebalance {
         if qty <= Decimal::ZERO {
             return Vec::new();
         }
+        // Ownership guard: a ladder/mirror order at this rung never exceeds
+        // the increment it guards. A larger fill — e.g. the opening IOC
+        // landing exactly on a rung price after `ladder_placed` flipped —
+        // is not ours to mirror; mirroring it would dump the entire anchor
+        // position one band over.
+        let increment = match side {
+            Side::Bid if idx + 1 < len => self.rung_units[idx] - self.rung_units[idx + 1],
+            Side::Ask if idx >= 1 => self.rung_units[idx - 1] - self.rung_units[idx],
+            _ => return Vec::new(),
+        }
+        .round_dp(8);
+        let dust = Decimal::new(1, 8);
+        if qty > increment + dust {
+            return Vec::new();
+        }
         match side {
             // Buy filled (price came down) → sell back one rung up.
-            Side::Bid if idx + 1 < len => {
-                vec![Action::Quote(self.mk(symbol, Side::Ask, idx + 1, qty))]
-            }
+            Side::Bid => vec![Action::Quote(self.mk(symbol, Side::Ask, idx + 1, qty))],
             // Sell filled (price came up) → buy back one rung down.
-            Side::Ask if idx >= 1 => {
-                vec![Action::Quote(self.mk(symbol, Side::Bid, idx - 1, qty))]
-            }
-            _ => Vec::new(),
+            Side::Ask => vec![Action::Quote(self.mk(symbol, Side::Bid, idx - 1, qty))],
         }
     }
 }
@@ -244,6 +265,7 @@ impl Strategy for Rebalance {
             rung_prices: Vec::new(),
             rung_units: Vec::new(),
             ladder_placed: false,
+            rejected: Vec::new(),
         }
     }
 
@@ -261,7 +283,25 @@ impl Strategy for Rebalance {
                     self.seed(mid);
                 }
                 if self.ladder_placed {
-                    return Vec::new(); // orders rest; only fills move the lattice
+                    // Orders rest; only fills move the lattice. The exception:
+                    // re-place rejected rungs once they'd rest post-only again.
+                    if self.rejected.is_empty() {
+                        return Vec::new();
+                    }
+                    let best_bid = snapshot.bids.first().map(|l| l.price.0);
+                    let best_ask = snapshot.asks.first().map(|l| l.price.0);
+                    let mut out = Vec::new();
+                    self.rejected.retain(|intent| {
+                        let ok = match intent.side {
+                            Side::Bid => best_ask.is_some_and(|a| intent.price.0 < a),
+                            Side::Ask => best_bid.is_some_and(|b| intent.price.0 > b),
+                        };
+                        if ok {
+                            out.push(Action::Quote(intent.clone()));
+                        }
+                        !ok
+                    });
+                    return out;
                 }
                 // Open (or top up) the anchor long `a0` before placing the ladder.
                 // Spot pre-seeds the position so `a0` is already held → this is a
@@ -292,7 +332,7 @@ impl Strategy for Rebalance {
                     })];
                 }
                 self.ladder_placed = true;
-                self.initial_ladder(ctx.symbol, mid)
+                self.initial_ladder(ctx.symbol)
             }
             // A resting ladder order filled → place its offsetting mirror. Opening
             // (taker) fills happen before the ladder and never match a rung price,
@@ -305,6 +345,21 @@ impl Strategy for Rebalance {
             }
             MarketEvent::Heartbeat { .. } | MarketEvent::Trade { .. } => Vec::new(),
         }
+    }
+
+    /// Park a rejected rung for re-placement (see the `rejected` field). Only
+    /// ladder/mirror rungs matter — an opening IOC reject just retries on the
+    /// next book via the top-up path.
+    fn on_quote_rejected(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        intent: &QuoteIntent,
+        _reason: &str,
+    ) -> Vec<Action> {
+        if self.ladder_placed && intent.tif == TimeInForce::PostOnly {
+            self.rejected.push(intent.clone());
+        }
+        Vec::new()
     }
 }
 

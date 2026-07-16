@@ -396,7 +396,11 @@ impl Strategy for MicroMeanReversion {
                     Vec::new()
                 }
             }
-            MarketEvent::Fill(fill) if fill.is_full => {
+            // Only a fill that leaves inventory needs an exit. A fill that
+            // flattened the position is a completed exit — posting a fresh
+            // opposite-side order off it would be an unintended re-entry
+            // that ping-pongs forever.
+            MarketEvent::Fill(fill) if fill.is_full && ctx.position.size.0 != Decimal::ZERO => {
                 // Anchor the resting TP to avg_entry (the blended cost basis
                 // of the whole position), not to this individual fill price.
                 // Emit CancelAll first so any orphaned prior exit is cleaned up,
@@ -425,8 +429,8 @@ impl Strategy for MicroMeanReversion {
             return Vec::new();
         };
         // Post-only would-cross (Binance -5022): the order priced off a
-        // snapshot raced the moved book. Re-attempt the entry, but throttled by
-        // the per-side cooldown so repeated crosses during a fast move retry at
+        // snapshot raced the moved book. Re-attempt, but throttled by the
+        // per-side cooldown so repeated crosses during a fast move retry at
         // most once per cooldown instead of storming the rate limit. Without a
         // cooldown configured there is nothing to throttle an immediate
         // re-cross, so drop. FillSim emits the same -5022 string, so backtest
@@ -436,9 +440,23 @@ impl Strategy for MicroMeanReversion {
                 return Vec::new();
             }
             self.record_entry(ctx.now.0, intent.side);
-            return vec![self.entry_quote(ctx, mid, intent.side)];
         }
-        // Re-quote on other rejections.
+        // A rejected EXIT (side opposes a live position) must be re-posted
+        // through the exit path — the entry path would silently replace the
+        // position's exit with a notional-sized order entry_bps off mid.
+        if let Some(pos_side) = Self::position_side(ctx)
+            && intent.side != pos_side
+        {
+            // Same anchor as the Fill branch: the blended cost basis, falling
+            // back to the rejected price when avg_entry is unknown.
+            let anchor = if ctx.position.avg_entry.0 > Decimal::ZERO {
+                ctx.position.avg_entry
+            } else {
+                intent.price
+            };
+            return vec![self.exit_quote(ctx.symbol, anchor, pos_side)];
+        }
+        // Re-quote entries as entries.
         vec![self.entry_quote(ctx, mid, intent.side)]
     }
 
@@ -620,7 +638,16 @@ mod tests {
     fn fill_places_opposite_exit() {
         let symbol = sym();
         let snapshot = book(&symbol);
-        let position = pos(&symbol);
+        // The runner applies a fill to the position tracker BEFORE the
+        // strategy sees the Fill event, so an entry fill arrives with the
+        // position already reflecting it. (A flat position + Fill means the
+        // fill was an exit — no re-quote, see the flat guard.)
+        let position = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::new(1, 3)),
+            avg_entry: Price(Decimal::from(99_980)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
         let mut strategy = strategy();
         let actions = strategy.on_event(
             &ctx(&symbol, &snapshot, &position, &[]),

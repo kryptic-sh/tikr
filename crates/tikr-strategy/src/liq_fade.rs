@@ -145,6 +145,9 @@ pub struct LiqFade {
     /// `ctx.recent_liqs`. Used as the dedup cursor so the same event
     /// isn't re-tallied across consecutive ticks. Strictly monotonic.
     last_liq_ts_seen: u64,
+    /// How many events at `last_liq_ts_seen` were already counted
+    /// (cascades emit several liqs in the same millisecond).
+    liqs_consumed_at_last_ts: usize,
     /// Running per-side liq notional sum, decayed by the runner's
     /// rolling-window prune. Lives here (not on context) so the
     /// strategy can re-evaluate on every tick without depending on the
@@ -247,13 +250,52 @@ impl LiqFade {
         Size(qty)
     }
 
+    /// Round a raw quote price to the venue tick, away from the cross:
+    /// bids floor, asks ceil. Un-rounded prices get rejected (or silently
+    /// adjusted) by the venue, and an entry reject during Capitulation
+    /// aborts the whole cycle.
+    fn round_price_for_side(&self, side: Side, price: Price) -> Price {
+        let tick = self.config.tick_size;
+        if tick <= Decimal::ZERO {
+            return price;
+        }
+        let p = match side {
+            Side::Bid => (price.0 / tick).floor() * tick,
+            Side::Ask => (price.0 / tick).ceil() * tick,
+        };
+        Price(p)
+    }
+
     fn make_quote(&self, symbol: &Symbol, side: Side, price: Price, tif: TimeInForce) -> Action {
+        let price = self.round_price_for_side(side, price);
         Action::Quote(QuoteIntent {
             symbol: symbol.clone(),
             side,
             price,
             size: self.quote_size_at(price),
             tif,
+            kind: QuoteKind::Point,
+        })
+    }
+
+    /// TP quote sized from the ACTUAL position, not from
+    /// `notional_per_entry` at the TP price — notional-based sizing
+    /// over-buys on a short fade (flip) and under-sells on a long fade
+    /// (residual), and mis-sizes badly after a partial entry fill.
+    fn make_tp_quote(&self, symbol: &Symbol, side: Side, price: Price, pos_abs: Decimal) -> Action {
+        let price = self.round_price_for_side(side, price);
+        let step = self.config.step_size;
+        let qty = if step > Decimal::ZERO {
+            (pos_abs / step).floor() * step
+        } else {
+            pos_abs
+        };
+        Action::Quote(QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price,
+            size: Size(qty),
+            tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         })
     }
@@ -278,15 +320,31 @@ impl LiqFade {
     }
 
     /// Tally fresh liq events from the context window into our sum
-    /// window. Dedup via `last_liq_ts_seen`. Assumes the context buffer
-    /// is sorted oldest-first (runner contract).
+    /// window. Dedup via `(last_liq_ts_seen, liqs_consumed_at_last_ts)`.
+    /// Assumes the context buffer is sorted oldest-first with stable
+    /// order (runner contract). Cascades deliver multiple forced orders
+    /// in the same millisecond — a plain strictly-greater-ts cursor
+    /// would count only the first per timestamp, undercounting exactly
+    /// the burst notional the arm trigger measures.
     fn ingest_liqs(&mut self, recent: &[LiqEvent]) {
+        let mut at_last: usize = 0;
         for ev in recent {
-            if ev.ts.0 <= self.last_liq_ts_seen {
-                continue;
+            match ev.ts.0.cmp(&self.last_liq_ts_seen) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    at_last += 1;
+                    if at_last <= self.liqs_consumed_at_last_ts {
+                        continue; // already counted in a prior call
+                    }
+                    self.liqs_consumed_at_last_ts = at_last;
+                }
+                std::cmp::Ordering::Greater => {
+                    self.last_liq_ts_seen = ev.ts.0;
+                    self.liqs_consumed_at_last_ts = 1;
+                    at_last = 1;
+                }
             }
             self.side_sum.observe(ev.ts.0, ev.side, ev.notional.0);
-            self.last_liq_ts_seen = ev.ts.0;
         }
     }
 
@@ -389,6 +447,7 @@ impl Strategy for LiqFade {
             last_mid: None,
             last_event_ts: 0,
             last_liq_ts_seen: 0,
+            liqs_consumed_at_last_ts: 0,
             side_sum,
         }
     }
@@ -448,16 +507,45 @@ impl Strategy for LiqFade {
                             Side::Bid => Side::Ask,
                             Side::Ask => Side::Bid,
                         };
-                        vec![self.make_quote(ctx.symbol, tp_side, tp, TimeInForce::PostOnly)]
+                        // CancelAll first: a partially-filled entry
+                        // remainder must not keep resting once we hold.
+                        // TP is sized from the actual position (fallback:
+                        // this fill's size if the report lags).
+                        let pos_abs = ctx.position.size.0.abs();
+                        let tp_qty = if pos_abs > Decimal::ZERO {
+                            pos_abs
+                        } else {
+                            f.size.0
+                        };
+                        vec![
+                            Action::CancelAll,
+                            self.make_tp_quote(ctx.symbol, tp_side, tp, tp_qty),
+                        ]
                     }
                     LiqFadeState::Holding => {
-                        // TP filled (or partial — we accept partials as
-                        // close-enough exit; the position tracker will
-                        // reflect residual size if any).
                         if ctx.position.size.0 == Decimal::ZERO {
+                            // TP filled — cycle done.
                             self.reset_to_idle();
+                            return Vec::new();
                         }
-                        Vec::new()
+                        let Some(trade) = self.trade else {
+                            return Vec::new();
+                        };
+                        if f.side != trade.entry_side {
+                            return Vec::new();
+                        }
+                        // Entry remainder filled before our CancelAll
+                        // landed — re-issue the TP sized to the grown
+                        // position.
+                        let tp = self.tp_price(&trade);
+                        let tp_side = match trade.entry_side {
+                            Side::Bid => Side::Ask,
+                            Side::Ask => Side::Bid,
+                        };
+                        vec![
+                            Action::CancelAll,
+                            self.make_tp_quote(ctx.symbol, tp_side, tp, ctx.position.size.0.abs()),
+                        ]
                     }
                     _ => Vec::new(),
                 }
@@ -586,6 +674,20 @@ impl LiqFade {
                 Vec::new()
             }
             LiqFadeState::Holding => {
+                // Escape hatch: if the TP filled but the Fill event was
+                // dropped, the position is flat and `check_exit` would
+                // no-op forever — the bot would be permanently dead in
+                // Holding. A short grace lets the entry fill propagate
+                // to the position report first.
+                if ctx.position.size.0 == Decimal::ZERO {
+                    let held_ns = now_ns
+                        .saturating_sub(self.trade.map(|t| t.phase_started_ts).unwrap_or(now_ns));
+                    if held_ns >= 2_000_000_000 {
+                        self.reset_to_idle();
+                        return vec![Action::CancelAll];
+                    }
+                    return Vec::new();
+                }
                 if let Some(close) = self.check_exit(ctx, mid, best_bid, best_ask, now_ns) {
                     self.reset_to_idle();
                     return close;
@@ -866,12 +968,15 @@ mod tests {
         let c3 = ctx(&s, &p, &s2, &liqs_empty, 4_000_000_000);
         let actions = f.on_event(&c3, &MarketEvent::Fill(fill));
         assert_eq!(f.state(), LiqFadeState::Holding);
-        // TP order on Ask side.
-        assert_eq!(actions.len(), 1);
-        let Action::Quote(intent) = &actions[0] else {
+        // CancelAll (clears any entry remainder) + TP order on Ask side.
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], Action::CancelAll));
+        let Action::Quote(intent) = &actions[1] else {
             panic!("expected TP Quote");
         };
         assert_eq!(intent.side, Side::Ask);
+        // TP sized from the fill (position report is flat in this fixture).
+        assert_eq!(intent.size.0, Decimal::from_str_exact("0.001").unwrap());
         // TP price = pre_liq_mid (100_005) × (1 - 10bps/10000) = 99_905.005
         // Below pre_liq_mid by revert_target_bps.
         assert!(intent.price.0 < Price(Decimal::from(100_005)).0);

@@ -156,13 +156,27 @@ impl Keel {
         Decimal::new(20, 2) // 0.20
     }
 
+    /// Round price to tick — FLOORED for bids, CEILED for asks — so a
+    /// post-only order never rounds *through* the touch. The cross-guards
+    /// in `desired()` run on the unrounded price; nearest-rounding could
+    /// still push a bid within half a tick of `best_ask` UP across it (or
+    /// an ask down across `best_bid`), triggering a post-only reject that
+    /// keel has no recovery for (the level just stays missing).
+    fn round_tick(&self, side: Side, price: Decimal) -> Decimal {
+        if self.inv_tick <= Decimal::ZERO {
+            return price;
+        }
+        let scaled = price * self.inv_tick;
+        let rounded = match side {
+            Side::Bid => scaled.floor(),
+            Side::Ask => scaled.ceil(),
+        };
+        rounded * self.config.tick_size
+    }
+
     /// Round price to tick, floor size to lot, bump size to clear min_notional.
     fn intent(&self, symbol: &Symbol, side: Side, price: Decimal, size: Decimal) -> QuoteIntent {
-        let price = if self.inv_tick > Decimal::ZERO {
-            (price * self.inv_tick).round() * self.config.tick_size
-        } else {
-            price
-        };
+        let price = self.round_tick(side, price);
         let size = if self.inv_step > Decimal::ZERO {
             (size * self.inv_step).floor() * self.config.step_size
         } else {
@@ -189,6 +203,43 @@ impl Keel {
             tif: TimeInForce::PostOnly,
             kind: QuoteKind::Point,
         }
+    }
+
+    /// Trailing-mode reduce order, capped at the step-floored `|position|`
+    /// — NEVER inflated above it by the min-notional bump. `intent()`'s
+    /// bump-to-min-notional is right for the adding-side lattice (there's
+    /// no position ceiling to respect) but wrong here: bumping a reduce
+    /// order past the position it's supposed to close turns a dust
+    /// position into a flip on futures. If the step-floored size can't
+    /// clear `min_notional`, skip placing the reduce entirely rather than
+    /// oversize it — the dust just stays open until it can.
+    fn reduce_intent(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        price: Decimal,
+        pos_abs: Decimal,
+    ) -> Option<QuoteIntent> {
+        let price = self.round_tick(side, price);
+        let size = if self.inv_step > Decimal::ZERO {
+            (pos_abs * self.inv_step).floor() * self.config.step_size
+        } else {
+            pos_abs
+        };
+        if size <= Decimal::ZERO || price <= Decimal::ZERO {
+            return None;
+        }
+        if self.config.min_notional > Decimal::ZERO && size * price < self.config.min_notional {
+            return None;
+        }
+        Some(QuoteIntent {
+            symbol: symbol.clone(),
+            side,
+            price: Price(price),
+            size: Size(size),
+            tif: TimeInForce::PostOnly,
+            kind: QuoteKind::Point,
+        })
     }
 
     /// Build the desired order set for the current book + position.
@@ -276,14 +327,16 @@ impl Keel {
 
         // Trailing-mode reduce: single order pegged at avg ± reduce_bps, clamped
         // to the touch (post-only). Guarantees the close is on the right side of
-        // the average → avg_sell > avg_buy.
+        // the average → avg_sell > avg_buy. Sized via `reduce_intent`, which
+        // caps at |position| instead of bumping past it for min_notional.
         if self.config.mode == KeelMode::Trailing && !flat && avg > Decimal::ZERO {
             let off = Self::bps(self.config.reduce_bps);
             if pos > Decimal::ZERO {
                 // Long → sell at max(avg·(1+off), best_ask): never below avg, never crossing.
                 let rp = (avg * (Decimal::ONE + off)).max(best_ask.unwrap_or(Decimal::ZERO));
-                if rp > Decimal::ZERO {
-                    let intent = self.intent(ctx.symbol, Side::Ask, rp, pos.abs());
+                if rp > Decimal::ZERO
+                    && let Some(intent) = self.reduce_intent(ctx.symbol, Side::Ask, rp, pos.abs())
+                {
                     let key = intent.price.0.to_string();
                     if seen.insert(key.clone()) {
                         desired.push((key, Side::Ask, intent));
@@ -296,8 +349,9 @@ impl Keel {
                     Some(bb) => raw.min(bb),
                     None => raw,
                 };
-                if rp > Decimal::ZERO {
-                    let intent = self.intent(ctx.symbol, Side::Bid, rp, pos.abs());
+                if rp > Decimal::ZERO
+                    && let Some(intent) = self.reduce_intent(ctx.symbol, Side::Bid, rp, pos.abs())
+                {
                     let key = intent.price.0.to_string();
                     if seen.insert(key.clone()) {
                         desired.push((key, Side::Bid, intent));
@@ -580,5 +634,96 @@ impl Strategy for Keel {
             return vec![Action::NoOp];
         }
         self.reconcile(ctx, &desired, mid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tikr_core::{Asset, MarketKind, VenueId};
+
+    fn sym() -> Symbol {
+        Symbol {
+            base: Asset::new("BTC"),
+            quote: Asset::new("USDT"),
+            venue: VenueId::new("test"),
+            kind: MarketKind::Perp,
+        }
+    }
+
+    fn keel_with(tick: &str, step: &str, min_notional: i64) -> Keel {
+        let mut cfg = KeelConfig::defaults(Decimal::from(100));
+        cfg.tick_size = Decimal::from_str_exact(tick).unwrap();
+        cfg.step_size = Decimal::from_str_exact(step).unwrap();
+        cfg.min_notional = Decimal::from(min_notional);
+        Keel::new(cfg)
+    }
+
+    /// Regression: nearest-rounding could push a bid within half a tick
+    /// of best_ask UP across it (or an ask down across best_bid),
+    /// triggering a post-only would-cross reject that keel has no
+    /// recovery for. Bids must floor, asks must ceil.
+    #[test]
+    fn round_tick_floors_bid_and_ceils_ask() {
+        let k = keel_with("0.01", "0.001", 0);
+        let s = sym();
+
+        // raw = 99.996 → nearest rounding would push this UP to 100.00
+        // (through a best_ask resting there); floor must stay at 99.99.
+        let bid = k.intent(
+            &s,
+            Side::Bid,
+            Decimal::from_str_exact("99.996").unwrap(),
+            Decimal::ONE,
+        );
+        assert_eq!(bid.price.0, Decimal::from_str_exact("99.99").unwrap());
+
+        // raw = 100.004 → nearest rounding would push this DOWN to
+        // 100.00 (through a best_bid resting there); ceil must move up
+        // to 100.01.
+        let ask = k.intent(
+            &s,
+            Side::Ask,
+            Decimal::from_str_exact("100.004").unwrap(),
+            Decimal::ONE,
+        );
+        assert_eq!(ask.price.0, Decimal::from_str_exact("100.01").unwrap());
+    }
+
+    /// Regression: the min-notional bump on `intent()` could inflate a
+    /// reduce order above the position it's meant to close, over-closing
+    /// (flipping) a dust position on futures. `reduce_intent` must skip
+    /// entirely instead of bumping past the position.
+    #[test]
+    fn reduce_intent_skips_instead_of_exceeding_position() {
+        let k = keel_with("0.01", "1", 10);
+        let s = sym();
+        // pos_abs = 2, price = 1 → notional = 2 < min_notional (10).
+        // Bumping to clear min_notional would need size = 10 > pos_abs =
+        // 2 — must skip instead.
+        let reduced = k.reduce_intent(&s, Side::Ask, Decimal::from(1), Decimal::from(2));
+        assert!(
+            reduced.is_none(),
+            "must skip rather than exceed the position"
+        );
+    }
+
+    /// When the step-floored position DOES clear min_notional, the
+    /// reduce order is capped at exactly that size — never bumped beyond
+    /// it.
+    #[test]
+    fn reduce_intent_caps_at_step_floored_position_when_it_clears_min_notional() {
+        let k = keel_with("0.01", "0.1", 0);
+        let s = sym();
+        // pos_abs = 2.37 → step-floored to 2.3 (step 0.1), never bumped.
+        let reduced = k
+            .reduce_intent(
+                &s,
+                Side::Ask,
+                Decimal::from(100),
+                Decimal::from_str_exact("2.37").unwrap(),
+            )
+            .expect("min_notional=0 always clears");
+        assert_eq!(reduced.size.0, Decimal::from_str_exact("2.3").unwrap());
     }
 }

@@ -83,20 +83,38 @@ impl Mantis {
         Size(sized)
     }
 
-    /// Reconcile open quotes to exactly `desired` (side, price) orders: keep
-    /// matching resting quotes, cancel everything else, place any missing.
-    /// `desired = []` cancels all resting quotes.
+    /// Step-floor `raw` to `step_size` (pass through when unset).
+    fn floor_to_step(&self, raw: Decimal) -> Decimal {
+        let step = self.config.step_size;
+        if step > Decimal::ZERO {
+            (raw / step).floor() * step
+        } else {
+            raw
+        }
+    }
+
+    /// Reconcile open quotes to exactly `desired` (side, price, size)
+    /// orders: keep matching resting quotes, cancel everything else,
+    /// place any missing. `desired = []` cancels all resting quotes.
+    /// Callers supply the size explicitly — the close leg while HOLDING
+    /// must size off `|position|`, not notional (see `on_event`), so a
+    /// resting order only counts as "kept" when its size ALSO matches;
+    /// otherwise it's cancelled and replaced at the correct size.
     fn reconcile(
         &self,
         ctx: &StrategyContext<'_>,
-        desired: &[(Side, Price)],
+        desired: &[(Side, Price, Size)],
         actions: &mut Vec<Action>,
     ) {
         let mut matched = vec![false; desired.len()];
         for (id, intent) in ctx.open_quotes {
             let mut keep = false;
-            for (i, (side, price)) in desired.iter().enumerate() {
-                if !matched[i] && intent.side == *side && intent.price == *price {
+            for (i, (side, price, size)) in desired.iter().enumerate() {
+                if !matched[i]
+                    && intent.side == *side
+                    && intent.price == *price
+                    && intent.size == *size
+                {
                     matched[i] = true;
                     keep = true;
                     break;
@@ -106,14 +124,13 @@ impl Mantis {
                 actions.push(Action::Cancel(*id));
             }
         }
-        for (i, (side, price)) in desired.iter().enumerate() {
+        for (i, (side, price, size)) in desired.iter().enumerate() {
             if matched[i] {
                 continue;
             }
-            let size = self.quote_size(*price);
             if size.0 > Decimal::ZERO {
                 actions.push(Action::Quote(make_post_only_intent(
-                    ctx.symbol, *side, *price, size,
+                    ctx.symbol, *side, *price, *size,
                 )));
             }
         }
@@ -180,7 +197,19 @@ impl Strategy for Mantis {
                     }
                 }
             };
-            self.reconcile(ctx, &[(close_side, close_price)], &mut actions);
+            // Close leg is sized to the ACTUAL held position, never
+            // notional/price — after a PARTIAL entry fill, the fixed leg
+            // opened alongside the entry is still sized off the full
+            // notional_per_order and would over-close (flip) the smaller
+            // position it's meant to flatten.
+            let close_size = Size(self.floor_to_step(pos.abs()));
+            if close_size.0 > Decimal::ZERO {
+                self.reconcile(ctx, &[(close_side, close_price, close_size)], &mut actions);
+            } else {
+                // Dust below one lot step — nothing sane to close; cancel
+                // any stragglers instead of posting a zero/garbage size.
+                self.reconcile(ctx, &[], &mut actions);
+            }
             return actions;
         }
 
@@ -211,7 +240,10 @@ impl Strategy for Mantis {
         self.active_pair = Some((bid_target, ask_target));
         self.reconcile(
             ctx,
-            &[(Side::Bid, bid_target), (Side::Ask, ask_target)],
+            &[
+                (Side::Bid, bid_target, self.quote_size(bid_target)),
+                (Side::Ask, ask_target, self.quote_size(ask_target)),
+            ],
             &mut actions,
         );
         actions
@@ -501,6 +533,57 @@ mod tests {
         assert_eq!(
             quoted(&acts, Side::Ask).unwrap().0,
             Decimal::from_str("100.09").unwrap()
+        );
+    }
+
+    /// Regression: the held close leg must size off the ACTUAL position,
+    /// not notional/price. A partial fill (here 0.05 out of the 0.1 leg
+    /// that was opened) leaves a stale, oversized close order resting —
+    /// before the fix it "matched" the desired close by (side, price)
+    /// alone and was left in place, so closing it would over-close (flip)
+    /// the smaller position.
+    #[test]
+    fn partial_fill_close_leg_sized_to_position_not_notional() {
+        let mut m = Mantis::new(cfg(0, 1));
+        // Flat → open the pair so active_pair is recorded (ask @ 100.10,
+        // full leg size 0.1).
+        let c0 = Ctx {
+            s: sym(),
+            p: pos("0", "0"),
+            bk: book("100.00", "100.10"),
+            open: vec![],
+            fills: vec![],
+        };
+        let _ = m.on_event(&c0.ctx(), &hb());
+
+        // Partial bid fill: only 0.05 filled, not the full 0.1 leg. The
+        // ask from the open-pair placement is still resting at the
+        // original 0.1 size.
+        let c1 = Ctx {
+            s: sym(),
+            p: pos("0.05", "100.00"),
+            bk: book("100.00", "100.10"),
+            open: vec![(QuoteId::new(), intent(Side::Ask, "100.10"))], // size 0.1
+            fills: vec![fill(Side::Bid, "100.00")],
+        };
+        let acts = m.on_event(&c1.ctx(), &MarketEvent::Fill(fill(Side::Bid, "100.00")));
+
+        let cancels = acts
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel(_)))
+            .count();
+        assert_eq!(
+            cancels, 1,
+            "stale oversized close leg must be cancelled: {acts:?}"
+        );
+        let new_ask_size = acts.iter().find_map(|a| match a {
+            Action::Quote(q) if q.side == Side::Ask => Some(q.size.0),
+            _ => None,
+        });
+        assert_eq!(
+            new_ask_size,
+            Some(Decimal::from_str("0.05").unwrap()),
+            "close leg resized to the actual position, not notional/price: {acts:?}"
         );
     }
 }

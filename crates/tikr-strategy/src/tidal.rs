@@ -93,7 +93,20 @@ pub struct Tidal {
     emitted_this_event_ask: HashSet<i64>,
     /// Resting maker TP price this event (exempted from pruning).
     tp_order_price: Option<Decimal>,
+    /// Side of the resting maker TP, paired with `tp_order_price` for
+    /// the pruning exemption. Price alone isn't a unique key — an
+    /// order on the OTHER side that happens to land at the same price
+    /// (grid coincidence, or a stale order from before a position
+    /// flip) must still be pruned normally.
+    tp_order_side: Option<Side>,
+    /// Timestamp of the last marketable TP/SL close emission. See
+    /// `close_in_flight`.
+    last_close_ts_ns: u64,
 }
+
+/// Min elapsed time between marketable TP/SL close emissions (see
+/// `last_close_ts_ns`).
+const CLOSE_RETRY_NS: u64 = 5_000_000_000;
 
 impl Tidal {
     fn quote_size(&self, price: Price) -> Size {
@@ -260,9 +273,16 @@ impl Tidal {
                 (shallow, deep)
             }
         };
+        // The resting TP order sits outside the band by design — only
+        // exempt it on ITS OWN side. Matching on price alone let a
+        // same-priced order on the other side dodge pruning too.
+        let tp_exempt_price = if self.tp_order_side == Some(side) {
+            self.tp_order_price
+        } else {
+            None
+        };
         for (id, q) in ctx.open_quotes {
-            // Exempt the resting take-profit order (sits outside the band).
-            if Some(q.price.0) == self.tp_order_price {
+            if q.side == side && Some(q.price.0) == tp_exempt_price {
                 continue;
             }
             if q.side == side && (q.price.0 < lo || q.price.0 > hi) {
@@ -363,6 +383,17 @@ impl Tidal {
         }
     }
 
+    /// True while a previously emitted marketable TP/SL close is
+    /// still in flight. The position report lags the fill by a few
+    /// events, so re-evaluating naively would re-fire a close on
+    /// every event until the fill lands — with `sl_close_pct = 100`
+    /// that over-closes and flips the position. Doubles as a retry
+    /// timer: if the IOC missed, the close re-fires once the window
+    /// elapses.
+    fn close_in_flight(&self, now_ns: u64) -> bool {
+        self.last_close_ts_ns > 0 && now_ns.saturating_sub(self.last_close_ts_ns) < CLOSE_RETRY_NS
+    }
+
     fn inventory_skew(
         &self,
         ctx: &StrategyContext<'_>,
@@ -411,6 +442,8 @@ impl Strategy for Tidal {
             emitted_this_event_bid: HashSet::new(),
             emitted_this_event_ask: HashSet::new(),
             tp_order_price: None,
+            tp_order_side: None,
+            last_close_ts_ns: 0,
         }
     }
 
@@ -467,9 +500,19 @@ impl Strategy for Tidal {
         // 1.5) Take-profit / stop-loss on the open bag. Runs EVERY event. TP
         // rests a maker close at avg ± tp (or marketable if already through);
         // SL fires a marketable (IOC) close at avg ∓ sl. Lattice origins are NOT
-        // touched (no recenter). tp_order_price is recorded so the pruner
-        // exempts the resting TP.
+        // touched (no recenter). tp_order_price/tp_order_side are recorded so
+        // the pruner exempts the resting TP. Marketable closes (both the
+        // through-the-touch TP branch and SL) are gated by `close_in_flight`
+        // — the position report lags a taker fill by a few events, so an
+        // ungated re-evaluation would re-fire on every one of those events
+        // until it lands (with `sl_close_pct = 100` that over-closes and
+        // flips the position).
         self.tp_order_price = None;
+        self.tp_order_side = None;
+        if pos == Decimal::ZERO {
+            // Flat — any in-flight close landed; re-arm the latch.
+            self.last_close_ts_ns = 0;
+        }
         if pos != Decimal::ZERO
             && avg > Decimal::ZERO
             && mid > Decimal::ZERO
@@ -484,7 +527,9 @@ impl Strategy for Tidal {
                     let sz = self.close_size(pos_abs, self.config.tp_close_pct);
                     if sz.0 > Decimal::ZERO {
                         if mid >= tp_price {
-                            if let Some(bp) = best_bid {
+                            if !self.close_in_flight(ctx.now.0)
+                                && let Some(bp) = best_bid
+                            {
                                 actions.push(self.make_close_quote(
                                     ctx.symbol,
                                     Side::Ask,
@@ -492,10 +537,12 @@ impl Strategy for Tidal {
                                     sz,
                                     TimeInForce::IOC,
                                 ));
+                                self.last_close_ts_ns = ctx.now.0;
                             }
                         } else {
                             let p = Price((tp_price / tick).ceil() * tick);
                             self.tp_order_price = Some(p.0);
+                            self.tp_order_side = Some(Side::Ask);
                             if !ctx
                                 .open_quotes
                                 .iter()
@@ -515,6 +562,7 @@ impl Strategy for Tidal {
                 if self.config.sl_bps > 0 && mid <= avg - off(self.config.sl_bps) {
                     let sz = self.close_size(pos_abs, self.config.sl_close_pct);
                     if sz.0 > Decimal::ZERO
+                        && !self.close_in_flight(ctx.now.0)
                         && let Some(bp) = best_bid
                     {
                         actions.push(self.make_close_quote(
@@ -524,6 +572,7 @@ impl Strategy for Tidal {
                             sz,
                             TimeInForce::IOC,
                         ));
+                        self.last_close_ts_ns = ctx.now.0;
                     }
                 }
             } else {
@@ -532,7 +581,9 @@ impl Strategy for Tidal {
                     let sz = self.close_size(pos_abs, self.config.tp_close_pct);
                     if sz.0 > Decimal::ZERO && tp_price > Decimal::ZERO {
                         if mid <= tp_price {
-                            if let Some(ap) = best_ask {
+                            if !self.close_in_flight(ctx.now.0)
+                                && let Some(ap) = best_ask
+                            {
                                 actions.push(self.make_close_quote(
                                     ctx.symbol,
                                     Side::Bid,
@@ -540,10 +591,12 @@ impl Strategy for Tidal {
                                     sz,
                                     TimeInForce::IOC,
                                 ));
+                                self.last_close_ts_ns = ctx.now.0;
                             }
                         } else {
                             let p = Price((tp_price / tick).floor() * tick);
                             self.tp_order_price = Some(p.0);
+                            self.tp_order_side = Some(Side::Bid);
                             if !ctx
                                 .open_quotes
                                 .iter()
@@ -563,6 +616,7 @@ impl Strategy for Tidal {
                 if self.config.sl_bps > 0 && mid >= avg + off(self.config.sl_bps) {
                     let sz = self.close_size(pos_abs, self.config.sl_close_pct);
                     if sz.0 > Decimal::ZERO
+                        && !self.close_in_flight(ctx.now.0)
                         && let Some(ap) = best_ask
                     {
                         actions.push(self.make_close_quote(
@@ -572,6 +626,7 @@ impl Strategy for Tidal {
                             sz,
                             TimeInForce::IOC,
                         ));
+                        self.last_close_ts_ns = ctx.now.0;
                     }
                 }
             }

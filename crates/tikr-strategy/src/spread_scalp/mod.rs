@@ -183,7 +183,17 @@ pub struct SpreadScalp {
     /// detect zero ↔ non-zero transitions for cycle_start_ts tracking
     /// without needing a separate Fill-hook path.
     prev_pos_size: Decimal,
+    /// Timestamp of the last risk-flatten emission (adverse stop or
+    /// Stage-5 TP/SL). While the IOC is in flight the position report
+    /// still shows the old size, so without this latch the close would
+    /// re-fire full-size on every event until the fill lands — two fills
+    /// flip the position. Doubles as a retry timer for a missed IOC.
+    last_risk_close_ts_ns: u64,
 }
+
+/// Min elapsed time between risk-flatten emissions (see
+/// `last_risk_close_ts_ns`).
+const RISK_CLOSE_RETRY_NS: u64 = 5_000_000_000;
 
 impl SpreadScalp {
     fn compute_targets(&self, snapshot: &Snapshot) -> Option<(Price, Price)> {
@@ -763,6 +773,7 @@ impl Strategy for SpreadScalp {
             adverse,
             cycle_start_ts: None,
             prev_pos_size: Decimal::ZERO,
+            last_risk_close_ts_ns: 0,
         }
     }
 
@@ -803,8 +814,16 @@ impl Strategy for SpreadScalp {
             self.cycle_start_ts = Some(ctx.now);
         } else if self.prev_pos_size != Decimal::ZERO && pos_size == Decimal::ZERO {
             self.cycle_start_ts = None;
+            // Any in-flight risk close landed — re-arm the latch.
+            self.last_risk_close_ts_ns = 0;
         }
         self.prev_pos_size = pos_size;
+
+        // Shared pending-close latch for the adverse stop + Stage-5 gate
+        // below: while a flatten IOC is in flight, re-evaluating against the
+        // stale position report would emit another full-size close.
+        let close_in_flight = self.last_risk_close_ts_ns > 0
+            && ctx.now.0.saturating_sub(self.last_risk_close_ts_ns) < RISK_CLOSE_RETRY_NS;
 
         // Adverse-drift hard stop. Fires before normal flow when:
         //  - configured (both bps + secs > 0)
@@ -816,6 +835,7 @@ impl Strategy for SpreadScalp {
         if self.config.adverse_stop_drift_bps > 0
             && self.config.adverse_stop_after_secs > 0
             && pos_size != Decimal::ZERO
+            && !close_in_flight
             && let Some(cycle_ts) = self.cycle_start_ts
             && let Some(top) = Top::from_snapshot(ctx.latest_book)
         {
@@ -859,7 +879,13 @@ impl Strategy for SpreadScalp {
                             qty
                         };
                         if stop_qty > Decimal::ZERO {
-                            self.cycle_start_ts = None;
+                            // `cycle_start_ts` stays set — clearing it here
+                            // would disarm both the adverse stop AND the
+                            // time-decay close for any residual left by a
+                            // partial/missed IOC. The zero-transition block
+                            // above clears it once the venue reports flat;
+                            // the latch bounds retries meanwhile.
+                            self.last_risk_close_ts_ns = ctx.now.0;
                             let mut actions: Vec<Action> = Vec::with_capacity(3);
                             actions.extend(self.drop_tracked_side(Side::Bid));
                             actions.extend(self.drop_tracked_side(Side::Ask));
@@ -886,8 +912,9 @@ impl Strategy for SpreadScalp {
         let mut cap_cancels: Vec<Action> = Vec::new();
         if let Some(top) = Top::from_snapshot(ctx.latest_book) {
             let mid = top.mid();
-            if let RiskDecision::Close { side, qty, .. } =
-                risk::evaluate(ctx.position, mid, self.risk_cfg())
+            if !close_in_flight
+                && let RiskDecision::Close { side, qty, .. } =
+                    risk::evaluate(ctx.position, mid, self.risk_cfg())
             {
                 // Stage 5 fires close + cancels any resting quotes so
                 // the runner doesn't keep two intents alive on the
@@ -950,107 +977,19 @@ impl Strategy for SpreadScalp {
                     }
                     return self.cancel_if_live(ts);
                 };
-                let size_mult = self.inventory_size_multiplier(ctx);
-                let fill_side = fill.side;
-                let opp_side = if fill_side == Side::Bid {
-                    Side::Ask
-                } else {
-                    Side::Bid
-                };
-                self.last_bid = Some(bid);
-                self.last_ask = Some(ask);
-                self.last_requote_ts = Some(ts);
-                self.quotes_live = true;
-
-                // Position-cap gate — `emit_requote` honoured it, the
-                // fill path did not. A Bid fill drives us long; if we
-                // already passed the cap, suppress the replacement Bid
-                // (and any opp-side top-up that would lean further in
-                // the same direction). Same logic mirrored for Ask /
-                // short. `<= 0` / `>= 0` keeps the inclusive flat case.
-                let mid = (bid.0 + ask.0) / Decimal::from(2);
-                let position_value = ctx.position.size.0.abs() * mid;
-                let cap = self.config.max_position_usdt;
-                let capped = cap > Decimal::ZERO && position_value >= cap;
-                let allow_bid = (!capped || ctx.position.size.0 <= Decimal::ZERO)
-                    && !self.side_in_cooldown(Side::Bid, ts);
-                let allow_ask = (!capped || ctx.position.size.0 >= Decimal::ZERO)
-                    && !self.side_in_cooldown(Side::Ask, ts);
-
-                // Filled side replacement.
-                let mut actions = Vec::new();
-                let allow_filled_side = match fill_side {
-                    Side::Bid => allow_bid,
-                    Side::Ask => allow_ask,
-                };
-                if allow_filled_side {
-                    let action = self.make_quote(
-                        ctx,
-                        fill_side,
-                        if fill_side == Side::Bid { bid } else { ask },
-                        if fill_side == Side::Bid {
-                            size_mult.0
-                        } else {
-                            size_mult.1
-                        },
-                    );
-                    if let Action::Quote(intent) = &action {
-                        self.resting.record_place(intent);
-                    }
-                    actions.push(action);
-                }
-
-                // Opp-side top-up — only if cap allows growing that side.
-                let allow_opp_side = match opp_side {
-                    Side::Bid => allow_bid,
-                    Side::Ask => allow_ask,
-                };
-                if allow_opp_side {
-                    let opp_mult = if opp_side == Side::Bid {
-                        size_mult.0
-                    } else {
-                        size_mult.1
-                    };
-                    let opp_price = if opp_side == Side::Bid { bid } else { ask };
-                    let existing_opp: Decimal = ctx
-                        .open_quotes
-                        .iter()
-                        .filter(|q| q.1.side == opp_side)
-                        .map(|q| q.1.size.0)
-                        .sum();
-                    let desired_total = self.quote_size(opp_price, opp_mult);
-                    if desired_total > existing_opp {
-                        let extra = desired_total - existing_opp;
-                        let step = self.config.step_size;
-                        let extra = if step > Decimal::ZERO {
-                            (extra / step).floor() * step
-                        } else {
-                            extra
-                        };
-                        if extra > Decimal::ZERO {
-                            let intent = QuoteIntent {
-                                symbol: ctx.symbol.clone(),
-                                side: opp_side,
-                                price: opp_price,
-                                size: Size(extra),
-                                tif: TimeInForce::PostOnly,
-                                kind: QuoteKind::Point,
-                            };
-                            // Opp-side top-up adds to whatever's already
-                            // tracked at that side. We overwrite the
-                            // entry with the latest intent — Stage 4's
-                            // multi-quote support will replace this
-                            // with proper additive bookkeeping.
-                            self.resting.record_place(&intent);
-                            actions.push(Action::Quote(intent));
-                        }
-                    }
-                }
-                // Prepend cap-driven cancels collected at the top of
-                // on_event so a Fill that puts us over the cap also
-                // tears down the exposing side immediately.
+                // Route the post-fill requote through `emit_requote` — the
+                // hand-rolled placement this replaced bypassed BOTH the
+                // tick-mode close pin (the reduce quote could rest below
+                // avg_entry, covering at a loss) and the close-qty cap (the
+                // reduce side was sized via inventory_size_multiplier at up
+                // to 2× notional, which can exceed the position and flip
+                // it). emit_requote applies the avg-anchored close target,
+                // pins the close side at min(chunk, |position|), honours
+                // the cap + per-side reject cooldowns, and diffs against
+                // the tracked resting quotes.
                 let mut out = cap_cancels;
-                out.extend(actions);
+                out.extend(self.emit_requote(ctx, bid, ask, ts));
+                out.retain(|a| !matches!(a, Action::NoOp));
                 return out;
             }
         };
@@ -1414,8 +1353,25 @@ mod tests {
                 snapshot: snapshot.clone(),
             },
         );
+        // Venue truth: the ask from the initial placement still rests.
+        // (`reconcile` drops any tracked side missing from open_quotes, so
+        // an empty list here would read as "ask gone" and re-emit it too.)
+        let resting_ask = (
+            tikr_venue::QuoteId::new(),
+            QuoteIntent {
+                symbol: symbol.clone(),
+                side: Side::Ask,
+                price: Price(Decimal::from(109)),
+                size: Size(Decimal::ZERO),
+                tif: TimeInForce::PostOnly,
+                kind: QuoteKind::Point,
+            },
+        );
+        let mut fill_ctx = ctx(&symbol, &snapshot, &position);
+        let open = [resting_ask];
+        fill_ctx.open_quotes = &open;
         let actions = strategy.on_event(
-            &ctx(&symbol, &snapshot, &position),
+            &fill_ctx,
             &MarketEvent::Fill(tikr_core::Fill {
                 quote_id: tikr_venue::QuoteId::new(),
                 price: Price(Decimal::from(101)),
@@ -1430,7 +1386,7 @@ mod tests {
             }),
         );
         // Fill replaces only the filled side; opposite side stays live.
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 1, "got {actions:?}");
         match &actions[0] {
             Action::Quote(q) => assert_eq!(q.side, Side::Bid),
             other => panic!("expected Quote, got {:?}", other),

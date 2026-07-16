@@ -34,7 +34,7 @@ use std::collections::VecDeque;
 use tikr_core::{
     Decimal, MarketEvent, Price, QuoteKind, Side, Size, Symbol, TimeInForce, Timestamp,
 };
-use tikr_venue::{QuoteId, QuoteIntent};
+use tikr_venue::QuoteIntent;
 
 use crate::{Action, Strategy, StrategyContext};
 
@@ -98,14 +98,29 @@ struct Bar {
     volume: Decimal,
 }
 
-/// Per-position state.
+/// Per-position state. Created ONLY when the entry order actually fills —
+/// creating it at order placement would arm the SL/timeout exits against a
+/// phantom position (an unfilled entry bid), and an IOC "flatten" of a
+/// position that doesn't exist opens a naked short.
 #[derive(Debug, Clone)]
 struct Position {
     entry_price: Decimal,
     entry_bar_idx: u64,
     atr_at_entry: Decimal,
-    /// QuoteId of the resting TP ASK, if any.
-    tp_quote_id: Option<QuoteId>,
+    /// Whether the TP ASK has been posted for this position. Exits use
+    /// `CancelAll` (the strategy rests at most one order at a time), so no
+    /// per-order id tracking is needed — a locally minted QuoteId could
+    /// never match the venue-assigned id anyway, making `Cancel(id)` a
+    /// silent no-op that leaves the TP resting to fill into a naked short.
+    tp_posted: bool,
+}
+
+/// Entry order in flight: placed but not (yet) filled. Indicator context is
+/// captured at signal time so the eventual fill anchors to the right ATR/bar.
+#[derive(Debug, Clone, Copy)]
+struct PendingEntry {
+    entry_bar_idx: u64,
+    atr_at_entry: Decimal,
 }
 
 /// Long-only RSI mean-reversion with KER gate.
@@ -119,6 +134,9 @@ pub struct RsiMr {
     /// Monotonic bar counter for hold-bar timeouts.
     bars_seen: u64,
     position: Option<Position>,
+    /// Resting entry bid not yet filled. Expires after one bar (the entry
+    /// signal is per-bar) via CancelAll.
+    pending_entry: Option<PendingEntry>,
 }
 
 impl RsiMr {
@@ -257,7 +275,8 @@ impl RsiMr {
     /// Simple ATR (average true range), unWilderized for simplicity.
     fn atr(&self) -> Option<Decimal> {
         let n = self.config.atr_period as usize;
-        if self.closed.len() < n + 1 {
+        // n == 0 would divide by zero below (rust_decimal panics).
+        if n == 0 || self.closed.len() < n + 1 {
             return None;
         }
         let bars: Vec<&Bar> = self.closed.iter().rev().take(n + 1).collect();
@@ -332,6 +351,31 @@ impl RsiMr {
             kind: QuoteKind::Point,
         })
     }
+
+    /// Exit ASK sized from the ACTUAL position (step-floored), not from the
+    /// configured notional — a notional-sized exit over-closes after a
+    /// partial entry fill (naked short) or under-closes after price moved.
+    /// Falls back to notional sizing when the position report is unavailable.
+    fn make_exit_quote(&self, ctx: &StrategyContext<'_>, price: Price, tif: TimeInForce) -> Action {
+        let pos_abs = ctx.position.size.0.abs();
+        let step = self.config.step_size;
+        let qty = if step > Decimal::ZERO {
+            (pos_abs / step).floor() * step
+        } else {
+            pos_abs
+        };
+        if qty <= Decimal::ZERO {
+            return self.make_quote(ctx.symbol, Side::Ask, price, tif);
+        }
+        Action::Quote(QuoteIntent {
+            symbol: ctx.symbol.clone(),
+            side: Side::Ask,
+            price,
+            size: Size(qty),
+            tif,
+            kind: QuoteKind::Point,
+        })
+    }
 }
 
 impl Strategy for RsiMr {
@@ -345,6 +389,7 @@ impl Strategy for RsiMr {
             current_bucket: None,
             bars_seen: 0,
             position: None,
+            pending_entry: None,
         }
     }
 
@@ -378,7 +423,21 @@ impl Strategy for RsiMr {
 
         let mut actions: Vec<Action> = Vec::new();
 
-        // 2) Position management (exits) — independent of bar-close.
+        // 2) Pending-entry expiry: the entry signal is per-bar, so an entry
+        // bid still unfilled after the bar rolls is stale — pull it. (If it
+        // filled in the meantime, the Fill handler below converted it to a
+        // position first.)
+        if let Some(pending) = self.pending_entry
+            && self.position.is_none()
+            && self.bars_seen > pending.entry_bar_idx
+        {
+            self.pending_entry = None;
+            actions.push(Action::CancelAll);
+        }
+
+        // 3) Position management (exits) — independent of bar-close. Exits
+        // use CancelAll (at most one order rests at a time), never a locally
+        // minted Cancel(id) that the venue could not match.
         if let Some(pos) = self.position.clone()
             && let Some(m) = mid
         {
@@ -388,11 +447,9 @@ impl Strategy for RsiMr {
             if m < sl_trigger
                 && let Some(bp) = ctx.latest_book.bids.first()
             {
-                if let Some(id) = pos.tp_quote_id {
-                    actions.push(Action::Cancel(id));
-                }
+                actions.push(Action::CancelAll);
                 let exit_price = Price(self.snap_to_tick(bp.price.0, false));
-                actions.push(self.make_quote(ctx.symbol, Side::Ask, exit_price, TimeInForce::IOC));
+                actions.push(self.make_exit_quote(ctx, exit_price, TimeInForce::IOC));
                 self.position = None;
                 return actions;
             }
@@ -401,40 +458,29 @@ impl Strategy for RsiMr {
             if held_bars >= self.config.max_hold_bars as u64
                 && let Some(bp) = ctx.latest_book.bids.first()
             {
-                if let Some(id) = pos.tp_quote_id {
-                    actions.push(Action::Cancel(id));
-                }
+                actions.push(Action::CancelAll);
                 let exit_price = Price(self.snap_to_tick(bp.price.0, false));
-                actions.push(self.make_quote(ctx.symbol, Side::Ask, exit_price, TimeInForce::IOC));
+                actions.push(self.make_exit_quote(ctx, exit_price, TimeInForce::IOC));
                 self.position = None;
                 return actions;
             }
-            // (c) RSI-exit — cancel TP and post fresh ASK at best_ask.
+            // (c) RSI-exit — replace the TP with a fresh ASK at best_ask.
             if let Some(rsi) = self.rsi()
                 && rsi > Decimal::from(self.config.rsi_exit_threshold)
                 && let Some(ap) = ctx.latest_book.asks.first()
             {
-                if let Some(id) = pos.tp_quote_id {
-                    actions.push(Action::Cancel(id));
-                }
+                actions.push(Action::CancelAll);
                 let exit_price = Price(self.snap_to_tick(ap.price.0, true));
-                actions.push(self.make_quote(
-                    ctx.symbol,
-                    Side::Ask,
-                    exit_price,
-                    TimeInForce::PostOnly,
-                ));
-                // Clear tp_quote_id — we don't track this new fallback emit
-                // because the runner-level reconciler will close the position
-                // when the ASK fills.
+                actions.push(self.make_exit_quote(ctx, exit_price, TimeInForce::PostOnly));
                 if let Some(p) = self.position.as_mut() {
-                    p.tp_quote_id = None;
+                    p.tp_posted = true;
                 }
             }
         }
 
-        // 3) Entry check (long-only, only on flat).
+        // 4) Entry check (long-only, only on flat with no entry in flight).
         if self.position.is_none()
+            && self.pending_entry.is_none()
             && let MarketEvent::BookUpdate { .. } = event
             && let Some(rsi) = self.rsi()
             && let Some(ker) = self.ker()
@@ -455,47 +501,47 @@ impl Strategy for RsiMr {
                     entry_price,
                     TimeInForce::PostOnly,
                 ));
-                // Provisionally mark the position; we'll refresh entry_price
-                // from the actual fill via on_event::Fill below.
-                self.position = Some(Position {
-                    entry_price: entry_price.0,
+                // Only the ORDER exists so far — the position is created by
+                // the Fill handler. Capture the signal context for it.
+                self.pending_entry = Some(PendingEntry {
                     entry_bar_idx: self.bars_seen,
                     atr_at_entry: atr,
-                    tp_quote_id: None,
                 });
             }
         }
 
-        // 4) Fill handling — when our entry BID fills, post TP ASK.
+        // 5) Fill handling — entry BID filled: create the position, post TP.
         if let MarketEvent::Fill(fill) = event
             && fill.side == Side::Bid
-            && self
-                .position
-                .as_ref()
-                .is_some_and(|p| p.tp_quote_id.is_none())
+            && self.position.is_none()
         {
-            // Read the immutable bits, then drop the borrow before
-            // calling self.make_quote (also a self borrow).
-            let (entry_price, atr_at_entry) = {
-                let pos = self.position.as_mut().unwrap();
-                pos.entry_price = fill.price.0;
-                (pos.entry_price, pos.atr_at_entry)
-            };
+            let pending = self.pending_entry.take();
+            let atr_at_entry = pending
+                .map(|p| p.atr_at_entry)
+                .or_else(|| self.atr())
+                .unwrap_or(Decimal::ZERO);
+            let entry_bar_idx = pending.map(|p| p.entry_bar_idx).unwrap_or(self.bars_seen);
+            self.position = Some(Position {
+                entry_price: fill.price.0,
+                entry_bar_idx,
+                atr_at_entry,
+                tp_posted: true,
+            });
             let tp_offset = atr_at_entry * self.config.atr_tp_mult;
-            let target = entry_price + tp_offset;
+            let target = fill.price.0 + tp_offset;
             let tp_price = Price(self.snap_to_tick(target, true));
-            actions.push(self.make_quote(ctx.symbol, Side::Ask, tp_price, TimeInForce::PostOnly));
-            // Placeholder QuoteId — runner assigns the real one; our
-            // tracking is best-effort. Cleanup happens via the ASK-fill
-            // path or on the next event's RSI-exit branch.
-            if let Some(pos) = self.position.as_mut() {
-                pos.tp_quote_id = Some(QuoteId::new());
-            }
+            // CancelAll first: a partially-filled entry remainder must not
+            // keep resting alongside the TP.
+            actions.push(Action::CancelAll);
+            actions.push(self.make_exit_quote(ctx, tp_price, TimeInForce::PostOnly));
         }
 
-        // 5) Ask-fill → position closed.
+        // 6) Ask-fill → position (fully) closed. A PARTIAL TP fill leaves
+        // real inventory and the TP remainder resting — clearing state on it
+        // would orphan that inventory with no SL/timeout coverage.
         if let MarketEvent::Fill(fill) = event
             && fill.side == Side::Ask
+            && fill.is_full
         {
             self.position = None;
         }
@@ -530,6 +576,7 @@ mod tests {
     use tikr_core::{
         Asset, Level, MarketKind, Notional, Position as CorePos, SignedSize, Snapshot, VenueId,
     };
+    use tikr_venue::QuoteId;
 
     fn sym() -> Symbol {
         Symbol {

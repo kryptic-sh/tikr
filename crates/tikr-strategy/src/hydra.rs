@@ -18,7 +18,10 @@
 //! 6. **SL**: when mid hits `first_entry_price - sl_bps_from_first`
 //!    adverse, IOC flatten + reset to Idle. **SL anchored on FIRST
 //!    fill, never on rolling avg** — DCA-on-loss is the classic
-//!    account-killer pattern when the SL trigger follows the avg.
+//!    account-killer pattern when the SL trigger follows the avg. A
+//!    pending-close latch guards the Idle→Holding re-lock: while a
+//!    flatten IOC may still be in flight (the position report lags
+//!    it), Idle won't re-anchor on the stale still-breached price.
 //!
 //! Hard total-notional cap (`max_position_usdt`) gates every add so
 //! pyramid + DCA can't stack and blow the account on one sweep.
@@ -141,7 +144,20 @@ pub struct Hydra {
     /// the drift-based refresh gate so we re-anchor when the market
     /// has walked away from where we planted the bracket.
     straddle_anchor_mid: Option<Decimal>,
+    /// Timestamp of the last SL flatten emission. While the IOC is in
+    /// flight the position report still shows the old size, so without
+    /// this latch the Idle branch would re-lock a fresh Holding phase
+    /// (anchored on the still-breached `avg_entry`) and re-evaluate SL
+    /// against it, emitting a second full-size close that can flip
+    /// the position. Doubles as a retry timer: once the window
+    /// elapses, re-locking Holding with the same (unchanged)
+    /// avg_entry lets SL re-fire naturally if the first IOC missed.
+    last_sl_close_ts_ns: u64,
 }
+
+/// Min elapsed time between SL flatten emissions (see
+/// `last_sl_close_ts_ns`).
+const SL_CLOSE_RETRY_NS: u64 = 5_000_000_000;
 
 impl Hydra {
     fn mid(best_bid: Price, best_ask: Price) -> Decimal {
@@ -273,6 +289,7 @@ impl Strategy for Hydra {
             straddle_placed: false,
             straddle_placed_ts_ns: None,
             straddle_anchor_mid: None,
+            last_sl_close_ts_ns: 0,
         }
     }
 
@@ -319,6 +336,21 @@ impl Strategy for Hydra {
         match self.phase {
             Phase::Idle => {
                 if pos_size != Decimal::ZERO {
+                    // A previously emitted SL flatten may still be in
+                    // flight — the position report lags it by a few
+                    // events. Re-locking Holding here would anchor
+                    // `first_entry_price` on the still-breached
+                    // `avg_entry` and let SL fire a second full-size
+                    // close, risking a position flip. Hold off until
+                    // the retry window elapses (at which point this IS
+                    // the retry path — same avg_entry re-locks and SL
+                    // re-fires if the first IOC missed) or the venue
+                    // reports the position flat.
+                    if self.last_sl_close_ts_ns > 0
+                        && ctx.now.0.saturating_sub(self.last_sl_close_ts_ns) < SL_CLOSE_RETRY_NS
+                    {
+                        return Vec::new();
+                    }
                     // First fill — cancel the other leg of the straddle
                     // before locking direction so the resting opposite
                     // leg doesn't fill into a reverse. Same call also
@@ -352,6 +384,10 @@ impl Strategy for Hydra {
                     self.straddle_placed_ts_ns = None;
                     self.straddle_anchor_mid = None;
                     return actions;
+                } else {
+                    // Flat — any in-flight SL close landed (or none was
+                    // ever pending); re-arm the latch.
+                    self.last_sl_close_ts_ns = 0;
                 }
             }
             Phase::Holding { .. } => {
@@ -360,6 +396,8 @@ impl Strategy for Hydra {
                     self.straddle_placed = false;
                     self.straddle_placed_ts_ns = None;
                     self.straddle_anchor_mid = None;
+                    // Flat — any in-flight SL close landed; re-arm the latch.
+                    self.last_sl_close_ts_ns = 0;
                     // Don't immediately re-arm in the same handler call —
                     // wait for the next BookUpdate so we reanchor on a
                     // fresh mid.
@@ -437,6 +475,7 @@ impl Strategy for Hydra {
                     let close_side = if side_long { Side::Ask } else { Side::Bid };
                     self.phase = Phase::Idle;
                     self.straddle_placed = false;
+                    self.last_sl_close_ts_ns = ctx.now.0;
                     return vec![
                         Action::CancelAll,
                         self.ioc_at_touch(ctx.symbol, close_side, qty, best_bid, best_ask),
@@ -1192,5 +1231,56 @@ mod tests {
         let actions = h.on_event(&ctx2, &MarketEvent::Heartbeat { ts: Timestamp(3) });
         assert!(actions.iter().any(|a| matches!(a, Action::CancelAll)));
         assert_eq!(h.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn sl_latch_blocks_relock_while_close_in_flight() {
+        // After SL emits the flatten IOC and jumps to Idle, the venue
+        // hasn't processed the fill yet — ctx.position keeps reporting
+        // the pre-close size for a few events. Without the latch the
+        // very next event would re-lock Holding (anchor = avg_entry,
+        // still breached) and re-evaluate SL, emitting a second
+        // full-size IOC that can flip the position. Contract: within
+        // the retry window, events with a still-nonzero (stale)
+        // position produce no actions and phase stays Idle.
+        let s_sym = sym();
+        let mut c = cfg();
+        c.sl_bps_from_first = 50;
+        let mut h = Hydra::new(c);
+        let s0 = snap(100_000, 100_001, 1);
+        let ctx0 = flat_ctx(&s_sym, &s0, 1);
+        let _ = h.on_event(
+            &ctx0,
+            &MarketEvent::BookUpdate {
+                snapshot: s0.clone(),
+            },
+        );
+        let s1 = snap(99_950, 99_955, 2);
+        let pos_size = Decimal::from_str_exact("0.001").unwrap();
+        let ctx1 = long_ctx(&s_sym, &s1, pos_size, Decimal::from(100_000), 2);
+        let _ = h.on_event(
+            &ctx1,
+            &MarketEvent::BookUpdate {
+                snapshot: s1.clone(),
+            },
+        );
+        // Big drop trips the SL — first fire.
+        let s2 = snap(99_495, 99_505, 3);
+        let ctx2 = long_ctx(&s_sym, &s2, pos_size, Decimal::from(100_000), 3);
+        let actions = h.on_event(
+            &ctx2,
+            &MarketEvent::BookUpdate {
+                snapshot: s2.clone(),
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(a, Action::CancelAll)));
+        assert_eq!(h.phase, Phase::Idle);
+        // Next event, still within the retry window: position report
+        // still shows the stale (pre-close) size. Must NOT re-lock
+        // Holding or emit a second close.
+        let ctx3 = long_ctx(&s_sym, &s2, pos_size, Decimal::from(100_000), 4);
+        let actions2 = h.on_event(&ctx3, &MarketEvent::Heartbeat { ts: Timestamp(4) });
+        assert!(actions2.is_empty(), "expected no re-fire, got {actions2:?}");
+        assert_eq!(h.phase, Phase::Idle, "must not re-lock Holding mid-latch");
     }
 }

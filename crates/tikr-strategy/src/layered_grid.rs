@@ -141,7 +141,18 @@ pub struct LayeredGrid {
     config: LayeredGridConfig,
     placed: bool,
     orders: Vec<(Side, Price)>,
+    /// Timestamp of the last risk-close (TP/SL) flatten emission. While
+    /// the IOC is in flight the position report still shows the old
+    /// size, so without this latch the risk gate would re-fire a
+    /// full-size close on every event until the fill lands. Doubles as
+    /// a retry timer: if the IOC missed, the close re-fires after the
+    /// window instead of never.
+    last_risk_close_ts_ns: u64,
 }
+
+/// Min elapsed time between risk-close flatten emissions (see
+/// `last_risk_close_ts_ns`).
+const RISK_CLOSE_RETRY_NS: u64 = 5_000_000_000;
 
 impl LayeredGrid {
     /// Snapshot the risk policy from the current config. Stateless —
@@ -156,9 +167,21 @@ impl LayeredGrid {
 
     /// Evaluate the risk gate; on breach return CancelAll + IOC close
     /// at the opposing touch. None when both thresholds disabled or
-    /// position is flat. Callers short-circuit normal logic on Some.
+    /// position is flat. Callers short-circuit normal logic on Some —
+    /// including `Some(vec![])` while a previously-emitted close IOC
+    /// is still in flight (the position report lags it, so
+    /// re-evaluating would re-fire a full-size close and risk flipping
+    /// the position).
+    ///
+    /// On breach also flattens the local grid mirror: `placed = false`
+    /// and `orders` cleared. Without this the flatten fill would be
+    /// processed by `on_fill` as an ordinary grid fill (posting a TP
+    /// re-entry right after a stop-loss), and — since the flattened
+    /// orders no longer rest at the venue — the outermost-id lookup
+    /// would miss and fall back to replaying the entire stale
+    /// pre-crash ladder.
     fn try_risk_close(
-        &self,
+        &mut self,
         ctx: &StrategyContext<'_>,
         mid: Price,
         best_bid: Price,
@@ -167,12 +190,27 @@ impl LayeredGrid {
         if self.config.take_profit_bps == 0 && self.config.stop_loss_bps == 0 {
             return None;
         }
+        if ctx.position.size.0 == Decimal::ZERO {
+            // Flat — any in-flight flatten landed; re-arm the latch.
+            self.last_risk_close_ts_ns = 0;
+            return None;
+        }
         match risk::evaluate(ctx.position, mid, self.risk_cfg()) {
             RiskDecision::Hold => None,
-            RiskDecision::Close { side, qty, .. } => Some(vec![
-                Action::CancelAll,
-                risk::build_close(ctx.symbol, side, qty, best_bid, best_ask),
-            ]),
+            RiskDecision::Close { side, qty, .. } => {
+                if self.last_risk_close_ts_ns > 0
+                    && ctx.now.0.saturating_sub(self.last_risk_close_ts_ns) < RISK_CLOSE_RETRY_NS
+                {
+                    return Some(Vec::new());
+                }
+                self.last_risk_close_ts_ns = ctx.now.0;
+                self.placed = false;
+                self.orders.clear();
+                Some(vec![
+                    Action::CancelAll,
+                    risk::build_close(ctx.symbol, side, qty, best_bid, best_ask),
+                ])
+            }
         }
     }
 
@@ -379,6 +417,7 @@ impl Strategy for LayeredGrid {
             config,
             placed: false,
             orders: Vec::new(),
+            last_risk_close_ts_ns: 0,
         }
     }
 
@@ -412,6 +451,15 @@ impl Strategy for LayeredGrid {
                 }
             }
             MarketEvent::Fill(f) if f.symbol_matches(ctx.symbol) && f.is_full => {
+                if !self.placed {
+                    // A risk close just flattened the grid (placed =
+                    // false, orders cleared) — this fill is the
+                    // flatten IOC landing, not a grid fill. Processing
+                    // it as one would post a TP re-entry right after a
+                    // stop-loss, and the outermost-id lookup would miss
+                    // (the mirror is empty) and replay a stale ladder.
+                    return Vec::new();
+                }
                 // Belt-and-suspenders: the runner already gates `is_full`,
                 // but guard here too so a future caller (test, alt runner)
                 // can't accidentally feed a partial fill — which would
@@ -706,5 +754,79 @@ mod tests {
             _ => panic!("expected extension Quote on Bid"),
         }
         assert!(matches!(actions[2], Action::Cancel(_)));
+    }
+
+    #[test]
+    fn risk_close_flattens_local_mirror_and_ignores_late_fill() {
+        // A stop-loss breach must reset the local grid mirror
+        // (`placed = false`, `orders` cleared) so the flatten fill
+        // isn't processed as an ordinary grid fill (which would post
+        // a TP re-entry right after the stop-loss) and a stale
+        // outermost-id lookup doesn't replay the pre-crash ladder.
+        let s = sym();
+        let snap0 = book(&s, 1000, 1001);
+        let mut c = cfg();
+        c.stop_loss_bps = 100; // 1%
+        let mut strat = LayeredGrid::new(c);
+        let flat = flat_pos(&s);
+        let _ = strat.on_event(
+            &ctx(&s, &flat, &snap0),
+            &MarketEvent::BookUpdate {
+                snapshot: snap0.clone(),
+            },
+        );
+        assert!(strat.placed);
+        assert!(!strat.orders.is_empty());
+
+        // Position sits 5%+ adverse from entry — well past the 1% SL.
+        let long_pos = Position {
+            symbol: s.clone(),
+            size: SignedSize(Decimal::from_str_exact("0.1").unwrap()),
+            avg_entry: Price(Decimal::from(1050)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let snap1 = book(&s, 990, 991);
+        let c1 = ctx(&s, &long_pos, &snap1);
+        let actions = strat.on_event(
+            &c1,
+            &MarketEvent::BookUpdate {
+                snapshot: snap1.clone(),
+            },
+        );
+        assert!(actions.iter().any(|a| matches!(a, Action::CancelAll)));
+        assert!(!strat.placed, "risk close must clear placed");
+        assert!(
+            strat.orders.is_empty(),
+            "risk close must clear the local mirror"
+        );
+
+        // A fill lands while not placed (the flatten IOC) — it must be
+        // ignored, not processed as a grid fill.
+        let fill = Fill {
+            quote_id: QuoteId::new(),
+            price: Price(Decimal::from(990)),
+            size: Size(Decimal::from_str_exact("0.1").unwrap()),
+            fee_asset: s.quote.clone(),
+            fee_amount: Decimal::ZERO,
+            fee_quote: Notional(Decimal::ZERO),
+            side: Side::Ask,
+            ts: Timestamp(1),
+            is_full: true,
+            trade_id: None,
+        };
+        let fill_ctx = StrategyContext {
+            symbol: &s,
+            now: Timestamp(1),
+            position: &flat,
+            recent_fills: &[],
+            latest_book: &snap1,
+            open_quotes: &[],
+            recent_liqs: &[],
+        };
+        let fill_actions = strat.on_event(&fill_ctx, &MarketEvent::Fill(fill));
+        assert!(
+            fill_actions.is_empty(),
+            "fill while not placed must be ignored"
+        );
     }
 }

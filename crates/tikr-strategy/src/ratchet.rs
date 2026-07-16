@@ -24,9 +24,9 @@
 //! 1. **Inventory cap** (`max_position_usdt`) — stop adding to the
 //!    deepening side once cap binds.
 //! 2. **Trend filter** (`trend_window_secs` + `trend_filter_bps`) —
-//!    sample mid every BookUpdate; skip the BUY side if mid has risen
-//!    `trend_filter_bps` over the window (don't catch falling knives
-//!    on a rip-up); skip the ASK side on a rip-down.
+//!    sample mid every BookUpdate; skip the BUY side if mid has FALLEN
+//!    `trend_filter_bps` over the window (don't catch the falling
+//!    knife); skip the ASK side on a rip-up (don't short the rally).
 //! 3. **Stop loss** (`sl_bps_from_first`) — IOC flatten when drift
 //!    from `first_entry_price` of the current cycle exceeds threshold.
 //!    Only checked in `Phase::Holding` — flat-state has nothing to
@@ -78,10 +78,10 @@ pub struct RatchetConfig {
     /// Rolling-window length for the trend filter, in seconds.
     /// `0` disables the filter (orders always placed on both sides).
     pub trend_window_secs: u32,
-    /// Trend filter threshold in bps. If `mid` has risen
+    /// Trend filter threshold in bps. If `mid` has fallen
     /// `trend_filter_bps` over the window, suppress the BUY side
-    /// (avoid falling-knife adds on a rip-up). Mirror for ASK on
-    /// rip-down. `0` disables threshold check even when
+    /// (avoid falling-knife adds on a rip-down). Mirror for ASK on
+    /// rip-up. `0` disables threshold check even when
     /// `trend_window_secs > 0`.
     pub trend_filter_bps: u32,
     /// Min elapsed time between order placements (ms). Stops a
@@ -149,7 +149,22 @@ pub struct Ratchet {
     /// identical orders (no-op). Supports multi-bid/ask placements
     /// from the hybrid pyramid path.
     last_placed_sig: Vec<(Side, Price)>,
+    /// Timestamp of the last SL flatten emission. While the IOC is in
+    /// flight the position report still shows the old size, so without
+    /// this latch the SL would re-fire a full-size close on every
+    /// event until the fill lands — two fills flip the position.
+    /// Doubles as a retry timer: if the IOC missed, the SL re-fires
+    /// after the window instead of never.
+    last_sl_close_ts_ns: u64,
 }
+
+/// Min elapsed time between SL flatten emissions (see
+/// `last_sl_close_ts_ns`).
+const SL_CLOSE_RETRY_NS: u64 = 5_000_000_000;
+
+/// Dust threshold for detecting a deepening fill in the pyramid
+/// reconciliation (1e-8 base units).
+const POS_EPSILON: Decimal = Decimal::from_parts(1, 0, 0, false, 8);
 
 impl Ratchet {
     fn round_price(&self, raw: Decimal) -> Price {
@@ -180,8 +195,12 @@ impl Ratchet {
 
     /// Trend filter — sample mid_samples and return `(suppress_bid,
     /// suppress_ask)` based on movement over the window.
-    /// `suppress_bid = true` means "don't buy now" (uptrend).
-    /// `suppress_ask = true` means "don't sell now" (downtrend).
+    /// `suppress_bid = true` means "don't buy now" (downtrend — don't
+    /// catch the falling knife). `suppress_ask = true` means "don't
+    /// sell now" (uptrend — don't short into the rip-up). In a trend
+    /// the side that actually fills is the one the market moves
+    /// *through*: a rip-down eats resting bids, a rip-up eats resting
+    /// asks — that is the side that stacks losing inventory.
     fn trend_suppress(&self, mid_now: Decimal) -> (bool, bool) {
         if self.config.trend_window_secs == 0 || self.config.trend_filter_bps == 0 {
             return (false, false);
@@ -194,8 +213,8 @@ impl Ratchet {
         }
         let delta_bps = (mid_now - mid_then) / mid_then * Decimal::from(10_000);
         let threshold = Decimal::from(self.config.trend_filter_bps);
-        let suppress_bid = delta_bps > threshold;
-        let suppress_ask = delta_bps < -threshold;
+        let suppress_bid = delta_bps < -threshold;
+        let suppress_ask = delta_bps > threshold;
         (suppress_bid, suppress_ask)
     }
 
@@ -536,6 +555,7 @@ impl Strategy for Ratchet {
             last_ask: None,
             last_place_ts_ns: 0,
             last_placed_sig: Vec::new(),
+            last_sl_close_ts_ns: 0,
         }
     }
 
@@ -613,7 +633,8 @@ impl Strategy for Ratchet {
             } => {
                 if pos_size == Decimal::ZERO {
                     self.phase = Phase::Flat;
-                } else if pos_abs > *prev_pos_abs + Decimal::from_str_exact("0.00000001").unwrap() {
+                    self.last_sl_close_ts_ns = 0;
+                } else if pos_abs > *prev_pos_abs + POS_EPSILON {
                     // Deepening fill detected — count as add. Anchor
                     // next add at the most recent fill price (best
                     // proxy: prefer last_buy_price/last_sell_price
@@ -644,6 +665,7 @@ impl Strategy for Ratchet {
             ..
         } = self.phase
             && self.config.sl_bps_from_first > 0
+            && first_entry_price > Decimal::ZERO
         {
             let drift_bps = if side_long {
                 (mid - first_entry_price) / first_entry_price * Decimal::from(10_000)
@@ -652,9 +674,20 @@ impl Strategy for Ratchet {
             };
             let sl = Decimal::from(self.config.sl_bps_from_first);
             if -drift_bps >= sl {
+                // A flatten IOC may already be in flight — the position
+                // report won't reflect it for a few events. Re-firing a
+                // full-size close each event can double-fill and flip
+                // the position, so hold off; if the IOC missed, this
+                // retries once the window elapses. Phase stays Holding —
+                // reconciliation flips to Flat when the venue reports 0.
+                if self.last_sl_close_ts_ns > 0
+                    && ctx.now.0.saturating_sub(self.last_sl_close_ts_ns) < SL_CLOSE_RETRY_NS
+                {
+                    return Vec::new();
+                }
                 let qty = pos_size.abs();
                 let close_side = if side_long { Side::Ask } else { Side::Bid };
-                self.phase = Phase::Flat;
+                self.last_sl_close_ts_ns = ctx.now.0;
                 self.last_placed_sig.clear();
                 return vec![
                     Action::CancelAll,
@@ -719,6 +752,21 @@ impl Strategy for Ratchet {
         self.last_placed_sig = sig;
         self.last_place_ts_ns = ctx.now.0;
         actions
+    }
+
+    /// A venue reject (post-only would-cross, min-notional, …) leaves the
+    /// book missing a leg while `last_placed_sig` still claims it was
+    /// placed — and since targets are anchored to static last-fill prices,
+    /// the recomputed sig stays identical forever, so the dedup gate would
+    /// never allow a re-place. Clear the sig so the next event re-emits.
+    fn on_quote_rejected(
+        &mut self,
+        _ctx: &StrategyContext<'_>,
+        _intent: &tikr_venue::QuoteIntent,
+        _reason: &str,
+    ) -> Vec<Action> {
+        self.last_placed_sig.clear();
+        Vec::new()
     }
 
     fn on_notional_updated(
@@ -979,7 +1027,9 @@ mod tests {
         };
         assert_eq!(ioc.tif, TimeInForce::IOC);
         assert_eq!(ioc.side, Side::Ask, "long SL closes via ask");
-        // Phase should reset to Flat after SL.
-        assert!(matches!(r.phase, Phase::Flat));
+        // Phase stays Holding until the venue reports the position flat —
+        // jumping straight to Flat would re-lock a fresh Holding (and
+        // re-arm the SL) while the flatten IOC is still in flight.
+        assert!(matches!(r.phase, Phase::Holding { .. }));
     }
 }

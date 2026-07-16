@@ -111,14 +111,22 @@ impl TopOfBook {
         if skew != Decimal::ZERO {
             bid = Price(bid.0 + skew);
             ask = Price(ask.0 + skew);
-            // Post-only safety: never let skewed bid >= best_ask or
-            // skewed ask <= best_bid (would cross). Clamp.
-            if bid.0 >= best_ask.0 {
-                bid = Price(best_ask.0 - tick);
-            }
-            if ask.0 <= best_bid.0 {
-                ask = Price(best_bid.0 + tick);
-            }
+        }
+        // Post-only safety — run UNCONDITIONALLY, not only when skewed:
+        // improve mode itself crosses on narrow spreads (spread = 1 tick
+        // → bid = best_bid + tick = best_ask). Never let bid >= best_ask
+        // or ask <= best_bid. Clamp.
+        if bid.0 >= best_ask.0 {
+            bid = Price(best_ask.0 - tick);
+        }
+        if ask.0 <= best_bid.0 {
+            ask = Price(best_bid.0 + tick);
+        }
+        // Self-cross guard: at a 2-tick spread, improve puts both sides on
+        // the same price. Fall back to joining the touch.
+        if bid.0 >= ask.0 {
+            bid = best_bid;
+            ask = best_ask;
         }
 
         Some((bid, ask))

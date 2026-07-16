@@ -7,9 +7,15 @@
 //!
 //! # Formula
 //!
-//! Reservation price: `r = mid - q·γ·σ²`
+//! Reservation price: `r = mid · (1 - q·γ·σ²)`
 //! Half-spread: `δ = mid · base_spread_bps / 10_000`
 //! Bid = `r - δ`, Ask = `r + δ`.
+//!
+//! `σ²` is log-return variance (dimensionless, price-scale-independent) —
+//! the skew term is multiplied by `mid` so it scales with the asset's price
+//! level. `q·γ·σ²` alone is a dimensionless fraction of price; without the
+//! `mid` factor the skew would be in raw base-unit magnitude and vanish in
+//! relative terms for a high-priced asset (BTC ~$76k).
 //!
 //! # Academic note — simplified reservation price
 //!
@@ -20,8 +26,8 @@
 //! (Phase 3). With the removal of `k` and `a` from the config (those parameters
 //! were only used in the now-replaced price-unit spread formula), the full `η`
 //! expression has no home. The reservation price is simplified to
-//! `r = mid - q·γ·σ²` (unit-scale η = 1), making GLFT structurally identical
-//! to A-S's inventory-skew term minus the finite-horizon multiplier. This
+//! `r = mid · (1 - q·γ·σ²)` (unit-scale η = 1), making GLFT structurally
+//! identical to A-S's inventory-skew term minus the finite-horizon multiplier. This
 //! sacrifices academic purity for practical portability: the strategy still
 //! delivers the core GLFT value proposition (infinite-horizon, no expiry reset)
 //! while avoiding a calibration dependency that was dead weight pre-Phase 3.
@@ -161,9 +167,14 @@ impl Strategy for Glft {
         let var = self.estimator.current_var();
         let gamma = self.config.gamma;
 
-        // Reservation price: r = mid - q·γ·σ²
+        // Reservation price: r = mid · (1 - q·γ·σ²)
+        // σ² (var) is log-return variance — dimensionless — so the skew
+        // term is scaled by mid to convert it into a price-space shift.
+        // Without the mid factor, q·γ·σ² alone is a raw base-unit
+        // magnitude that's effectively inert at crypto price levels
+        // (BTC ~$76k): the skew must scale with the price level.
         // Infinite-horizon: no (T-t) multiplier; η simplified to 1 (see module doc).
-        let r = mid.0 - q * gamma * var;
+        let r = mid.0 * (Decimal::ONE - q * gamma * var);
 
         // Half-spread: δ = mid · base_spread_bps / 10_000
         let delta = mid.0 * Decimal::from(self.config.base_spread_bps) / Decimal::from(10_000);

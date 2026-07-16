@@ -329,8 +329,21 @@ impl FlatMm {
             let off = inner + step * Decimal::from(k - 1);
             let bid_px = r * (Decimal::ONE - off);
             let ask_px = r * (Decimal::ONE + off);
-            let mut bid_sz = self.config.notional_per_order * bid_mult / bid_px.max(Decimal::ONE);
-            let mut ask_sz = self.config.notional_per_order * ask_mult / ask_px.max(Decimal::ONE);
+            // `.max(Decimal::ONE)` on the divisor was wrong on sub-$1 symbols:
+            // it deploys `notional / 1` instead of `notional / price`, wildly
+            // oversizing the level. Guard for a usable price and divide by
+            // the real price; a non-positive price just skips the level
+            // below (`bid_px > ZERO && bid_sz > ZERO`).
+            let mut bid_sz = if bid_px > Decimal::ZERO {
+                self.config.notional_per_order * bid_mult / bid_px
+            } else {
+                Decimal::ZERO
+            };
+            let mut ask_sz = if ask_px > Decimal::ZERO {
+                self.config.notional_per_order * ask_mult / ask_px
+            } else {
+                Decimal::ZERO
+            };
             if clamp_uw {
                 // Long: Ask is the reducing side; underwater when ask_px < avg.
                 if inv > Decimal::ZERO && ask_px < avg {
@@ -1569,5 +1582,33 @@ mod tests {
                 .any(|q| q.side == Side::Ask && q.size.0 == Decimal::from(50)),
             "flush ask sized to the whole bag"
         );
+    }
+
+    /// Regression: `notional / price.max(ONE)` deployed `notional / 1`
+    /// instead of `notional / price` on sub-$1 symbols, undersizing every
+    /// level by orders of magnitude. At mid = 0.05, `notional_per_order =
+    /// 5` should size a level to roughly `5 / 0.05 = 100` base units, not
+    /// `5 / 1 = 5`.
+    #[test]
+    fn sub_dollar_price_sizes_off_real_price_not_clamped_to_one() {
+        let s = sym();
+        let b = book_mid(&s, Decimal::new(5, 2)); // mid = 0.05
+        let p = pos(&s, Decimal::ZERO, Decimal::ZERO);
+        let mut st = FlatMm::new(cfg());
+        let acts = st.on_event(
+            &ctx(&s, &b, &p, &[]),
+            &MarketEvent::BookUpdate {
+                snapshot: b.clone(),
+            },
+        );
+        let qs = quotes(&acts);
+        assert!(!qs.is_empty(), "sub-$1 book must still quote");
+        for q in &qs {
+            assert!(
+                q.size.0 > Decimal::from(50),
+                "size {} too small for notional=5 at price≈0.05 — looks clamped to notional/1",
+                q.size.0
+            );
+        }
     }
 }

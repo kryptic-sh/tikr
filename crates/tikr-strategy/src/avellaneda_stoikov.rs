@@ -2,12 +2,17 @@
 //!
 //! # Formula (finite-horizon)
 //!
-//! Reservation price: `r = mid - q·γ·σ²·(T-t)`
+//! Reservation price: `r = mid · (1 - q·γ·σ²·(T-t))`
 //! Half-spread: `δ = mid · base_spread_bps / 10_000`
 //!
 //! Bid quote = `r - δ`, ask quote = `r + δ`. `mid` = book mid, `q` = signed
 //! inventory (long > 0), `γ` = risk aversion, `σ²` = log-return variance from
 //! [`crate::volatility::EwmaVolatility`], `T-t` = pinned horizon in seconds.
+//!
+//! `σ²` is dimensionless (log-return variance, price-scale-independent), so
+//! the `q·γ·σ²·(T-t)` skew term is multiplied by `mid` to convert it into a
+//! price-space shift — the skew must scale with the asset's price level, or
+//! it's effectively inert for a high-priced asset (BTC ~$76k).
 //!
 //! # Half-spread
 //!
@@ -151,8 +156,12 @@ impl Strategy for AvellanedaStoikov {
         let var = self.estimator.current_var();
         let gamma = self.config.gamma;
         let horizon = Decimal::from(self.config.horizon_sec);
-        // Reservation price: r = mid - q · γ · σ² · (T-t)
-        let r = mid.0 - q * gamma * var * horizon;
+        // Reservation price: r = mid · (1 - q · γ · σ² · (T-t))
+        // σ² (var) is log-return variance — dimensionless — so the skew
+        // term is scaled by mid to convert it into a price-space shift;
+        // without the mid factor the skew is a raw base-unit magnitude
+        // that doesn't scale with the price level.
+        let r = mid.0 * (Decimal::ONE - q * gamma * var * horizon);
         // Half-spread: δ = mid · base_spread_bps / 10_000
         let delta = mid.0 * Decimal::from(self.config.base_spread_bps) / Decimal::from(10_000);
         self.last_requote_ts = Some(snapshot.ts);

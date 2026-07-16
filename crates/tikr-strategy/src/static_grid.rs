@@ -315,6 +315,22 @@ pub struct StaticGrid {
     /// `make_level` consults `is_trending()` to decide whether to
     /// engage `auto_skew`.
     regime: RegimeTracker,
+    /// Timestamp of the last TP/SL flatten emission. While the IOC is
+    /// in flight the position report still shows the old size, so
+    /// without this latch the risk gate would re-fire a full-size
+    /// close on every event until the fill lands — two fills flip the
+    /// position. Doubles as a retry timer: if the IOC missed, the
+    /// close re-fires after the window instead of never.
+    last_risk_close_ts_ns: u64,
+    /// Whether the most recent `build_batch` call intentionally left
+    /// the Bid / Ask side empty because `max_position_usdt` was
+    /// breached. Consulted by `rebuild_decision` so a cap-suppressed
+    /// empty side isn't mistaken for a broken one — without this, an
+    /// inventory-capped grid CancelAll + re-places both sides every
+    /// ~2s forever, losing queue priority on the still-healthy closing
+    /// side.
+    last_bid_suppressed: bool,
+    last_ask_suppressed: bool,
 }
 
 /// How long to wait before re-attempting a side refill after the
@@ -322,6 +338,10 @@ pub struct StaticGrid {
 /// arrives (the position changed → rebuild_decision now computes
 /// against a different state, so the cooldown becomes irrelevant).
 const REFILL_COOLDOWN_NS: u64 = 2_000_000_000; // 2 seconds
+
+/// Min elapsed time between TP/SL flatten emissions (see
+/// `last_risk_close_ts_ns`).
+const RISK_CLOSE_RETRY_NS: u64 = 5_000_000_000;
 
 /// Sort an action batch by `|price - mid|` ascending so the venue sees
 /// inner orders first. Non-quote actions (CancelAll, Cancel(id)) keep
@@ -352,9 +372,12 @@ impl StaticGrid {
     /// Evaluate the risk gate; on breach, return CancelAll + IOC close
     /// at the opposing touch. None when both thresholds are disabled
     /// or position is flat. Caller short-circuits the normal quote loop
-    /// when Some is returned.
+    /// when Some is returned — including `Some(vec![])` while a
+    /// previously-emitted close IOC is still in flight (the position
+    /// report lags it, so re-evaluating would re-fire a full-size
+    /// close and flip the position).
     fn try_risk_close(
-        &self,
+        &mut self,
         ctx: &StrategyContext<'_>,
         mid: Price,
         best_bid: Price,
@@ -363,12 +386,25 @@ impl StaticGrid {
         if self.config.take_profit_bps == 0 && self.config.stop_loss_bps == 0 {
             return None;
         }
+        if ctx.position.size.0 == Decimal::ZERO {
+            // Flat — any in-flight flatten landed; re-arm the latch.
+            self.last_risk_close_ts_ns = 0;
+            return None;
+        }
         match risk::evaluate(ctx.position, mid, self.risk_cfg()) {
             RiskDecision::Hold => None,
-            RiskDecision::Close { side, qty, .. } => Some(vec![
-                Action::CancelAll,
-                risk::build_close(ctx.symbol, side, qty, best_bid, best_ask),
-            ]),
+            RiskDecision::Close { side, qty, .. } => {
+                if self.last_risk_close_ts_ns > 0
+                    && ctx.now.0.saturating_sub(self.last_risk_close_ts_ns) < RISK_CLOSE_RETRY_NS
+                {
+                    return Some(Vec::new());
+                }
+                self.last_risk_close_ts_ns = ctx.now.0;
+                Some(vec![
+                    Action::CancelAll,
+                    risk::build_close(ctx.symbol, side, qty, best_bid, best_ask),
+                ])
+            }
         }
     }
 
@@ -380,10 +416,24 @@ impl StaticGrid {
         } else {
             raw_size
         };
-        if self.config.min_notional > Decimal::ZERO && step > Decimal::ZERO {
-            let min_qty = (self.config.min_notional / price.0 / step).ceil() * step;
-            if qty < min_qty {
-                qty = min_qty + step;
+        if self.config.min_notional > Decimal::ZERO {
+            if step > Decimal::ZERO {
+                // Ceil to the step: the smallest on-lot qty at or above
+                // the min-notional floor. No extra step on top — ceil
+                // already lands at-or-above, so adding one more lot
+                // was inflating every constrained order by a full step.
+                let min_qty = (self.config.min_notional / price.0 / step).ceil() * step;
+                if qty < min_qty {
+                    qty = min_qty;
+                }
+            } else {
+                // No lot step to round to (fractional-qty venue) —
+                // enforce min_notional via direct division so a
+                // zero-step config can't quote below the venue floor.
+                let min_qty = self.config.min_notional / price.0;
+                if qty < min_qty {
+                    qty = min_qty;
+                }
             }
         }
         Action::Quote(QuoteIntent {
@@ -510,6 +560,11 @@ impl StaticGrid {
     ///
     /// `pos_ratio < 0` (short): mirrored — Ask widens from mid, Bid joins
     /// the book at `best_bid`.
+    ///
+    /// Returns `(actions, bid_suppressed, ask_suppressed)` — the two
+    /// bools flag whether the cap left that side intentionally empty
+    /// this build. Callers persist them into `last_bid_suppressed` /
+    /// `last_ask_suppressed` for `rebuild_decision` to consult.
     fn build_batch(
         &self,
         symbol: &Symbol,
@@ -518,7 +573,7 @@ impl StaticGrid {
         best_ask: Price,
         pos_ratio: Decimal,
         pos_usdt: Decimal,
-    ) -> Vec<Action> {
+    ) -> (Vec<Action>, bool, bool) {
         let mut actions = Vec::with_capacity(self.config.levels_per_side as usize * 2);
         let cap = self.config.max_position_usdt;
         let bid_capped = add_side_capped(pos_usdt, cap, Side::Bid);
@@ -556,7 +611,7 @@ impl StaticGrid {
         // want to avoid. Sorting by |price - mid| ascending sends the
         // nearest-to-mid quote first whatever its side.
         sort_inside_out(&mut actions, mid);
-        actions
+        (actions, bid_capped, ask_capped)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -666,10 +721,20 @@ impl StaticGrid {
     }
 
     /// What the bot should do on a full fill.
+    ///
+    /// `bid_suppressed` / `ask_suppressed` reflect whether the LAST
+    /// `build_batch` call intentionally left that side empty because
+    /// the inventory cap bound. An empty side only counts as "broken"
+    /// (worth a rebuild) when it was NOT intentionally suppressed —
+    /// otherwise a capped grid would CancelAll + re-place both sides
+    /// every cycle, losing queue priority on the still-healthy closing
+    /// side for as long as the position sits at the cap.
     fn rebuild_decision(
         &self,
         open_quotes: &[(QuoteId, QuoteIntent)],
         cur_pos_ratio: Decimal,
+        bid_suppressed: bool,
+        ask_suppressed: bool,
     ) -> RebuildDecision {
         let buys = open_quotes
             .iter()
@@ -679,7 +744,11 @@ impl StaticGrid {
 
         // One side empty: rebuild the whole grid so the surviving side
         // follows the current price instead of lagging in fast trends.
-        if buys == 0 || sells == 0 {
+        // Skip when the empty side is the cap-suppressed one — that
+        // side is SUPPOSED to be empty right now.
+        let bid_broken = buys == 0 && !bid_suppressed;
+        let ask_broken = sells == 0 && !ask_suppressed;
+        if bid_broken || ask_broken {
             return RebuildDecision::FullRebuild;
         }
 
@@ -734,6 +803,9 @@ impl Strategy for StaticGrid {
             last_refill_bid_ts: None,
             last_refill_ask_ts: None,
             regime,
+            last_risk_close_ts_ns: 0,
+            last_bid_suppressed: false,
+            last_ask_suppressed: false,
         }
     }
 
@@ -782,7 +854,11 @@ impl Strategy for StaticGrid {
                 if !self.placed {
                     let ratio = self.pos_ratio(pos_usdt);
                     self.placed = true;
-                    return self.build_batch(ctx.symbol, mid, best_bid, best_ask, ratio, pos_usdt);
+                    let (actions, bid_suppressed, ask_suppressed) =
+                        self.build_batch(ctx.symbol, mid, best_bid, best_ask, ratio, pos_usdt);
+                    self.last_bid_suppressed = bid_suppressed;
+                    self.last_ask_suppressed = ask_suppressed;
+                    return actions;
                 }
                 // Self-heal on book updates: if a side has gone empty
                 // since the last fill arrived (e.g. a fill event was
@@ -794,7 +870,12 @@ impl Strategy for StaticGrid {
                 // one book tick (~100ms on a busy symbol).
                 let cur_ratio = self.pos_ratio(pos_usdt);
                 let now_ns = self.last_event_ts.unwrap_or(0);
-                match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
+                match self.rebuild_decision(
+                    ctx.open_quotes,
+                    cur_ratio,
+                    self.last_bid_suppressed,
+                    self.last_ask_suppressed,
+                ) {
                     RebuildDecision::None => vec![Action::NoOp],
                     RebuildDecision::FullRebuild => {
                         // Both sides need re-placement; rate-limit on
@@ -810,11 +891,11 @@ impl Strategy for StaticGrid {
                         let mut actions =
                             Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
                         actions.push(Action::CancelAll);
-                        actions.extend(
-                            self.build_batch(
-                                ctx.symbol, mid, best_bid, best_ask, cur_ratio, pos_usdt,
-                            ),
-                        );
+                        let (batch, bid_suppressed, ask_suppressed) = self
+                            .build_batch(ctx.symbol, mid, best_bid, best_ask, cur_ratio, pos_usdt);
+                        self.last_bid_suppressed = bid_suppressed;
+                        self.last_ask_suppressed = ask_suppressed;
+                        actions.extend(batch);
                         actions
                     }
                 }
@@ -853,22 +934,29 @@ impl Strategy for StaticGrid {
                     let mut actions =
                         Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
                     actions.push(Action::CancelAll);
-                    actions.extend(
-                        self.build_batch(ctx.symbol, mid, best_bid, best_ask, cur_ratio, pos_usdt),
-                    );
+                    let (batch, bid_suppressed, ask_suppressed) =
+                        self.build_batch(ctx.symbol, mid, best_bid, best_ask, cur_ratio, pos_usdt);
+                    self.last_bid_suppressed = bid_suppressed;
+                    self.last_ask_suppressed = ask_suppressed;
+                    actions.extend(batch);
                     return actions;
                 }
-                match self.rebuild_decision(ctx.open_quotes, cur_ratio) {
+                match self.rebuild_decision(
+                    ctx.open_quotes,
+                    cur_ratio,
+                    self.last_bid_suppressed,
+                    self.last_ask_suppressed,
+                ) {
                     RebuildDecision::None => Vec::new(),
                     RebuildDecision::FullRebuild => {
                         let mut actions =
                             Vec::with_capacity(1 + self.config.levels_per_side as usize * 2);
                         actions.push(Action::CancelAll);
-                        actions.extend(
-                            self.build_batch(
-                                ctx.symbol, mid, best_bid, best_ask, cur_ratio, pos_usdt,
-                            ),
-                        );
+                        let (batch, bid_suppressed, ask_suppressed) = self
+                            .build_batch(ctx.symbol, mid, best_bid, best_ask, cur_ratio, pos_usdt);
+                        self.last_bid_suppressed = bid_suppressed;
+                        self.last_ask_suppressed = ask_suppressed;
+                        actions.extend(batch);
                         actions
                     }
                 }
@@ -909,7 +997,19 @@ impl Strategy for StaticGrid {
         if add_side_capped(pos_usdt, self.config.max_position_usdt, intent.side) {
             return Vec::new();
         }
+        // Rate-limit the rejected side too. Deterministic rejections
+        // (insufficient margin, min-notional, etc.) would otherwise
+        // hot-loop place→reject→place at the venue round-trip rate —
+        // every rejection re-emits immediately, which just re-triggers
+        // the same rejection. Reuses the BookUpdate self-heal's per-
+        // side cooldown state so a rejection and a self-heal refill on
+        // the same side share one clock.
+        let now_ns = ctx.now.0;
+        if self.side_in_cooldown(intent.side, now_ns) {
+            return Vec::new();
+        }
         let ratio = self.pos_ratio(pos_usdt);
+        self.mark_refill(intent.side, now_ns);
         vec![self.make_level(ctx.symbol, mid, best_bid, best_ask, ratio, intent.side, 0)]
     }
 
@@ -987,11 +1087,48 @@ mod tests {
     fn side_empty_triggers_full_rebuild() {
         let g = StaticGrid::new(cfg("0", 60, "1", "4"));
         assert_eq!(
-            g.rebuild_decision(&[quote(Side::Ask), quote(Side::Ask)], Decimal::ZERO),
+            g.rebuild_decision(
+                &[quote(Side::Ask), quote(Side::Ask)],
+                Decimal::ZERO,
+                false,
+                false
+            ),
             RebuildDecision::FullRebuild
         );
         assert_eq!(
-            g.rebuild_decision(&[quote(Side::Bid), quote(Side::Bid)], Decimal::ZERO),
+            g.rebuild_decision(
+                &[quote(Side::Bid), quote(Side::Bid)],
+                Decimal::ZERO,
+                false,
+                false
+            ),
+            RebuildDecision::FullRebuild
+        );
+    }
+
+    #[test]
+    fn suppressed_empty_side_does_not_trigger_rebuild() {
+        // Cap suppression intentionally leaves a side empty — that
+        // must NOT be treated as "broken" (see fix for the FullRebuild
+        // hot-loop when max_position_usdt binds).
+        let g = StaticGrid::new(cfg("0", 60, "1", "4"));
+        assert_eq!(
+            g.rebuild_decision(
+                &[quote(Side::Ask), quote(Side::Ask)],
+                Decimal::ZERO,
+                /* bid_suppressed */ true,
+                false
+            ),
+            RebuildDecision::None
+        );
+        // But an ask_suppressed flag doesn't excuse an empty BID side.
+        assert_eq!(
+            g.rebuild_decision(
+                &[quote(Side::Ask), quote(Side::Ask)],
+                Decimal::ZERO,
+                false,
+                /* ask_suppressed */ true
+            ),
             RebuildDecision::FullRebuild
         );
     }
@@ -1000,7 +1137,12 @@ mod tests {
     fn single_per_side_does_not_trigger_rebuild_decision() {
         let g = StaticGrid::new(cfg("0", 60, "1", "4"));
         assert_eq!(
-            g.rebuild_decision(&[quote(Side::Bid), quote(Side::Ask)], Decimal::ZERO),
+            g.rebuild_decision(
+                &[quote(Side::Bid), quote(Side::Ask)],
+                Decimal::ZERO,
+                false,
+                false
+            ),
             RebuildDecision::None
         );
     }
@@ -1022,7 +1164,9 @@ mod tests {
                     quote(Side::Ask),
                     quote(Side::Ask),
                 ],
-                Decimal::ZERO
+                Decimal::ZERO,
+                false,
+                false
             ),
             RebuildDecision::None
         );
@@ -1038,7 +1182,7 @@ mod tests {
     fn empty_both_sides_triggers_full_rebuild() {
         let g = StaticGrid::new(cfg("0", 60, "1", "4"));
         assert_eq!(
-            g.rebuild_decision(&[], Decimal::ZERO),
+            g.rebuild_decision(&[], Decimal::ZERO, false, false),
             RebuildDecision::FullRebuild
         );
     }
@@ -1225,7 +1369,12 @@ mod tests {
             kind: tikr_core::MarketKind::Perp,
         };
         let mid = Price(Decimal::from(100_000));
-        let actions = g.build_batch(&sym, mid, mid, mid, Decimal::ZERO, Decimal::ZERO);
+        let (actions, bid_suppressed, ask_suppressed) =
+            g.build_batch(&sym, mid, mid, mid, Decimal::ZERO, Decimal::ZERO);
+        assert!(
+            !bid_suppressed && !ask_suppressed,
+            "cap disabled — nothing suppressed"
+        );
         // Extract |price - mid| sequence; must be non-decreasing.
         let dists: Vec<Decimal> = actions
             .iter()
@@ -1265,7 +1414,8 @@ mod tests {
         let mid = Price(Decimal::from(100_000));
         let best_bid = Price(Decimal::from(99_000));
         let best_ask = Price(Decimal::from(101_000));
-        let actions = g.build_batch(&sym, mid, best_bid, best_ask, Decimal::ZERO, Decimal::ZERO);
+        let (actions, _, _) =
+            g.build_batch(&sym, mid, best_bid, best_ask, Decimal::ZERO, Decimal::ZERO);
         let bids: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {
@@ -1316,7 +1466,8 @@ mod tests {
         let mid = Price(Decimal::from(100_000));
         let best_bid = Price(Decimal::from(99_990));
         let best_ask = Price(Decimal::from(100_010));
-        let actions = g.build_batch(&sym, mid, best_bid, best_ask, Decimal::ZERO, Decimal::ZERO);
+        let (actions, _, _) =
+            g.build_batch(&sym, mid, best_bid, best_ask, Decimal::ZERO, Decimal::ZERO);
         let bids: Vec<_> = actions
             .iter()
             .filter_map(|a| match a {

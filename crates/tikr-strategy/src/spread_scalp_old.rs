@@ -10,6 +10,7 @@ use tikr_core::{
 };
 use tikr_venue::QuoteIntent;
 
+use crate::risk;
 use crate::{Action, Strategy, StrategyContext};
 
 /// Configuration for [`SpreadScalp`].
@@ -227,20 +228,26 @@ impl SpreadScalpOld {
             };
             let unrealized = profit * pos_abs;
             if unrealized >= tp_threshold {
-                // Reducing side + opposing touch = guaranteed taker.
-                let (tp_side, tp_price) = if long {
-                    (Side::Ask, bid)
-                } else {
-                    (Side::Bid, ask)
-                };
-                actions.push(Action::Quote(QuoteIntent {
-                    symbol: ctx.symbol.clone(),
-                    side: tp_side,
-                    price: tp_price,
-                    size: Size(pos_abs),
-                    tif: TimeInForce::IOC,
-                    kind: QuoteKind::Point,
-                }));
+                // Reducing side must cross at the OPPOSING touch to
+                // guarantee a taker fill (same shape as
+                // risk.rs::build_close). `bid`/`ask` here are the
+                // strategy's own inside-the-spread quote targets — a
+                // tick INSIDE the real touch, not across it — so pricing
+                // the IOC there never crossed and the fill simulator
+                // silently dropped it every cycle. Recover the real
+                // touch by inverting the tick offset `compute_targets`
+                // applied (bid = best_bid + tick, ask = best_ask - tick).
+                let tick = self.config.tick_size;
+                let best_bid = Price(bid.0 - tick);
+                let best_ask = Price(ask.0 + tick);
+                let tp_side = if long { Side::Ask } else { Side::Bid };
+                actions.push(risk::build_close(
+                    ctx.symbol,
+                    tp_side,
+                    Size(pos_abs),
+                    best_bid,
+                    best_ask,
+                ));
                 return actions;
             }
         }
@@ -734,6 +741,55 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::Quote(q) => assert_eq!(q.side, Side::Bid),
+            other => panic!("expected Quote, got {:?}", other),
+        }
+    }
+
+    /// Regression: the take-profit IOC must cross at the real opposing
+    /// touch, not the strategy's own inside-the-spread quote price
+    /// (which never crosses and left the TP silently dropped by the
+    /// fill simulator every cycle).
+    #[test]
+    fn take_profit_ioc_crosses_at_real_opposing_touch() {
+        let symbol = sym();
+        // Wide spread (100/110) → strategy quotes 1 tick inside: bid=101,
+        // ask=109. Neither crosses the real touch.
+        let snapshot = book(&symbol, 100, 110, 1);
+        let mut strategy = SpreadScalpOld::new(SpreadScalpOldConfig {
+            notional_per_order: Decimal::from(100),
+            tick_size: Decimal::from(1),
+            step_size: Decimal::from(1),
+            min_notional: Decimal::ZERO,
+            min_spread_bps: Decimal::from(5),
+            requote_interval_ms: 1000,
+            max_position_usdt: Decimal::ZERO,
+            take_profit_usdt: Decimal::from(1),
+            reject_cooldown_ms: 0,
+        });
+        // Long 1 @ avg 50 — deeply in profit vs mid 105.
+        let position = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::ONE),
+            avg_entry: Price(Decimal::from(50)),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let actions = strategy.on_event(
+            &ctx(&symbol, &snapshot, &position),
+            &MarketEvent::BookUpdate {
+                snapshot: snapshot.clone(),
+            },
+        );
+        assert_eq!(actions.len(), 2, "expected CancelAll + TP IOC: {actions:?}");
+        assert!(matches!(actions[0], Action::CancelAll));
+        match &actions[1] {
+            Action::Quote(q) => {
+                assert_eq!(q.side, Side::Ask, "long TP reduces via Ask");
+                assert_eq!(q.tif, TimeInForce::IOC);
+                // Real best_bid (100), NOT the strategy's own inside bid
+                // (101) — pricing at 101 would never cross and the IOC
+                // would be silently dropped.
+                assert_eq!(q.price.0, Decimal::from(100));
+            }
             other => panic!("expected Quote, got {:?}", other),
         }
     }
