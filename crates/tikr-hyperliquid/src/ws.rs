@@ -142,13 +142,19 @@ async fn pump_loop(
         None
     };
 
+    let mut ping_iv = new_ping_interval();
+
     loop {
         let action = match heartbeat.as_mut() {
             Some(hb) => tokio::select! {
                 frame = stream.next() => PumpAction::Frame(frame),
                 _ = hb.tick() => PumpAction::Heartbeat,
+                _ = ping_iv.tick() => PumpAction::ClientPing,
             },
-            None => PumpAction::Frame(stream.next().await),
+            None => tokio::select! {
+                frame = stream.next() => PumpAction::Frame(frame),
+                _ = ping_iv.tick() => PumpAction::ClientPing,
+            },
         };
 
         match action {
@@ -159,6 +165,11 @@ async fn pump_loop(
                 if tx.send(ev).await.is_err() {
                     return;
                 }
+            }
+            PumpAction::ClientPing => {
+                // Send-failure surfaces as a read error on the next frame;
+                // the reconnect path there owns recovery.
+                let _ = stream.send(Message::Text(PING_FRAME.into())).await;
             }
             PumpAction::Frame(None) => {
                 // Stream ended.
@@ -234,6 +245,24 @@ async fn reconnect(
 enum PumpAction {
     Frame(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
     Heartbeat,
+    /// Application-level keepalive is due (see `PING_INTERVAL`).
+    ClientPing,
+}
+
+/// Hyperliquid closes connections that receive no client message within
+/// ~60s; WS protocol pongs don't count. Both pumps send an application-level
+/// `{"method":"ping"}` on this interval — without it, low-traffic sockets
+/// (especially `userEvents`) churn through disconnect cycles and lose fills
+/// that land in the reconnect gaps.
+const PING_INTERVAL: Duration = Duration::from_secs(45);
+
+/// The application-level keepalive frame.
+const PING_FRAME: &str = r#"{"method":"ping"}"#;
+
+fn new_ping_interval() -> tokio::time::Interval {
+    let mut iv = tokio::time::interval(PING_INTERVAL);
+    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    iv
 }
 
 /// Parse a text frame to a flat list of [`MarketEvent`]. Returns `None` for
@@ -344,8 +373,19 @@ async fn user_events_pump(
 ) {
     let mut backoff_ms = config.reconnect_min_backoff_ms.max(1);
 
+    // The `userEvents` socket is the lowest-traffic one — without the
+    // application-level keepalive it hits the venue's idle disconnect and
+    // loses any fills landing in the reconnect gaps (no backfill exists).
+    let mut ping_iv = new_ping_interval();
+
     loop {
-        let frame = stream.next().await;
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = ping_iv.tick() => {
+                let _ = stream.send(Message::Text(PING_FRAME.into())).await;
+                continue;
+            }
+        };
         match frame {
             None => {
                 // Stream ended; reconnect.

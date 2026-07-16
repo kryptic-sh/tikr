@@ -174,6 +174,8 @@ pub fn fill_from_user_fill(f: &UserFillEntry) -> Fill {
         // status here; conservatively treat each as full. Refine when the
         // adapter exposes partial-fill metadata.
         is_full: true,
-        trade_id: None,
+        // The venue trade id is what `fills_since` reconciliation dedupes
+        // against WS-delivered fills — `None` would double-count them.
+        trade_id: Some(f.tid),
     }
 }

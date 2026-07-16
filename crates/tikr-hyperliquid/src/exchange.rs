@@ -205,14 +205,49 @@ impl ExchangeClient {
         format!("{}", d.normalize())
     }
 
+    /// Round a price to Hyperliquid's tick rules: at most 5 significant
+    /// figures AND at most `6 − szDecimals` decimal places (perps).
+    /// Integer prices are always allowed regardless of significant figures.
+    /// A violating price is rejected by the venue outright.
+    fn round_price(price: Decimal, sz_decimals: u32) -> Decimal {
+        if price <= Decimal::ZERO {
+            return price;
+        }
+        let max_dp = 6u32.saturating_sub(sz_decimals);
+        // Find e with 10^e <= price < 10^(e+1); 5 sig figs → dp = 4 − e.
+        let mut e: i32 = 0;
+        let mut x = price;
+        while x >= Decimal::TEN {
+            x /= Decimal::TEN;
+            e += 1;
+        }
+        while x < Decimal::ONE {
+            x *= Decimal::TEN;
+            e -= 1;
+        }
+        let sig_dp = (4 - e).max(0) as u32;
+        price.round_dp(sig_dp.min(max_dp))
+    }
+
     // -------------------------------------------------------------------
     // Sign + POST
     // -------------------------------------------------------------------
 
     /// Sign an L1 action and POST it to `/exchange`.
     ///
+    /// `action` must be one of the ordered wire structs below — NOT a
+    /// `serde_json::Value`. The signature hash is msgpack over the action
+    /// bytes in the Python SDK's canonical field order, and the server
+    /// recomputes it from the JSON body in *received* order; `Value` maps
+    /// serialize alphabetically and produce a hash the server can never
+    /// match (every signed action would be rejected).
+    ///
     /// Returns the parsed JSON response body.
-    async fn post_action(&self, action: Value, nonce: u64) -> Result<Value, VenueError> {
+    async fn post_action<A: serde::Serialize>(
+        &self,
+        action: A,
+        nonce: u64,
+    ) -> Result<Value, VenueError> {
         // 1. Compute action_hash: msgpack(action) ++ nonce(8-byte BE) ++ \x00
         let action_bytes =
             rmp_serde::to_vec_named(&action).map_err(|e| VenueError::Internal(Box::new(e)))?;
@@ -226,17 +261,18 @@ impl ExchangeClient {
         let source = if self.is_mainnet { "a" } else { "b" };
         let agent_hash = sign_agent_eip712(&self.signer, source, connection_id).await?;
 
-        // 3. Build POST body.
-        let body = json!({
-            "action": action,
-            "nonce": nonce,
-            "signature": {
-                "r": format!("0x{}", hex::encode(agent_hash.r)),
-                "s": format!("0x{}", hex::encode(agent_hash.s)),
-                "v": agent_hash.v,
+        // 3. Build POST body — an ordered struct for the same reason as the
+        // action itself (the server hashes the action in received order).
+        let body = ExchangeBody {
+            action,
+            nonce,
+            signature: WireSignature {
+                r: format!("0x{}", hex::encode(agent_hash.r)),
+                s: format!("0x{}", hex::encode(agent_hash.s)),
+                v: agent_hash.v,
             },
-            "vaultAddress": null,
-        });
+            vault_address: None,
+        };
 
         // 4. POST.
         let resp = self
@@ -279,26 +315,29 @@ impl ExchangeClient {
         let asset = self.asset_index_for(coin)?;
         let cloid = cloid_from_quote_id(quote_id);
 
-        // Round price to 5 significant figures (Hyperliquid perp tick).
-        // Round size to szDecimals for this asset.
+        // Round price to 5 significant figures / max decimals (Hyperliquid
+        // perp tick rules). Round size to szDecimals for this asset.
         let sz_dec = self.sz_decimals.get(coin).copied().unwrap_or(3);
         let rounded_size = size.0.round_dp(sz_dec);
-        let price_str = Self::format_decimal(price.0);
+        let rounded_price = Self::round_price(price.0, sz_dec);
+        let price_str = Self::format_decimal(rounded_price);
         let size_str = Self::format_decimal(rounded_size);
 
-        let action = json!({
-            "type": "order",
-            "orders": [{
-                "a": asset,
-                "b": is_buy,
-                "p": price_str,
-                "s": size_str,
-                "r": false,
-                "t": { "limit": { "tif": "Alo" } },
-                "c": cloid,
+        let action = OrderAction {
+            kind: "order",
+            orders: vec![WireOrder {
+                a: asset,
+                b: is_buy,
+                p: price_str.clone(),
+                s: size_str.clone(),
+                r: false,
+                t: WireOrderType {
+                    limit: WireLimit { tif: "Alo" },
+                },
+                c: cloid,
             }],
-            "grouping": "na",
-        });
+            grouping: "na",
+        };
 
         let nonce = self.next_nonce();
         info!(
@@ -322,10 +361,10 @@ impl ExchangeClient {
 
         let asset = self.asset_index_for(coin)?;
 
-        let action = json!({
-            "type": "cancel",
-            "cancels": [{ "a": asset, "o": oid }],
-        });
+        let action = CancelAction {
+            kind: "cancel",
+            cancels: vec![WireCancel { a: asset, o: oid }],
+        };
 
         let nonce = self.next_nonce();
         info!(coin, oid, nonce, "canceling order");
@@ -349,15 +388,15 @@ impl ExchangeClient {
         }
 
         let asset = self.asset_index_for(coin)?;
-        let cancels: Vec<Value> = open_oids
+        let cancels: Vec<WireCancel> = open_oids
             .into_iter()
-            .map(|oid| json!({ "a": asset, "o": oid }))
+            .map(|oid| WireCancel { a: asset, o: oid })
             .collect();
 
-        let cancel_action = json!({
-            "type": "cancel",
-            "cancels": cancels,
-        });
+        let cancel_action = CancelAction {
+            kind: "cancel",
+            cancels,
+        };
 
         let nonce = self.next_nonce();
         info!(coin, nonce, "cancel_all for coin");
@@ -395,18 +434,42 @@ impl ExchangeClient {
 
         let asset = self.asset_index_for(coin)?;
 
-        let action = json!({
-            "type": "updateLeverage",
-            "asset": asset,
-            "isCross": true,
-            "leverage": leverage,
-        });
+        let action = UpdateLeverageAction {
+            kind: "updateLeverage",
+            asset,
+            is_cross: true,
+            leverage,
+        };
 
         let nonce = self.next_nonce();
         info!(coin, leverage, nonce, "updating leverage");
 
         let resp = self.post_action(action, nonce).await?;
         parse_generic_ok(&resp)
+    }
+
+    /// Cancel a single order by its venue-assigned `oid`.
+    ///
+    /// Looks up the asset index from open orders (the cancel action requires
+    /// `a`), then cancels. An oid not found in open orders is treated as
+    /// already-resolved (idempotent success).
+    pub async fn cancel_by_oid_raw(&self, oid: u64) -> Result<(), VenueError> {
+        self.check_mainnet_gate()?;
+
+        let (asset, real_oid) = self.fetch_asset_for_oid(oid).await?;
+        if let Some(asset) = asset {
+            let cancel_action = CancelAction {
+                kind: "cancel",
+                cancels: vec![WireCancel {
+                    a: asset,
+                    o: real_oid,
+                }],
+            };
+            let nonce = self.next_nonce();
+            let resp = self.post_action(cancel_action, nonce).await?;
+            return parse_cancel_response(&resp);
+        }
+        Ok(())
     }
 
     /// Cancel a single order by cloid (128-bit hex string).
@@ -426,10 +489,13 @@ impl ExchangeClient {
             // We still need the asset. Fetch it from the open order.
             let (asset, real_oid) = self.fetch_asset_for_oid(oid).await?;
             if let Some(asset) = asset {
-                let cancel_action = serde_json::json!({
-                    "type": "cancel",
-                    "cancels": [{ "a": asset, "o": real_oid }],
-                });
+                let cancel_action = CancelAction {
+                    kind: "cancel",
+                    cancels: vec![WireCancel {
+                        a: asset,
+                        o: real_oid,
+                    }],
+                };
                 let nonce = self.next_nonce();
                 let resp = self.post_action(cancel_action, nonce).await?;
                 return parse_cancel_response(&resp);
@@ -482,6 +548,93 @@ impl ExchangeClient {
     pub fn address(&self) -> String {
         self.signer.address().to_checksum(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Signed-action wire types
+// ---------------------------------------------------------------------------
+//
+// Field DECLARATION ORDER in these structs is load-bearing: it must match
+// the Python SDK's canonical insertion order exactly. The action hash is
+// msgpack over these bytes, and the server recomputes the hash from the
+// JSON body in the order it was received — serde struct serialization
+// preserves declaration order for both encodings, `serde_json::Value` does
+// not (BTreeMap → alphabetical → hash mismatch → every action rejected).
+
+/// `{"limit": {"tif": ...}}` order type wrapper.
+#[derive(serde::Serialize)]
+struct WireOrderType {
+    limit: WireLimit,
+}
+
+#[derive(serde::Serialize)]
+struct WireLimit {
+    tif: &'static str,
+}
+
+/// One order in an `order` action. Canonical order: a, b, p, s, r, t, c.
+#[derive(serde::Serialize)]
+struct WireOrder {
+    a: u32,
+    b: bool,
+    p: String,
+    s: String,
+    r: bool,
+    t: WireOrderType,
+    c: String,
+}
+
+/// `order` action. Canonical order: type, orders, grouping.
+#[derive(serde::Serialize)]
+struct OrderAction {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    orders: Vec<WireOrder>,
+    grouping: &'static str,
+}
+
+/// One cancel target. Canonical order: a, o.
+#[derive(serde::Serialize)]
+struct WireCancel {
+    a: u32,
+    o: u64,
+}
+
+/// `cancel` action. Canonical order: type, cancels.
+#[derive(serde::Serialize)]
+struct CancelAction {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    cancels: Vec<WireCancel>,
+}
+
+/// `updateLeverage` action. Canonical order: type, asset, isCross, leverage.
+#[derive(serde::Serialize)]
+struct UpdateLeverageAction {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    asset: u32,
+    #[serde(rename = "isCross")]
+    is_cross: bool,
+    leverage: u32,
+}
+
+#[derive(serde::Serialize)]
+struct WireSignature {
+    r: String,
+    s: String,
+    v: u8,
+}
+
+/// `/exchange` POST body. Canonical order: action, nonce, signature,
+/// vaultAddress.
+#[derive(serde::Serialize)]
+struct ExchangeBody<A: serde::Serialize> {
+    action: A,
+    nonce: u64,
+    signature: WireSignature,
+    #[serde(rename = "vaultAddress")]
+    vault_address: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -602,8 +755,12 @@ fn parse_order_response(resp: &Value) -> Result<u64, VenueError> {
         return classify_rejection(err.to_string());
     }
     // "filled" immediately is also possible for Ioc — not expected for Alo.
+    // A missing oid must be an error, not a silent 0: QuoteId(0) breaks all
+    // subsequent cancel/fill correlation for the order.
     if let Some(filled) = status.get("filled") {
-        let oid = filled.get("oid").and_then(Value::as_u64).unwrap_or(0);
+        let oid = filled.get("oid").and_then(Value::as_u64).ok_or_else(|| {
+            VenueError::Internal(Box::new(std::io::Error::other("filled status missing oid")))
+        })?;
         return Ok(oid);
     }
     Err(VenueError::Internal(Box::new(std::io::Error::other(
@@ -799,7 +956,9 @@ pub fn fill_from_user_event(_coin: &str, f: &UserEventFill) -> Fill {
         side,
         is_full: true,
         ts: Timestamp(f.time.saturating_mul(1_000_000)),
-        trade_id: None,
+        // Venue trade id keeps `fills_since` reconciliation from
+        // double-counting fills already applied from this WS event.
+        trade_id: Some(f.tid),
     }
 }
 
@@ -832,6 +991,9 @@ pub struct UserEventFill {
     pub oid: u64,
     /// Fill time in milliseconds.
     pub time: u64,
+    /// Venue-side trade id — the `fills_since` dedup key.
+    #[serde(default)]
+    pub tid: u64,
 }
 
 // ---------------------------------------------------------------------------

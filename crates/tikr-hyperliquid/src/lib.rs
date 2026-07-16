@@ -294,31 +294,14 @@ impl Venue for Hyperliquid {
     /// Idempotent: "never placed", "already canceled", "already filled" → `Ok(())`.
     async fn cancel(&self, id: QuoteId) -> Result<(), VenueError> {
         let exchange = self.require_exchange()?;
-        // We need the symbol's coin name for cancellation. Since the Venue
-        // trait's cancel() does not pass the symbol, we need to recover it.
-        // In Hyperliquid's cancel action, `coin` is identified by `asset`
-        // (integer index). We could store the coin name in the QuoteId's high
-        // bits, but that's not done in v0. Instead we pass a sentinel: the
-        // cancel-by-oid endpoint does not strictly require the coin if we
-        // know the oid.
-        //
-        // However, Hyperliquid's cancel action does require the `a` (asset)
-        // field. We keep a per-oid coin map is out of scope for v0. As a
-        // workaround: the caller is expected to use cancel(id) only for IDs
-        // that were placed by this same adapter instance; the coin can be
-        // inferred from the oid's high bits if we embedded it, but v0 does
-        // not do so. For now, we iterate all assets and find the matching oid
-        // via /info openOrders.
-        //
-        // Practical note: in the live runner, cancel() is always called with
-        // a QuoteId that came from quote() on a known symbol, and the runner
-        // tracks symbol→QuoteId mapping. v0 adopts the pragmatic approach of
-        // encoding the cancel as a no-symbol request via the exchange API's
-        // flexible cancel form.
-        //
-        // We use cancelByCloid since we always know the cloid.
-        let cloid = cloid_from_quote_id(id);
-        exchange.cancel_by_cloid_raw(&cloid).await
+        // `quote()` returns an OID-derived QuoteId while the resting order's
+        // cloid is a fresh uuid minted at place time — so a cloid derived
+        // from `id` here would never match anything and the cancel would
+        // "succeed" idempotently while the order kept resting. Cancel by the
+        // oid encoded in the id instead; the exchange client resolves the
+        // required asset index from open orders.
+        let oid = oid_from_quote_id(id);
+        exchange.cancel_by_oid_raw(oid).await
     }
 
     /// Cancel all open orders for a symbol.
