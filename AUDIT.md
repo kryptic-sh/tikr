@@ -4,6 +4,10 @@ Audit target: commit `2506fbb980462c9990650669b8ee268f82652737`
 
 Audit date: 2026-07-22
 
+Resolution status: all 11 verified findings were remediated and independently
+reviewed on 2026-07-22. Regression coverage was added for each affected code
+path; the original findings remain below as the audit record.
+
 ## Scope and method
 
 The repository was divided into seven slices and reviewed by read-only audit

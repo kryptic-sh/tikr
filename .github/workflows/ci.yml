@@ -9,12 +9,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  RUSTFLAGS: '-D warnings'
   RUST_BACKTRACE: 1
   # Opt JS-based actions into Node 24 ahead of the GH default flip
   # (June 2026) so upstream incompatibilities surface early. Mirrors
   # the hjkl / krypt env baseline.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -73,7 +73,8 @@ jobs:
           cache: false
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features --workspace -- -D warnings
+      - run:
+          cargo clippy --all-targets --all-features --workspace -- -D warnings
 
   test:
     name: cargo test (${{ matrix.os }})
@@ -118,3 +119,14 @@ jobs:
         with:
           submodules: recursive
       - uses: bnjbvr/cargo-machete@main
+
+  launcher-shellcheck:
+    name: launcher shell syntax check
+    needs: warning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: bash -n run
+        run: bash -n run

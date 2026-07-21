@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Launch the Binance USD-M Perp testnet paper trader, one process per symbol.
+# Launch tikr app bots, one process per config.
 #
 # Usage:
-#   ./run                                 # default BTCUSDT
-#   ./run ETHUSDT                         # single
-#   ./run BTCUSDT,ETHUSDT,SOLUSDT         # multi
+#   ./run                            # use root config.toml
+#   ./run config/foo.toml            # single config
+#   ./run config/a.toml,config/b.toml  # multi-config
 #
-# Logs land at /tmp/tikr_paper_<SYM>.log. Ctrl-C kills all children.
+# Logs land at a private mode-0700 temp directory. Ctrl-C kills all children.
 
 set -euo pipefail
+umask 077
 
 cd "$(dirname "$(readlink -f "$0")")"
 
@@ -20,21 +21,40 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-SYMBOLS_ARG="${1:-BTCUSDT}"
-IFS=',' read -ra SYMBOLS <<< "$SYMBOLS_ARG"
+# Resolve config path(s).
+# Usage: ./run [config1.toml[,config2.toml,...]]
+# Default: root config.toml.
+if [[ $# -ge 1 ]]; then
+  IFS=',' read -ra CONFIGS <<< "$1"
+else
+  CONFIGS=("config.toml")
+  echo "==> no config specified; using ${CONFIGS[0]}"
+fi
 
-# Single notional target — run_perp auto-bumps to clear per-symbol
-# minNotional × 1.2 buffer from cached exchangeInfo (no manual table).
-NOTIONAL="${TIKR_NOTIONAL:-25}"
+for cfg in "${CONFIGS[@]}"; do
+  cfg_clean="${cfg// /}"
+  if [[ -z "$cfg_clean" || ! -f "$cfg_clean" ]]; then
+    echo "Config not found: ${cfg_clean:-<empty>}" >&2
+    exit 1
+  fi
+done
 
-echo "==> building (release) ..."
-cargo build --release --example run_perp -p tikr-binance
+echo "==> building tikr (release) ..."
+cargo build --release -p tikr
 
-# Force colored tracing output to log files.
 export RUST_LOG="${RUST_LOG:-info}"
 export RUST_LOG_STYLE=always
 
+# Private log directory. mktemp creates it atomically with an unpredictable name.
+LOG_PARENT="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+if [[ ! -d "$LOG_PARENT" || ! -w "$LOG_PARENT" ]]; then
+  LOG_PARENT="/tmp"
+fi
+LOG_DIR=$(mktemp -d "${LOG_PARENT%/}/tikr.XXXXXXXX")
+chmod 0700 "$LOG_DIR"
+
 declare -a PIDS=()
+declare -a LOGS=()
 
 cleanup() {
   echo
@@ -43,30 +63,30 @@ cleanup() {
     kill -INT "$pid" 2>/dev/null || true
   done
   wait
+  echo "==> logs retained at ${LOG_DIR}"
   echo "==> done."
 }
-trap cleanup INT TERM
+trap 'cleanup; exit 130' INT TERM
 
-for sym in "${SYMBOLS[@]}"; do
-  sym_clean="${sym// /}"
-  [[ -z "$sym_clean" ]] && continue
-  log="/tmp/tikr_paper_${sym_clean}.log"
-  echo "==> launching ${sym_clean} (notional=\$${NOTIONAL}, log: ${log})"
-  cargo run --release --example run_perp -p tikr-binance -- \
-    --env futures-testnet \
-    --symbol "${sym_clean}" \
-    --strategy layered-grid \
-    --lg-notional "${NOTIONAL}" \
-    --minutes 0 \
+for cfg in "${CONFIGS[@]}"; do
+  cfg_clean="${cfg// /}"
+  [[ -z "$cfg_clean" ]] && continue
+  # Derive a short label from the config filename.
+  label=$(basename "$cfg_clean" .toml)
+  log="${LOG_DIR}/${label}.log"
+  LOGS+=("$log")
+  echo "==> launching ${label} (config: ${cfg_clean}, log: ${log})"
+  cargo run --release -p tikr -- \
+    --config "$cfg_clean" \
+    --headless \
     > "${log}" 2>&1 &
   PIDS+=($!)
 done
 
-echo "==> ${#PIDS[@]} trader(s) running. Tailing status lines (Ctrl-C to stop)."
+echo "==> ${#PIDS[@]} bot(s) running. Tailing logs (Ctrl-C to stop)."
 echo
 
-# Tail status lines across all symbols. Filters for the periodic
-# tikr_paper::status events so logs stay readable.
-tail -F -n 0 /tmp/tikr_paper_*.log | grep --line-buffered -E "status|fill |WARN|ERROR"
+# Tail the explicitly-named log files (no wildcard).
+tail -F "${LOGS[@]}" -n 0 2>/dev/null | grep --line-buffered -E "status|fill |WARN|ERROR" || true
 
-wait
+cleanup 0
