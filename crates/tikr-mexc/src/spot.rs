@@ -34,10 +34,6 @@ fn network_err(e: reqwest::Error) -> VenueError {
     VenueError::Network(std::io::Error::other(e.to_string()))
 }
 
-fn internal_err(e: reqwest::Error) -> VenueError {
-    VenueError::Internal(Box::new(e))
-}
-
 /// MEXC returns errors as `{"code": N, "msg": "..."}`. Map to VenueError.
 fn try_parse_error(body: &Value) -> Option<VenueError> {
     let code = body.get("code").and_then(Value::as_i64)?;
@@ -51,6 +47,63 @@ fn try_parse_error(body: &Value) -> Option<VenueError> {
     Some(VenueError::Rejected {
         reason: format!("mexc error (code {code}): {msg}"),
     })
+}
+
+/// Inspect HTTP response status before parsing JSON.
+///
+/// - 418/429 → [`VenueError::RateLimited`] with `retry_after_ms` parsed from
+///   the `Retry-After` header (delta-seconds). Falls back to 1000 ms when the
+///   header is absent or invalid.
+/// - Other non-2xx → [`VenueError::Rejected`] with the HTTP status code and
+///   a bounded (≤512 B) body excerpt.
+/// - 2xx → JSON [`Value`] parsed from the response body.
+async fn check_response(resp: reqwest::Response) -> Result<Value, VenueError> {
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| VenueError::Network(std::io::Error::other(e.to_string())))?;
+    check_response_impl(status, retry_after.as_deref(), &body)
+}
+
+/// Pure-logic half of [`check_response`]; testable without HTTP.
+fn check_response_impl(
+    status: u16,
+    retry_after: Option<&str>,
+    body: &[u8],
+) -> Result<Value, VenueError> {
+    if status == 429 || status == 418 {
+        let retry_after_ms = retry_after
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| secs * 1000)
+            .unwrap_or(1000);
+        return Err(VenueError::RateLimited { retry_after_ms });
+    }
+
+    if !(200..300).contains(&status) {
+        let text = String::from_utf8_lossy(body);
+        let context = if text.len() > 512 {
+            let end = text
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= 512)
+                .last()
+                .unwrap_or(0);
+            format!("{}...", &text[..end])
+        } else {
+            text.to_string()
+        };
+        return Err(VenueError::Rejected {
+            reason: format!("HTTP {status}: {context}"),
+        });
+    }
+
+    serde_json::from_slice(body).map_err(|e| VenueError::Internal(Box::new(e)))
 }
 
 /// Place a LIMIT order on MEXC Spot.
@@ -96,14 +149,7 @@ pub async fn place_limit_order(
         .await
         .map_err(network_err)?;
 
-    let status = resp.status();
-    if status.as_u16() == 429 || status.as_u16() == 418 {
-        return Err(VenueError::RateLimited {
-            retry_after_ms: 1000,
-        });
-    }
-
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -146,7 +192,7 @@ pub async fn cancel_order(
         .send()
         .await
         .map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     // MEXC returns -2011 / -2013 for already-gone orders. Treat as success.
     if let Some(code) = body.get("code").and_then(Value::as_i64)
         && (code == -2011 || code == -2013)
@@ -180,7 +226,7 @@ pub async fn cancel_all_orders(
         .await
         .map_err(network_err)?;
     // Response is an array of cancelled orders OR an error object.
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     if body.is_object()
         && let Some(e) = try_parse_error(&body)
     {
@@ -200,7 +246,7 @@ pub async fn get_book_ticker(
 ) -> Result<SpotBookTicker, VenueError> {
     let url = format!("{base_url}/api/v3/ticker/bookTicker?symbol={symbol}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -236,7 +282,7 @@ pub async fn get_balance(
         .send()
         .await
         .map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -295,7 +341,7 @@ pub async fn get_open_orders(
         .send()
         .await
         .map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     if body.is_object()
         && let Some(e) = try_parse_error(&body)
     {
@@ -365,7 +411,7 @@ pub async fn get_symbol_filters(
 ) -> Result<SymbolFilters, VenueError> {
     let url = format!("{base_url}/api/v3/exchangeInfo?symbol={symbol}");
     let resp = http.get(&url).send().await.map_err(network_err)?;
-    let body: Value = resp.json().await.map_err(internal_err)?;
+    let body = check_response(resp).await?;
     if let Some(e) = try_parse_error(&body) {
         return Err(e);
     }
@@ -409,4 +455,140 @@ pub async fn get_symbol_filters(
         min_notional: quote_amount_precision,
         min_qty: base_size_precision,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── check_response_impl ──────────────────────────────────────────
+
+    #[test]
+    fn response_200_ok() {
+        let val = check_response_impl(200, None, br#"{"key": "value"}"#).unwrap();
+        assert_eq!(val["key"], "value");
+    }
+
+    #[test]
+    fn response_200_array_ok() {
+        let val = check_response_impl(200, None, b"[1, 2, 3]").unwrap();
+        assert!(val.is_array());
+    }
+
+    #[test]
+    fn response_429_no_header() {
+        let err = check_response_impl(429, None, b"too many").unwrap_err();
+        assert!(
+            matches!(&err, VenueError::RateLimited { retry_after_ms } if *retry_after_ms == 1000),
+            "expected RateLimited(1000), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn response_429_with_header() {
+        let err = check_response_impl(429, Some("30"), b"too many").unwrap_err();
+        assert!(
+            matches!(&err, VenueError::RateLimited { retry_after_ms } if *retry_after_ms == 30000),
+            "expected RateLimited(30000), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn response_418_with_header() {
+        let err = check_response_impl(418, Some("60"), b"banned").unwrap_err();
+        assert!(
+            matches!(&err, VenueError::RateLimited { retry_after_ms } if *retry_after_ms == 60000),
+            "expected RateLimited(60000), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn response_429_invalid_retry_after_falls_back() {
+        let err = check_response_impl(429, Some("not-a-number"), b"").unwrap_err();
+        assert!(
+            matches!(&err, VenueError::RateLimited { retry_after_ms } if *retry_after_ms == 1000),
+            "expected RateLimited(1000), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn response_500_non_json() {
+        let err = check_response_impl(500, None, b"Internal Server Error").unwrap_err();
+        assert!(
+            matches!(&err, VenueError::Rejected { reason } if reason.contains("500") && reason.contains("Internal Server Error"))
+        );
+    }
+
+    #[test]
+    fn response_400_json_body() {
+        // Non-2xx with a JSON body → Rejected with HTTP status + body excerpt.
+        let err = check_response_impl(400, None, br#"{"code": -2001, "msg": "bad"}"#).unwrap_err();
+        assert!(
+            matches!(&err, VenueError::Rejected { reason } if reason.contains("400") && reason.contains("-2001"))
+        );
+    }
+
+    #[test]
+    fn response_long_body_truncated() {
+        let long = "x".repeat(600);
+        let err = check_response_impl(500, None, long.as_bytes()).unwrap_err();
+        match &err {
+            VenueError::Rejected { reason } => {
+                assert!(
+                    reason.contains("..."),
+                    "long body should be truncated: {reason}"
+                );
+                assert!(
+                    reason.len() < 600 + 50,
+                    "truncated reason too long: {}",
+                    reason.len()
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_utf8_body_truncated_on_char_boundary() {
+        let body = format!("{}é", "x".repeat(511));
+        let err = check_response_impl(500, None, body.as_bytes()).unwrap_err();
+        assert!(
+            matches!(err, VenueError::Rejected { reason } if reason.contains("...") && reason.contains(&"x".repeat(511)))
+        );
+    }
+
+    // ── try_parse_error ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_err_code_200_is_ok() {
+        let body: Value = serde_json::from_str(r#"{"code": 200, "msg": "ok"}"#).unwrap();
+        assert!(try_parse_error(&body).is_none());
+    }
+
+    #[test]
+    fn parse_err_code_0_is_ok() {
+        let body: Value = serde_json::from_str(r#"{"code": 0, "msg": "success"}"#).unwrap();
+        assert!(try_parse_error(&body).is_none());
+    }
+
+    #[test]
+    fn parse_err_rejected() {
+        let body: Value =
+            serde_json::from_str(r#"{"code": -2011, "msg": "order not found"}"#).unwrap();
+        let err = try_parse_error(&body).unwrap();
+        assert!(matches!(&err, VenueError::Rejected { reason } if reason.contains("-2011")));
+    }
+
+    #[test]
+    fn parse_err_no_code() {
+        let body: Value = serde_json::from_str(r#"{"foo": "bar"}"#).unwrap();
+        assert!(try_parse_error(&body).is_none());
+    }
+
+    #[test]
+    fn parse_err_no_msg() {
+        let body: Value = serde_json::from_str(r#"{"code": -1001}"#).unwrap();
+        let err = try_parse_error(&body).unwrap();
+        assert!(matches!(&err, VenueError::Rejected { reason } if reason.contains("(no msg)")));
+    }
 }
