@@ -55,7 +55,7 @@ use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tikr_core::{Decimal, Fill, MarketEvent, Position, Price, Side, Size, Snapshot, Symbol};
-use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
+use tikr_venue::{OpenOrder, QuoteId, QuoteIntent, Venue, VenueError};
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -325,6 +325,23 @@ impl Venue for Hyperliquid {
         let exchange = self.require_exchange()?;
         let coin = symbol.base.0.as_ref();
         exchange.cancel_all(coin).await
+    }
+
+    /// Return the currently-resting orders for `symbol`.
+    ///
+    /// Authoritative source for the runner's open-order reconciliation: because
+    /// `fill_from_user_fill` conservatively marks fills as partial, orders are
+    /// only dropped from local state once this confirms them absent from the
+    /// venue. Requires `user_address`; without it the trait default (empty) can
+    /// never gate reconciliation correctly, so we error instead.
+    async fn open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrder>, VenueError> {
+        let Some(user) = self.config.user_address.as_deref() else {
+            return Err(VenueError::Rejected {
+                reason: "open_orders() requires HyperliquidConfig::user_address".into(),
+            });
+        };
+        let client = client::HyperliquidClient::new(self.config.env);
+        client.open_orders(symbol, user).await
     }
 
     /// Close the current position with a marketable IOC order and

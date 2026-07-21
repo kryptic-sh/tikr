@@ -9,7 +9,7 @@ use crate::messages::*;
 use reqwest::Client as HttpClient;
 use serde_json::json;
 use tikr_core::{Fill, Position, Snapshot, Symbol};
-use tikr_venue::VenueError;
+use tikr_venue::{OpenOrder, VenueError};
 
 pub(crate) struct HyperliquidClient {
     http: HttpClient,
@@ -79,6 +79,33 @@ impl HyperliquidClient {
                 f.coin.eq_ignore_ascii_case(coin) && f.time.saturating_mul(1_000_000) >= since_ts
             })
             .map(fill_from_user_fill)
+            .collect())
+    }
+
+    /// Fetch the user's currently-resting orders for `symbol`.
+    ///
+    /// Queries the account-wide `openOrders` list and filters to the requested
+    /// coin before mapping — mirroring [`user_fills_since`](Self::user_fills_since),
+    /// the account response is not symbol-scoped.
+    pub(crate) async fn open_orders(
+        &self,
+        symbol: &Symbol,
+        user: &str,
+    ) -> Result<Vec<OpenOrder>, VenueError> {
+        let coin = symbol.base.0.as_ref();
+        let body = json!({ "type": "openOrders", "user": user });
+        let resp = self
+            .http
+            .post(&self.info_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(network_err)?;
+        let entries: Vec<OpenOrderEntry> = resp.json().await.map_err(internal_err)?;
+        Ok(entries
+            .iter()
+            .filter(|e| e.coin.eq_ignore_ascii_case(coin))
+            .map(|e| open_order_from_entry(symbol, e))
             .collect())
     }
 }

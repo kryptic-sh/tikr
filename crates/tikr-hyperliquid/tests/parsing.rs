@@ -2,7 +2,7 @@
 //! [`tikr_hyperliquid::mapping`]. No network, no async runtime.
 
 use std::fs;
-use tikr_core::{Asset, Decimal, MarketEvent, MarketKind, Side, Symbol, VenueId};
+use tikr_core::{Asset, Decimal, MarketEvent, MarketKind, QuoteId, Side, Symbol, Uuid, VenueId};
 use tikr_hyperliquid::mapping::*;
 use tikr_hyperliquid::messages::*;
 
@@ -233,6 +233,73 @@ fn maps_user_fill_mixed_coin_filter() {
     // No SOL fills exist
     let sol_fills: Vec<&UserFillEntry> = entries.iter().filter(|f| f.coin == "SOL").collect();
     assert!(sol_fills.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// openOrders
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parses_open_orders_response() {
+    let txt = load("open_orders.json");
+    let entries: Vec<OpenOrderEntry> = serde_json::from_str(&txt).expect("parse");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].coin, "BTC");
+    assert_eq!(entries[0].oid, 12345);
+    assert_eq!(entries[0].limit_px, "59000.0");
+}
+
+#[test]
+fn maps_open_order_fields() {
+    let txt = load("open_orders.json");
+    let entries: Vec<OpenOrderEntry> = serde_json::from_str(&txt).unwrap();
+    let sym = btc_symbol();
+
+    // entries[0]: BTC bid, remaining 0.05 @ 59000.
+    let bid = open_order_from_entry(&sym, &entries[0]);
+    assert_eq!(bid.side, Side::Bid);
+    assert_eq!(bid.price.0, Decimal::from_str_exact("59000.0").unwrap());
+    assert_eq!(bid.size.0, Decimal::from_str_exact("0.05").unwrap());
+    assert_eq!(bid.symbol, sym);
+
+    // entries[1]: BTC ask.
+    let ask = open_order_from_entry(&sym, &entries[1]);
+    assert_eq!(ask.side, Side::Ask);
+    assert_eq!(ask.price.0, Decimal::from_str_exact("61000.0").unwrap());
+}
+
+#[test]
+fn open_order_id_derives_from_oid() {
+    let txt = load("open_orders.json");
+    let entries: Vec<OpenOrderEntry> = serde_json::from_str(&txt).unwrap();
+    let sym = btc_symbol();
+
+    // The id MUST equal quote_id_from_oid(oid) so the runner's reconciliation
+    // can match resting orders against locally-tracked quotes.
+    let order = open_order_from_entry(&sym, &entries[0]);
+    let expected = QuoteId::from_uuid(Uuid::from_u128(12345u128));
+    assert_eq!(order.id, expected);
+
+    // Distinct oid → distinct id.
+    let other = open_order_from_entry(&sym, &entries[1]);
+    assert_ne!(order.id, other.id);
+}
+
+#[test]
+fn open_order_id_matches_fill_quote_id_for_same_oid() {
+    // A resting order and a fill sharing the same oid must map to the same
+    // QuoteId — otherwise reconciliation would treat a still-resting order as
+    // a ghost and wipe it. user_fills entries[0] and open_orders entries[0]
+    // both carry oid 12345.
+    let of_txt = load("open_orders.json");
+    let of_entries: Vec<OpenOrderEntry> = serde_json::from_str(&of_txt).unwrap();
+    let uf_txt = load("user_fills.json");
+    let uf_entries: Vec<UserFillEntry> = serde_json::from_str(&uf_txt).unwrap();
+
+    assert_eq!(of_entries[0].oid, uf_entries[0].oid, "fixtures share oid");
+    let order = open_order_from_entry(&btc_symbol(), &of_entries[0]);
+    let fill = fill_from_user_fill(&uf_entries[0]);
+    assert_eq!(order.id, fill.quote_id);
 }
 
 #[test]

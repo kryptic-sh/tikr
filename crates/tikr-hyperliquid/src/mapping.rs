@@ -18,12 +18,14 @@
 //! [`tikr_core::MarketEvent::Trade::side`] carries the aggressor side; for
 //! [`Fill`] the user's own side is preserved, also using B → Bid / A → Ask.
 
+use crate::exchange::quote_id_from_oid;
 use crate::messages::*;
 use std::str::FromStr;
 use tikr_core::{
     Asset, Decimal, Fill, Level, MarketEvent, Notional, Position, Price, QuoteId, SignedSize, Size,
     Snapshot, Symbol, Timestamp, Uuid,
 };
+use tikr_venue::OpenOrder;
 use tracing::warn;
 
 /// Parse a decimal string defensively. Returns `Decimal::ZERO` on failure.
@@ -91,6 +93,23 @@ pub fn trade_to_event(symbol: &Symbol, t: &TradePush) -> MarketEvent {
         size: Size(parse_decimal(&t.sz, "trade.sz")),
         side,
         ts: Timestamp(ms_to_ns(t.time)),
+    }
+}
+
+/// Convert an `openOrders` entry to an [`OpenOrder`].
+///
+/// The `id` is derived from the venue `oid` via [`quote_id_from_oid`] so it
+/// matches the `QuoteId` returned by [`Venue::quote`][tikr_venue::Venue::quote]
+/// — this is what lets the runner's open-order reconciliation match resting
+/// orders against locally-tracked quotes. Per-coin filtering happens upstream
+/// in [`HyperliquidClient::open_orders`](crate::client::HyperliquidClient::open_orders).
+pub fn open_order_from_entry(symbol: &Symbol, e: &OpenOrderEntry) -> OpenOrder {
+    OpenOrder {
+        id: quote_id_from_oid(e.oid),
+        symbol: symbol.clone(),
+        side: side_from_str(&e.side),
+        price: Price(parse_decimal(&e.limit_px, "openOrder.limitPx")),
+        size: Size(parse_decimal(&e.sz, "openOrder.sz")),
     }
 }
 

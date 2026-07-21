@@ -188,3 +188,23 @@ pub struct UserFillEntry {
     /// Venue-side order id; mapped into [`tikr_core::QuoteId`].
     pub oid: u64,
 }
+
+/// One entry in the `openOrders` info response.
+///
+/// Hyperliquid returns the currently-resting orders for a user. `sz` is the
+/// *remaining* size (partials show the unfilled remainder); `limitPx` is the
+/// resting price; `side` follows the B/A convention (`"B"` = bid, `"A"` = ask).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenOrderEntry {
+    /// Hyperliquid coin (base asset the order rests on).
+    pub coin: String,
+    /// Resting limit price (decimal as string).
+    pub limit_px: String,
+    /// Remaining size (decimal as string).
+    pub sz: String,
+    /// Order side: `"B"` = bid, `"A"` = ask.
+    pub side: String,
+    /// Venue-side order id; mapped into [`tikr_core::QuoteId`].
+    pub oid: u64,
+}

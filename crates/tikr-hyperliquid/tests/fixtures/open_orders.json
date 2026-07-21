@@ -1,0 +1,5 @@
+[
+  { "coin": "BTC", "limitPx": "59000.0", "sz": "0.05", "side": "B", "oid": 12345 },
+  { "coin": "BTC", "limitPx": "61000.0", "sz": "0.2", "side": "A", "oid": 67890 },
+  { "coin": "ETH", "limitPx": "3000.0", "sz": "1.0", "side": "B", "oid": 99999 }
+]
