@@ -1008,6 +1008,7 @@ async fn main() -> anyhow::Result<()> {
             bagboy_cfg,
             shared_state.clone(),
             global_shutdown_rx.clone(),
+            base_state_dir.clone(),
         ));
     }
     if let Some(auto) = cfg.rampage.clone().filter(|c| c.enabled) {

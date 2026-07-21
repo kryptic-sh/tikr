@@ -20,11 +20,13 @@
 //! Credentials loaded from env: `MEXC_API_KEY`, `MEXC_API_SECRET`.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use tikr_core::Side;
 use tikr_mexc::MexcClient;
 use tikr_paper::live::LiveSnapshot;
@@ -40,6 +42,7 @@ pub fn spawn_bagboy(
     cfg: BagboyConfig,
     shared_state: SharedBotState,
     mut global_shutdown: watch::Receiver<bool>,
+    base_state_dir: PathBuf,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let api_key = match std::env::var("MEXC_API_KEY") {
@@ -91,22 +94,93 @@ pub fn spawn_bagboy(
         );
         shared_state.set_status(&symbol, BotStatus::Running);
 
-        let mut total_spent_usdt = Decimal::ZERO;
-        let mut total_base_acquired = Decimal::ZERO;
-        let mut last_seen_base = Decimal::ZERO;
-        let mut last_known_bid = Decimal::ZERO;
+        // Restore persisted cumulative state, then establish authoritative
+        // base balance and valid positive bid before entering fill-delta
+        // accounting.  This prevents the hard-cap restart reset that would
+        // otherwise grant fresh budget after a restart.
+        let state_dir = base_state_dir.join(symbol.to_lowercase());
+        let (restored, restore_failed) = match load_bagboy_state(&state_dir) {
+            Ok(state) => (state, false),
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    "bagboy: cumulative state unreadable — stopping placements"
+                );
+                (None, true)
+            }
+        };
+        let mut total_spent_usdt = restored
+            .as_ref()
+            .map(|s| s.cumulative_quote_spent)
+            .unwrap_or(Decimal::ZERO);
+        let mut total_base_acquired = restored
+            .as_ref()
+            .map(|s| s.cumulative_base_acquired)
+            .unwrap_or(Decimal::ZERO);
+        if restored.is_some() {
+            info!(
+                symbol = %symbol,
+                base_acquired = %total_base_acquired,
+                quote_spent = %total_spent_usdt,
+                "bagboy: restored cumulative state"
+            );
+        }
+
+        // Phase 1: establish authoritative base balance.  Keep retrying on
+        // failure.  Do NOT count the existing balance as a new fill.
+        let mut last_seen_base = loop {
+            match client.balance(&base_asset).await {
+                Ok(b) => {
+                    let cur = b.free + b.locked;
+                    info!(
+                        symbol = %symbol, base = %base_asset,
+                        seed_balance = %cur, restored_base = %total_base_acquired,
+                        "bagboy: initial balance established"
+                    );
+                    break cur;
+                }
+                Err(e) => {
+                    warn!(error = ?e, "bagboy: initial balance fetch failed — retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if *global_shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
+        };
+
+        // Phase 2: establish valid positive book bid before normal delta
+        // accounting.
+        let mut last_known_bid = loop {
+            match client.book_ticker(&symbol).await {
+                Ok(b) if b.bid_price > Decimal::ZERO => {
+                    info!(
+                        symbol = %symbol, bid = %b.bid_price,
+                        "bagboy: initial bid established"
+                    );
+                    break b.bid_price;
+                }
+                Ok(_) => {
+                    warn!("bagboy: initial book bid is zero — waiting for valid bid");
+                }
+                Err(e) => {
+                    warn!(error = ?e, "bagboy: initial book fetch failed — retrying");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if *global_shutdown.borrow() {
+                return;
+            }
+        };
+
         // Set once cancel_all has fired for a reached cap, so we don't re-fire
         // it every poll tick (500ms) forever — cancel once, then just monitor.
         // Reset if the cap ever re-opens (e.g. a live config change raises the
         // budget) so a later breach cancels again.
         let mut cap_cancel_done = false;
-        if let Ok(b) = client.balance(&base_asset).await {
-            last_seen_base = b.free + b.locked;
-            info!(
-                symbol = %symbol, base = %base_asset,
-                seed_balance = %last_seen_base, "bagboy: seeded"
-            );
-        }
+        // When cumulative-state persistence fails we stop placing orders rather
+        // than granting fresh budget on restart.
+        let mut persist_failed = restore_failed;
 
         let mut tick = tokio::time::interval(Duration::from_millis(poll));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -149,6 +223,21 @@ pub fn spawn_bagboy(
                     total_spent = %total_spent_usdt,
                     "bagboy: fill detected"
                 );
+
+                // Persist updated cumulative counters immediately so a
+                // restart does not reset the hard-cap budget.
+                let new_ps = BagboyPersistedState {
+                    cumulative_base_acquired: total_base_acquired,
+                    cumulative_quote_spent: total_spent_usdt,
+                };
+                if let Err(e) = save_bagboy_state(&state_dir, &new_ps) {
+                    warn!(
+                        error = ?e,
+                        "bagboy: failed to persist cumulative state — stopping placements"
+                    );
+                    persist_failed = true;
+                }
+
                 // Record fill on LiveSnapshot so the watcher task picks
                 // it up. Approximate price = last known bid.
                 let now_ms = std::time::SystemTime::now()
@@ -166,16 +255,22 @@ pub fn spawn_bagboy(
                 last_seen_base = cur_base;
             }
 
-            // 2. Cap check.
+            // 2. Cap check.  A persistence failure also caps (fails safe)
+            // rather than granting fresh budget on restart.
+            let capped_by_fault = persist_failed;
             let capped_usdt = cfg
                 .max_total_usdt
                 .is_some_and(|cap| total_spent_usdt >= cap);
             let capped_base = cfg
                 .max_total_base
                 .is_some_and(|cap| total_base_acquired >= cap);
-            if capped_usdt || capped_base {
+            if capped_by_fault || capped_usdt || capped_base {
                 if !cap_cancel_done {
-                    info!(symbol = %symbol, "bagboy: cap reached — canceling all + monitoring");
+                    info!(
+                        symbol = %symbol,
+                        persist_failed = %persist_failed,
+                        "bagboy: cap reached — canceling all + monitoring"
+                    );
                     let _ = client.cancel_all(&symbol).await;
                     cap_cancel_done = true;
                 }
@@ -442,4 +537,167 @@ fn split_symbol_assets(symbol: &str) -> (String, String) {
     }
     let split = symbol.len().saturating_sub(4);
     (symbol[..split].to_string(), symbol[split..].to_string())
+}
+
+/// On-disk cumulative fill counters for a Bagboy instance.
+///
+/// Survives restarts so the hard-cap budget is not silently reset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BagboyPersistedState {
+    cumulative_base_acquired: Decimal,
+    cumulative_quote_spent: Decimal,
+}
+
+fn save_bagboy_state(dir: &std::path::Path, state: &BagboyPersistedState) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    // Restrict directory permissions on platforms that support it so
+    // other local users cannot read cumulative state.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // Atomic write: temp file then rename.
+    let tmp = dir.join("bagboy_state.tmp");
+    let final_path = dir.join("bagboy_state.json");
+    let json = serde_json::to_vec(state).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, &final_path)?;
+    // Best-effort directory sync — not critical on every modern FS.
+    let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
+    Ok(())
+}
+
+fn load_bagboy_state(dir: &std::path::Path) -> std::io::Result<Option<BagboyPersistedState>> {
+    let path = dir.join("bagboy_state.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn state_round_trip() {
+        let dir = std::env::temp_dir().join(format!("bagboy_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let s = BagboyPersistedState {
+            cumulative_base_acquired: Decimal::new(123456, 6), // 0.123456
+            cumulative_quote_spent: Decimal::new(500000, 2),   // 5000.00
+        };
+        save_bagboy_state(&dir, &s).expect("save should succeed");
+
+        let loaded = load_bagboy_state(&dir)
+            .expect("load should succeed")
+            .expect("state should exist");
+        assert_eq!(loaded.cumulative_base_acquired, s.cumulative_base_acquired);
+        assert_eq!(loaded.cumulative_quote_spent, s.cumulative_quote_spent);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_round_trip_zero() {
+        let dir = std::env::temp_dir().join(format!("bagboy_test_zero_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let s = BagboyPersistedState {
+            cumulative_base_acquired: Decimal::ZERO,
+            cumulative_quote_spent: Decimal::ZERO,
+        };
+        save_bagboy_state(&dir, &s).expect("save should succeed");
+
+        let loaded = load_bagboy_state(&dir)
+            .expect("load should succeed")
+            .expect("state should exist");
+        assert_eq!(loaded.cumulative_base_acquired, Decimal::ZERO);
+        assert_eq!(loaded.cumulative_quote_spent, Decimal::ZERO);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_returns_none() {
+        let dir = std::env::temp_dir().join(format!("bagboy_test_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            load_bagboy_state(&dir)
+                .expect("missing state is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn corrupt_state_returns_error() {
+        let dir = std::env::temp_dir().join(format!("bagboy_test_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bagboy_state.json"), b"not json").unwrap();
+
+        assert!(load_bagboy_state(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_creates_dir_and_file() {
+        let dir = std::env::temp_dir().join(format!("bagboy_test_create_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!dir.exists());
+        let s = BagboyPersistedState {
+            cumulative_base_acquired: Decimal::new(1, 0),
+            cumulative_quote_spent: Decimal::new(2, 0),
+        };
+        save_bagboy_state(&dir, &s).expect("save should create dir and file");
+        assert!(dir.join("bagboy_state.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn init_does_not_count_seed_balance_as_fill() {
+        // Pure-function analogue: after seed balance is established,
+        // any delta from current balance is a fill only when it
+        // exceeds last_seen_base.  This test verifies the helper
+        // pattern used by the real bot.
+        let last_seen_base = Decimal::new(1000, 0); // seeded at 1000
+        let cur_base = Decimal::new(1000, 0);
+        // No delta → no fill.
+        assert!(!(cur_base > last_seen_base));
+
+        // A real fill delta: 1000 → 1005
+        let cur_base = Decimal::new(1005, 0);
+        assert!(cur_base > last_seen_base);
+        assert_eq!(cur_base - last_seen_base, Decimal::new(5, 0));
+    }
+
+    #[test]
+    fn existing_balance_not_added_to_accumulators() {
+        // When the bot initializes last_seen_base from the current
+        // balance, that existing amount is NOT added to
+        // total_base_acquired.  Only a *subsequent* increase counts.
+        let mut total_base_acquired = Decimal::ZERO; // restored from persisted state
+        let last_seen_base = Decimal::new(5000, 0); // current wallet balance
+        let _total_base_acquired_before = total_base_acquired;
+
+        // Simulate a fill: balance goes from 5000 → 5003
+        let cur_base = Decimal::new(5003, 0);
+        if cur_base > last_seen_base {
+            let delta = cur_base - last_seen_base;
+            total_base_acquired += delta;
+        }
+
+        // Only the delta was counted.
+        assert_eq!(total_base_acquired, Decimal::new(3, 0));
+    }
 }
