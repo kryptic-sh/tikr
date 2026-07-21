@@ -204,6 +204,47 @@ fn user_fill_quote_id_is_stable_for_oid() {
     assert_ne!(a.quote_id, c.quote_id);
 }
 
+#[test]
+fn user_fill_is_full_is_false() {
+    let txt = load("user_fills.json");
+    let entries: Vec<UserFillEntry> = serde_json::from_str(&txt).unwrap();
+    for entry in &entries {
+        let fill = fill_from_user_fill(entry);
+        assert!(
+            !fill.is_full,
+            "userFill should not claim is_full (Hyperliquid does not expose remaining size)"
+        );
+    }
+}
+
+#[test]
+fn maps_user_fill_mixed_coin_filter() {
+    let txt = load("user_fills.json");
+    let entries: Vec<UserFillEntry> = serde_json::from_str(&txt).unwrap();
+    // Fixture has: entries[0] = BTC, entries[1] = ETH
+    let btc_fills: Vec<&UserFillEntry> = entries.iter().filter(|f| f.coin == "BTC").collect();
+    assert_eq!(btc_fills.len(), 1);
+    assert_eq!(btc_fills[0].oid, 12345);
+
+    let eth_fills: Vec<&UserFillEntry> = entries.iter().filter(|f| f.coin == "ETH").collect();
+    assert_eq!(eth_fills.len(), 1);
+    assert_eq!(eth_fills[0].oid, 12346);
+
+    // No SOL fills exist
+    let sol_fills: Vec<&UserFillEntry> = entries.iter().filter(|f| f.coin == "SOL").collect();
+    assert!(sol_fills.is_empty());
+}
+
+#[test]
+fn user_fill_maps_trade_id_for_dedup() {
+    let txt = load("user_fills.json");
+    let entries: Vec<UserFillEntry> = serde_json::from_str(&txt).unwrap();
+    let fill = fill_from_user_fill(&entries[0]);
+    assert_eq!(fill.trade_id, Some(67890));
+    let fill2 = fill_from_user_fill(&entries[1]);
+    assert_eq!(fill2.trade_id, Some(67891));
+}
+
 // ---------------------------------------------------------------------------
 // envelope behavior
 // ---------------------------------------------------------------------------

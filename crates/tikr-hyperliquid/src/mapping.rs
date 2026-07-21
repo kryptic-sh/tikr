@@ -148,10 +148,9 @@ pub fn position_from_clearinghouse(symbol: &Symbol, resp: &ClearinghouseStateRes
 
 /// Convert a `userFills` entry to a [`Fill`].
 ///
-/// The [`Venue::fills_since`][tikr_venue::Venue::fills_since] method signature
-/// does not carry a symbol, and [`Fill`] itself does not embed a symbol — so
-/// this function does not require one. Callers wanting per-symbol filtering
-/// must do it externally using [`UserFillEntry::coin`].
+/// Per-symbol filtering happens upstream in
+/// [`HyperliquidClient::user_fills_since`](crate::client::HyperliquidClient::user_fills_since)
+/// via [`UserFillEntry::coin`] before this mapping runs.
 ///
 /// `oid` (u64) is widened to [`Uuid::from_u128`] to populate
 /// [`QuoteId::from_uuid`]. This gives each Hyperliquid order a stable,
@@ -171,9 +170,9 @@ pub fn fill_from_user_fill(f: &UserFillEntry) -> Fill {
         side,
         ts: Timestamp(ms_to_ns(f.time)),
         // Hyperliquid userFill events don't expose a per-fill remaining-size
-        // status here; conservatively treat each as full. Refine when the
-        // adapter exposes partial-fill metadata.
-        is_full: true,
+        // status. Conservatively mark as partial so reconciliation removes
+        // filled orders only when open-orders API confirms absence.
+        is_full: false,
         // The venue trade id is what `fills_since` reconciliation dedupes
         // against WS-delivered fills — `None` would double-count them.
         trade_id: Some(f.tid),

@@ -298,10 +298,12 @@ impl ExchangeClient {
     // Public API
     // -------------------------------------------------------------------
 
-    /// Place a post-only limit order. Returns the venue-assigned `oid`.
+    /// Place an order with the given parameters. Returns the venue-assigned `oid`.
     ///
-    /// All orders use `Limit` with `tif: "Alo"` (post-only, add-liquidity-only).
-    /// The `cloid` is derived from the provided `quote_id` as a 32-char hex string.
+    /// `tif` can be `"Alo"` (post-only, add-liquidity-only, the default for
+    /// [`Venue::quote`]), `"Ioc"` (immediate-or-cancel, used by
+    /// [`Venue::market_close`]), or others supported by the Hyperliquid API.
+    #[allow(clippy::too_many_arguments)]
     pub async fn place_order(
         &self,
         coin: &str,
@@ -309,6 +311,8 @@ impl ExchangeClient {
         size: Size,
         is_buy: bool,
         quote_id: QuoteId,
+        reduce_only: bool,
+        tif: &'static str,
     ) -> Result<u64, VenueError> {
         self.check_mainnet_gate()?;
 
@@ -330,9 +334,9 @@ impl ExchangeClient {
                 b: is_buy,
                 p: price_str.clone(),
                 s: size_str.clone(),
-                r: false,
+                r: reduce_only,
                 t: WireOrderType {
-                    limit: WireLimit { tif: "Alo" },
+                    limit: WireLimit { tif },
                 },
                 c: cloid,
             }],
@@ -345,6 +349,8 @@ impl ExchangeClient {
             price = %price_str,
             size = %size_str,
             is_buy,
+            reduce_only,
+            tif,
             nonce,
             "placing order"
         );
@@ -954,7 +960,7 @@ pub fn fill_from_user_event(_coin: &str, f: &UserEventFill) -> Fill {
         fee_amount: fee,
         fee_quote: Notional(fee),
         side,
-        is_full: true,
+        is_full: false,
         ts: Timestamp(f.time.saturating_mul(1_000_000)),
         // Venue trade id keeps `fills_since` reconciliation from
         // double-counting fills already applied from this WS event.
@@ -1090,5 +1096,155 @@ mod tests {
             matches!(gate_err, Err(VenueError::Rejected { .. })),
             "expected Rejected when mainnet writes disabled"
         );
+    }
+
+    /// userEvents fill mapping must not claim is_full — Hyperliquid does
+    /// not expose remaining size in the fill payload.
+    #[test]
+    fn user_event_fill_is_partial() {
+        let event = UserEventFill {
+            px: "50000.0".into(),
+            sz: "0.5".into(),
+            side: "B".into(),
+            fee: "0.01".into(),
+            fee_token: "USDC".into(),
+            oid: 999,
+            time: 1_730_000_000_000,
+            tid: 111,
+        };
+        let fill = fill_from_user_event("BTC", &event);
+        assert!(
+            !fill.is_full,
+            "userEvent fill must not claim is_full (Hyperliquid does not expose remaining size)"
+        );
+        assert_eq!(fill.trade_id, Some(111));
+        assert_eq!(fill.side, tikr_core::Side::Bid);
+    }
+
+    /// fill_from_user_event marks ask-side fill correctly.
+    #[test]
+    fn user_event_fill_ask_side() {
+        let event = UserEventFill {
+            px: "3000.0".into(),
+            sz: "1.0".into(),
+            side: "A".into(),
+            fee: "0.03".into(),
+            fee_token: "USDC".into(),
+            oid: 1000,
+            time: 1_730_000_001_000,
+            tid: 222,
+        };
+        let fill = fill_from_user_event("ETH", &event);
+        assert_eq!(fill.side, tikr_core::Side::Ask);
+        assert!(!fill.is_full);
+    }
+
+    /// parse_cancel_response rejects non-idempotent errors.
+    #[test]
+    fn cancel_response_rejects_non_idempotent_errors() {
+        let cases = [
+            (
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"signature verification failed"}]}}}"#,
+                "signature verification failed",
+            ),
+            (
+                r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"insufficient margin"}]}}}"#,
+                "insufficient margin",
+            ),
+        ];
+        for (json_str, expected_reason) in &cases {
+            let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+            let result = parse_cancel_response(&v);
+            match result {
+                Err(VenueError::Rejected { reason }) => {
+                    assert!(
+                        reason.contains(expected_reason),
+                        "expected '{expected_reason}' in '{reason}'"
+                    );
+                }
+                other => panic!("expected Rejected for '{expected_reason}', got {other:?}"),
+            }
+        }
+    }
+
+    /// parse_cancel_response returns Ok for idempotent cancel errors.
+    #[test]
+    fn cancel_response_ok_for_idempotent_errors() {
+        let cases = [
+            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"order not found"}]}}}"#,
+            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"already canceled"}]}}}"#,
+            r#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"never placed"}]}}}"#,
+        ];
+        for json_str in &cases {
+            let v: serde_json::Value = serde_json::from_str(json_str).unwrap();
+            let result = parse_cancel_response(&v);
+            assert!(
+                result.is_ok(),
+                "expected Ok for idempotent cancel: {json_str}"
+            );
+        }
+    }
+
+    /// parse_cancel_response handles outer error status.
+    #[test]
+    fn cancel_response_outer_error_rejected() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"status":"err","response":"invalid nonce"}"#).unwrap();
+        let result = parse_cancel_response(&v);
+        match result {
+            Err(VenueError::Rejected { reason }) => {
+                assert!(reason.contains("invalid nonce"));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    /// market_close price convention: 0 for sell (close long), high for buy (close short).
+    #[test]
+    fn market_close_price_convention() {
+        // Close long (sell) → price 0
+        let ask_price = Price(Decimal::ZERO);
+        assert_eq!(ask_price.0, Decimal::ZERO);
+
+        // Close short (buy) → very high price
+        let buy_price = Price(Decimal::from(1_000_000_000u64));
+        assert!(buy_price.0 > Decimal::from(500_000u64));
+
+        // Both must round-trip through format_decimal without error
+        assert_eq!(ExchangeClient::format_decimal(ask_price.0), "0");
+        assert_eq!(ExchangeClient::format_decimal(buy_price.0), "1000000000");
+    }
+
+    /// WireOrder reduce_only field is correctly mapped.
+    #[test]
+    fn wire_order_reduce_only() {
+        // We can't construct an ExchangeClient (needs network),
+        // but we can verify the WireOrder struct serialization
+        // includes the `r` field in the correct position.
+        let order = WireOrder {
+            a: 0,
+            b: true,
+            p: "50000.0".into(),
+            s: "0.1".into(),
+            r: true,
+            t: WireOrderType {
+                limit: WireLimit { tif: "Ioc" },
+            },
+            c: "0x00000000000000000000000000000001".into(),
+        };
+        let json = serde_json::to_value(&order).unwrap();
+        assert_eq!(json["r"], true);
+        assert_eq!(json["t"]["limit"]["tif"], "Ioc");
+
+        let order_no_reduce = WireOrder {
+            r: false,
+            t: WireOrderType {
+                limit: WireLimit { tif: "Alo" },
+            },
+            ..order
+        };
+        let json = serde_json::to_value(&order_no_reduce).unwrap();
+        assert_eq!(json["r"], false);
+        assert_eq!(json["t"]["limit"]["tif"], "Alo");
     }
 }

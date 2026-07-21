@@ -54,7 +54,7 @@ pub use ws::subscribe_user_events;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use tikr_core::{Fill, MarketEvent, Position, Snapshot, Symbol};
+use tikr_core::{Decimal, Fill, MarketEvent, Position, Price, Side, Size, Snapshot, Symbol};
 use tikr_venue::{QuoteId, QuoteIntent, Venue, VenueError};
 use tracing::warn;
 
@@ -260,31 +260,47 @@ impl Venue for Hyperliquid {
         // oid_from_quote_id(quote_id) == oid is always true.
         let quote_id = QuoteId::new();
         let oid = exchange
-            .place_order(coin, intent.price, intent.size, is_buy, quote_id)
+            .place_order(
+                coin,
+                intent.price,
+                intent.size,
+                is_buy,
+                quote_id,
+                false,
+                "Alo",
+            )
             .await?;
         Ok(quote_id_from_oid(oid))
     }
 
     /// Cancel the old quote, then place a new one.
     ///
-    /// Cancel failures are logged at `warn!` level but do NOT abort the new
-    /// quote placement (the risk gate's `max_fills_per_minute` is the
-    /// canonical backstop for runaway orders).
+    /// Cancel errors propagate: only proceed on a successful or idempotent
+    /// unknown-order cancellation (the [`ExchangeClient`] already maps those
+    /// to `Ok`). Ambiguous failures retain the old local order state for
+    /// reconciliation.
     async fn requote(&self, id: QuoteId, intent: QuoteIntent) -> Result<(), VenueError> {
         let exchange = self.require_exchange()?;
         let coin = intent.symbol.base.0.as_ref();
 
-        // Cancel old.
+        // Cancel old.  Errors propagate — ambiguous cancel failures must not
+        // silently create a duplicate resting order.
         let oid = oid_from_quote_id(id);
-        if let Err(e) = exchange.cancel_order(coin, oid).await {
-            warn!(oid, error = ?e, "requote: cancel failed; proceeding with new quote");
-        }
+        exchange.cancel_order(coin, oid).await?;
 
         // Place new.
         let is_buy = intent.side == tikr_core::Side::Bid;
         let new_quote_id = QuoteId::new();
         exchange
-            .place_order(coin, intent.price, intent.size, is_buy, new_quote_id)
+            .place_order(
+                coin,
+                intent.price,
+                intent.size,
+                is_buy,
+                new_quote_id,
+                false,
+                "Alo",
+            )
             .await?;
         Ok(())
     }
@@ -311,6 +327,30 @@ impl Venue for Hyperliquid {
         exchange.cancel_all(coin).await
     }
 
+    /// Close the current position with a marketable IOC order and
+    /// `reduce_only=true`. Uses price 0 for sells and a sufficiently high
+    /// price for buys to cross the spread immediately, then lets IOC
+    /// cancellation remove any unfilled remainder.
+    async fn market_close(&self, symbol: &Symbol, side: Side, qty: Size) -> Result<(), VenueError> {
+        let exchange = self.require_exchange()?;
+        let coin = symbol.base.0.as_ref();
+        let is_buy = side == Side::Bid;
+
+        // Hyperliquid market order conventions: 0 → market sell,
+        // high price → market buy.
+        let price = if is_buy {
+            Price(Decimal::from(1_000_000_000u64))
+        } else {
+            Price(Decimal::ZERO)
+        };
+
+        let quote_id = QuoteId::new();
+        exchange
+            .place_order(coin, price, qty, is_buy, quote_id, true, "Ioc")
+            .await?;
+        Ok(())
+    }
+
     async fn position(&self, symbol: &Symbol) -> Result<Position, VenueError> {
         let Some(user) = self.config.user_address.as_deref() else {
             return Err(VenueError::Rejected {
@@ -321,13 +361,14 @@ impl Venue for Hyperliquid {
         client.position(symbol, user).await
     }
 
-    async fn fills_since(&self, _symbol: &Symbol, since_ts: u64) -> Result<Vec<Fill>, VenueError> {
+    async fn fills_since(&self, symbol: &Symbol, since_ts: u64) -> Result<Vec<Fill>, VenueError> {
         let Some(user) = self.config.user_address.as_deref() else {
             return Err(VenueError::Rejected {
                 reason: "fills_since() requires HyperliquidConfig::user_address".into(),
             });
         };
         let client = client::HyperliquidClient::new(self.config.env);
-        client.user_fills_since(user, since_ts).await
+        let coin = symbol.base.0.as_ref();
+        client.user_fills_since(user, coin, since_ts).await
     }
 }

@@ -61,6 +61,7 @@ impl HyperliquidClient {
     pub(crate) async fn user_fills_since(
         &self,
         user: &str,
+        coin: &str,
         since_ts: u64,
     ) -> Result<Vec<Fill>, VenueError> {
         let body = json!({ "type": "userFills", "user": user });
@@ -74,7 +75,9 @@ impl HyperliquidClient {
         let entries: Vec<UserFillEntry> = resp.json().await.map_err(internal_err)?;
         Ok(entries
             .iter()
-            .filter(|f| f.time.saturating_mul(1_000_000) >= since_ts)
+            .filter(|f| {
+                f.coin.eq_ignore_ascii_case(coin) && f.time.saturating_mul(1_000_000) >= since_ts
+            })
             .map(fill_from_user_fill)
             .collect())
     }

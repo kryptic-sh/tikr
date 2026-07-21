@@ -231,18 +231,19 @@ pub trait Venue: Send + Sync {
     }
 
     /// Close the current position on `symbol` with a market order.
-    /// Default uses an IOC limit at the worst price (0 or max) as a fallback.
-    async fn market_close(&self, symbol: &Symbol, side: Side, qty: Size) -> Result<(), VenueError> {
-        let intent = QuoteIntent {
-            symbol: symbol.clone(),
-            side,
-            price: Price(tikr_core::Decimal::ZERO),
-            size: qty,
-            tif: TimeInForce::IOC,
-            kind: QuoteKind::Point,
-        };
-        let _ = self.quote(intent).await?;
-        Ok(())
+    /// Venues without a native market-order API should override this with a
+    /// venue-specific implementation (e.g. IOC limit at an aggressive price).
+    /// The default returns [`VenueError::Rejected`] — it must not silently
+    /// place a zero-priced order that any sane venue will reject.
+    async fn market_close(
+        &self,
+        _symbol: &Symbol,
+        _side: Side,
+        _qty: Size,
+    ) -> Result<(), VenueError> {
+        Err(VenueError::Rejected {
+            reason: "market_close not supported by this venue".to_string(),
+        })
     }
 
     /// Place a reduce-only, post-only LIMIT order on `symbol` — a passive maker
