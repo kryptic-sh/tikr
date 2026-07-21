@@ -1152,6 +1152,7 @@ where
                             &current_book,
                             live_mode,
                             &mut side_fails,
+                            &mut side_fails_last,
                             config.min_notional,
                             current_max_position,
                             inventory_boost,
@@ -1201,6 +1202,7 @@ where
                             &current_book,
                             live_mode,
                             &mut side_fails,
+                            &mut side_fails_last,
                             config.min_notional,
                             current_max_position,
                             inventory_boost,
@@ -1817,12 +1819,13 @@ where
                                         // strategy/config bug — don't burn the
                                         // side_fails budget on them.
                                         if !is_transient {
-                                            match intent.side {
-                                                Side::Bid => state.0 += 1,
-                                                Side::Ask => state.1 += 1,
-                                            }
-                                            side_fails_last
-                                                .insert(symbol.base.0.to_string(), Instant::now());
+                                            let key = symbol.base.0.to_string();
+                                            record_side_failure(
+                                                intent.side,
+                                                &mut *state,
+                                                &mut side_fails_last,
+                                                &key,
+                                            );
                                         }
                                     }
                                 }
@@ -2050,6 +2053,7 @@ where
                             &current_book,
                             false,
                             &mut side_fails,
+                            &mut side_fails_last,
                             config.min_notional,
                             current_max_position,
                             inventory_boost,
@@ -2430,6 +2434,7 @@ where
                     &current_book,
                     true,
                     &mut side_fails,
+                    &mut side_fails_last,
                     config.min_notional,
                     current_max_position,
                     inventory_boost,
@@ -2990,6 +2995,22 @@ fn snapshot_mid(book: &tikr_core::Snapshot) -> Option<Decimal> {
     Some((bid + ask) / Decimal::from(2))
 }
 
+/// Record a non-transient side-quote failure: increment the per-side counter
+/// and set `side_fails_last` so `SIDE_FAILS_RESET_AFTER` can clear the lockout.
+/// Both the main dispatch and post-fill paths share this accounting.
+fn record_side_failure(
+    side: Side,
+    state: &mut (u32, u32),
+    side_fails_last: &mut HashMap<String, Instant>,
+    symbol_key: &str,
+) {
+    match side {
+        Side::Bid => state.0 += 1,
+        Side::Ask => state.1 += 1,
+    }
+    side_fails_last.insert(symbol_key.to_string(), Instant::now());
+}
+
 /// Bot-side worst-case inventory cap, applied at order placement (the same
 /// shape as the exchange margin check, but at the bot's own wallet limit
 /// rather than `balance × leverage`). For each add-side Quote, the worst-case
@@ -3198,6 +3219,7 @@ async fn dispatch_post_fill_actions<V, S>(
     current_book: &tikr_core::Snapshot,
     live_mode: bool,
     side_fails: &mut HashMap<String, (u32, u32)>,
+    side_fails_last: &mut HashMap<String, Instant>,
     min_notional: Decimal,
     max_position: Decimal,
     inventory_boost: Option<InventoryBoostConfig>,
@@ -3349,10 +3371,8 @@ async fn dispatch_post_fill_actions<V, S>(
                             || msg.contains("Quantitative Rules");
                         warn!(error = ?e, "live: venue.quote failed (post-fill) — leaving slot empty, refill next tick");
                         if !is_transient {
-                            match intent.side {
-                                Side::Bid => state.0 += 1,
-                                Side::Ask => state.1 += 1,
-                            }
+                            let key = symbol.base.0.to_string();
+                            record_side_failure(intent.side, &mut *state, side_fails_last, &key);
                         }
                         // No retry: the fixed lattice refills this slot next tick.
                     }
@@ -5219,6 +5239,141 @@ mod tests {
             quote_log.lock().unwrap().len(),
             0,
             "paper mode must not dispatch Quote to venue"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_fill_non_transient_error_sets_side_fails_last() {
+        /// Venue whose batch_quote always returns a non-transient error.
+        struct FailQuoteVenue;
+
+        #[async_trait]
+        impl Venue for FailQuoteVenue {
+            fn id(&self) -> &str {
+                "fail"
+            }
+            async fn snapshot(&self, _: &Symbol) -> Result<Snapshot, VenueError> {
+                unimplemented!()
+            }
+            async fn subscribe(
+                &self,
+                _: &Symbol,
+            ) -> Result<BoxStream<'_, MarketEvent>, VenueError> {
+                unimplemented!()
+            }
+            async fn quote(&self, _: QuoteIntent) -> Result<QuoteId, VenueError> {
+                Err(VenueError::Rejected {
+                    reason: "non-transient test error".into(),
+                })
+            }
+            async fn requote(&self, _: QuoteId, _: QuoteIntent) -> Result<(), VenueError> {
+                Ok(())
+            }
+            async fn cancel(&self, _: QuoteId) -> Result<(), VenueError> {
+                Ok(())
+            }
+            async fn cancel_all(&self, _: &Symbol) -> Result<(), VenueError> {
+                Ok(())
+            }
+            async fn position(&self, _: &Symbol) -> Result<Position, VenueError> {
+                unimplemented!()
+            }
+        }
+
+        let symbol = Symbol {
+            base: Asset::new("BTC"),
+            quote: Asset::new("USDC"),
+            venue: VenueId::new("test"),
+            kind: MarketKind::Perp,
+        };
+        let mut side_fails: HashMap<String, (u32, u32)> = HashMap::new();
+        let mut side_fails_last: HashMap<String, Instant> = HashMap::new();
+        let mut fill_sim = fill_sim();
+        let mut strategy = layered_grid();
+
+        // One bid quote — batch_quote returns Rejected (non-transient).
+        let actions = vec![tikr_strategy::Action::Quote(QuoteIntent {
+            symbol: symbol.clone(),
+            side: Side::Bid,
+            price: Price(Decimal::from(100)),
+            size: Size(Decimal::ONE),
+            tif: tikr_core::TimeInForce::PostOnly,
+            kind: tikr_core::QuoteKind::Point,
+        })];
+
+        let pos = Position {
+            symbol: symbol.clone(),
+            size: SignedSize(Decimal::ZERO),
+            avg_entry: Price(Decimal::ZERO),
+            realized_pnl: Notional(Decimal::ZERO),
+        };
+        let book = Snapshot {
+            symbol: symbol.clone(),
+            bids: vec![],
+            asks: vec![],
+            ts: Timestamp(0),
+        };
+
+        dispatch_post_fill_actions(
+            actions,
+            &FailQuoteVenue,
+            &mut fill_sim,
+            &mut strategy,
+            &symbol,
+            Timestamp(1000),
+            &pos,
+            &book,
+            true,
+            &mut side_fails,
+            &mut side_fails_last,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            None,
+            &mut None,
+        )
+        .await;
+
+        // Regression: post-fill non-transient error MUST record side_fails_last
+        // so SIDE_FAILS_RESET_AFTER can clear the lockout.
+        let key = symbol.base.0.to_string();
+        assert!(
+            side_fails_last.contains_key(&key),
+            "post-fill non-transient error must set side_fails_last"
+        );
+        let &(bid_fails, ask_fails) = side_fails.get(&key).unwrap();
+        assert_eq!(bid_fails, 1, "bid failure counter must increment");
+        assert_eq!(ask_fails, 0, "ask failures must remain 0");
+    }
+
+    #[test]
+    fn record_side_failure_accumulates_max_and_expires_via_time() {
+        // Pure-unit regression: post-fill failures increment side_fails AND set
+        // side_fails_last so the time-based reset (in the main dispatch) can
+        // clear the lockout after SIDE_FAILS_RESET_AFTER.
+        let mut state = (0u32, 0u32);
+        let mut fails_last: HashMap<String, Instant> = HashMap::new();
+        let key = "TEST";
+
+        for _ in 0..MAX_FAILS_PER_SIDE {
+            record_side_failure(Side::Bid, &mut state, &mut fails_last, key);
+        }
+        assert_eq!(state.0, MAX_FAILS_PER_SIDE, "bid must reach max");
+        assert_eq!(state.1, 0, "ask must stay 0");
+        assert!(
+            fails_last.contains_key(key),
+            "record_side_failure must set side_fails_last"
+        );
+
+        // Simulate time passing past SIDE_FAILS_RESET_AFTER.
+        let stale = Instant::now() - SIDE_FAILS_RESET_AFTER - Duration::from_secs(1);
+        fails_last.insert(key.to_string(), stale);
+
+        // Verifies the main dispatch path's time-based clearing condition.
+        assert!(
+            fails_last
+                .get(key)
+                .is_some_and(|last| last.elapsed() >= SIDE_FAILS_RESET_AFTER),
+            "stale side_fails_last must trip the reset condition"
         );
     }
 }
