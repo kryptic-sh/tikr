@@ -23,6 +23,15 @@ All notable changes to this project will be documented in this file. Follows
 
 ### Fixed
 
+- Dependencies bumped for security advisories: `tokio` 1.54.1
+  (RUSTSEC-2026-0386), `rustls` 0.23.46 (RUSTSEC-2026-0285, -0346, -0348,
+  -0349), `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.11 (RUSTSEC-2026-0381,
+  -0382), `anyhow` 1.0.104 (RUSTSEC-2026-0190), `crossbeam-epoch` 0.9.21
+  (RUSTSEC-2026-0204), `ruint` 1.21.1 (RUSTSEC-2026-0220) and `zstd-safe` 7.3.0
+  / `zstd-sys` 2.1.2. RUSTSEC-2026-0391, -0398 and -0403 (zstd, via polars) and
+  RUSTSEC-2026-0387 (crypto-bigint 0.5, via alloy-signer) have no fixed release
+  reachable through polars or alloy yet and are ignored in `deny.toml` with the
+  reasons.
 - MEXC order mutations now require `TIKR_MEXC_ENABLE_MAINNET=1`, and every REST
   endpoint preserves venue rate-limit cooldowns from HTTP 418/429 responses.
 - Bybit order-book throttling now returns `VenueError::RateLimited` with

@@ -23,6 +23,22 @@ ignore = [
   # no runtime exposure. No safe upgrade until polars drops it. Revisit on
   # polars bump.
   { id = "RUSTSEC-2026-0173", reason = "transitive via polars; compile-time proc-macro only, no runtime exposure" },
+  # zstd / zstd-safe: fixed only in zstd 0.14.3 and zstd-safe 8.2.0, but
+  # polars-parquet (0.43 and the latest 0.55) requires zstd ^0.13. It builds
+  # zstd with default features off, so neither `legacy` (0403) nor `seekable`
+  # (0398) is compiled in, and it only calls the bulk compressor and
+  # `zstd::Decoder::new` (the read decoder), never the `with_context`
+  # constructors (0391). Revisit on polars bump.
+  { id = "RUSTSEC-2026-0391", reason = "transitive via polars-parquet; with_context constructors never called" },
+  { id = "RUSTSEC-2026-0398", reason = "transitive via polars-parquet; seekable feature not enabled" },
+  { id = "RUSTSEC-2026-0403", reason = "transitive via polars-parquet; legacy feature not enabled" },
+  # crypto-bigint 0.5: timing variability in operations meant to be
+  # constant-time; fixed only in 0.7.6. Reached through elliptic-curve 0.13,
+  # which alloy-signer (2.0 and the latest 2.5) still requires via k256 0.13,
+  # so the Hyperliquid signer has no fixed version to move to. Not analysed
+  # which of the affected operations k256 signing reaches. Revisit when alloy
+  # moves to k256 0.14.
+  { id = "RUSTSEC-2026-0387", reason = "transitive via alloy-signer; no alloy release off crypto-bigint 0.5 yet" },
 ]
 
 [licenses]
